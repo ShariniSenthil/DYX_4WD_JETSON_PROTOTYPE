@@ -170,10 +170,10 @@ def generate_launch_description() -> LaunchDescription:
                         # Must be the physically verified
                         # fully-released servo position.
                         "release_value": 0.0,
-                        "spray_duration_sec": 3.0,
-                        # mission_manager already requires
-                        # <=30 mm radial error and
-                        # <=0.01 m/s rover speed.
+                        "spray_duration_sec": 0.50,
+                        # mission_manager already requires <=30 mm radial error,
+                        # <=0.01 m/s rover speed, then holds the marking point
+                        # for 3.0 s total. Spray actuator ON time is only 0.5 s.
                         "pre_spray_stable_sec": 0.25,
                         "command_timeout_sec": 1.0,
                         ("release_retry_interval_sec"): 0.25,
@@ -213,6 +213,9 @@ def generate_launch_description() -> LaunchDescription:
                         # Marking must remain inside 30 mm AND stationary
                         # continuously before spray is requested.
                         "arrival_settle_sec": 0.30,
+                        # After arrival validation, keep the rover at ZERO for
+                        # 3.0 s total at every real marking point P1/P2/P3/...
+                        "marking_hold_sec": 3.00,
                         "stationary_speed_tolerance_mps": 0.01,
                         # Extension/dummy semantic goal uses the SAME exact
                         # 30 mm waypoint radius as marking points, but is never

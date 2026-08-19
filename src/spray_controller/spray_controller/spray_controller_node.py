@@ -84,7 +84,7 @@ class SprayController(Node):
         self.declare_parameter("enabled", True)
         self.declare_parameter("press_value", 1.0)
         self.declare_parameter("release_value", 0.0)
-        self.declare_parameter("spray_duration_sec", 3.0)
+        self.declare_parameter("spray_duration_sec", 0.50)
         self.declare_parameter("pre_spray_stable_sec", 0.25)
 
         self.declare_parameter("command_timeout_sec", 1.0)
@@ -1288,8 +1288,8 @@ class SprayController(Node):
 
             # The configured spray duration is the physical PRESS hold time.
             # Start the timer only after PX4/MAVROS has ACKed the PRESS command,
-            # so command/transport latency is not subtracted from the 3-second
-            # marking interval.
+            # so command/transport latency is not subtracted from the configured
+            # physical spray ON interval.
             self.spray_started_at = now
             self.state = self.STATE_SPRAYING
             return

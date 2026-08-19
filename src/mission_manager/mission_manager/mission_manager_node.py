@@ -54,12 +54,11 @@ class MissionManager(Node):
     FCU_STATE_STALE_SEC = 3.0
     GPS_FIX_STALE_SEC = 2.0
     RTK_STATUS_STALE_SEC = 5.0
-    MAX_RTK_CORRECTION_AGE_SEC = 5.0
+    MAX_RTK_CORRECTION_AGE_SEC = 2.0
     OFFBOARD_STREAM_SETTLE_SEC = 0.60
     SERVICE_DISCOVERY_TIMEOUT_SEC = 3.0
     SERVICE_RESPONSE_TIMEOUT_SEC = 5.0
     VEHICLE_STATE_CONFIRM_TIMEOUT_SEC = 3.0
-    SPRAY_STOP_RECOVERY_TIMEOUT_SEC = 3.0
 
     POINT_PASS_THROUGH = 0
     POINT_DUMMY_ALIGNMENT = 1
@@ -78,6 +77,7 @@ class MissionManager(Node):
         self.declare_parameter("local_frame", "map")
         self.declare_parameter("marking_tolerance_m", 0.03)
         self.declare_parameter("arrival_settle_sec", 0.30)
+        self.declare_parameter("marking_hold_sec", 3.00)
         self.declare_parameter("stationary_speed_tolerance_mps", 0.01)
         self.declare_parameter("dummy_arrival_tolerance_m", 0.03)
         self.declare_parameter("waypoint_match_tolerance_m", 0.002)
@@ -93,6 +93,7 @@ class MissionManager(Node):
             self.get_parameter("marking_tolerance_m").value
         )
         self.arrival_settle_sec = float(self.get_parameter("arrival_settle_sec").value)
+        self.marking_hold_sec = float(self.get_parameter("marking_hold_sec").value)
         self.stationary_speed_tolerance_mps = float(
             self.get_parameter("stationary_speed_tolerance_mps").value
         )
@@ -310,9 +311,6 @@ class MissionManager(Node):
         self._mode_client = self.create_client(
             SetMode, "/mavros/set_mode", callback_group=self._io_group
         )
-        self._spray_reset_fault_client = self.create_client(
-            Trigger, "/spray/reset_fault", callback_group=self._io_group
-        )
 
         # ----------------------------------------------------------
         # Prepared mission snapshot
@@ -349,6 +347,11 @@ class MissionManager(Node):
         # Arrival verification. This is NOT spray duration.
         self._arrival_settle_started: Optional[float] = None
         self._arrival_settle_elapsed_sec = 0.0
+        # Marking hold starts only after exact arrival has been validated.
+        # The rover remains stopped for marking_hold_sec total; spray is only
+        # a short transaction inside that hold.
+        self._marking_hold_started: Optional[float] = None
+        self._marking_hold_elapsed_sec = 0.0
         self._spray_request_started: Optional[float] = None
 
         self._marking_xtrack_m = math.inf
@@ -359,9 +362,6 @@ class MissionManager(Node):
 
         self._spray_controller_ready = False
         self._spray_controller_state: Optional[str] = None
-        self._spray_fault_latched = False
-        self._spray_press_may_be_active = False
-        self._spray_release_confirmed = True
         self._spray_fault_reason: Optional[str] = None
         self._spray_status_last_rx_monotonic: Optional[float] = None
         self._spray_status_timestamp_unix_ns: Optional[int] = None
@@ -410,22 +410,10 @@ class MissionManager(Node):
         self.get_logger().warn(
             f"Marking: radial <= {self.marking_tolerance_m*1000.0:.0f} mm AND "
             f"speed <= {self.stationary_speed_tolerance_mps:.3f} m/s for "
-            f"{self.arrival_settle_sec:.2f}s"
+            f"{self.arrival_settle_sec:.2f}s arrival settle, {self.marking_hold_sec:.2f}s marking hold"
         )
         self.get_logger().warn(
             "RTK runtime rule: FLOAT/lost => PAUSE; FIXED return => READY TO RESUME; no auto-resume"
-        )
-        self.get_logger().warn(
-            "RC/manual rule: leaving OFFBOARD during a run requires STOP -> START; "
-            "Resume is intentionally disabled"
-        )
-        self.get_logger().warn(
-            "STOP rule: full mission clear + PX4 disarm/MANUAL; "
-            "new CSV upload required before START"
-        )
-        self.get_logger().warn(
-            f"RTK transport age gate: <= {self.MAX_RTK_CORRECTION_AGE_SEC:.1f}s; "
-            "actual fix_type=6 remains mandatory"
         )
 
     # ==============================================================
@@ -437,6 +425,7 @@ class MissionManager(Node):
         values = {
             "marking_tolerance_m": self.marking_tolerance_m,
             "arrival_settle_sec": self.arrival_settle_sec,
+            "marking_hold_sec": self.marking_hold_sec,
             "stationary_speed_tolerance_mps": self.stationary_speed_tolerance_mps,
             "dummy_arrival_tolerance_m": self.dummy_arrival_tolerance_m,
             "waypoint_match_tolerance_m": self.waypoint_match_tolerance_m,
@@ -509,12 +498,6 @@ class MissionManager(Node):
             if not points:
                 self._handle_source_clear("/nav_path cleared")
                 return
-            if self._state in {"RUNNING", "PAUSED", "WAITING_FOR_NEXT"}:
-                self.get_logger().warn(
-                    "Ignored replacement /nav_path while mission is active; "
-                    "STOP before uploading/preparing a new CSV"
-                )
-                return
             self._pending_nav_path = points
             self._try_load_prepared_mission()
 
@@ -530,12 +513,6 @@ class MissionManager(Node):
             if not points:
                 self._handle_source_clear("/mission_waypoints cleared")
                 return
-            if self._state in {"RUNNING", "PAUSED", "WAITING_FOR_NEXT"}:
-                self.get_logger().warn(
-                    "Ignored replacement /mission_waypoints while mission is active; "
-                    "STOP before uploading/preparing a new CSV"
-                )
-                return
             self._pending_mission_waypoints = points
             self._try_load_prepared_mission()
 
@@ -547,12 +524,6 @@ class MissionManager(Node):
         with self._lock:
             if not values:
                 self._handle_source_clear("Path types cleared")
-                return
-            if self._state in {"RUNNING", "PAUSED", "WAITING_FOR_NEXT"}:
-                self.get_logger().warn(
-                    "Ignored replacement path types while mission is active; "
-                    "STOP before uploading/preparing a new CSV"
-                )
                 return
             self._pending_path_types = values
             self._try_load_prepared_mission()
@@ -566,58 +537,31 @@ class MissionManager(Node):
             if not values:
                 self._handle_source_clear("Marking indices cleared")
                 return
-            if self._state in {"RUNNING", "PAUSED", "WAITING_FOR_NEXT"}:
-                self.get_logger().warn(
-                    "Ignored replacement marking indices while mission is active; "
-                    "STOP before uploading/preparing a new CSV"
-                )
-                return
             self._pending_marking_indices = values
             self._try_load_prepared_mission()
 
     def _trajectory_ready_callback(self, message: Bool) -> None:
         with self._lock:
-            incoming_ready = bool(message.data)
-
-            # A new upload/prepare is not allowed to disturb an active mission.
-            # The operator must explicitly STOP first. Preserve the currently
-            # loaded trajectory and runtime state; never auto-stop or enter ERROR
-            # because another node published ready=False while active.
-            if (
-                not incoming_ready
-                and self._state in {"RUNNING", "PAUSED", "WAITING_FOR_NEXT"}
-            ):
-                self.get_logger().warn(
-                    "Ignored trajectory ready=False while mission is active; "
-                    "STOP the mission before uploading/preparing a new CSV"
-                )
-                return
-
-            self._trajectory_ready = incoming_ready
+            self._trajectory_ready = bool(message.data)
             if not self._trajectory_ready:
                 self._pending_nav_path = None
                 self._pending_mission_waypoints = None
                 self._pending_path_types = None
                 self._pending_marking_indices = None
+                if self._state in {"RUNNING", "PAUSED", "WAITING_FOR_NEXT"}:
+                    self._enter_error("Trajectory readiness lost during active mission")
                 return
-
             self._try_load_prepared_mission()
 
     def _handle_source_clear(self, reason: str) -> None:
-        # Source-clear messages are also rejected while active. The current
-        # mission remains untouched until the operator explicitly presses STOP.
-        if self._state in {"RUNNING", "PAUSED", "WAITING_FOR_NEXT"}:
-            self.get_logger().warn(
-                f"Ignored prepared-trajectory clear while mission is active: {reason}; "
-                "STOP the mission before uploading/preparing a new CSV"
-            )
-            return
-
         self._trajectory_ready = False
         self._pending_nav_path = None
         self._pending_mission_waypoints = None
         self._pending_path_types = None
         self._pending_marking_indices = None
+        if self._state in {"RUNNING", "PAUSED", "WAITING_FOR_NEXT"}:
+            self._enter_error(f"Prepared trajectory cleared while active: {reason}")
+            return
         self._clear_loaded_runtime(reason)
 
     def _try_load_prepared_mission(self) -> None:
@@ -738,37 +682,6 @@ class MissionManager(Node):
             self._px4_mode = str(message.mode or "UNKNOWN").strip().upper()
             self._last_fcu_rx_monotonic = time.monotonic()
 
-            # Operator RC/manual takeover (or any loss of OFFBOARD) invalidates
-            # the current autonomous run. Do NOT auto-resume it later because
-            # the rover may have been driven away from the stored leg state.
-            #
-            # Required recovery:
-            #   RC/manual takeover -> PAUSED/STOP_REQUIRED -> operator STOP
-            #   -> prepared mission retained -> START creates a fresh run.
-            if self._state == "RUNNING" and self._px4_mode != "OFFBOARD":
-                self._state = "PAUSED"
-                self._pause_reason = (
-                    "MANUAL_OVERRIDE"
-                    if self._px4_mode == "MANUAL"
-                    else "OFFBOARD_LOST"
-                )
-                self._resume_available = False
-                self._set_safety(
-                    emergency_stop=False,
-                    mission_enable=False,
-                )
-                self._publish_marking_active(False)
-                self._last_message = (
-                    f"PX4 left OFFBOARD ({self._px4_mode}); "
-                    "mission stopped for operator takeover. "
-                    "Press STOP before STARTing again"
-                )
-                self._emit_system_event(
-                    "CONTROL_OVERRIDE",
-                    self._last_message,
-                )
-                self._publish_status(force=True)
-
     def _gps_status_callback(self, message: GPSRAW) -> None:
         with self._lock:
             self._gps_fix_type = int(message.fix_type)
@@ -823,13 +736,6 @@ class MissionManager(Node):
             self._spray_controller_ready = bool(payload.get("ready", False))
             state = payload.get("controller_state")
             self._spray_controller_state = str(state) if state is not None else None
-            self._spray_fault_latched = bool(payload.get("fault_latched", False))
-            self._spray_press_may_be_active = bool(
-                payload.get("press_may_be_active", False)
-            )
-            self._spray_release_confirmed = bool(
-                payload.get("release_confirmed", True)
-            )
             reason = payload.get("fault_reason")
             self._spray_fault_reason = str(reason) if reason else None
 
@@ -991,14 +897,6 @@ class MissionManager(Node):
         if self._state != "PAUSED":
             return
 
-        # RC/manual takeover changes the physical rover state outside the
-        # autonomous mission. Never offer Resume for this condition.
-        if self._pause_reason in {"MANUAL_OVERRIDE", "OFFBOARD_LOST"}:
-            if self._resume_available:
-                self._resume_available = False
-                self._publish_status(force=True)
-            return
-
         # A latched E-stop must first be explicitly released.
         if self._pause_reason == "ESTOP" and self._emergency_stop:
             if self._resume_available:
@@ -1061,34 +959,6 @@ class MissionManager(Node):
             self._reset_arrival_state()
             self._publish_marking_active(False)
         self._publish_safety()
-
-    def _require_start_ready(self) -> None:
-        """Minimal START gate.
-
-        START intentionally checks only the operator/mission contract:
-          * a validated prepared trajectory is loaded and manager is READY;
-          * the Mosaic/PX4 GPS solution currently reports RTK FIXED (fix_type=6).
-
-        It does NOT block START on NTRIP-health, RTCM byte age, spray status,
-        backend heartbeat, odometry age or the previous E-stop value. Runtime
-        safety/RTK monitoring remains separate after the mission is running.
-        """
-        if self._state != "READY":
-            raise RuntimeError(
-                f"Mission is not READY (state={self._state}); STOP the previous "
-                "mission before uploading/starting a new mission"
-            )
-        if (
-            not self._navigation_path
-            or not self._mission_waypoints
-            or not self._trajectory_ready
-        ):
-            raise RuntimeError("No validated prepared mission is ready")
-        if self._gps_fix_type != 6:
-            raise RuntimeError(
-                "RTK FIXED required to START "
-                f"(fix_type={self._gps_fix_type}, state={self._rtk_state()})"
-            )
 
     def _require_motion_health(
         self, *, require_ready_state: bool, require_estop_released: bool = False
@@ -1162,74 +1032,6 @@ class MissionManager(Node):
             warnings.append(f"MANUAL warning: {exc}")
         return warnings
 
-    def _best_effort_spray_reset_after_stop(self) -> list[str]:
-        """Clear a previous run's spray fault only after the actuator is safe.
-
-        STOP first forces marking_active=False, mission_enable=False and E-stop.
-        The spray controller is then allowed to finish/retry RELEASE. If it has
-        a latched fault after RELEASE is confirmed, use its existing
-        /spray/reset_fault service. That service independently refuses unsafe
-        resets, so a possibly-active spray press is never silently cleared.
-        """
-        warnings: list[str] = []
-        deadline = time.monotonic() + self.SPRAY_STOP_RECOVERY_TIMEOUT_SEC
-
-        while rclpy.ok() and time.monotonic() < deadline:
-            with self._lock:
-                press_may_be_active = self._spray_press_may_be_active
-                release_confirmed = self._spray_release_confirmed
-                state = self._spray_controller_state
-                fault_latched = self._spray_fault_latched
-
-            if (
-                not press_may_be_active
-                and release_confirmed
-                and state not in {
-                    "WAIT_PRESS_ACK",
-                    "SPRAYING",
-                    "WAIT_RELEASE_ACK",
-                    "RECOVERY_RELEASE",
-                }
-            ):
-                break
-
-            time.sleep(0.05)
-
-        with self._lock:
-            press_may_be_active = self._spray_press_may_be_active
-            release_confirmed = self._spray_release_confirmed
-            fault_latched = self._spray_fault_latched
-            state = self._spray_controller_state
-
-        if press_may_be_active or not release_confirmed:
-            warnings.append(
-                "spray reset skipped: RELEASE is not yet safely confirmed"
-            )
-            return warnings
-
-        if not fault_latched:
-            return warnings
-
-        try:
-            request = Trigger.Request()
-            result = self._call_service(
-                self._spray_reset_fault_client,
-                request,
-                "spray reset_fault",
-            )
-            if not bool(result.success):
-                warnings.append(
-                    f"spray reset warning: {result.message or 'reset rejected'}"
-                )
-            else:
-                self.get_logger().warn(
-                    "Previous spray fault safely reset during operator STOP"
-                )
-        except Exception as exc:
-            warnings.append(f"spray reset warning: {exc}")
-
-        return warnings
-
     # ==============================================================
     # Services
     # ==============================================================
@@ -1238,47 +1040,18 @@ class MissionManager(Node):
     ) -> Trigger.Response:
         self._start_stage = "PRECHECK"
         self._start_failed_stage = None
-
-        # ----------------------------------------------------------
-        # Request/state gate only. A rejected START must NOT change PX4 mode,
-        # arm state, E-stop, mission_enable, or the currently active mission.
-        # ----------------------------------------------------------
         try:
             with self._lock:
                 if self._state == "RUNNING":
-                    raise RuntimeError(
-                        "Previous mission is still RUNNING; press STOP before START"
-                    )
+                    raise RuntimeError("Previous mission is still RUNNING; STOP the current mission before START")
                 if self._state == "PAUSED":
-                    raise RuntimeError(
-                        "Previous mission is PAUSED; press STOP before uploading/START"
-                    )
+                    raise RuntimeError("Mission paused; use Resume")
                 if self._state == "WAITING_FOR_NEXT":
-                    raise RuntimeError(
-                        "Previous MANUAL mission is waiting for NEXT; press STOP first"
-                    )
+                    raise RuntimeError("Manual mission waiting for NEXT")
                 if self._state == "ERROR":
-                    raise RuntimeError("Mission in ERROR; Stop/Clear and prepare again")
+                    raise RuntimeError("Mission in ERROR; clear/prepare again")
+            self._require_motion_health(require_ready_state=True)
 
-                # Minimal START gate: prepared mission + actual RTK FIXED only.
-                self._require_start_ready()
-
-        except Exception as exc:
-            with self._lock:
-                self._last_error = str(exc)
-                self._last_message = f"Start rejected: {exc}"
-                self._start_failed_stage = "PRECHECK"
-                self._start_stage = "IDLE"
-                self._publish_status(force=True)
-            response.success = False
-            response.message = self._last_message
-            return response
-
-        # ----------------------------------------------------------
-        # Start sequence. Only failures AFTER this point perform safe cleanup,
-        # because PX4 mode/arm state may already have been changed.
-        # ----------------------------------------------------------
-        try:
             self._start_stage = "ZERO_SETPOINT_SETTLE"
             self._set_safety(emergency_stop=False, mission_enable=False)
             time.sleep(self.OFFBOARD_STREAM_SETTLE_SEC)
@@ -1291,17 +1064,12 @@ class MissionManager(Node):
             self._start_stage = "ARMING"
             if not self._px4_armed:
                 self._request_arm(True)
-            self._wait_for_vehicle_state(
-                expected_mode="OFFBOARD", expected_armed=True
-            )
+            self._wait_for_vehicle_state(expected_mode="OFFBOARD", expected_armed=True)
 
             self._start_stage = "FINAL_CHECK"
-            # Do not reintroduce the old spray/RTCM-age/odom/backend precheck.
-            # Reconfirm only that the prepared mission is still READY and the
-            # receiver still reports actual RTK FIXED before opening motion.
-            with self._lock:
-                self._require_start_ready()
+            self._require_motion_health(require_ready_state=True)
 
+            with self._lock:
                 self._point_status = ["PENDING"] * len(self._mission_waypoints)
                 self._reset_execution_progress()
                 self._mission_run_id = uuid.uuid4().hex
@@ -1311,20 +1079,16 @@ class MissionManager(Node):
                 self._resume_available = False
                 self._state = "RUNNING"
                 self._last_error = None
-                self._last_message = (
-                    f"Mission started in {self._execution_mode} mode"
-                )
+                self._last_message = f"Mission started in {self._execution_mode} mode"
                 self._start_stage = "RUNNING"
                 self._publish_mission_complete(False)
                 self._publish_runtime_path()
                 self._publish_goal()
-
             self._set_safety(emergency_stop=False, mission_enable=True)
             self._publish_status(force=True)
             response.success = True
             response.message = self._last_message
             return response
-
         except Exception as exc:
             failed_stage = self._start_stage
             self._set_safety(emergency_stop=True, mission_enable=False)
@@ -1337,7 +1101,7 @@ class MissionManager(Node):
                 ):
                     self._state = "READY"
                 self._last_error = str(exc)
-                self._last_message = f"Start failed at {failed_stage}: {exc}"
+                self._last_message = f"Start blocked at {failed_stage}: {exc}"
                 self._start_failed_stage = failed_stage
                 self._start_stage = "FAILED"
                 self._start_debug = {"cleanup_warnings": cleanup}
@@ -1373,13 +1137,6 @@ class MissionManager(Node):
                 if self._state != "PAUSED":
                     response.success = False
                     response.message = "Mission is not paused"
-                    return response
-                if self._pause_reason in {"MANUAL_OVERRIDE", "OFFBOARD_LOST"}:
-                    response.success = False
-                    response.message = (
-                        "RC/manual takeover detected; press STOP and then START "
-                        "a fresh mission run"
-                    )
                     return response
             self._require_motion_health(
                 require_ready_state=False, require_estop_released=True
@@ -1575,50 +1332,28 @@ class MissionManager(Node):
     def _stop_service(
         self, _request: Trigger.Request, response: Trigger.Response
     ) -> Trigger.Response:
-        """STOP is a full run reset.
-
-        Required operator workflow:
-            STOP
-              -> spray permission removed / safe release
-              -> mission_enable false + hard stop asserted
-              -> PX4 disarmed and switched to MANUAL
-              -> previous Mission Manager snapshot cleared
-              -> backend/trajectory_generator are cleared by the backend STOP API
-              -> a NEW CSV upload is required before START
-
-        No previous mission may remain READY after STOP.
-        """
-        # Remove spray permission before changing PX4 mode or arming state.
-        self._publish_marking_active(False)
         self._set_safety(emergency_stop=True, mission_enable=False)
-
-        # Make PX4 safe first.
         cleanup = self._best_effort_px4_safe_cleanup()
-
-        # Once release is confirmed, clear only the previous run's safely
-        # resettable spray fault. Never blindly reset a possibly-active press.
-        cleanup.extend(self._best_effort_spray_reset_after_stop())
-
         with self._lock:
+            if self._navigation_path:
+                self._point_status = ["PENDING"] * len(self._mission_waypoints)
+            self._reset_execution_progress()
             self._mission_run_id = ""
             self._spray_success_keys.clear()
             self._spray_failure_keys.clear()
-
-            self._trajectory_ready = False
-            self._pending_nav_path = None
-            self._pending_mission_waypoints = None
-            self._pending_path_types = None
-            self._pending_marking_indices = None
-
-            self._clear_loaded_runtime(
-                "Mission stopped and cleared; upload a CSV before START"
+            self._state = (
+                "READY" if self._navigation_path and self._trajectory_ready else "EMPTY"
             )
-            self._start_stage = "IDLE"
             self._last_error = None
+            self._last_message = "Mission stopped; prepared mission retained"
+            self._start_stage = "IDLE"
+            self._publish_marking_active(False)
+            self._publish_mission_complete(False)
+            self._publish_runtime_path()
+            self._publish_goal()
             self._publish_status(force=True)
-
         response.success = True
-        response.message = "Mission stopped and cleared; upload a CSV before START"
+        response.message = self._last_message
         if cleanup:
             response.message += "; " + "; ".join(cleanup)
         return response
@@ -1731,6 +1466,8 @@ class MissionManager(Node):
     def _reset_arrival_state(self) -> None:
         self._arrival_settle_started = None
         self._arrival_settle_elapsed_sec = 0.0
+        self._marking_hold_started = None
+        self._marking_hold_elapsed_sec = 0.0
         self._spray_request_started = None
         self._marking_error_valid = False
         self._marking_xtrack_m = math.inf
@@ -1861,10 +1598,6 @@ class MissionManager(Node):
             "point_index": marking_number,
             "path_index": path_index,
             "state": self._state,
-            # A point completing is NOT the same as the mission completing.
-            # The whole mission terminates only via _complete_mission().
-            "terminal": False,
-            "mission_complete": False,
             "timestamp_unix_ns": time.time_ns(),
             "radial_error_m": (
                 round(self._marking_radial_error_m, 6)
@@ -1978,9 +1711,6 @@ class MissionManager(Node):
             "spray_required": self.spray_required,
             "spray_controller_ready": self._spray_controller_ready,
             "spray_controller_state": self._spray_controller_state,
-            "spray_fault_latched": self._spray_fault_latched,
-            "spray_press_may_be_active": self._spray_press_may_be_active,
-            "spray_release_confirmed": self._spray_release_confirmed,
             "spray_fault_reason": self._spray_fault_reason,
             "current_point_spray_confirmed": (
                 spray_key in self._spray_success_keys if spray_key else False
@@ -1988,9 +1718,12 @@ class MissionManager(Node):
             "marking_active": self._spray_request_started is not None,
             "arrival_settle_elapsed_sec": round(self._arrival_settle_elapsed_sec, 3),
             "arrival_settle_required_sec": self.arrival_settle_sec,
+            "marking_hold_elapsed_sec": round(self._marking_hold_elapsed_sec, 3),
+            "marking_hold_required_sec": self.marking_hold_sec,
             # Compatibility names retained for current frontend/backend.
-            "hold_elapsed_sec": round(self._arrival_settle_elapsed_sec, 3),
-            "hold_required_sec": self.arrival_settle_sec,
+            # These now represent the REAL marking hold, not arrival settle.
+            "hold_elapsed_sec": round(self._marking_hold_elapsed_sec, 3),
+            "hold_required_sec": self.marking_hold_sec,
             "marking_error_mode": "RADIAL_2D",
             "marking_tolerance_m": self.marking_tolerance_m,
             "marking_xtrack_m": (
@@ -2038,22 +1771,8 @@ class MissionManager(Node):
     # Mission completion / error
     # ==============================================================
     def _finish_if_done(self) -> bool:
-        """Finish only when every uploaded CSV marking is terminal."""
-        if not self._point_status:
-            return False
-
         if self._next_pending_marking_number(0) is not None:
             return False
-
-        if any(
-            state not in self.TERMINAL_POINT_STATES
-            for state in self._point_status
-        ):
-            self._enter_error(
-                "Mission completion invariant failed: non-terminal point remains"
-            )
-            return True
-
         self._complete_mission()
         return True
 
@@ -2224,39 +1943,42 @@ class MissionManager(Node):
 
                 # Stable exact arrival accepted. Mission Manager now asks the
                 # separate spray controller to perform its own timed transaction.
+                self._marking_hold_started = now
+                self._marking_hold_elapsed_sec = 0.0
                 self._spray_request_started = now
                 self._publish_marking_active(True)
                 self._last_message = (
                     f"P{marking_number+1:04d} arrival validated: "
-                    f"radial={self._marking_radial_error_m*1000.0:.1f}mm; spray enabled"
+                    f"radial={self._marking_radial_error_m*1000.0:.1f}mm; "
+                    f"3.0s marking hold started; spray enabled"
                 )
                 self._publish_status(force=True)
 
             point_id = f"P{marking_number+1:04d}"
             spray_key = (self._mission_run_id, point_id)
 
-            # Once spraying has been requested, precision is still a live safety
-            # condition. Keep /marking_active TRUE at CONTROL_HZ so the spray
-            # controller's freshness watchdog remains valid for the full press.
-            # Any drift outside 30 mm or motion above the stationary threshold
-            # immediately removes spray permission and fails this marking point.
+            # Once a REAL marking point has passed the exact 30 mm + stationary
+            # arrival gate, the physical spray transaction is committed. Keep
+            # /marking_active TRUE at CONTROL_HZ until spray SUCCESS/FAILED or a
+            # real mission safety gate (E-stop, RTK pause, odom stale, mission
+            # disable, PX4 loss) removes permission elsewhere in this manager.
+            #
+            # Do NOT fail an already-started spray merely because EKF/GNSS
+            # position or velocity jitters outside the 30 mm / 0.01 m/s arrival
+            # gate for one control sample. The rover is already commanded ZERO by
+            # RPP while marking_active is true, and failing here used to create:
+            #   P1 physically sprayed -> MM ERROR -> spray fault latch -> no P2.
+            # The 30 mm tolerance remains mandatory BEFORE the spray is started.
             if self._spray_request_started is not None:
-                if not (inside_30mm and stationary):
-                    self._publish_marking_active(False)
-                    radial_mm = (
-                        self._marking_radial_error_m * 1000.0
-                        if math.isfinite(self._marking_radial_error_m)
-                        else math.inf
-                    )
-                    reason = (
-                        f"Marking precision lost during spray at {point_id}: "
-                        f"radial={radial_mm:.1f}mm, speed={self._speed_mps:.3f}m/s"
-                    )
-                    self._fail_marking_point(
-                        marking_number, self._current_path_index, reason
-                    )
-                    return
                 self._publish_marking_active(True)
+
+            # Keep the rover stopped for the complete marking hold. The spray
+            # controller may finish its short 0.5 s PRESS early, but this point
+            # cannot become COMPLETED until the full marking_hold_sec has elapsed.
+            if self._marking_hold_started is not None:
+                self._marking_hold_elapsed_sec = max(
+                    0.0, time.monotonic() - self._marking_hold_started
+                )
 
             if self.spray_required:
                 failure = self._spray_failure_keys.get(spray_key)
@@ -2281,9 +2003,20 @@ class MissionManager(Node):
                         )
                     return
 
-            # Spray success (or spray disabled for bench testing) is accepted
-            # only while the rover is still inside the 30 mm radius and
-            # stationary; the live check above guarantees that here.
+            # Spray SUCCESS may arrive well before the requested 3.0 s marking
+            # hold is finished (normal spray ON time is only 0.5 s). Keep
+            # /marking_active TRUE so RPP continues commanding exact ZERO until
+            # the complete marking hold expires.
+            if self._marking_hold_elapsed_sec < self.marking_hold_sec:
+                remaining = max(0.0, self.marking_hold_sec - self._marking_hold_elapsed_sec)
+                self._last_message = (
+                    f"{point_id} spray complete; holding position "
+                    f"{remaining:.2f}s more"
+                )
+                return
+
+            # Full marking hold is complete and spray has succeeded. Only now
+            # clear marking_active and advance to the next marking point.
             self._publish_marking_active(False)
             self._point_status[marking_number] = "COMPLETED"
             self._last_completed_marking_number = marking_number
@@ -2307,13 +2040,7 @@ class MissionManager(Node):
                     f"{point_id} COMPLETED at {final_mm:.1f}mm; waiting for NEXT"
                 )
             else:
-                # Point completion is not mission completion. AUTO remains
-                # RUNNING and immediately publishes the next semantic goal.
-                self._state = "RUNNING"
-                self._last_message = (
-                    f"{point_id} COMPLETED at {final_mm:.1f}mm; "
-                    "continuing automatically"
-                )
+                self._last_message = f"{point_id} COMPLETED at {final_mm:.1f}mm; continuing automatically"
                 self._publish_goal()
 
             self._publish_status(force=True)
