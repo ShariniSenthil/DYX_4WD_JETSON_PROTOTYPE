@@ -1,0 +1,784 @@
+#!/usr/bin/env python3
+
+import math
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import (
+    QoSProfile,
+    ReliabilityPolicy,
+    DurabilityPolicy,
+    HistoryPolicy,
+)
+
+from geometry_msgs.msg import (
+    PoseStamped,
+    Twist,
+    Vector3Stamped,
+)
+from std_msgs.msg import Bool
+from mavros_msgs.msg import PositionTarget, State
+
+
+class CmdVelBridge(Node):
+
+    STREAM_HZ = 50.0
+
+    # MAVLink MAV_FRAME_LOCAL_NED
+    FRAME_LOCAL_NED = 1
+
+    # PositionTarget:
+    #
+    # Use velocity only.
+    #
+    # Ignore:
+    #   position
+    #   acceleration
+    #   yaw
+    #   yaw rate
+    TYPE_MASK_VELOCITY_ONLY = 3527
+
+    # Command safety timeout.
+    INPUT_TIMEOUT_SEC = 0.20
+
+    COMMAND_EPSILON = 0.001
+
+    # Pure pivot command:
+    #
+    # PX4 differential rover receives a moving bearing target.
+    # The bearing is continuously placed to the left or right
+    # of the current rover heading.
+    #
+    # PX4 therefore remains in spot-turning control while the
+    # angular command is continuously received.
+    PIVOT_VECTOR_SPEED = 0.05
+    PIVOT_HEADING_OFFSET_RAD = math.radians(75.0)
+
+    # When linear.x and angular.z are both non-zero,
+    # angular.z becomes a heading lead.
+    STEERING_LOOKAHEAD_SEC = 0.75
+    MAX_STEERING_OFFSET_RAD = math.radians(45.0)
+
+    def __init__(self):
+        super().__init__("cmd_vel_bridge")
+
+        # ---------------------------------------------------------
+        # Safety state
+        # ---------------------------------------------------------
+
+        self.mission_enabled = False
+        self.emergency_stop = True
+
+        self.connected = False
+        self.armed = False
+        self.mode = ""
+
+        # ---------------------------------------------------------
+        # Autonomous RPP input
+        # ---------------------------------------------------------
+
+        self.latest_rpp_velocity = None
+        self.latest_rpp_velocity_time = None
+
+        # ---------------------------------------------------------
+        # Manual /cmd_vel input
+        # ---------------------------------------------------------
+
+        self.latest_cmd_vel = None
+        self.latest_cmd_vel_time = None
+
+        # Current rover heading in PX4 NED convention.
+        self.current_yaw_ned = None
+
+        self.last_debug_time = self.get_clock().now()
+
+        fast_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+
+        # ---------------------------------------------------------
+        # INPUT 1:
+        # Autonomous RPP velocity in NED
+        #
+        # vector.x = North
+        # vector.y = East
+        # vector.z = Down
+        # ---------------------------------------------------------
+
+        self.create_subscription(
+            Vector3Stamped,
+            "/rpp/velocity_ned",
+            self.rpp_velocity_callback,
+            fast_qos,
+        )
+
+        # ---------------------------------------------------------
+        # INPUT 2:
+        # Manual body command
+        #
+        # linear.x:
+        #   positive = forward
+        #   negative = reverse
+        #
+        # angular.z:
+        #   positive = left
+        #   negative = right
+        # ---------------------------------------------------------
+
+        self.create_subscription(
+            Twist,
+            "/cmd_vel",
+            self.cmd_vel_callback,
+            fast_qos,
+        )
+
+        # ---------------------------------------------------------
+        # Rover heading
+        #
+        # MAVROS local pose is ENU.
+        # It is converted to NED heading.
+        # ---------------------------------------------------------
+
+        self.create_subscription(
+            PoseStamped,
+            "/mavros/local_position/pose",
+            self.pose_callback,
+            fast_qos,
+        )
+
+        # ---------------------------------------------------------
+        # Safety / state topics
+        # ---------------------------------------------------------
+
+        self.create_subscription(
+            Bool,
+            "/mission_enable",
+            self.mission_callback,
+            10,
+        )
+
+        self.create_subscription(
+            Bool,
+            "/emergency_stop",
+            self.estop_callback,
+            10,
+        )
+
+        self.create_subscription(
+            State,
+            "/mavros/state",
+            self.state_callback,
+            10,
+        )
+
+        # ---------------------------------------------------------
+        # PX4 OFFBOARD velocity output
+        # ---------------------------------------------------------
+
+        self.setpoint_pub = self.create_publisher(
+            PositionTarget,
+            "/mavros/setpoint_raw/local",
+            fast_qos,
+        )
+
+        self.timer = self.create_timer(
+            1.0 / self.STREAM_HZ,
+            self.control_loop,
+        )
+
+        self.get_logger().warn(
+            "===== PX4 4WD VELOCITY OFFBOARD BRIDGE STARTED ====="
+        )
+        self.get_logger().warn(
+            "Autonomous input : /rpp/velocity_ned"
+        )
+        self.get_logger().warn(
+            "Manual input     : /cmd_vel"
+        )
+        self.get_logger().warn(
+            "Heading input    : /mavros/local_position/pose"
+        )
+        self.get_logger().warn(
+            "PX4 output       : /mavros/setpoint_raw/local"
+        )
+        self.get_logger().warn(
+            "Rate             : 50 Hz"
+        )
+        self.get_logger().warn(
+            "Manual /cmd_vel has priority while fresh"
+        )
+        self.get_logger().warn(
+            "NO ActuatorControl"
+        )
+        self.get_logger().warn(
+            "NO AttitudeTarget heartbeat"
+        )
+        self.get_logger().warn(
+            "NO direct Motor 1 / Motor 2 commands"
+        )
+
+    # =============================================================
+    # Utility functions
+    # =============================================================
+
+    @staticmethod
+    def wrap_pi(angle):
+        return (
+            angle + math.pi
+        ) % (
+            2.0 * math.pi
+        ) - math.pi
+
+    @staticmethod
+    def constrain(value, minimum, maximum):
+        return max(
+            minimum,
+            min(maximum, value),
+        )
+
+    def age_seconds(self, timestamp):
+        return (
+            self.get_clock().now() - timestamp
+        ).nanoseconds / 1e9
+
+    # =============================================================
+    # Input callbacks
+    # =============================================================
+
+    def rpp_velocity_callback(self, msg):
+
+        values = (
+            msg.vector.x,
+            msg.vector.y,
+            msg.vector.z,
+        )
+
+        if not all(
+            math.isfinite(value)
+            for value in values
+        ):
+            self.get_logger().error(
+                "Rejected non-finite /rpp/velocity_ned command"
+            )
+            return
+
+        self.latest_rpp_velocity = msg
+        self.latest_rpp_velocity_time = (
+            self.get_clock().now()
+        )
+
+    def cmd_vel_callback(self, msg):
+
+        values = (
+            msg.linear.x,
+            msg.angular.z,
+        )
+
+        if not all(
+            math.isfinite(value)
+            for value in values
+        ):
+            self.get_logger().error(
+                "Rejected non-finite /cmd_vel command"
+            )
+            return
+
+        self.latest_cmd_vel = msg
+        self.latest_cmd_vel_time = (
+            self.get_clock().now()
+        )
+
+    def pose_callback(self, msg):
+
+        q = msg.pose.orientation
+
+        values = (
+            q.x,
+            q.y,
+            q.z,
+            q.w,
+        )
+
+        if not all(
+            math.isfinite(value)
+            for value in values
+        ):
+            return
+
+        quaternion_norm = math.sqrt(
+            q.x * q.x
+            + q.y * q.y
+            + q.z * q.z
+            + q.w * q.w
+        )
+
+        if quaternion_norm < 1e-6:
+            return
+
+        # Quaternion -> ENU yaw
+        siny_cosp = 2.0 * (
+            q.w * q.z
+            + q.x * q.y
+        )
+
+        cosy_cosp = 1.0 - 2.0 * (
+            q.y * q.y
+            + q.z * q.z
+        )
+
+        yaw_enu = math.atan2(
+            siny_cosp,
+            cosy_cosp,
+        )
+
+        # ENU yaw -> NED heading
+        #
+        # ENU:
+        #   0 rad = East
+        #   positive = counter-clockwise
+        #
+        # NED:
+        #   0 rad = North
+        #   positive = clockwise
+        self.current_yaw_ned = self.wrap_pi(
+            math.pi / 2.0 - yaw_enu
+        )
+
+    def mission_callback(self, msg):
+        self.mission_enabled = bool(msg.data)
+
+    def estop_callback(self, msg):
+        self.emergency_stop = bool(msg.data)
+
+    def state_callback(self, msg):
+        self.connected = bool(msg.connected)
+        self.armed = bool(msg.armed)
+        self.mode = msg.mode
+
+    # =============================================================
+    # PX4 output
+    # =============================================================
+
+    def publish_velocity_setpoint(
+        self,
+        velocity_north,
+        velocity_east,
+        velocity_down,
+    ):
+
+        msg = PositionTarget()
+
+        msg.header.stamp = (
+            self.get_clock().now().to_msg()
+        )
+
+        msg.header.frame_id = ""
+
+        msg.coordinate_frame = (
+            self.FRAME_LOCAL_NED
+        )
+
+        msg.type_mask = (
+            self.TYPE_MASK_VELOCITY_ONLY
+        )
+
+        # Input to this function is NED:
+        #
+        # x = North
+        # y = East
+        # z = Down
+        #
+        # MAVROS ROS message convention is ENU:
+        #
+        # x = East
+        # y = North
+        # z = Up
+        #
+        # Convert NED -> ENU.
+        msg.velocity.x = float(velocity_east)
+        msg.velocity.y = float(velocity_north)
+        msg.velocity.z = float(-velocity_down)
+
+        # Ignored by type mask.
+        msg.position.x = 0.0
+        msg.position.y = 0.0
+        msg.position.z = 0.0
+
+        msg.acceleration_or_force.x = 0.0
+        msg.acceleration_or_force.y = 0.0
+        msg.acceleration_or_force.z = 0.0
+
+        msg.yaw = 0.0
+        msg.yaw_rate = 0.0
+
+        self.setpoint_pub.publish(msg)
+
+    def publish_zero(self):
+        self.publish_velocity_setpoint(
+            0.0,
+            0.0,
+            0.0,
+        )
+
+    # =============================================================
+    # Manual /cmd_vel conversion
+    # =============================================================
+
+    def convert_cmd_vel_to_ned(self):
+
+        linear_x = float(
+            self.latest_cmd_vel.linear.x
+        )
+
+        angular_z = float(
+            self.latest_cmd_vel.angular.z
+        )
+
+        # ---------------------------------------------------------
+        # STOP
+        # ---------------------------------------------------------
+
+        if (
+            abs(linear_x) < self.COMMAND_EPSILON
+            and abs(angular_z) < self.COMMAND_EPSILON
+        ):
+            return (
+                0.0,
+                0.0,
+                0.0,
+                "cmd_vel_stop",
+            )
+
+        # Non-zero body commands require current heading.
+        if self.current_yaw_ned is None:
+            return None
+
+        # ---------------------------------------------------------
+        # PURE LEFT / RIGHT PIVOT
+        # ---------------------------------------------------------
+
+        if abs(linear_x) < self.COMMAND_EPSILON:
+
+            # ROS angular.z:
+            #
+            # positive = left / counter-clockwise
+            # negative = right / clockwise
+            #
+            # NED bearing:
+            #
+            # positive direction = clockwise
+            #
+            # Therefore the sign is reversed here.
+
+            if angular_z > 0.0:
+                target_bearing = self.wrap_pi(
+                    self.current_yaw_ned
+                    - self.PIVOT_HEADING_OFFSET_RAD
+                )
+                reason = "cmd_vel_left_pivot"
+
+            else:
+                target_bearing = self.wrap_pi(
+                    self.current_yaw_ned
+                    + self.PIVOT_HEADING_OFFSET_RAD
+                )
+                reason = "cmd_vel_right_pivot"
+
+            velocity_north = (
+                self.PIVOT_VECTOR_SPEED
+                * math.cos(target_bearing)
+            )
+
+            velocity_east = (
+                self.PIVOT_VECTOR_SPEED
+                * math.sin(target_bearing)
+            )
+
+            return (
+                velocity_north,
+                velocity_east,
+                0.0,
+                reason,
+            )
+
+        # ---------------------------------------------------------
+        # FORWARD / REVERSE
+        #
+        # angular.z can also create a heading lead while moving.
+        # ---------------------------------------------------------
+
+        heading_offset = self.constrain(
+            -angular_z
+            * self.STEERING_LOOKAHEAD_SEC,
+            -self.MAX_STEERING_OFFSET_RAD,
+            self.MAX_STEERING_OFFSET_RAD,
+        )
+
+        facing_bearing = self.wrap_pi(
+            self.current_yaw_ned
+            + heading_offset
+        )
+
+        speed_magnitude = abs(linear_x)
+
+        if linear_x > 0.0:
+
+            # FORWARD:
+            #
+            # Velocity vector points in the direction
+            # the rover should face and travel.
+            travel_bearing = facing_bearing
+
+            if angular_z > self.COMMAND_EPSILON:
+                reason = "cmd_vel_forward_left"
+
+            elif angular_z < -self.COMMAND_EPSILON:
+                reason = "cmd_vel_forward_right"
+
+            else:
+                reason = "cmd_vel_forward"
+
+        else:
+
+            # REVERSE:
+            #
+            # Velocity vector points opposite to the rover's
+            # desired facing direction.
+            #
+            # The PX4 P3 patch detects the negative forward
+            # component and produces negative rover speed.
+            travel_bearing = self.wrap_pi(
+                facing_bearing + math.pi
+            )
+
+            if angular_z > self.COMMAND_EPSILON:
+                reason = "cmd_vel_reverse_left"
+
+            elif angular_z < -self.COMMAND_EPSILON:
+                reason = "cmd_vel_reverse_right"
+
+            else:
+                reason = "cmd_vel_reverse"
+
+        velocity_north = (
+            speed_magnitude
+            * math.cos(travel_bearing)
+        )
+
+        velocity_east = (
+            speed_magnitude
+            * math.sin(travel_bearing)
+        )
+
+        return (
+            velocity_north,
+            velocity_east,
+            0.0,
+            reason,
+        )
+
+    # =============================================================
+    # Debug output
+    # =============================================================
+
+    def debug(
+        self,
+        reason,
+        velocity_north,
+        velocity_east,
+    ):
+
+        now = self.get_clock().now()
+
+        elapsed = (
+            now - self.last_debug_time
+        ).nanoseconds / 1e9
+
+        if elapsed < 1.0:
+            return
+
+        self.last_debug_time = now
+
+        if self.current_yaw_ned is None:
+            yaw_text = "nan"
+        else:
+            yaw_text = (
+                f"{self.current_yaw_ned:.3f}"
+            )
+
+        self.get_logger().info(
+            f"reason={reason} "
+            f"connected={self.connected} "
+            f"armed={self.armed} "
+            f"mode={self.mode} "
+            f"mission={self.mission_enabled} "
+            f"estop={self.emergency_stop} "
+            f"yawNED={yaw_text} "
+            f"vN={velocity_north:.3f} "
+            f"vE={velocity_east:.3f}"
+        )
+
+    # =============================================================
+    # 50 Hz control loop
+    # =============================================================
+
+    def control_loop(self):
+
+        # Always publish a PositionTarget at 50 Hz.
+        #
+        # Safety states send zero velocity instead of
+        # stopping the OFFBOARD setpoint stream.
+
+        if not self.connected:
+            self.publish_zero()
+            self.debug(
+                "fcu_not_connected",
+                0.0,
+                0.0,
+            )
+            return
+
+        if self.emergency_stop:
+            self.publish_zero()
+            self.debug(
+                "emergency_stop",
+                0.0,
+                0.0,
+            )
+            return
+
+        if not self.mission_enabled:
+            self.publish_zero()
+            self.debug(
+                "mission_disabled",
+                0.0,
+                0.0,
+            )
+            return
+
+        # ---------------------------------------------------------
+        # Priority 1:
+        # Fresh manual /cmd_vel command
+        # ---------------------------------------------------------
+
+        if (
+            self.latest_cmd_vel is not None
+            and self.latest_cmd_vel_time is not None
+            and self.age_seconds(
+                self.latest_cmd_vel_time
+            ) <= self.INPUT_TIMEOUT_SEC
+        ):
+
+            result = self.convert_cmd_vel_to_ned()
+
+            if result is None:
+                self.publish_zero()
+                self.debug(
+                    "cmd_vel_waiting_for_heading",
+                    0.0,
+                    0.0,
+                )
+                return
+
+            (
+                velocity_north,
+                velocity_east,
+                velocity_down,
+                reason,
+            ) = result
+
+            self.publish_velocity_setpoint(
+                velocity_north,
+                velocity_east,
+                velocity_down,
+            )
+
+            self.debug(
+                reason,
+                velocity_north,
+                velocity_east,
+            )
+
+            return
+
+        # ---------------------------------------------------------
+        # Priority 2:
+        # Fresh autonomous RPP NED velocity
+        # ---------------------------------------------------------
+
+        if (
+            self.latest_rpp_velocity is not None
+            and self.latest_rpp_velocity_time is not None
+            and self.age_seconds(
+                self.latest_rpp_velocity_time
+            ) <= self.INPUT_TIMEOUT_SEC
+        ):
+
+            velocity_north = float(
+                self.latest_rpp_velocity.vector.x
+            )
+
+            velocity_east = float(
+                self.latest_rpp_velocity.vector.y
+            )
+
+            velocity_down = float(
+                self.latest_rpp_velocity.vector.z
+            )
+
+            self.publish_velocity_setpoint(
+                velocity_north,
+                velocity_east,
+                velocity_down,
+            )
+
+            self.debug(
+                "publishing_rpp_velocity",
+                velocity_north,
+                velocity_east,
+            )
+
+            return
+
+        # ---------------------------------------------------------
+        # No fresh command
+        # ---------------------------------------------------------
+
+        self.publish_zero()
+
+        self.debug(
+            "command_timeout",
+            0.0,
+            0.0,
+        )
+
+
+def main(args=None):
+
+    rclpy.init(args=args)
+
+    node = CmdVelBridge()
+
+    try:
+        rclpy.spin(node)
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+
+        # Final neutral commands.
+        for _ in range(10):
+            node.publish_zero()
+
+        node.destroy_node()
+
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

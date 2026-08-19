@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+
+"""Production launch for the complete DYX 4WD rover stack.
+
+Startup remains safe:
+
+- backend publishes /emergency_stop=true;
+- backend publishes /mission_enable=false;
+- no mission is prepared or started automatically;
+- cmd_vel_bridge requires a fresh backend heartbeat.
+
+The RTK correction bridge remains started separately using start_rtk.sh
+because the current RTK script requests the NTRIP password interactively.
+"""
+
+from launch import LaunchDescription
+
+from launch.actions import ExecuteProcess
+from launch.actions import LogInfo
+from launch.actions import TimerAction
+
+from launch_ros.actions import Node
+
+
+MISSION_FILE = (
+    "/home/flash/rover_ws/"
+    "missions/mission.csv"
+)
+
+MISSION_METADATA_FILE = (
+    "/home/flash/.local/share/"
+    "dyx_rover/runtime/mission_metadata.json"
+)
+
+
+def generate_launch_description(
+) -> LaunchDescription:
+    mavros = ExecuteProcess(
+        cmd=[
+            "bash",
+            "-lc",
+
+            "source "
+            "/opt/ros/humble/setup.bash && "
+
+            "ros2 launch mavros node.launch "
+
+            "fcu_url:="
+            "/dev/ttyACM0:921600 "
+
+            "gcs_url:="
+            "udp://:14550@192.168.3.102:14550 "
+
+            "pluginlists_yaml:="
+            "/opt/ros/humble/share/mavros/"
+            "launch/px4_pluginlists.yaml "
+
+            "config_yaml:="
+            "/opt/ros/humble/share/mavros/"
+            "launch/px4_config.yaml "
+
+            "tgt_system:=1 "
+            "tgt_component:=1 "
+            "fcu_protocol:=v2.0",
+        ],
+
+        output="screen",
+    )
+
+    rover_backend = TimerAction(
+        period=4.0,
+
+        actions=[
+            LogInfo(
+                msg=(
+                    "Starting production "
+                    "rover_backend"
+                )
+            ),
+
+            Node(
+                package="rover_backend",
+
+                executable="rover_backend",
+
+                name="rover_backend",
+
+                output="screen",
+
+                emulate_tty=True,
+
+                respawn=True,
+
+                respawn_delay=2.0,
+            ),
+        ],
+    )
+
+    cmd_vel_bridge = TimerAction(
+        period=6.0,
+
+        actions=[
+            LogInfo(
+                msg=(
+                    "Starting heartbeat-gated "
+                    "cmd_vel_bridge"
+                )
+            ),
+
+            Node(
+                package="jetson_4wd_control",
+
+                executable="cmd_vel_bridge",
+
+                name="cmd_vel_bridge",
+
+                output="screen",
+
+                emulate_tty=True,
+
+                respawn=True,
+
+                respawn_delay=2.0,
+
+                parameters=[
+                    {
+                        "command_timeout_sec": (
+                            0.25
+                        ),
+
+                        (
+                            "backend_heartbeat_"
+                            "timeout_sec"
+                        ): 1.5,
+
+                        "maximum_speed_mps": (
+                            0.40
+                        ),
+
+                        (
+                            "maximum_yaw_rate_"
+                            "radps"
+                        ): 0.20,
+                    }
+                ],
+            ),
+        ],
+    )
+
+    trajectory_generator = TimerAction(
+        period=7.0,
+
+        actions=[
+            LogInfo(
+                msg=(
+                    "Starting dynamic "
+                    "trajectory_generator"
+                )
+            ),
+
+            Node(
+                package=(
+                    "trajectory_generator"
+                ),
+
+                executable=(
+                    "trajectory_generator_node"
+                ),
+
+                name=(
+                    "trajectory_generator"
+                ),
+
+                output="screen",
+
+                emulate_tty=True,
+
+                respawn=True,
+
+                respawn_delay=2.0,
+
+                parameters=[
+                    {
+                        "mission_file": (
+                            MISSION_FILE
+                        ),
+
+                        (
+                            "mission_metadata_file"
+                        ): (
+                            MISSION_METADATA_FILE
+                        ),
+
+                        "frame_id": "map",
+
+                        (
+                            "global_position_topic"
+                        ): (
+                            "/mavros/"
+                            "global_position/"
+                            "raw/fix"
+                        ),
+
+                        "local_odom_topic": (
+                            "/mavros/"
+                            "local_position/odom"
+                        ),
+
+                        "gps_status_topic": (
+                            "/mavros/"
+                            "gpsstatus/gps1/raw"
+                        ),
+
+                        "rtk_health_topic": (
+                            "/rtk_correction_bridge/"
+                            "healthy"
+                        ),
+
+                        (
+                            "rtk_correction_age_"
+                            "topic"
+                        ): (
+                            "/rtk_correction_bridge/"
+                            "correction_age_sec"
+                        ),
+
+                        (
+                            "required_gps_fix_type"
+                        ): 6,
+
+                        "rtk_stable_sec": 3.0,
+
+                        (
+                            "max_correction_age_sec"
+                        ): 2.0,
+
+                        (
+                            "reference_timeout_sec"
+                        ): 1.0,
+
+                        (
+                            "max_reference_skew_sec"
+                        ): 0.25,
+
+                        (
+                            "max_target_distance_m"
+                        ): 1000.0,
+
+                        (
+                            "max_abs_coordinate_m"
+                        ): 10000.0,
+
+                        (
+                            "maximum_marking_points"
+                        ): 10000,
+
+                        (
+                            "maximum_navigation_"
+                            "points"
+                        ): 200000,
+
+                        (
+                            "interpolation_spacing_m"
+                        ): 0.05,
+
+                        (
+                            "minimum_segment_length_m"
+                        ): 0.001,
+
+                        (
+                            "minimum_dummy_clearance_m"
+                        ): 0.05,
+                    }
+                ],
+            ),
+        ],
+    )
+
+    mission_manager = TimerAction(
+        period=8.0,
+
+        actions=[
+            LogInfo(
+                msg=(
+                    "Starting production "
+                    "mission_manager"
+                )
+            ),
+
+            Node(
+                package="mission_manager",
+
+                executable=(
+                    "mission_manager_node"
+                ),
+
+                name="mission_manager",
+
+                output="screen",
+
+                emulate_tty=True,
+
+                respawn=True,
+
+                respawn_delay=2.0,
+
+                parameters=[
+                    {
+                        "local_frame": "map",
+
+                        (
+                            "marking_tolerance_m"
+                        ): 0.03,
+
+                        "marking_hold_sec": 3.0,
+
+                        (
+                            "stationary_speed_"
+                            "tolerance_mps"
+                        ): 0.01,
+
+                        (
+                            "pass_through_switch_"
+                            "distance_m"
+                        ): 0.10,
+
+                        (
+                            "pass_through_lookahead_"
+                            "distance_m"
+                        ): 0.25,
+
+                        (
+                            "boundary_handoff_"
+                            "distance_m"
+                        ): 0.40,
+
+                        (
+                            "dummy_arrival_"
+                            "tolerance_m"
+                        ): 0.05,
+
+                        (
+                            "dummy_alignment_heading_"
+                            "tolerance_deg"
+                        ): 4.0,
+
+                        (
+                            "dummy_alignment_hold_sec"
+                        ): 0.30,
+
+                        (
+                            "waypoint_match_tolerance_m"
+                        ): 0.002,
+
+                        "odom_timeout_sec": 0.50,
+
+                        (
+                            "maximum_navigation_"
+                            "points"
+                        ): 200000,
+
+                        (
+                            "maximum_marking_points"
+                        ): 10000,
+                    }
+                ],
+            ),
+        ],
+    )
+
+    rpp_controller = TimerAction(
+        period=9.0,
+
+        actions=[
+            LogInfo(
+                msg=(
+                    "Starting precision "
+                    "RPP controller"
+                )
+            ),
+
+            Node(
+                package="rpp_controller",
+
+                executable=(
+                    "rpp_controller_node"
+                ),
+
+                name="rpp_controller",
+
+                output="screen",
+
+                emulate_tty=True,
+
+                respawn=True,
+
+                respawn_delay=2.0,
+
+                parameters=[
+                    {
+                        "local_frame": "map",
+
+                        # One and only non-zero movement speed.
+                        "cruise_speed_mps": 0.40,
+                        "minimum_speed_mps": 0.40,
+                        "segment_alignment_speed_mps": 0.40,
+                        "segment_alignment_recovery_speed_mps": 0.40,
+                        "xtrack_priority_speed_mps": 0.40,
+                        "decel_profile_speed_1_mps": 0.40,
+                        "decel_profile_speed_2_mps": 0.40,
+                        "decel_profile_speed_3_mps": 0.40,
+                        "marking_terminal_max_speed_mps": 0.40,
+                        "marking_final_creep_speed_mps": 0.40,
+                        "terminal_close_recovery_speed_mps": 0.40,
+
+                        # PX4 native rover alignment:
+                        # pivot begins at >=45deg,
+                        # straight drive begins at <=12deg,
+                        # no 6deg gate.
+                        # Normal line correction remains +/-12deg.
+                        # Damped xtrack recovery uses prediction,
+                        # +/-20deg correction, a 20mm neutral crossing band,
+                        # and a 30deg moving-command cap.
+                        "segment_alignment_deadband_enter_cross_track_m": 0.08,
+                        "segment_alignment_deadband_exit_cross_track_m": 0.04,
+                        "segment_alignment_min_effective_heading_error_deg": 12.0,
+                        "segment_alignment_correction_limit_deg": 12.0,
+                        "segment_alignment_cross_track_tolerance_m": 0.03,
+                        "segment_alignment_reentry_cross_track_m": 0.08,
+                        "segment_alignment_max_cross_track_m": 0.60,
+                        "terminal_line_entry_cross_track_m": 0.02,
+                        "pivot_enter_angle_deg": 45.0,
+                        "pivot_exit_angle_deg": 12.0,
+                        "alignment_hold_sec": 0.50,
+                        "maximum_yaw_rate_radps": 0.20,
+                        "minimum_yaw_rate_radps": 0.06,
+                        "pivot_yaw_kp": 1.00,
+                        "alignment_reentry_goal_distance_m": 0.60,
+
+                        # Straight-line and cross-track guidance.
+                        "path_correction_limit_deg": 12.0,
+                        "terminal_line_correction_limit_deg": 10.0,
+                        "line_tracking_lookahead_m": 0.25,
+                        "xtrack_priority_enter_m": 0.01,
+                        "xtrack_priority_exit_m": 0.005,
+                        "xtrack_priority_hold_sec": 0.30,
+                        "xtrack_priority_lookahead_m": 0.20,
+                        "xtrack_priority_correction_limit_deg": 20.0,
+                        "xtrack_prediction_time_sec": 0.45,
+                        "xtrack_rate_filter_alpha": 0.35,
+                        "xtrack_correction_slew_rate_degps": 60.0,
+                        "xtrack_neutral_crossing_band_m": 0.02,
+                        "xtrack_priority_release_heading_deg": 12.0,
+
+                        # Legacy profile distances are retained only for
+                        # interface compatibility; every speed is 0.40 m/s.
+                        "slow_distance_m": 0.70,
+                        "decel_profile_distance_1_m": 0.60,
+                        "decel_profile_distance_2_m": 0.50,
+                        "decel_profile_distance_3_m": 0.40,
+                        "final_speed_distance_m": 0.30,
+                        "terminal_line_alignment_distance_m": 0.30,
+                        "marking_terminal_speed_start_distance_m": 0.30,
+                        "marking_final_creep_start_distance_m": 0.15,
+                        "alignment_release_accel_distance_m": 0.30,
+                        "heading_full_speed_deg": 2.0,
+                        "heading_min_speed_deg": 4.0,
+
+                        # Strict terminal marking gate. There is no reduced
+                        # terminal/final/creep speed; movement remains 0.40.
+                        "waypoint_tolerance_m": 0.03,
+                        "marking_final_creep_cross_track_m": 0.02,
+                        "terminal_capture_gate_cross_track_m": 0.02,
+                        "terminal_capture_gate_heading_deg": 2.0,
+                        "terminal_capture_gate_hold_sec": 0.50,
+                        "terminal_recovery_min_heading_error_deg": 8.0,
+                        "terminal_recovery_correction_limit_deg": 20.0,
+                        "terminal_recovery_lookahead_min_m": 0.15,
+                        "terminal_exact_target_start_distance_m": 0.15,
+                        "terminal_native_pivot_enter_error_deg": 45.0,
+                        "terminal_native_pivot_release_error_deg": 12.0,
+                        # Deprecated compatibility parameter. It is no
+                        # longer used to create a moving 60-degree vector;
+                        # alignment now uses a zero-translation yaw-rate pivot.
+                        "terminal_native_pivot_request_error_deg": 60.0,
+                        "terminal_close_recovery_distance_m": 0.20,
+                        "terminal_unready_hold_along_m": 0.05,
+
+                        # Stop/capture safety.
+                        "marking_stop_settle_timeout_sec": 2.0,
+                        "stationary_speed_tolerance_mps": 0.01,
+                        "marking_capture_arm_distance_m": 0.25,
+                        "marking_capture_abort_distance_m": 0.35,
+                        "miss_margin_m": 0.02,
+                        "marking_along_track_abort_m": 0.05,
+                        "waypoint_match_tolerance_m": 0.001,
+                        "odom_timeout_sec": 0.50,
+                        "waypoint_timeout_sec": 1.00,
+                    }
+                ],
+            ),
+        ],
+    )
+
+    return LaunchDescription(
+        [
+            LogInfo(
+                msg=(
+                    "Starting DYX rover safely: "
+                    "E-stop asserted and mission "
+                    "disabled until an authenticated "
+                    "Start command"
+                )
+            ),
+
+            mavros,
+
+            rover_backend,
+
+            cmd_vel_bridge,
+
+            trajectory_generator,
+
+            mission_manager,
+
+            rpp_controller,
+        ]
+    )

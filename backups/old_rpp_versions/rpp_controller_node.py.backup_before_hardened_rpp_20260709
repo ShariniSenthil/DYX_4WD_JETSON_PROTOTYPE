@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+
+import math
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from std_msgs.msg import Bool
+
+from tf_transformations import euler_from_quaternion
+
+
+class RPPController(Node):
+    def __init__(self):
+        super().__init__('rpp_controller')
+
+        self.current_odom = None
+        self.current_yaw_enu = None
+
+        self.target_waypoint = None
+        self.last_waypoint_time = None
+
+        self.mission_enabled = False
+        self.emergency_stop = True
+
+        # Rover speeds in m/s.
+        self.forward_speed = 0.08
+        self.slow_forward_speed = 0.04
+        self.tight_turn_speed = 0.02
+
+        # Heading regions.
+        self.tight_turn_angle_deg = 35.0
+        self.slow_turn_angle_deg = 12.0
+
+        self.waypoint_tolerance = 0.50
+        self.waypoint_timeout_sec = 5.0
+
+        self.last_log_time = self.get_clock().now()
+        self.last_wait_log_time = self.get_clock().now()
+
+        odom_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+
+        self.create_subscription(
+            Odometry,
+            '/mavros/local_position/odom',
+            self.odom_callback,
+            odom_qos,
+        )
+
+        self.create_subscription(
+            PoseStamped,
+            '/active_waypoint',
+            self.waypoint_callback,
+            10,
+        )
+
+        self.create_subscription(
+            Bool,
+            '/mission_enable',
+            self.mission_enable_callback,
+            10,
+        )
+
+        self.create_subscription(
+            Bool,
+            '/emergency_stop',
+            self.emergency_stop_callback,
+            10,
+        )
+
+        # IMPORTANT:
+        # Autonomous RPP output only.
+        # Never publish /cmd_vel from this node.
+        self.velocity_pub = self.create_publisher(
+            Vector3Stamped,
+            '/rpp/velocity_ned',
+            10,
+        )
+
+        self.timer = self.create_timer(0.05, self.control_loop)
+
+        self.get_logger().warn(
+            '========== SAFE RPP NED CONTROLLER STARTED =========='
+        )
+        self.get_logger().warn(
+            'Position input : /mavros/local_position/odom'
+        )
+        self.get_logger().warn(
+            'Waypoint input : /active_waypoint'
+        )
+        self.get_logger().warn(
+            'Output         : /rpp/velocity_ned'
+        )
+        self.get_logger().warn(
+            'NO /cmd_vel output'
+        )
+        self.get_logger().warn(
+            'NO direct MAVROS/PX4 output'
+        )
+        self.get_logger().warn(
+            'Manual /cmd_vel remains independent'
+        )
+
+    def odom_callback(self, msg):
+        self.current_odom = msg
+
+        q = msg.pose.pose.orientation
+
+        _, _, yaw = euler_from_quaternion([
+            q.x,
+            q.y,
+            q.z,
+            q.w,
+        ])
+
+        # MAVROS local odometry uses ENU convention.
+        self.current_yaw_enu = yaw
+
+    def waypoint_callback(self, msg):
+        self.target_waypoint = msg
+        self.last_waypoint_time = self.get_clock().now()
+
+    def mission_enable_callback(self, msg):
+        self.mission_enabled = msg.data
+
+    def emergency_stop_callback(self, msg):
+        self.emergency_stop = msg.data
+
+    @staticmethod
+    def normalize_angle_rad(angle):
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+
+        return angle
+
+    def is_waypoint_timeout(self):
+        if self.last_waypoint_time is None:
+            return True
+
+        age = (
+            self.get_clock().now() - self.last_waypoint_time
+        ).nanoseconds / 1e9
+
+        return age > self.waypoint_timeout_sec
+
+    def log_waiting(self, reason):
+        now = self.get_clock().now()
+
+        if (
+            now - self.last_wait_log_time
+        ).nanoseconds < 1_000_000_000:
+            return
+
+        self.last_wait_log_time = now
+
+        self.get_logger().info(
+            f'WAITING: {reason} | no autonomous velocity published'
+        )
+
+    def publish_velocity_ned(self, north, east):
+        msg = Vector3Stamped()
+
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'local_ned'
+
+        # cmd_vel_bridge autonomous input convention:
+        #
+        # vector.x = North velocity
+        # vector.y = East velocity
+        # vector.z = Down velocity
+        msg.vector.x = float(north)
+        msg.vector.y = float(east)
+        msg.vector.z = 0.0
+
+        self.velocity_pub.publish(msg)
+
+    def publish_stop(self):
+        self.publish_velocity_ned(0.0, 0.0)
+
+    def control_loop(self):
+        # Do not send autonomous commands unless all safety conditions
+        # and input data are valid.
+
+        if self.emergency_stop:
+            self.log_waiting('emergency stop active')
+            return
+
+        if not self.mission_enabled:
+            self.log_waiting('mission disabled')
+            return
+
+        if self.current_odom is None:
+            self.log_waiting(
+                'waiting for /mavros/local_position/odom'
+            )
+            return
+
+        if self.current_yaw_enu is None:
+            self.log_waiting('waiting for heading')
+            return
+
+        if self.target_waypoint is None:
+            self.log_waiting('waiting for /active_waypoint')
+            return
+
+        if self.is_waypoint_timeout():
+            self.log_waiting('active waypoint timeout')
+            return
+
+        current_x = self.current_odom.pose.pose.position.x
+        current_y = self.current_odom.pose.pose.position.y
+
+        target_x = self.target_waypoint.pose.position.x
+        target_y = self.target_waypoint.pose.position.y
+
+        # MAVROS local coordinates are ENU:
+        # x = East
+        # y = North
+        delta_east = target_x - current_x
+        delta_north = target_y - current_y
+
+        distance = math.hypot(delta_east, delta_north)
+
+        if distance <= self.waypoint_tolerance:
+            self.publish_stop()
+
+            status = 'WAYPOINT REACHED'
+            speed = 0.0
+            velocity_north = 0.0
+            velocity_east = 0.0
+
+            heading_error = 0.0
+
+        else:
+            target_yaw_enu = math.atan2(
+                delta_north,
+                delta_east,
+            )
+
+            heading_error = self.normalize_angle_rad(
+                target_yaw_enu - self.current_yaw_enu
+            )
+
+            heading_error_deg = abs(
+                math.degrees(heading_error)
+            )
+
+            # The desired velocity direction always points toward
+            # the active waypoint.
+            #
+            # PX4 P3/P4 performs the rover direction/stop handling.
+
+            if heading_error_deg >= self.tight_turn_angle_deg:
+                speed = self.tight_turn_speed
+                status = 'TIGHT TURN'
+
+            elif heading_error_deg >= self.slow_turn_angle_deg:
+                speed = self.slow_forward_speed
+                status = 'SLOW CURVE'
+
+            else:
+                speed = self.forward_speed
+                status = 'FORWARD TRACKING'
+
+            velocity_east = (
+                speed * delta_east / distance
+            )
+
+            velocity_north = (
+                speed * delta_north / distance
+            )
+
+            self.publish_velocity_ned(
+                velocity_north,
+                velocity_east,
+            )
+
+        now = self.get_clock().now()
+
+        if (
+            now - self.last_log_time
+        ).nanoseconds >= 1_000_000_000:
+
+            self.get_logger().info(
+                f'{status} | '
+                f'pos_EN=({current_x:.2f},{current_y:.2f}) | '
+                f'target_EN=({target_x:.2f},{target_y:.2f}) | '
+                f'dist={distance:.2f}m | '
+                f'heading_error='
+                f'{math.degrees(heading_error):.1f}deg | '
+                f'speed={speed:.3f} | '
+                f'vN={velocity_north:.3f} | '
+                f'vE={velocity_east:.3f}'
+            )
+
+            self.last_log_time = now
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    node = RPPController()
+
+    try:
+        rclpy.spin(node)
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        node.publish_stop()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

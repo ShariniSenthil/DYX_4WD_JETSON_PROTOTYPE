@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+
+from launch import LaunchDescription
+from launch.actions import ExecuteProcess, LogInfo, TimerAction
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+    """4WD JETSON NODES (SATHEESH) marking rover bringup."""
+
+    mavros = ExecuteProcess(
+        cmd=[
+            'bash',
+            '-lc',
+            'source /opt/ros/humble/setup.bash && '
+            'ros2 launch mavros node.launch '
+            'fcu_url:=/dev/ttyACM0:921600 '
+            'gcs_url:=udp://:14550@192.168.3.102:14550 '
+            'pluginlists_yaml:=/opt/ros/humble/share/mavros/launch/px4_pluginlists.yaml '
+            'config_yaml:=/opt/ros/humble/share/mavros/launch/px4_config.yaml '
+            'tgt_system:=1 '
+            'tgt_component:=1 '
+            'fcu_protocol:=v2.0',
+        ],
+        output='screen',
+    )
+
+    cmd_vel_bridge = TimerAction(
+        period=8.0,
+        actions=[
+            LogInfo(msg='Starting cmd_vel_bridge'),
+            Node(
+                package='jetson_4wd_control',
+                executable='cmd_vel_bridge',
+                name='cmd_vel_bridge',
+                output='screen',
+            ),
+        ],
+    )
+
+    trajectory_generator = TimerAction(
+        period=10.0,
+        actions=[
+            LogInfo(msg='Starting trajectory_generator'),
+            Node(
+                package='trajectory_generator',
+                executable='trajectory_generator_node',
+                name='trajectory_generator',
+                output='screen',
+                parameters=[{
+                    'mission_file': (
+                        '/home/flash/rover_ws/missions/mission1.csv'
+                    ),
+                    'input_mode': 'gps',
+                    'global_position_topic': (
+                        '/mavros/global_position/raw/fix'
+                    ),
+                    'local_odom_topic': (
+                        '/mavros/local_position/odom'
+                    ),
+                    'gps_status_topic': (
+                        '/mavros/gpsstatus/gps1/raw'
+                    ),
+                    'rtk_health_topic': (
+                        '/rtk_correction_bridge/healthy'
+                    ),
+                    'rtk_correction_age_topic': (
+                        '/rtk_correction_bridge/correction_age_sec'
+                    ),
+                    'required_gps_fix_type': 6,
+                    'rtk_stable_sec': 3.0,
+                    'max_correction_age_sec': 2.0,
+                    'reference_timeout_sec': 1.0,
+                    'max_reference_skew_sec': 0.25,
+                    'max_target_distance_m': 1000.0,
+                    'interpolation_spacing_m': 0.25,
+                }],
+            ),
+        ],
+    )
+
+    mission_manager = TimerAction(
+        period=11.0,
+        actions=[
+            LogInfo(msg='Starting mission_manager'),
+            Node(
+                package='mission_manager',
+                executable='mission_manager_node',
+                name='mission_manager',
+                output='screen',
+                parameters=[{
+                    'navigation_tolerance_m': 0.05,
+                    'intermediate_switch_distance_m': 0.10,
+                    'marking_lookahead_distance_m': 0.30,
+                    'marking_dwell_sec': 3.0,
+                    'waypoint_match_tolerance_m': 0.001,
+                    'corner_forward_limit_deg': 60.0,
+                    'reverse_enter_angle_deg': 135.0,
+                    'reverse_exit_angle_deg': 110.0,
+                }],
+            ),
+        ],
+    )
+
+    rpp_controller = TimerAction(
+        period=12.0,
+        actions=[
+            LogInfo(msg='Starting rpp_controller'),
+            Node(
+                package='rpp_controller',
+                executable='rpp_controller_node',
+                name='rpp_controller',
+                output='screen',
+                parameters=[{
+                    'forward_speed_mps': 0.08,
+                    'slow_forward_speed_mps': 0.08,
+                    'tight_turn_speed_mps': 0.08,
+                    'marking_slow_distance_m': 0.30,
+                    'marking_creep_distance_m': 0.10,
+                    'marking_slow_speed_mps': 0.08,
+                    'marking_creep_speed_mps': 0.08,
+                    'waypoint_tolerance_m': 0.05,
+                    'waypoint_match_tolerance_m': 0.001,
+                }],
+            ),
+        ],
+    )
+
+    return LaunchDescription([
+        mavros,
+        cmd_vel_bridge,
+        trajectory_generator,
+        mission_manager,
+        rpp_controller,
+    ])

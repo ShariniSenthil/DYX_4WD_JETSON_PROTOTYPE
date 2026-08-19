@@ -1,0 +1,61 @@
+from launch import LaunchDescription
+from launch.actions import TimerAction
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+
+    return LaunchDescription([
+
+        # 1. MAVROS: Jetson <-> PX4
+        Node(
+            package='mavros',
+            executable='mavros_node',
+            name='mavros',
+            output='screen',
+            parameters=[
+                {
+                    'fcu_url': '/dev/ttyACM0:921600',
+                }
+            ]
+        ),
+
+        # 2. Start rover nodes after MAVROS gets time to connect
+        TimerAction(
+            period=5.0,
+            actions=[
+
+                # Trajectory Generator
+                Node(
+                    package='trajectory_generator',
+                    executable='trajectory_generator_node',
+                    name='trajectory_generator',
+                    output='screen'
+                ),
+
+                # Mission Manager
+                Node(
+                    package='mission_manager',
+                    executable='mission_manager_node',
+                    name='mission_manager',
+                    output='screen'
+                ),
+
+                # RPP Controller
+                Node(
+                    package='rpp_controller',
+                    executable='rpp_controller_node',
+                    name='rpp_controller',
+                    output='screen'
+                ),
+
+                # cmd_vel -> MAVROS Bridge
+                Node(
+                    package='offboard_controller',
+                    executable='cmd_vel_bridge',
+                    name='cmd_vel_bridge',
+                    output='screen'
+                ),
+            ]
+        ),
+    ])

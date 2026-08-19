@@ -1,0 +1,976 @@
+#!/usr/bin/env python3
+
+import hashlib
+import math
+import struct
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
+
+from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Odometry, Path
+from std_msgs.msg import Bool
+
+
+class MissionManager(Node):
+    """
+    Safe mission sequencer for local-map rover missions.
+
+    Inputs:
+        /nav_path
+        /mavros/local_position/odom
+        /mission_enable
+        /emergency_stop
+
+    Output:
+        /active_waypoint
+
+    Contract:
+        - /nav_path uses the same local frame as PX4 odometry.
+        - Default frame is map.
+        - Path coordinates are ENU:
+              x = East
+              y = North
+        - This node never publishes /cmd_vel.
+        - This node never publishes RPP velocity.
+        - This node never publishes MAVROS/PX4 setpoints.
+        - A new mission is accepted only in a safe state.
+        - Repeated identical paths never reset mission progress.
+    """
+
+    CONTROL_HZ = 20.0
+
+    def __init__(self):
+
+        super().__init__(
+            'mission_manager'
+        )
+
+        # ---------------------------------------------------------
+        # Parameters
+        # ---------------------------------------------------------
+
+        self.declare_parameter(
+            'local_frame',
+            'map',
+        )
+
+        self.declare_parameter(
+            'navigation_tolerance_m',
+            0.05,
+        )
+
+        self.declare_parameter(
+            'odom_timeout_sec',
+            0.50,
+        )
+
+        self.declare_parameter(
+            'max_waypoints',
+            10000,
+        )
+
+        self.local_frame = str(
+            self.get_parameter(
+                'local_frame'
+            ).value
+        ).strip()
+
+        self.navigation_tolerance = float(
+            self.get_parameter(
+                'navigation_tolerance_m'
+            ).value
+        )
+
+        self.odom_timeout_sec = float(
+            self.get_parameter(
+                'odom_timeout_sec'
+            ).value
+        )
+
+        self.max_waypoints = int(
+            self.get_parameter(
+                'max_waypoints'
+            ).value
+        )
+
+        self.validate_parameters()
+
+        # ---------------------------------------------------------
+        # Mission state
+        # ---------------------------------------------------------
+
+        self.waypoints = []
+
+        self.path_signature = None
+
+        self.current_wp_index = 0
+
+        self.mission_complete = False
+
+        # ---------------------------------------------------------
+        # Rover state
+        # ---------------------------------------------------------
+
+        self.current_x = None
+        self.current_y = None
+
+        self.last_odom_time = None
+
+        # ---------------------------------------------------------
+        # Safety state
+        # ---------------------------------------------------------
+
+        self.mission_enabled = False
+
+        self.emergency_stop = True
+
+        # ---------------------------------------------------------
+        # Logging state
+        # ---------------------------------------------------------
+
+        now = self.get_clock().now()
+
+        self.last_status_log_time = now
+        self.last_wait_log_time = now
+        self.last_path_reject_log_time = now
+
+        # ---------------------------------------------------------
+        # QoS
+        # ---------------------------------------------------------
+
+        path_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+
+        odom_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        # ---------------------------------------------------------
+        # Subscriptions
+        # ---------------------------------------------------------
+
+        self.create_subscription(
+            Path,
+            '/nav_path',
+            self.path_callback,
+            path_qos,
+        )
+
+        self.create_subscription(
+            Odometry,
+            '/mavros/local_position/odom',
+            self.odom_callback,
+            odom_qos,
+        )
+
+        self.create_subscription(
+            Bool,
+            '/mission_enable',
+            self.mission_enable_callback,
+            10,
+        )
+
+        self.create_subscription(
+            Bool,
+            '/emergency_stop',
+            self.emergency_stop_callback,
+            10,
+        )
+
+        # ---------------------------------------------------------
+        # Output
+        # ---------------------------------------------------------
+
+        self.active_wp_pub = (
+            self.create_publisher(
+                PoseStamped,
+                '/active_waypoint',
+                10,
+            )
+        )
+
+        self.timer = self.create_timer(
+            1.0 / self.CONTROL_HZ,
+            self.control_loop,
+        )
+
+        # ---------------------------------------------------------
+        # Startup information
+        # ---------------------------------------------------------
+
+        self.get_logger().warn(
+            '===== HARDENED MISSION MANAGER STARTED ====='
+        )
+
+        self.get_logger().warn(
+            'Path input       : /nav_path'
+        )
+
+        self.get_logger().warn(
+            'Odometry input   : '
+            '/mavros/local_position/odom'
+        )
+
+        self.get_logger().warn(
+            'Mission gate     : /mission_enable'
+        )
+
+        self.get_logger().warn(
+            'Emergency gate   : /emergency_stop'
+        )
+
+        self.get_logger().warn(
+            'Waypoint output  : /active_waypoint'
+        )
+
+        self.get_logger().warn(
+            f'Local frame      : {self.local_frame}'
+        )
+
+        self.get_logger().warn(
+            f'Waypoint tol.    : '
+            f'{self.navigation_tolerance:.2f} m'
+        )
+
+        self.get_logger().warn(
+            f'Odom timeout     : '
+            f'{self.odom_timeout_sec:.2f} s'
+        )
+
+        self.get_logger().warn(
+            'Identical paths do NOT reset mission progress'
+        )
+
+        self.get_logger().warn(
+            'New paths accepted only while '
+            'paused or E-stop active'
+        )
+
+        self.get_logger().warn(
+            'NO /cmd_vel output'
+        )
+
+        self.get_logger().warn(
+            'NO direct RPP/MAVROS/PX4 output'
+        )
+
+    # =============================================================
+    # Parameter validation
+    # =============================================================
+
+    def validate_parameters(self):
+
+        if not self.local_frame:
+
+            raise ValueError(
+                'local_frame must not be empty'
+            )
+
+        if (
+            not math.isfinite(
+                self.navigation_tolerance
+            )
+            or self.navigation_tolerance <= 0.0
+        ):
+
+            raise ValueError(
+                'navigation_tolerance_m '
+                'must be finite and > 0'
+            )
+
+        if (
+            not math.isfinite(
+                self.odom_timeout_sec
+            )
+            or self.odom_timeout_sec <= 0.0
+        ):
+
+            raise ValueError(
+                'odom_timeout_sec '
+                'must be finite and > 0'
+            )
+
+        if self.max_waypoints < 1:
+
+            raise ValueError(
+                'max_waypoints must be >= 1'
+            )
+
+    # =============================================================
+    # Utility functions
+    # =============================================================
+
+    def age_seconds(
+        self,
+        timestamp,
+    ):
+
+        if timestamp is None:
+            return math.inf
+
+        return (
+            self.get_clock().now()
+            - timestamp
+        ).nanoseconds / 1e9
+
+    def odometry_is_fresh(self):
+
+        age = self.age_seconds(
+            self.last_odom_time
+        )
+
+        return (
+            math.isfinite(age)
+            and 0.0
+            <= age
+            <= self.odom_timeout_sec
+        )
+
+    @staticmethod
+    def make_path_signature(
+        frame_id,
+        waypoints,
+    ):
+
+        digest = hashlib.sha256()
+
+        digest.update(
+            frame_id.encode('utf-8')
+        )
+
+        for x, y in waypoints:
+
+            digest.update(
+                struct.pack(
+                    '!dd',
+                    x,
+                    y,
+                )
+            )
+
+        return digest.hexdigest()
+
+    def log_waiting(
+        self,
+        reason,
+    ):
+
+        now = self.get_clock().now()
+
+        if (
+            now
+            - self.last_wait_log_time
+        ).nanoseconds < 1_000_000_000:
+
+            return
+
+        self.last_wait_log_time = now
+
+        self.get_logger().info(
+            f'WAITING: {reason} | '
+            'no active waypoint published'
+        )
+
+    def log_path_rejected(
+        self,
+        reason,
+    ):
+
+        now = self.get_clock().now()
+
+        if (
+            now
+            - self.last_path_reject_log_time
+        ).nanoseconds < 2_000_000_000:
+
+            return
+
+        self.last_path_reject_log_time = now
+
+        self.get_logger().error(
+            f'PATH REJECTED: {reason}'
+        )
+
+    # =============================================================
+    # Path input
+    # =============================================================
+
+    def path_callback(self, msg):
+
+        frame_id = (
+            msg.header.frame_id.strip()
+        )
+
+        if frame_id != self.local_frame:
+
+            self.log_path_rejected(
+                f'path frame must be '
+                f'{self.local_frame!r}, '
+                f'got {frame_id!r}'
+            )
+
+            return
+
+        waypoint_count = len(
+            msg.poses
+        )
+
+        if waypoint_count == 0:
+
+            self.log_path_rejected(
+                'path contains zero waypoints'
+            )
+
+            return
+
+        if (
+            waypoint_count
+            > self.max_waypoints
+        ):
+
+            self.log_path_rejected(
+                f'path contains '
+                f'{waypoint_count} waypoints; '
+                f'maximum is '
+                f'{self.max_waypoints}'
+            )
+
+            return
+
+        validated_waypoints = []
+
+        for index, pose_stamped in enumerate(
+            msg.poses
+        ):
+
+            pose_frame = (
+                pose_stamped.header.frame_id.strip()
+            )
+
+            if (
+                pose_frame
+                and pose_frame
+                != self.local_frame
+            ):
+
+                self.log_path_rejected(
+                    f'waypoint {index + 1} '
+                    f'frame {pose_frame!r} '
+                    f'does not match '
+                    f'{self.local_frame!r}'
+                )
+
+                return
+
+            x = float(
+                pose_stamped.pose.position.x
+            )
+
+            y = float(
+                pose_stamped.pose.position.y
+            )
+
+            if not all(
+                math.isfinite(value)
+                for value in (x, y)
+            ):
+
+                self.log_path_rejected(
+                    f'waypoint {index + 1} '
+                    'contains non-finite x/y'
+                )
+
+                return
+
+            validated_waypoints.append(
+                (x, y)
+            )
+
+        new_signature = (
+            self.make_path_signature(
+                frame_id,
+                validated_waypoints,
+            )
+        )
+
+        # ---------------------------------------------------------
+        # Same mission
+        #
+        # Repeated publication of the exact same path must NEVER
+        # reset current_wp_index.
+        # ---------------------------------------------------------
+
+        if (
+            new_signature
+            == self.path_signature
+        ):
+
+            return
+
+        # ---------------------------------------------------------
+        # Different mission
+        #
+        # A path must never change while autonomous movement is
+        # permitted.
+        # ---------------------------------------------------------
+
+        safe_to_replace = (
+            self.emergency_stop
+            or not self.mission_enabled
+        )
+
+        if not safe_to_replace:
+
+            self.log_path_rejected(
+                'new mission received while '
+                'mission is active; '
+                'set E-stop or disable mission first'
+            )
+
+            return
+
+        self.waypoints = (
+            validated_waypoints
+        )
+
+        self.path_signature = (
+            new_signature
+        )
+
+        self.current_wp_index = 0
+
+        self.mission_complete = False
+
+        self.get_logger().warn(
+            '========== NEW MISSION LOADED =========='
+        )
+
+        self.get_logger().warn(
+            f'Waypoints       : '
+            f'{len(self.waypoints)}'
+        )
+
+        self.get_logger().warn(
+            f'Frame           : '
+            f'{self.local_frame}'
+        )
+
+        self.get_logger().warn(
+            f'Mission ID      : '
+            f'{self.path_signature[:12]}'
+        )
+
+        self.get_logger().warn(
+            'Progress reset to waypoint 1'
+        )
+
+        for index, (x, y) in enumerate(
+            self.waypoints
+        ):
+
+            self.get_logger().info(
+                f'WP {index + 1}: '
+                f'E={x:.3f}, N={y:.3f}'
+            )
+
+    # =============================================================
+    # Odometry input
+    # =============================================================
+
+    def odom_callback(self, msg):
+
+        frame_id = (
+            msg.header.frame_id.strip()
+        )
+
+        if frame_id != self.local_frame:
+            return
+
+        x = float(
+            msg.pose.pose.position.x
+        )
+
+        y = float(
+            msg.pose.pose.position.y
+        )
+
+        if not all(
+            math.isfinite(value)
+            for value in (x, y)
+        ):
+
+            self.get_logger().error(
+                'Rejected non-finite '
+                'odometry position'
+            )
+
+            return
+
+        self.current_x = x
+        self.current_y = y
+
+        self.last_odom_time = (
+            self.get_clock().now()
+        )
+
+    # =============================================================
+    # Safety inputs
+    # =============================================================
+
+    def mission_enable_callback(
+        self,
+        msg,
+    ):
+
+        new_state = bool(
+            msg.data
+        )
+
+        if (
+            new_state
+            == self.mission_enabled
+        ):
+
+            return
+
+        self.mission_enabled = (
+            new_state
+        )
+
+        if self.mission_enabled:
+
+            self.get_logger().warn(
+                'MISSION ENABLED'
+            )
+
+            if not self.waypoints:
+
+                self.get_logger().warn(
+                    'Mission enabled but '
+                    'no valid path is loaded'
+                )
+
+        else:
+
+            self.get_logger().warn(
+                'MISSION DISABLED | '
+                'mission progress preserved'
+            )
+
+    def emergency_stop_callback(
+        self,
+        msg,
+    ):
+
+        new_state = bool(
+            msg.data
+        )
+
+        if (
+            new_state
+            == self.emergency_stop
+        ):
+
+            return
+
+        self.emergency_stop = (
+            new_state
+        )
+
+        if self.emergency_stop:
+
+            self.get_logger().warn(
+                'EMERGENCY STOP ACTIVE | '
+                'mission progress preserved'
+            )
+
+        else:
+
+            self.get_logger().warn(
+                'EMERGENCY STOP RELEASED'
+            )
+
+    # =============================================================
+    # Waypoint output
+    # =============================================================
+
+    def publish_active_waypoint(
+        self,
+        x,
+        y,
+    ):
+
+        msg = PoseStamped()
+
+        msg.header.stamp = (
+            self.get_clock().now().to_msg()
+        )
+
+        msg.header.frame_id = (
+            self.local_frame
+        )
+
+        msg.pose.position.x = float(x)
+        msg.pose.position.y = float(y)
+        msg.pose.position.z = 0.0
+
+        msg.pose.orientation.x = 0.0
+        msg.pose.orientation.y = 0.0
+        msg.pose.orientation.z = 0.0
+        msg.pose.orientation.w = 1.0
+
+        self.active_wp_pub.publish(
+            msg
+        )
+
+    # =============================================================
+    # Control loop
+    # =============================================================
+
+    def control_loop(self):
+
+        # ---------------------------------------------------------
+        # Safety gates
+        # ---------------------------------------------------------
+
+        if self.emergency_stop:
+
+            self.log_waiting(
+                'emergency stop active'
+            )
+
+            return
+
+        if not self.mission_enabled:
+
+            self.log_waiting(
+                'mission disabled'
+            )
+
+            return
+
+        # ---------------------------------------------------------
+        # Mission validity
+        # ---------------------------------------------------------
+
+        if not self.waypoints:
+
+            self.log_waiting(
+                'waiting for valid /nav_path'
+            )
+
+            return
+
+        if self.mission_complete:
+
+            self.log_waiting(
+                'mission complete; '
+                'waiting for new mission'
+            )
+
+            return
+
+        if (
+            self.current_wp_index
+            >= len(self.waypoints)
+        ):
+
+            self.mission_complete = True
+
+            self.get_logger().warn(
+                '========== MISSION COMPLETE =========='
+            )
+
+            return
+
+        # ---------------------------------------------------------
+        # Odometry validity
+        # ---------------------------------------------------------
+
+        if (
+            self.current_x is None
+            or self.current_y is None
+        ):
+
+            self.log_waiting(
+                'waiting for odometry'
+            )
+
+            return
+
+        if not self.odometry_is_fresh():
+
+            self.log_waiting(
+                'odometry timeout'
+            )
+
+            return
+
+        # ---------------------------------------------------------
+        # Active waypoint geometry
+        # ---------------------------------------------------------
+
+        target_x, target_y = (
+            self.waypoints[
+                self.current_wp_index
+            ]
+        )
+
+        delta_east = (
+            target_x
+            - self.current_x
+        )
+
+        delta_north = (
+            target_y
+            - self.current_y
+        )
+
+        distance = math.hypot(
+            delta_east,
+            delta_north,
+        )
+
+        if not math.isfinite(
+            distance
+        ):
+
+            self.log_waiting(
+                'invalid waypoint distance'
+            )
+
+            return
+
+        # ---------------------------------------------------------
+        # Waypoint progression
+        #
+        # Arrival is checked BEFORE publishing the waypoint.
+        #
+        # This avoids sending a target that is already reached to
+        # the RPP and unnecessarily activating its reached latch.
+        # ---------------------------------------------------------
+
+        if (
+            distance
+            <= self.navigation_tolerance
+        ):
+
+            reached_number = (
+                self.current_wp_index + 1
+            )
+
+            self.get_logger().warn(
+                f'WAYPOINT '
+                f'{reached_number} REACHED | '
+                f'distance={distance:.3f} m'
+            )
+
+            self.current_wp_index += 1
+
+            if (
+                self.current_wp_index
+                >= len(self.waypoints)
+            ):
+
+                self.mission_complete = True
+
+                self.get_logger().warn(
+                    '========== '
+                    'MISSION COMPLETE '
+                    '=========='
+                )
+
+                return
+
+            next_x, next_y = (
+                self.waypoints[
+                    self.current_wp_index
+                ]
+            )
+
+            self.get_logger().warn(
+                f'SWITCHING TO WAYPOINT '
+                f'{self.current_wp_index + 1}/'
+                f'{len(self.waypoints)} | '
+                f'E={next_x:.3f} '
+                f'N={next_y:.3f}'
+            )
+
+            # Publish the new waypoint on the next 20 Hz tick.
+
+            return
+
+        # ---------------------------------------------------------
+        # Publish active target at 20 Hz.
+        #
+        # This keeps the RPP's waypoint freshness watchdog healthy.
+        # ---------------------------------------------------------
+
+        self.publish_active_waypoint(
+            target_x,
+            target_y,
+        )
+
+        now = self.get_clock().now()
+
+        if (
+            now
+            - self.last_status_log_time
+        ).nanoseconds >= 1_000_000_000:
+
+            self.last_status_log_time = (
+                now
+            )
+
+            self.get_logger().info(
+                f'ACTIVE WP '
+                f'{self.current_wp_index + 1}/'
+                f'{len(self.waypoints)} | '
+                f'rover_EN=('
+                f'{self.current_x:.2f},'
+                f'{self.current_y:.2f}) | '
+                f'target_EN=('
+                f'{target_x:.2f},'
+                f'{target_y:.2f}) | '
+                f'dist={distance:.2f} m | '
+                f'odom_age='
+                f'{self.age_seconds(self.last_odom_time):.2f} s'
+            )
+
+
+def main(args=None):
+
+    rclpy.init(args=args)
+
+    node = MissionManager()
+
+    try:
+        rclpy.spin(node)
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+
+        node.destroy_node()
+
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

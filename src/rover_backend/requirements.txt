@@ -1,0 +1,6 @@
+fastapi>=0.115,<1.0
+uvicorn>=0.30,<1.0
+python-socketio>=5.11,<6.0
+argon2-cffi>=23.1,<26.0
+python-multipart>=0.0.20,<1.0
+psutil>=5.9,<8.0

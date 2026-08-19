@@ -1,0 +1,190 @@
+import math
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import (
+    QoSProfile,
+    ReliabilityPolicy,
+    DurabilityPolicy,
+    HistoryPolicy,
+)
+
+from nav_msgs.msg import Path
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped
+
+
+class MissionManager(Node):
+
+    def __init__(self):
+        super().__init__("mission_manager")
+
+        self.path = None
+        self.current_odom = None
+
+        self.current_wp_index = 0
+        self.navigation_tolerance = 0.50
+        self.mission_complete = False
+
+        self.last_distance_log_time = self.get_clock().now()
+
+        # Important:
+        # /nav_path is published once by trajectory_generator.
+        # So mission_manager must use TRANSIENT_LOCAL to receive old path.
+        path_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+
+        odom_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        self.create_subscription(
+            Path,
+            "/nav_path",
+            self.path_callback,
+            path_qos,
+        )
+
+        self.create_subscription(
+            Odometry,
+            "/mavros/local_position/odom",
+            self.odom_callback,
+            odom_qos,
+        )
+
+        self.active_wp_pub = self.create_publisher(
+            PoseStamped,
+            "/active_waypoint",
+            10,
+        )
+
+        self.timer = self.create_timer(
+            0.05,
+            self.control_loop,
+        )
+
+        self.get_logger().info("Mission Manager Started")
+        self.get_logger().info("Waiting for /nav_path and /mavros/local_position/odom")
+
+    def path_callback(self, msg):
+        self.path = msg
+        self.current_wp_index = 0
+        self.mission_complete = False
+
+        self.get_logger().info(
+            f"Mission Loaded: {len(msg.poses)} waypoints"
+        )
+
+    def odom_callback(self, msg):
+        self.current_odom = msg
+
+    def publish_active_waypoint(self):
+        if self.path is None:
+            return
+
+        if self.current_wp_index >= len(self.path.poses):
+            return
+
+        target = self.path.poses[self.current_wp_index]
+        target.header.stamp = self.get_clock().now().to_msg()
+
+        self.active_wp_pub.publish(target)
+
+    def compute_distance(self):
+        if self.current_odom is None:
+            return None
+
+        if self.path is None:
+            return None
+
+        if self.current_wp_index >= len(self.path.poses):
+            return None
+
+        target = self.path.poses[self.current_wp_index]
+
+        rover_x = self.current_odom.pose.pose.position.x
+        rover_y = self.current_odom.pose.pose.position.y
+
+        target_x = target.pose.position.x
+        target_y = target.pose.position.y
+
+        dx = target_x - rover_x
+        dy = target_y - rover_y
+
+        return math.sqrt(dx * dx + dy * dy)
+
+    def control_loop(self):
+        if self.path is None:
+            return
+
+        if self.current_odom is None:
+            return
+
+        if self.mission_complete:
+            return
+
+        if self.current_wp_index >= len(self.path.poses):
+            self.mission_complete = True
+            self.get_logger().info("========== MISSION COMPLETE ==========")
+            return
+
+        self.publish_active_waypoint()
+
+        distance = self.compute_distance()
+
+        if distance is None:
+            return
+
+        now = self.get_clock().now()
+
+        if (now - self.last_distance_log_time).nanoseconds >= 1_000_000_000:
+            target = self.path.poses[self.current_wp_index]
+
+            self.get_logger().info(
+                f"Active waypoint {self.current_wp_index + 1}/{len(self.path.poses)} "
+                f"x={target.pose.position.x:.2f}, "
+                f"y={target.pose.position.y:.2f}, "
+                f"distance={distance:.2f} m"
+            )
+
+            self.last_distance_log_time = now
+
+        if distance <= self.navigation_tolerance:
+            self.get_logger().info(
+                f"Waypoint {self.current_wp_index + 1} reached"
+            )
+
+            self.current_wp_index += 1
+
+            if self.current_wp_index >= len(self.path.poses):
+                self.mission_complete = True
+                self.get_logger().info("========== MISSION COMPLETE ==========")
+            else:
+                self.get_logger().info(
+                    f"Switching to waypoint {self.current_wp_index + 1}"
+                )
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    node = MissionManager()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

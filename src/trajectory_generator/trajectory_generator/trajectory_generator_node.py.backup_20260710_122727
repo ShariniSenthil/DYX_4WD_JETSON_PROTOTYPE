@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+
+import csv
+import os
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import (
+    QoSProfile,
+    ReliabilityPolicy,
+    DurabilityPolicy,
+    HistoryPolicy,
+)
+
+from nav_msgs.msg import Path
+from geometry_msgs.msg import PoseStamped
+
+
+class TrajectoryGenerator(Node):
+
+    def __init__(self):
+        super().__init__('trajectory_generator')
+
+        self.declare_parameter(
+            'mission_file',
+            '/home/flash/missions/mission_local.csv',
+        )
+
+        self.mission_file = self.get_parameter('mission_file').value
+
+        path_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+
+        self.path_pub = self.create_publisher(
+            Path,
+            '/nav_path',
+            path_qos,
+        )
+
+        self.path = Path()
+        self.path.header.frame_id = 'map'
+
+        self.path_loaded = False
+        self.last_log_time = self.get_clock().now()
+
+        self.load_local_mission()
+
+        self.timer = self.create_timer(
+            2.0,
+            self.publish_path,
+        )
+
+        self.get_logger().warn('========== TRAJECTORY GENERATOR STARTED ==========')
+        self.get_logger().warn(f'Mission file: {self.mission_file}')
+        self.get_logger().warn('Output: /nav_path')
+
+    def load_local_mission(self):
+        self.path.poses.clear()
+
+        if not os.path.exists(self.mission_file):
+            self.get_logger().error('Mission file not found')
+            self.get_logger().error(self.mission_file)
+            self.get_logger().error('Create CSV with columns: x,y')
+            self.path_loaded = False
+            return
+
+        try:
+            with open(self.mission_file, 'r') as file:
+                reader = csv.DictReader(file)
+
+                if reader.fieldnames is None:
+                    self.get_logger().error('Mission CSV is empty')
+                    self.path_loaded = False
+                    return
+
+                if 'x' not in reader.fieldnames or 'y' not in reader.fieldnames:
+                    self.get_logger().error('Mission CSV must contain columns: x,y')
+                    self.get_logger().error(f'Found columns: {reader.fieldnames}')
+                    self.path_loaded = False
+                    return
+
+                for index, row in enumerate(reader):
+                    try:
+                        x = float(row['x'])
+                        y = float(row['y'])
+                    except Exception:
+                        self.get_logger().error(f'Invalid x/y value at row {index + 2}: {row}')
+                        continue
+
+                    pose = PoseStamped()
+                    pose.header.frame_id = 'map'
+
+                    pose.pose.position.x = x
+                    pose.pose.position.y = y
+                    pose.pose.position.z = 0.0
+
+                    pose.pose.orientation.x = 0.0
+                    pose.pose.orientation.y = 0.0
+                    pose.pose.orientation.z = 0.0
+                    pose.pose.orientation.w = 1.0
+
+                    self.path.poses.append(pose)
+
+        except Exception as e:
+            self.get_logger().error(f'Failed to read mission file: {e}')
+            self.path_loaded = False
+            return
+
+        if len(self.path.poses) == 0:
+            self.get_logger().error('No valid waypoints loaded')
+            self.path_loaded = False
+            return
+
+        self.path_loaded = True
+
+        self.get_logger().warn(f'Loaded {len(self.path.poses)} local waypoints')
+
+        for i, pose in enumerate(self.path.poses):
+            self.get_logger().info(
+                f'WP {i + 1}: x={pose.pose.position.x:.2f}, y={pose.pose.position.y:.2f}'
+            )
+
+    def publish_path(self):
+        if not self.path_loaded:
+            self.get_logger().error(
+                'No mission path published because mission file is invalid or missing',
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        stamp = self.get_clock().now().to_msg()
+
+        self.path.header.stamp = stamp
+        self.path.header.frame_id = 'map'
+
+        for pose in self.path.poses:
+            pose.header.stamp = stamp
+            pose.header.frame_id = 'map'
+
+        self.path_pub.publish(self.path)
+
+        self.get_logger().info(
+            f'Mission path published: {len(self.path.poses)} waypoints',
+            throttle_duration_sec=5.0,
+        )
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    node = TrajectoryGenerator()
+
+    try:
+        rclpy.spin(node)
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

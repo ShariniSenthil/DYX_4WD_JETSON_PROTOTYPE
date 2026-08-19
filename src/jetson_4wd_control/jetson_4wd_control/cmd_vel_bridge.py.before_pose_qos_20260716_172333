@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+
+import math
+
+import rclpy
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from mavros_msgs.msg import PositionTarget, State
+from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
+from std_msgs.msg import Bool
+
+
+class CmdVelBridge(Node):
+    """
+    Safety-gated autonomous bridge.
+
+    Autonomous path:
+        /rpp/velocity_ned
+            vector.x = North velocity [m/s]
+            vector.y = East velocity [m/s]
+            vector.z = ENU yaw rate [rad/s]
+
+        Positive vector.z = left / counter-clockwise.
+        Negative vector.z = right / clockwise.
+
+        -> /mavros/setpoint_raw/local
+
+    Radio-control manual operation is intentionally not routed through this
+    node. The RC receiver remains connected directly to PX4. In MANUAL mode
+    PX4 uses the radio sticks and ignores the offboard setpoint stream.
+
+    Nonzero autonomous output requires:
+        connected
+        armed
+        mode == OFFBOARD
+        mission_enable == true
+        emergency_stop == false
+        fresh RPP command
+    """
+
+    STREAM_HZ = 50.0
+    FRAME_LOCAL_NED = PositionTarget.FRAME_LOCAL_NED
+    TYPE_MASK_VELOCITY_ONLY = (
+        PositionTarget.IGNORE_PX
+        | PositionTarget.IGNORE_PY
+        | PositionTarget.IGNORE_PZ
+        | PositionTarget.IGNORE_AFX
+        | PositionTarget.IGNORE_AFY
+        | PositionTarget.IGNORE_AFZ
+        | PositionTarget.IGNORE_YAW
+        | PositionTarget.IGNORE_YAW_RATE
+    )
+
+    # Pure rover body-yaw-rate command.
+    #
+    # Position, velocity, acceleration and absolute yaw are ignored.
+    # Only yaw_rate remains active. This is required so PX4 selects the
+    # differential-rover body-rate offboard branch instead of its
+    # velocity branch.
+    TYPE_MASK_YAW_RATE_ONLY = (
+        PositionTarget.IGNORE_PX
+        | PositionTarget.IGNORE_PY
+        | PositionTarget.IGNORE_PZ
+        | PositionTarget.IGNORE_VX
+        | PositionTarget.IGNORE_VY
+        | PositionTarget.IGNORE_VZ
+        | PositionTarget.IGNORE_AFX
+        | PositionTarget.IGNORE_AFY
+        | PositionTarget.IGNORE_AFZ
+        | PositionTarget.IGNORE_YAW
+    )
+
+    COMMAND_EPSILON = 1.0e-6
+
+    HOLD_VECTOR_EPSILON = 1.0e-4
+
+    def __init__(self):
+        super().__init__("cmd_vel_bridge")
+
+        self.declare_parameter("command_timeout_sec", 0.25)
+        self.declare_parameter("maximum_speed_mps", 0.10)
+        self.declare_parameter("maximum_yaw_rate_radps", 0.35)
+
+        self.command_timeout_sec = float(
+            self.get_parameter("command_timeout_sec").value
+        )
+        self.maximum_speed = float(
+            self.get_parameter("maximum_speed_mps").value
+        )
+        self.maximum_yaw_rate = float(
+            self.get_parameter("maximum_yaw_rate_radps").value
+        )
+
+        self.pose_sub = self.create_subscription(
+
+            PoseStamped,
+
+            "/mavros/local_position/pose",
+
+            self.pose_callback,
+
+            10,
+
+        )
+
+
+        self.validate_parameters()
+
+        command_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        self.create_subscription(
+            Vector3Stamped,
+            "/rpp/velocity_ned",
+            self.rpp_velocity_callback,
+            command_qos,
+        )
+        self.create_subscription(
+            State,
+            "/mavros/state",
+            self.state_callback,
+            10,
+        )
+        self.create_subscription(
+            Bool,
+            "/mission_enable",
+            self.mission_callback,
+            10,
+        )
+        self.create_subscription(
+            Bool,
+            "/emergency_stop",
+            self.estop_callback,
+            10,
+        )
+
+        self.setpoint_pub = self.create_publisher(
+            PositionTarget,
+            "/mavros/setpoint_raw/local",
+            command_qos,
+        )
+
+        self.latest_north = 0.0
+        self.latest_east = 0.0
+        self.latest_yaw_rate = 0.0
+        self.current_yaw_enu = None
+        self.latest_command_time = None
+
+        self.connected = False
+        self.armed = False
+        self.mode = ""
+        self.mission_enabled = False
+        self.emergency_stop = True
+
+        self.last_log_time = self.get_clock().now()
+
+        self.timer = self.create_timer(
+            1.0 / self.STREAM_HZ,
+            self.control_loop,
+        )
+
+        self.get_logger().warn(
+            "===== AUTONOMOUS PX4 VELOCITY BRIDGE STARTED ====="
+        )
+        self.get_logger().warn(
+            "Autonomous input : /rpp/velocity_ned"
+        )
+        self.get_logger().warn(
+            "PX4 output       : /mavros/setpoint_raw/local"
+        )
+        self.get_logger().warn(
+            "RC manual input  : direct PX4 MANUAL mode"
+        )
+        self.get_logger().warn(
+            "This node never changes mode or arms PX4"
+        )
+
+    def validate_parameters(self):
+        positive_values = {
+            "command_timeout_sec": self.command_timeout_sec,
+            "maximum_speed_mps": self.maximum_speed,
+            "maximum_yaw_rate_radps": self.maximum_yaw_rate,
+        }
+        for name, value in positive_values.items():
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and > 0")
+
+    def age_seconds(self, timestamp):
+        if timestamp is None:
+            return math.inf
+        return (
+            self.get_clock().now() - timestamp
+        ).nanoseconds / 1e9
+
+    def rpp_velocity_callback(self, msg):
+        north = float(msg.vector.x)
+        east = float(msg.vector.y)
+        yaw_rate_enu = float(msg.vector.z)
+
+        if not all(
+            math.isfinite(value)
+            for value in (north, east, yaw_rate_enu)
+        ):
+            self.get_logger().error(
+                "Rejected non-finite RPP command"
+            )
+            return
+
+        horizontal_speed = math.hypot(north, east)
+        if horizontal_speed > self.maximum_speed:
+            scale = self.maximum_speed / horizontal_speed
+            north *= scale
+            east *= scale
+            self.get_logger().error(
+                f"RPP velocity clamped from "
+                f"{horizontal_speed:.3f}m/s to "
+                f"{self.maximum_speed:.3f}m/s"
+            )
+
+        yaw_rate_enu = max(
+            -self.maximum_yaw_rate,
+            min(self.maximum_yaw_rate, yaw_rate_enu),
+        )
+
+        # A yaw-rate request is always a pure rotation command.
+        # Never combine it with horizontal translation.
+        if abs(yaw_rate_enu) > self.COMMAND_EPSILON:
+            north = 0.0
+            east = 0.0
+
+        self.latest_north = north
+        self.latest_east = east
+        self.latest_yaw_rate = yaw_rate_enu
+        self.latest_command_time = self.get_clock().now()
+
+    def pose_callback(self, msg):
+        """Store current rover heading in the MAVROS ENU frame."""
+        q = msg.pose.orientation
+
+        sin_yaw = 2.0 * (
+            q.w * q.z
+            + q.x * q.y
+        )
+
+        cos_yaw = 1.0 - 2.0 * (
+            q.y * q.y
+            + q.z * q.z
+        )
+
+        self.current_yaw_enu = math.atan2(
+            sin_yaw,
+            cos_yaw,
+        )
+
+    def state_callback(self, msg):
+        self.connected = bool(msg.connected)
+        self.armed = bool(msg.armed)
+        self.mode = str(msg.mode)
+
+    def mission_callback(self, msg):
+        self.mission_enabled = bool(msg.data)
+
+    def estop_callback(self, msg):
+        self.emergency_stop = bool(msg.data)
+
+    def publish_velocity_setpoint(
+        self,
+        north,
+        east,
+        yaw_rate_enu,
+    ):
+        msg = PositionTarget()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = ""
+        msg.coordinate_frame = self.FRAME_LOCAL_NED
+
+        stop_requested = (
+            abs(north) <= self.COMMAND_EPSILON
+            and abs(east) <= self.COMMAND_EPSILON
+            and abs(yaw_rate_enu) <= self.COMMAND_EPSILON
+        )
+
+        if (
+            stop_requested
+            and self.current_yaw_enu is not None
+        ):
+            # PX4 differential velocity mode derives yaw from
+            # atan2(velocity_y, velocity_x). A literal (0, 0)
+            # therefore requests yaw zero/North.
+            #
+            # Publish a microscopic vector along the rover's
+            # current heading instead. Its speed is effectively
+            # zero, but its bearing remains valid.
+            east = (
+                self.HOLD_VECTOR_EPSILON
+                * math.cos(self.current_yaw_enu)
+            )
+
+            north = (
+                self.HOLD_VECTOR_EPSILON
+                * math.sin(self.current_yaw_enu)
+            )
+
+        pivot_requested = (
+            abs(yaw_rate_enu) > self.COMMAND_EPSILON
+        )
+
+        if pivot_requested:
+            # True rotation in place:
+            # horizontal translation is forced to zero and yaw-rate is
+            # enabled in the PositionTarget mask.
+            north = 0.0
+            east = 0.0
+            msg.type_mask = (
+                self.TYPE_MASK_YAW_RATE_ONLY
+            )
+        else:
+            # Normal navigation remains exactly velocity-only.
+            msg.type_mask = self.TYPE_MASK_VELOCITY_ONLY
+
+        # Controller input is NED horizontal velocity:
+        #     North -> ROS ENU y
+        #     East  -> ROS ENU x
+        msg.velocity.x = float(east)
+        msg.velocity.y = float(north)
+        msg.velocity.z = 0.0
+
+        msg.position.x = 0.0
+        msg.position.y = 0.0
+        msg.position.z = 0.0
+        msg.acceleration_or_force.x = 0.0
+        msg.acceleration_or_force.y = 0.0
+        msg.acceleration_or_force.z = 0.0
+
+        msg.yaw = 0.0
+
+        # ROS-side yaw-rate is ENU:
+        # positive = left / counter-clockwise
+        # negative = right / clockwise
+        #
+        # MAVROS converts it to NED before transmitting to PX4.
+        msg.yaw_rate = float(yaw_rate_enu)
+
+        self.setpoint_pub.publish(msg)
+
+    def control_loop(self):
+        north = 0.0
+        east = 0.0
+        yaw_rate_enu = 0.0
+
+        if self.emergency_stop:
+            reason = "emergency_stop"
+        elif not self.mission_enabled:
+            reason = "mission_disabled"
+        elif not self.connected:
+            reason = "px4_disconnected"
+        elif not self.armed:
+            reason = "px4_disarmed"
+        elif self.mode != "OFFBOARD":
+            reason = f"mode_{self.mode or 'unknown'}"
+        elif (
+            self.age_seconds(self.latest_command_time)
+            > self.command_timeout_sec
+        ):
+            reason = "rpp_command_timeout"
+        else:
+            north = self.latest_north
+            east = self.latest_east
+            yaw_rate_enu = self.latest_yaw_rate
+
+            reason = (
+                "publishing_rpp_yaw_rate"
+                if abs(yaw_rate_enu) > self.COMMAND_EPSILON
+                else "publishing_rpp_velocity"
+            )
+
+        self.publish_velocity_setpoint(
+            north,
+            east,
+            yaw_rate_enu,
+        )
+
+        now = self.get_clock().now()
+        if (
+            now - self.last_log_time
+        ).nanoseconds >= 1_000_000_000:
+            self.last_log_time = now
+            self.get_logger().info(
+                f"reason={reason} "
+                f"connected={self.connected} "
+                f"armed={self.armed} "
+                f"mode={self.mode} "
+                f"mission={self.mission_enabled} "
+                f"estop={self.emergency_stop} "
+                f"vN={north:.3f} "
+                f"vE={east:.3f} "
+                f"yawRateENU={yaw_rate_enu:.3f}"
+            )
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = CmdVelBridge()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for _ in range(10):
+            node.publish_velocity_setpoint(
+                0.0,
+                0.0,
+                0.0,
+            )
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

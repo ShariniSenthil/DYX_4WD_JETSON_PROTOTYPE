@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+
+import hashlib
+import math
+import struct
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
+
+from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Odometry, Path
+from std_msgs.msg import Bool
+
+
+class MissionManager(Node):
+    """
+    Sequence dense path points while stopping only at original CSV points.
+
+    Original CSV points:
+        - 50 mm arrival radius by default
+        - zero-motion latch is handled by RPP
+        - /marking_active is true for marking_dwell_sec
+
+    Generated intermediate points:
+        - pass-through only
+        - no stop and no dwell
+    """
+
+    CONTROL_HZ = 20.0
+
+    def __init__(self):
+        super().__init__('mission_manager')
+
+        self.declare_parameter('local_frame', 'map')
+        self.declare_parameter('navigation_tolerance_m', 0.05)
+        self.declare_parameter('intermediate_switch_distance_m', 0.10)
+        self.declare_parameter('marking_lookahead_distance_m', 0.30)
+        self.declare_parameter('marking_dwell_sec', 3.0)
+        self.declare_parameter('waypoint_match_tolerance_m', 0.001)
+        self.declare_parameter('odom_timeout_sec', 0.50)
+        self.declare_parameter('max_waypoints', 10000)
+
+        self.local_frame = str(
+            self.get_parameter('local_frame').value
+        ).strip()
+        self.navigation_tolerance = float(
+            self.get_parameter('navigation_tolerance_m').value
+        )
+        self.intermediate_switch_distance = float(
+            self.get_parameter('intermediate_switch_distance_m').value
+        )
+        self.marking_lookahead_distance = float(
+            self.get_parameter('marking_lookahead_distance_m').value
+        )
+        self.marking_dwell_sec = float(
+            self.get_parameter('marking_dwell_sec').value
+        )
+        self.waypoint_match_tolerance = float(
+            self.get_parameter('waypoint_match_tolerance_m').value
+        )
+        self.odom_timeout_sec = float(
+            self.get_parameter('odom_timeout_sec').value
+        )
+        self.max_waypoints = int(
+            self.get_parameter('max_waypoints').value
+        )
+
+        self.validate_parameters()
+
+        self.pending_path = None
+        self.pending_marking_waypoints = None
+
+        self.path_points = []
+        self.marking_flags = []
+        self.marking_numbers = []
+        self.path_signature = None
+        self.current_path_index = 0
+        self.mission_complete = False
+        self.dwell_start_time = None
+
+        self.current_x = None
+        self.current_y = None
+        self.last_odom_time = None
+
+        self.mission_enabled = False
+        self.emergency_stop = True
+
+        now = self.get_clock().now()
+        self.last_wait_log_time = now
+        self.last_status_log_time = now
+        self.last_reject_log_time = now
+
+        retained_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        odom_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        self.create_subscription(
+            Path,
+            '/nav_path',
+            self.path_callback,
+            retained_qos,
+        )
+        self.create_subscription(
+            Path,
+            '/mission_waypoints',
+            self.marking_waypoints_callback,
+            retained_qos,
+        )
+        self.create_subscription(
+            Odometry,
+            '/mavros/local_position/odom',
+            self.odom_callback,
+            odom_qos,
+        )
+        self.create_subscription(
+            Bool,
+            '/mission_enable',
+            self.mission_enable_callback,
+            10,
+        )
+        self.create_subscription(
+            Bool,
+            '/emergency_stop',
+            self.emergency_stop_callback,
+            10,
+        )
+
+        self.active_wp_pub = self.create_publisher(
+            PoseStamped,
+            '/active_waypoint',
+            10,
+        )
+        self.marking_active_pub = self.create_publisher(
+            Bool,
+            '/marking_active',
+            10,
+        )
+
+        self.timer = self.create_timer(
+            1.0 / self.CONTROL_HZ,
+            self.control_loop,
+        )
+
+        self.get_logger().warn(
+            '===== MARKING MISSION MANAGER STARTED ====='
+        )
+        self.get_logger().warn(
+            f'Marking tolerance : {self.navigation_tolerance:.3f} m'
+        )
+        self.get_logger().warn(
+            f'Marking dwell     : {self.marking_dwell_sec:.1f} s'
+        )
+        self.get_logger().warn(
+            f'Pass-through      : {self.intermediate_switch_distance:.2f} m'
+        )
+
+    def validate_parameters(self):
+        positive_values = {
+            'navigation_tolerance_m': self.navigation_tolerance,
+            'intermediate_switch_distance_m': (
+                self.intermediate_switch_distance
+            ),
+            'marking_lookahead_distance_m': (
+                self.marking_lookahead_distance
+            ),
+            'marking_dwell_sec': self.marking_dwell_sec,
+            'waypoint_match_tolerance_m': (
+                self.waypoint_match_tolerance
+            ),
+            'odom_timeout_sec': self.odom_timeout_sec,
+        }
+        for name, value in positive_values.items():
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f'{name} must be finite and > 0')
+
+        if not self.local_frame:
+            raise ValueError('local_frame must not be empty')
+        if self.max_waypoints < 1:
+            raise ValueError('max_waypoints must be >= 1')
+        if (
+            self.intermediate_switch_distance
+            <= self.navigation_tolerance
+        ):
+            raise ValueError(
+                'intermediate_switch_distance_m must be greater '
+                'than navigation_tolerance_m'
+            )
+
+    def age_seconds(self, timestamp):
+        if timestamp is None:
+            return math.inf
+        return (
+            self.get_clock().now() - timestamp
+        ).nanoseconds / 1e9
+
+    def odometry_is_fresh(self):
+        age = self.age_seconds(self.last_odom_time)
+        return math.isfinite(age) and 0.0 <= age <= self.odom_timeout_sec
+
+    def log_waiting(self, reason):
+        now = self.get_clock().now()
+        if (
+            now - self.last_wait_log_time
+        ).nanoseconds < 1_000_000_000:
+            return
+        self.last_wait_log_time = now
+        self.get_logger().info(f'WAITING: {reason}')
+
+    def log_rejected(self, reason):
+        now = self.get_clock().now()
+        if (
+            now - self.last_reject_log_time
+        ).nanoseconds < 2_000_000_000:
+            return
+        self.last_reject_log_time = now
+        self.get_logger().error(f'MISSION REJECTED: {reason}')
+
+    def validate_path_message(self, msg, label):
+        frame_id = msg.header.frame_id.strip()
+        if frame_id != self.local_frame:
+            self.log_rejected(
+                f'{label} frame must be {self.local_frame!r}, '
+                f'got {frame_id!r}'
+            )
+            return None
+
+        if len(msg.poses) == 0:
+            self.log_rejected(f'{label} contains zero points')
+            return None
+        if len(msg.poses) > self.max_waypoints:
+            self.log_rejected(
+                f'{label} contains {len(msg.poses)} points; '
+                f'maximum is {self.max_waypoints}'
+            )
+            return None
+
+        points = []
+        for index, pose_stamped in enumerate(msg.poses, start=1):
+            pose_frame = pose_stamped.header.frame_id.strip()
+            if pose_frame and pose_frame != self.local_frame:
+                self.log_rejected(
+                    f'{label} point {index} has wrong frame '
+                    f'{pose_frame!r}'
+                )
+                return None
+
+            x = float(pose_stamped.pose.position.x)
+            y = float(pose_stamped.pose.position.y)
+            if not all(math.isfinite(value) for value in (x, y)):
+                self.log_rejected(
+                    f'{label} point {index} contains non-finite x/y'
+                )
+                return None
+            points.append((x, y))
+
+        return points
+
+    def path_callback(self, msg):
+        points = self.validate_path_message(msg, '/nav_path')
+        if points is None:
+            return
+        self.pending_path = points
+        self.try_load_combined_mission()
+
+    def marking_waypoints_callback(self, msg):
+        points = self.validate_path_message(
+            msg,
+            '/mission_waypoints',
+        )
+        if points is None:
+            return
+        self.pending_marking_waypoints = points
+        self.try_load_combined_mission()
+
+    def match_marking_points(self, path_points, marking_waypoints):
+        marking_flags = [False] * len(path_points)
+        marking_numbers = [0] * len(path_points)
+        search_start = 0
+
+        for marking_number, marking_point in enumerate(
+            marking_waypoints,
+            start=1,
+        ):
+            matched_index = None
+            for path_index in range(search_start, len(path_points)):
+                if math.hypot(
+                    path_points[path_index][0] - marking_point[0],
+                    path_points[path_index][1] - marking_point[1],
+                ) <= self.waypoint_match_tolerance:
+                    matched_index = path_index
+                    break
+
+            if matched_index is None:
+                return None, None
+
+            marking_flags[matched_index] = True
+            marking_numbers[matched_index] = marking_number
+            search_start = matched_index + 1
+
+        return marking_flags, marking_numbers
+
+    @staticmethod
+    def make_signature(path_points, marking_waypoints):
+        digest = hashlib.sha256()
+        for label, points in (
+            (b'PATH', path_points),
+            (b'MARK', marking_waypoints),
+        ):
+            digest.update(label)
+            for x, y in points:
+                digest.update(struct.pack('!dd', x, y))
+        return digest.hexdigest()
+
+    def try_load_combined_mission(self):
+        if (
+            self.pending_path is None
+            or self.pending_marking_waypoints is None
+        ):
+            return
+
+        flags, numbers = self.match_marking_points(
+            self.pending_path,
+            self.pending_marking_waypoints,
+        )
+        if flags is None:
+            self.log_rejected(
+                'original CSV waypoints were not found in /nav_path'
+            )
+            return
+
+        new_signature = self.make_signature(
+            self.pending_path,
+            self.pending_marking_waypoints,
+        )
+        if new_signature == self.path_signature:
+            return
+
+        safe_to_replace = self.emergency_stop or not self.mission_enabled
+        if not safe_to_replace:
+            self.log_rejected(
+                'new mission received while motion is permitted; '
+                'enable E-stop or disable mission first'
+            )
+            return
+
+        self.path_points = list(self.pending_path)
+        self.marking_flags = flags
+        self.marking_numbers = numbers
+        self.path_signature = new_signature
+        self.current_path_index = 0
+        self.mission_complete = False
+        self.dwell_start_time = None
+        self.publish_marking_active(False)
+
+        marking_count = sum(1 for flag in flags if flag)
+        intermediate_count = len(flags) - marking_count
+
+        self.get_logger().warn(
+            '========== NEW MARKING MISSION LOADED =========='
+        )
+        self.get_logger().warn(
+            f'Marking waypoints : {marking_count}'
+        )
+        self.get_logger().warn(
+            f'Pass-through pts  : {intermediate_count}'
+        )
+        self.get_logger().warn(
+            f'Total path points : {len(self.path_points)}'
+        )
+
+    def odom_callback(self, msg):
+        frame_id = msg.header.frame_id.strip()
+        if frame_id and frame_id != self.local_frame:
+            return
+
+        x = float(msg.pose.pose.position.x)
+        y = float(msg.pose.pose.position.y)
+        if not all(math.isfinite(value) for value in (x, y)):
+            return
+
+        self.current_x = x
+        self.current_y = y
+        self.last_odom_time = self.get_clock().now()
+
+    def mission_enable_callback(self, msg):
+        new_state = bool(msg.data)
+        if new_state == self.mission_enabled:
+            return
+        self.mission_enabled = new_state
+        self.dwell_start_time = None
+        self.publish_marking_active(False)
+        self.get_logger().warn(
+            'MISSION ENABLED' if new_state else 'MISSION DISABLED'
+        )
+
+    def emergency_stop_callback(self, msg):
+        new_state = bool(msg.data)
+        if new_state == self.emergency_stop:
+            return
+        self.emergency_stop = new_state
+        self.dwell_start_time = None
+        self.publish_marking_active(False)
+        self.get_logger().warn(
+            'EMERGENCY STOP ACTIVE'
+            if new_state
+            else 'EMERGENCY STOP RELEASED'
+        )
+
+    def publish_active_waypoint(self, x, y):
+        msg = PoseStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.local_frame
+        msg.pose.position.x = float(x)
+        msg.pose.position.y = float(y)
+        msg.pose.position.z = 0.0
+        msg.pose.orientation.w = 1.0
+        self.active_wp_pub.publish(msg)
+
+    def publish_marking_active(self, active):
+        msg = Bool()
+        msg.data = bool(active)
+        self.marking_active_pub.publish(msg)
+
+    def next_marking_index(self, start_index):
+        for index in range(start_index, len(self.marking_flags)):
+            if self.marking_flags[index]:
+                return index
+        return None
+
+    def advance_after_target(self):
+        self.current_path_index += 1
+        self.dwell_start_time = None
+        self.publish_marking_active(False)
+
+        if self.current_path_index >= len(self.path_points):
+            self.mission_complete = True
+            self.get_logger().warn(
+                '========== MISSION COMPLETE =========='
+            )
+
+    def control_loop(self):
+        # Safety gates pause mission progression and marking, but the current
+        # target is still published. This lets RPP generate commands while
+        # cmd_vel_bridge safely clamps PX4 output to zero until both gates
+        # permit movement.
+        motion_permitted = self.mission_enabled and not self.emergency_stop
+
+        if not self.path_points:
+            self.publish_marking_active(False)
+            self.log_waiting('waiting for mission paths')
+            return
+
+        if self.mission_complete:
+            self.publish_marking_active(False)
+            self.log_waiting('mission complete')
+            return
+
+        if self.current_x is None or self.current_y is None:
+            self.publish_marking_active(False)
+            self.log_waiting('waiting for odometry')
+            return
+
+        if not self.odometry_is_fresh():
+            self.publish_marking_active(False)
+            self.log_waiting('odometry timeout')
+            return
+
+        if self.current_path_index >= len(self.path_points):
+            self.mission_complete = True
+            self.publish_marking_active(False)
+            return
+
+        target_x, target_y = self.path_points[self.current_path_index]
+        is_marking = self.marking_flags[self.current_path_index]
+        marking_number = self.marking_numbers[self.current_path_index]
+
+        distance = math.hypot(
+            target_x - self.current_x,
+            target_y - self.current_y,
+        )
+        if not math.isfinite(distance):
+            self.publish_marking_active(False)
+            self.log_waiting('invalid target distance')
+            return
+
+        # Always publish the current target, including while mission is
+        # disabled or E-stop is active. The bridge remains the final safety
+        # gate and must output zero unless mission=true and E-stop=false.
+        self.publish_active_waypoint(target_x, target_y)
+
+        if not motion_permitted:
+            self.dwell_start_time = None
+            self.publish_marking_active(False)
+            if self.emergency_stop:
+                self.log_waiting('emergency stop active; target held')
+            else:
+                self.log_waiting('mission disabled; target held')
+            return
+
+        # Before a marking waypoint, skip any remaining pass-through points
+        # once the rover enters the configured marking approach distance.
+        if not is_marking:
+            upcoming_marking_index = self.next_marking_index(
+                self.current_path_index + 1
+            )
+            if upcoming_marking_index is not None:
+                upcoming_x, upcoming_y = self.path_points[
+                    upcoming_marking_index
+                ]
+                distance_to_marking = math.hypot(
+                    upcoming_x - self.current_x,
+                    upcoming_y - self.current_y,
+                )
+                if distance_to_marking <= self.marking_lookahead_distance:
+                    self.current_path_index = upcoming_marking_index
+                    self.dwell_start_time = None
+                    self.publish_marking_active(False)
+                    return
+
+            if distance <= self.intermediate_switch_distance:
+                self.get_logger().info(
+                    f'PASS-THROUGH POINT '
+                    f'{self.current_path_index + 1} PASSED'
+                )
+                self.advance_after_target()
+                return
+
+            self.publish_marking_active(False)
+
+        else:
+            if distance <= self.navigation_tolerance:
+                now = self.get_clock().now()
+
+                if self.dwell_start_time is None:
+                    self.dwell_start_time = now
+                    self.get_logger().warn(
+                        f'MARKING WP {marking_number} REACHED | '
+                        f'error={distance:.3f} m | '
+                        f'marking for {self.marking_dwell_sec:.1f} s'
+                    )
+
+                elapsed = (
+                    now - self.dwell_start_time
+                ).nanoseconds / 1e9
+                self.publish_marking_active(True)
+
+                if elapsed >= self.marking_dwell_sec:
+                    self.get_logger().warn(
+                        f'MARKING WP {marking_number} COMPLETE'
+                    )
+                    self.advance_after_target()
+                    return
+            else:
+                self.dwell_start_time = None
+                self.publish_marking_active(False)
+
+        now = self.get_clock().now()
+        if (
+            now - self.last_status_log_time
+        ).nanoseconds >= 1_000_000_000:
+            self.last_status_log_time = now
+            target_type = (
+                f'MARKING WP {marking_number}'
+                if is_marking
+                else 'PASS-THROUGH'
+            )
+            self.get_logger().info(
+                f'{target_type} | path '
+                f'{self.current_path_index + 1}/'
+                f'{len(self.path_points)} | '
+                f'dist={distance:.3f} m'
+            )
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = MissionManager()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.publish_marking_active(False)
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

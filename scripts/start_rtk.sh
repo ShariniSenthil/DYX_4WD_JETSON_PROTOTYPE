@@ -1,0 +1,18 @@
+#!/bin/bash
+
+source /opt/ros/humble/setup.bash
+source ~/rover_ws/install/setup.bash
+
+export NTRIP_MOUNTPOINT="MP23960"
+export NTRIP_USERNAME="u98264"
+
+read -s -p "Enter NTRIP password: " NTRIP_PASSWORD
+export NTRIP_PASSWORD
+echo
+
+ros2 run rtk_correction_bridge ntrip_to_px4_node --ros-args \
+  -p caster_host:=caster.emlid.com \
+  -p caster_port:=2101 \
+  -p mountpoint:="$NTRIP_MOUNTPOINT" \
+  -p username:="$NTRIP_USERNAME" \
+  -p rtcm_topic:=/mavros/gps_rtk/send_rtcm

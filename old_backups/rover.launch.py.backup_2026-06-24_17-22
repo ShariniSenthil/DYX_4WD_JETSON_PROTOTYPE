@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+
+from launch import LaunchDescription
+from launch.actions import TimerAction, ExecuteProcess, LogInfo
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+
+    # Start MAVROS using the exact command that already worked manually
+    mavros = ExecuteProcess(
+        cmd=[
+            'bash',
+            '-lc',
+            'source /opt/ros/humble/setup.bash && ros2 run mavros mavros_node --ros-args -p fcu_url:=/dev/ttyACM0:921600'
+        ],
+        output='screen',
+    )
+
+    set_body_ned = TimerAction(
+        period=7.0,
+        actions=[
+            LogInfo(msg='Setting MAVROS setpoint_velocity mav_frame to BODY_NED'),
+            ExecuteProcess(
+                cmd=[
+                    'bash',
+                    '-lc',
+                    'source /opt/ros/humble/setup.bash && ros2 param set /mavros/setpoint_velocity mav_frame BODY_NED'
+                ],
+                output='screen',
+            ),
+        ],
+    )
+
+    disarm_px4 = TimerAction(
+        period=8.0,
+        actions=[
+            LogInfo(msg='Disarming PX4 at startup'),
+            ExecuteProcess(
+                cmd=[
+                    'bash',
+                    '-lc',
+                    'source /opt/ros/humble/setup.bash && ros2 service call /mavros/cmd/arming mavros_msgs/srv/CommandBool "{value: false}" || true'
+                ],
+                output='screen',
+            ),
+        ],
+    )
+
+    cmd_vel_bridge = TimerAction(
+        period=9.0,
+        actions=[
+            LogInfo(msg='Starting cmd_vel_bridge'),
+            Node(
+                package='offboard_controller',
+                executable='cmd_vel_bridge',
+                name='cmd_vel_bridge',
+                output='screen',
+            ),
+        ],
+    )
+
+    csv_path_publisher = TimerAction(
+        period=10.0,
+        actions=[
+            LogInfo(msg='Starting csv_path_publisher'),
+            Node(
+                package='rover_bringup',
+                executable='csv_path_publisher',
+                name='csv_path_publisher',
+                output='screen',
+                parameters=[
+                    {'csv_file': '/home/flash/rover_ws/missions/mission1.csv'}
+                ],
+            ),
+        ],
+    )
+
+    mission_manager = TimerAction(
+        period=11.0,
+        actions=[
+            LogInfo(msg='Starting mission_manager'),
+            Node(
+                package='mission_manager',
+                executable='mission_manager_node',
+                name='mission_manager',
+                output='screen',
+            ),
+        ],
+    )
+
+    rpp_controller = TimerAction(
+        period=12.0,
+        actions=[
+            LogInfo(msg='Starting rpp_controller'),
+            Node(
+                package='rpp_controller',
+                executable='rpp_controller_node',
+                name='rpp_controller',
+                output='screen',
+            ),
+        ],
+    )
+
+    return LaunchDescription([
+        mavros,
+        set_body_ned,
+        disarm_px4,
+        cmd_vel_bridge,
+        csv_path_publisher,
+        mission_manager,
+        rpp_controller,
+    ])

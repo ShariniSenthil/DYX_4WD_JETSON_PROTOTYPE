@@ -1,0 +1,874 @@
+#!/usr/bin/env python3
+
+import csv
+import hashlib
+import math
+import os
+import struct
+
+import rclpy
+from geometry_msgs.msg import PoseStamped
+from mavros_msgs.msg import GPSRAW
+from nav_msgs.msg import Odometry, Path
+from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
+from sensor_msgs.msg import NavSatFix
+from std_msgs.msg import Bool, Float32
+
+
+class TrajectoryGenerator(Node):
+    """
+    Convert the original P1-P4 CSV coordinates into the MAVROS local ENU
+    frame and publish:
+
+        /mission_waypoints
+            Exact original marking coordinates only.
+
+        /nav_path
+            Exact marking coordinates plus interpolated pass-through points.
+
+    Interpolated points are generated at spacing <= interpolation_spacing_m.
+    Every original marking point remains exactly present in /nav_path.
+    """
+
+    WGS84_A_M = 6378137.0
+    WGS84_F = 1.0 / 298.257223563
+    CONTROL_HZ = 5.0
+
+    LATITUDE_HEADERS = ("latitude", "lat")
+    LONGITUDE_HEADERS = ("longitude", "lon", "lng", "long")
+
+    def __init__(self):
+        super().__init__("trajectory_generator")
+
+        self.declare_parameter(
+            "mission_file",
+            "/home/flash/rover_ws/missions/mission1.csv",
+        )
+        self.declare_parameter("frame_id", "map")
+        self.declare_parameter("input_mode", "gps")
+        self.declare_parameter("expected_marking_waypoints", 4)
+        self.declare_parameter(
+            "global_position_topic",
+            "/mavros/global_position/raw/fix",
+        )
+        self.declare_parameter(
+            "local_odom_topic",
+            "/mavros/local_position/odom",
+        )
+        self.declare_parameter(
+            "gps_status_topic",
+            "/mavros/gpsstatus/gps1/raw",
+        )
+        self.declare_parameter(
+            "rtk_health_topic",
+            "/rtk_correction_bridge/healthy",
+        )
+        self.declare_parameter(
+            "rtk_correction_age_topic",
+            "/rtk_correction_bridge/correction_age_sec",
+        )
+        self.declare_parameter("required_gps_fix_type", 6)
+        self.declare_parameter("rtk_stable_sec", 3.0)
+        self.declare_parameter("max_correction_age_sec", 2.0)
+        self.declare_parameter("reference_timeout_sec", 1.0)
+        self.declare_parameter("max_reference_skew_sec", 0.25)
+        self.declare_parameter("max_target_distance_m", 1000.0)
+        self.declare_parameter("max_abs_coordinate_m", 10000.0)
+        self.declare_parameter("max_path_points", 10000)
+        self.declare_parameter("interpolation_spacing_m", 0.25)
+
+        self.mission_file = os.path.abspath(os.path.expanduser(str(
+            self.get_parameter("mission_file").value
+        )))
+        self.frame_id = str(
+            self.get_parameter("frame_id").value
+        ).strip()
+        self.input_mode = str(
+            self.get_parameter("input_mode").value
+        ).strip().lower()
+        self.expected_marking_waypoints = int(
+            self.get_parameter("expected_marking_waypoints").value
+        )
+        self.global_position_topic = str(
+            self.get_parameter("global_position_topic").value
+        ).strip()
+        self.local_odom_topic = str(
+            self.get_parameter("local_odom_topic").value
+        ).strip()
+        self.gps_status_topic = str(
+            self.get_parameter("gps_status_topic").value
+        ).strip()
+        self.rtk_health_topic = str(
+            self.get_parameter("rtk_health_topic").value
+        ).strip()
+        self.rtk_correction_age_topic = str(
+            self.get_parameter("rtk_correction_age_topic").value
+        ).strip()
+        self.required_gps_fix_type = int(
+            self.get_parameter("required_gps_fix_type").value
+        )
+        self.rtk_stable_sec = float(
+            self.get_parameter("rtk_stable_sec").value
+        )
+        self.max_correction_age_sec = float(
+            self.get_parameter("max_correction_age_sec").value
+        )
+        self.reference_timeout_sec = float(
+            self.get_parameter("reference_timeout_sec").value
+        )
+        self.max_reference_skew_sec = float(
+            self.get_parameter("max_reference_skew_sec").value
+        )
+        self.max_target_distance_m = float(
+            self.get_parameter("max_target_distance_m").value
+        )
+        self.max_abs_coordinate_m = float(
+            self.get_parameter("max_abs_coordinate_m").value
+        )
+        self.max_path_points = int(
+            self.get_parameter("max_path_points").value
+        )
+        self.interpolation_spacing_m = float(
+            self.get_parameter("interpolation_spacing_m").value
+        )
+
+        self.validate_parameters()
+
+        retained_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        sensor_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        self.mission_waypoints_pub = self.create_publisher(
+            Path,
+            "/mission_waypoints",
+            retained_qos,
+        )
+        self.nav_path_pub = self.create_publisher(
+            Path,
+            "/nav_path",
+            retained_qos,
+        )
+        self.ready_pub = self.create_publisher(
+            Bool,
+            "/trajectory_generator/ready",
+            retained_qos,
+        )
+
+        self.create_subscription(
+            NavSatFix,
+            self.global_position_topic,
+            self.global_position_callback,
+            sensor_qos,
+        )
+        self.create_subscription(
+            Odometry,
+            self.local_odom_topic,
+            self.local_odom_callback,
+            sensor_qos,
+        )
+        self.create_subscription(
+            GPSRAW,
+            self.gps_status_topic,
+            self.gps_status_callback,
+            sensor_qos,
+        )
+        self.create_subscription(
+            Bool,
+            self.rtk_health_topic,
+            self.rtk_health_callback,
+            sensor_qos,
+        )
+        self.create_subscription(
+            Float32,
+            self.rtk_correction_age_topic,
+            self.rtk_correction_age_callback,
+            sensor_qos,
+        )
+
+        self.raw_mode = None
+        self.raw_marking_waypoints = []
+
+        self.latest_global_fix = None
+        self.latest_global_time = None
+        self.latest_local_odom = None
+        self.latest_local_time = None
+        self.latest_gps_status = None
+        self.latest_gps_status_time = None
+        self.rtk_healthy = False
+        self.correction_age_sec = math.inf
+        self.rtk_ready_since = None
+
+        self.published = False
+        self.last_wait_log_time = self.get_clock().now()
+
+        self.read_csv()
+        self.publish_ready(False)
+
+        self.timer = self.create_timer(
+            1.0 / self.CONTROL_HZ,
+            self.control_loop,
+        )
+
+        self.get_logger().warn(
+            "===== INTERPOLATED P1-P4 TRAJECTORY GENERATOR STARTED ====="
+        )
+        self.get_logger().warn(f"Mission file       : {self.mission_file}")
+        self.get_logger().warn(
+            f"CSV input mode     : {self.raw_mode or 'invalid'}"
+        )
+        self.get_logger().warn(
+            f"Interpolation      : <= {self.interpolation_spacing_m:.3f} m"
+        )
+        self.get_logger().warn(
+            f"Expected markings  : {self.expected_marking_waypoints}"
+        )
+
+    def validate_parameters(self):
+        if not self.frame_id:
+            raise ValueError("frame_id must not be empty")
+        if self.input_mode not in ("gps", "local", "auto"):
+            raise ValueError("input_mode must be gps, local, or auto")
+        if self.expected_marking_waypoints < 2:
+            raise ValueError(
+                "expected_marking_waypoints must be >= 2"
+            )
+        if self.required_gps_fix_type < 0:
+            raise ValueError("required_gps_fix_type must be >= 0")
+        if self.max_path_points < self.expected_marking_waypoints:
+            raise ValueError("max_path_points is too small")
+
+        positive_values = {
+            "rtk_stable_sec": self.rtk_stable_sec,
+            "max_correction_age_sec": self.max_correction_age_sec,
+            "reference_timeout_sec": self.reference_timeout_sec,
+            "max_reference_skew_sec": self.max_reference_skew_sec,
+            "max_target_distance_m": self.max_target_distance_m,
+            "max_abs_coordinate_m": self.max_abs_coordinate_m,
+            "interpolation_spacing_m": self.interpolation_spacing_m,
+        }
+        for name, value in positive_values.items():
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and > 0")
+
+    @staticmethod
+    def find_header(headers, aliases):
+        for alias in aliases:
+            if alias in headers:
+                return headers[alias]
+        return None
+
+    def read_csv(self):
+        if not os.path.isfile(self.mission_file):
+            self.get_logger().error(
+                f"Mission file not found: {self.mission_file}"
+            )
+            return
+
+        try:
+            with open(
+                self.mission_file,
+                "r",
+                encoding="utf-8-sig",
+                newline="",
+            ) as handle:
+                reader = csv.DictReader(handle)
+                if reader.fieldnames is None:
+                    raise ValueError("CSV has no header row")
+
+                headers = {
+                    name.strip().lower(): name
+                    for name in reader.fieldnames
+                    if name is not None
+                }
+
+                latitude_column = self.find_header(
+                    headers,
+                    self.LATITUDE_HEADERS,
+                )
+                longitude_column = self.find_header(
+                    headers,
+                    self.LONGITUDE_HEADERS,
+                )
+                x_column = headers.get("x")
+                y_column = headers.get("y")
+
+                has_gps = (
+                    latitude_column is not None
+                    and longitude_column is not None
+                )
+                has_local = (
+                    x_column is not None
+                    and y_column is not None
+                )
+
+                if self.input_mode == "gps":
+                    detected_mode = "gps" if has_gps else None
+                elif self.input_mode == "local":
+                    detected_mode = "local" if has_local else None
+                elif has_gps:
+                    detected_mode = "gps"
+                elif has_local:
+                    detected_mode = "local"
+                else:
+                    detected_mode = None
+
+                if detected_mode is None:
+                    raise ValueError(
+                        "CSV must contain latitude,longitude or x,y"
+                    )
+
+                points = []
+                for row_number, row in enumerate(reader, start=2):
+                    if not any(
+                        value is not None and str(value).strip()
+                        for value in row.values()
+                    ):
+                        continue
+
+                    try:
+                        if detected_mode == "gps":
+                            first = float(
+                                str(row[latitude_column]).strip()
+                            )
+                            second = float(
+                                str(row[longitude_column]).strip()
+                            )
+                        else:
+                            first = float(
+                                str(row[x_column]).strip()
+                            )
+                            second = float(
+                                str(row[y_column]).strip()
+                            )
+                    except (KeyError, TypeError, ValueError) as error:
+                        raise ValueError(
+                            f"invalid coordinate at row {row_number}: "
+                            f"{error}"
+                        ) from error
+
+                    if not all(
+                        math.isfinite(value)
+                        for value in (first, second)
+                    ):
+                        raise ValueError(
+                            f"non-finite coordinate at row {row_number}"
+                        )
+
+                    if detected_mode == "gps":
+                        if not -90.0 <= first <= 90.0:
+                            raise ValueError(
+                                f"latitude outside range at row {row_number}"
+                            )
+                        if not -180.0 <= second <= 180.0:
+                            raise ValueError(
+                                f"longitude outside range at row {row_number}"
+                            )
+                    elif (
+                        abs(first) > self.max_abs_coordinate_m
+                        or abs(second) > self.max_abs_coordinate_m
+                    ):
+                        raise ValueError(
+                            f"local coordinate outside allowed range "
+                            f"at row {row_number}"
+                        )
+
+                    points.append((first, second))
+
+                if len(points) != self.expected_marking_waypoints:
+                    raise ValueError(
+                        f"expected exactly "
+                        f"{self.expected_marking_waypoints} markings, "
+                        f"got {len(points)}"
+                    )
+
+                for index in range(1, len(points)):
+                    if points[index] == points[index - 1]:
+                        raise ValueError(
+                            f"consecutive duplicate at P{index + 1}"
+                        )
+
+                self.raw_mode = detected_mode
+                self.raw_marking_waypoints = points
+
+                self.get_logger().warn(
+                    f"CSV marking rows   : {len(points)}"
+                )
+
+        except (OSError, ValueError) as error:
+            self.get_logger().error(f"Mission CSV rejected: {error}")
+            self.raw_mode = None
+            self.raw_marking_waypoints = []
+
+    def global_position_callback(self, msg):
+        self.latest_global_fix = msg
+        self.latest_global_time = self.get_clock().now()
+
+    def local_odom_callback(self, msg):
+        self.latest_local_odom = msg
+        self.latest_local_time = self.get_clock().now()
+
+    def gps_status_callback(self, msg):
+        self.latest_gps_status = msg
+        self.latest_gps_status_time = self.get_clock().now()
+
+    def rtk_health_callback(self, msg):
+        self.rtk_healthy = bool(msg.data)
+
+    def rtk_correction_age_callback(self, msg):
+        value = float(msg.data)
+        self.correction_age_sec = (
+            value if math.isfinite(value) else math.inf
+        )
+
+    def publish_ready(self, ready):
+        msg = Bool()
+        msg.data = bool(ready)
+        self.ready_pub.publish(msg)
+
+    def age_seconds(self, timestamp):
+        if timestamp is None:
+            return math.inf
+        return (
+            self.get_clock().now() - timestamp
+        ).nanoseconds / 1e9
+
+    def log_waiting(self, reason):
+        now = self.get_clock().now()
+        if (
+            now - self.last_wait_log_time
+        ).nanoseconds < 1_000_000_000:
+            return
+        self.last_wait_log_time = now
+        self.get_logger().info(
+            f"WAITING FOR RTK REFERENCE: {reason}"
+        )
+
+    def reference_is_ready(self):
+        now = self.get_clock().now()
+
+        if self.latest_global_fix is None:
+            return False, "no global fix"
+        if self.latest_local_odom is None:
+            return False, "no local odometry"
+        if self.latest_gps_status is None:
+            return False, "no GPS status"
+
+        if self.age_seconds(
+            self.latest_global_time
+        ) > self.reference_timeout_sec:
+            return False, "global fix timeout"
+        if self.age_seconds(
+            self.latest_local_time
+        ) > self.reference_timeout_sec:
+            return False, "local odometry timeout"
+        if self.age_seconds(
+            self.latest_gps_status_time
+        ) > self.reference_timeout_sec:
+            return False, "GPS status timeout"
+
+        if int(
+            self.latest_gps_status.fix_type
+        ) < self.required_gps_fix_type:
+            return False, (
+                f"fix_type={self.latest_gps_status.fix_type}; "
+                f"required={self.required_gps_fix_type}"
+            )
+
+        if not self.rtk_healthy:
+            return False, "RTK correction bridge unhealthy"
+        if (
+            not math.isfinite(self.correction_age_sec)
+            or self.correction_age_sec
+            > self.max_correction_age_sec
+        ):
+            return False, (
+                f"correction age={self.correction_age_sec:.2f}s"
+            )
+
+        skew = abs(
+            (
+                self.latest_global_time
+                - self.latest_local_time
+            ).nanoseconds
+        ) / 1e9
+        if skew > self.max_reference_skew_sec:
+            return False, f"global/local skew={skew:.3f}s"
+
+        reference_values = (
+            float(self.latest_global_fix.latitude),
+            float(self.latest_global_fix.longitude),
+            float(self.latest_global_fix.altitude),
+            float(self.latest_local_odom.pose.pose.position.x),
+            float(self.latest_local_odom.pose.pose.position.y),
+        )
+        if not all(
+            math.isfinite(value)
+            for value in reference_values
+        ):
+            return False, "non-finite reference data"
+
+        return True, "ready"
+
+    @classmethod
+    def geodetic_to_ecef(
+        cls,
+        latitude_deg,
+        longitude_deg,
+        altitude_m,
+    ):
+        latitude = math.radians(latitude_deg)
+        longitude = math.radians(longitude_deg)
+        eccentricity_sq = cls.WGS84_F * (
+            2.0 - cls.WGS84_F
+        )
+        sin_latitude = math.sin(latitude)
+        cos_latitude = math.cos(latitude)
+        sin_longitude = math.sin(longitude)
+        cos_longitude = math.cos(longitude)
+
+        prime_vertical = cls.WGS84_A_M / math.sqrt(
+            1.0
+            - eccentricity_sq
+            * sin_latitude
+            * sin_latitude
+        )
+
+        x = (
+            prime_vertical + altitude_m
+        ) * cos_latitude * cos_longitude
+        y = (
+            prime_vertical + altitude_m
+        ) * cos_latitude * sin_longitude
+        z = (
+            prime_vertical * (1.0 - eccentricity_sq)
+            + altitude_m
+        ) * sin_latitude
+        return x, y, z
+
+    @classmethod
+    def geodetic_delta_to_enu(
+        cls,
+        target_latitude,
+        target_longitude,
+        reference_latitude,
+        reference_longitude,
+        reference_altitude,
+    ):
+        ref_x, ref_y, ref_z = cls.geodetic_to_ecef(
+            reference_latitude,
+            reference_longitude,
+            reference_altitude,
+        )
+        target_x, target_y, target_z = cls.geodetic_to_ecef(
+            target_latitude,
+            target_longitude,
+            reference_altitude,
+        )
+
+        delta_x = target_x - ref_x
+        delta_y = target_y - ref_y
+        delta_z = target_z - ref_z
+
+        latitude = math.radians(reference_latitude)
+        longitude = math.radians(reference_longitude)
+        sin_latitude = math.sin(latitude)
+        cos_latitude = math.cos(latitude)
+        sin_longitude = math.sin(longitude)
+        cos_longitude = math.cos(longitude)
+
+        east = (
+            -sin_longitude * delta_x
+            + cos_longitude * delta_y
+        )
+        north = (
+            -sin_latitude
+            * cos_longitude
+            * delta_x
+            - sin_latitude
+            * sin_longitude
+            * delta_y
+            + cos_latitude
+            * delta_z
+        )
+        return east, north
+
+    def convert_markings_to_local(self):
+        if self.raw_mode == "local":
+            return list(self.raw_marking_waypoints)
+
+        reference_latitude = float(
+            self.latest_global_fix.latitude
+        )
+        reference_longitude = float(
+            self.latest_global_fix.longitude
+        )
+        reference_altitude = float(
+            self.latest_global_fix.altitude
+        )
+        local_reference_east = float(
+            self.latest_local_odom.pose.pose.position.x
+        )
+        local_reference_north = float(
+            self.latest_local_odom.pose.pose.position.y
+        )
+
+        self.get_logger().warn(
+            "GPS/local reference locked at: "
+            f"lat={reference_latitude:.9f}, "
+            f"lon={reference_longitude:.9f}, "
+            f"local_E={local_reference_east:.3f}, "
+            f"local_N={local_reference_north:.3f}"
+        )
+
+        local_points = []
+        for index, (latitude, longitude) in enumerate(
+            self.raw_marking_waypoints,
+            start=1,
+        ):
+            east_offset, north_offset = (
+                self.geodetic_delta_to_enu(
+                    latitude,
+                    longitude,
+                    reference_latitude,
+                    reference_longitude,
+                    reference_altitude,
+                )
+            )
+            target_distance = math.hypot(
+                east_offset,
+                north_offset,
+            )
+            if target_distance > self.max_target_distance_m:
+                raise ValueError(
+                    f"P{index} is {target_distance:.1f}m "
+                    f"from the locked reference"
+                )
+
+            local_east = (
+                local_reference_east + east_offset
+            )
+            local_north = (
+                local_reference_north + north_offset
+            )
+            local_points.append((local_east, local_north))
+
+            self.get_logger().warn(
+                f"MARKING WP {index}: "
+                f"E={local_east:.3f}, N={local_north:.3f}"
+            )
+
+        return local_points
+
+    def interpolate_waypoints(self, marking_waypoints):
+        generated = [marking_waypoints[0]]
+
+        for segment_index in range(
+            len(marking_waypoints) - 1
+        ):
+            start_x, start_y = marking_waypoints[segment_index]
+            end_x, end_y = marking_waypoints[segment_index + 1]
+            delta_x = end_x - start_x
+            delta_y = end_y - start_y
+            segment_length = math.hypot(delta_x, delta_y)
+
+            if not math.isfinite(segment_length):
+                raise ValueError(
+                    f"segment P{segment_index + 1}->"
+                    f"P{segment_index + 2} is non-finite"
+                )
+            if segment_length <= 0.0:
+                raise ValueError(
+                    f"segment P{segment_index + 1}->"
+                    f"P{segment_index + 2} has zero length"
+                )
+
+            divisions = max(
+                1,
+                int(math.ceil(
+                    segment_length
+                    / self.interpolation_spacing_m
+                )),
+            )
+
+            for division in range(1, divisions + 1):
+                ratio = division / divisions
+                generated.append((
+                    start_x + ratio * delta_x,
+                    start_y + ratio * delta_y,
+                ))
+
+        if len(generated) > self.max_path_points:
+            raise ValueError(
+                f"generated {len(generated)} path points; "
+                f"maximum is {self.max_path_points}"
+            )
+
+        return generated
+
+    def build_path(self, points, stamp):
+        path = Path()
+        path.header.stamp = stamp
+        path.header.frame_id = self.frame_id
+
+        for x, y in points:
+            pose = PoseStamped()
+            pose.header.stamp = stamp
+            pose.header.frame_id = self.frame_id
+            pose.pose.position.x = float(x)
+            pose.pose.position.y = float(y)
+            pose.pose.position.z = 0.0
+            pose.pose.orientation.w = 1.0
+            path.poses.append(pose)
+
+        return path
+
+    @staticmethod
+    def make_signature(path_points, marking_waypoints):
+        digest = hashlib.sha256()
+        for label, points in (
+            (b"PATH", path_points),
+            (b"MARK", marking_waypoints),
+        ):
+            digest.update(label)
+            for x, y in points:
+                digest.update(struct.pack("!dd", x, y))
+        return digest.hexdigest()
+
+    def control_loop(self):
+        if self.published:
+            return
+
+        if (
+            self.raw_mode is None
+            or len(self.raw_marking_waypoints)
+            != self.expected_marking_waypoints
+        ):
+            self.publish_ready(False)
+            self.log_waiting("mission CSV invalid")
+            return
+
+        if self.raw_mode == "gps":
+            ready, reason = self.reference_is_ready()
+            now = self.get_clock().now()
+
+            if not ready:
+                self.rtk_ready_since = None
+                self.publish_ready(False)
+                self.log_waiting(reason)
+                return
+
+            if self.rtk_ready_since is None:
+                self.rtk_ready_since = now
+                self.get_logger().warn(
+                    "RTK FIXED detected. Holding stable reference "
+                    "before mission conversion..."
+                )
+                return
+
+            stable_age = (
+                now - self.rtk_ready_since
+            ).nanoseconds / 1e9
+            if stable_age < self.rtk_stable_sec:
+                self.log_waiting(
+                    f"RTK stable {stable_age:.1f}/"
+                    f"{self.rtk_stable_sec:.1f}s"
+                )
+                return
+
+        try:
+            marking_waypoints = (
+                self.convert_markings_to_local()
+            )
+            generated_path = self.interpolate_waypoints(
+                marking_waypoints
+            )
+        except ValueError as error:
+            self.get_logger().error(
+                f"Mission generation rejected: {error}"
+            )
+            self.publish_ready(False)
+            self.timer.cancel()
+            return
+
+        stamp = self.get_clock().now().to_msg()
+        mission_path = self.build_path(
+            marking_waypoints,
+            stamp,
+        )
+        nav_path = self.build_path(
+            generated_path,
+            stamp,
+        )
+
+        signature = self.make_signature(
+            generated_path,
+            marking_waypoints,
+        )
+
+        self.mission_waypoints_pub.publish(mission_path)
+        self.nav_path_pub.publish(nav_path)
+        self.publish_ready(True)
+        self.published = True
+        self.timer.cancel()
+
+        pass_through_count = (
+            len(generated_path) - len(marking_waypoints)
+        )
+
+        self.get_logger().warn(
+            "========== MISSION TRAJECTORY PUBLISHED =========="
+        )
+        self.get_logger().warn(
+            f"Marking waypoints : {len(marking_waypoints)}"
+        )
+        self.get_logger().warn(
+            f"Pass-through pts  : {pass_through_count}"
+        )
+        self.get_logger().warn(
+            f"Total path points : {len(generated_path)}"
+        )
+        self.get_logger().warn(
+            f"Mission ID        : {signature[:12]}"
+        )
+        self.get_logger().warn(
+            "/mission_waypoints and /nav_path published "
+            "with TRANSIENT_LOCAL QoS"
+        )
+        self.get_logger().warn(
+            "TRAJECTORY READY: "
+            "/trajectory_generator/ready = true"
+        )
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = TrajectoryGenerator()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.publish_ready(False)
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

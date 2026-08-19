@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>rover_bringup</name>
+  <version>1.0.0</version>
+  <description>
+    Production launch package for the DYX 4WD marking rover.
+  </description>
+
+  <maintainer email="flash@todo.todo">flash</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+
+  <exec_depend>mavros</exec_depend>
+  <exec_depend>rover_backend</exec_depend>
+  <exec_depend>jetson_4wd_control</exec_depend>
+  <exec_depend>trajectory_generator</exec_depend>
+  <exec_depend>mission_manager</exec_depend>
+  <exec_depend>rpp_controller</exec_depend>
+  <exec_depend>spray_controller</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

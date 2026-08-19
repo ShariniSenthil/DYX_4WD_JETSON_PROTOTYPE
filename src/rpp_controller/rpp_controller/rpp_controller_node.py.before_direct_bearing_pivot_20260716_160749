@@ -1,0 +1,980 @@
+#!/usr/bin/env python3
+
+import math
+
+import rclpy
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from nav_msgs.msg import Odometry, Path
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
+from std_msgs.msg import Bool
+from tf_transformations import euler_from_quaternion
+
+
+class RPPController(Node):
+    """
+    Forward-only precision controller for the interpolated marking mission.
+
+    Control policy:
+        - pass-through points are tracked using a mission-manager lookahead;
+        - marking alignment begins before the final 0.50 m zone;
+        - no stationary pivot is allowed inside the final 0.50 m zone;
+        - speed is reduced in two stages near a marking point;
+        - marking completion is owned by mission_manager;
+        - a missed 50 mm capture results in a safe hold, not a circular
+          close-range re-approach.
+
+    Motion outputs are limited to:
+        - forward path tracking;
+        - stationary left/right pivot using a +/-90 degree side vector;
+        - stop.
+
+    No reverse target vector is generated.
+    """
+
+    CONTROL_HZ = 20.0
+    WAYPOINT_CHANGE_EPSILON_M = 0.01
+
+    def __init__(self):
+        super().__init__("rpp_controller")
+
+        self.declare_parameter("local_frame", "map")
+        self.declare_parameter("forward_speed_mps", 0.4)
+        self.declare_parameter("turn_speed_mps", 0.05)
+        self.declare_parameter("marking_approach_speed_mps", 0.06)
+        self.declare_parameter("marking_near_speed_mps", 0.06)
+        self.declare_parameter("marking_near_distance_m", 0.15)
+        self.declare_parameter("pivot_vector_speed_mps", 0.2)
+        self.declare_parameter("slow_heading_error_deg", 20.0)
+        self.declare_parameter("pivot_enter_angle_deg", 4.0)
+        self.declare_parameter("pivot_exit_angle_deg", 2.0)
+        self.declare_parameter("marking_alignment_pivot_deg", 15.0)
+        self.declare_parameter("pivot_hold_sec", 0.75)
+        self.declare_parameter("marking_alignment_distance_m", 1.10)
+        self.declare_parameter("marking_no_pivot_distance_m", 1.00)
+        self.declare_parameter("final_bearing_lock_distance_m", 0.20)
+        self.declare_parameter("final_bearing_lock_error_deg", 6.0)
+        self.declare_parameter("pass_through_no_pivot_distance_m", 0.25)
+        self.declare_parameter("waypoint_tolerance_m", 0.05)
+        self.declare_parameter("waypoint_match_tolerance_m", 0.001)
+        self.declare_parameter("miss_margin_m", 0.02)
+        self.declare_parameter("odom_timeout_sec", 0.50)
+        self.declare_parameter("waypoint_timeout_sec", 1.00)
+
+        self.local_frame = str(
+            self.get_parameter("local_frame").value
+        ).strip()
+        self.forward_speed = float(
+            self.get_parameter("forward_speed_mps").value
+        )
+        self.turn_speed = float(
+            self.get_parameter("turn_speed_mps").value
+        )
+        self.marking_approach_speed = float(
+            self.get_parameter("marking_approach_speed_mps").value
+        )
+        self.marking_near_speed = float(
+            self.get_parameter("marking_near_speed_mps").value
+        )
+        self.marking_near_distance = float(
+            self.get_parameter("marking_near_distance_m").value
+        )
+        self.pivot_vector_speed = float(
+            self.get_parameter("pivot_vector_speed_mps").value
+        )
+        self.slow_heading_error_deg = float(
+            self.get_parameter("slow_heading_error_deg").value
+        )
+        self.pivot_enter_angle_deg = float(
+            self.get_parameter("pivot_enter_angle_deg").value
+        )
+        self.pivot_exit_angle_deg = float(
+            self.get_parameter("pivot_exit_angle_deg").value
+        )
+        self.marking_alignment_pivot_deg = float(
+            self.get_parameter("marking_alignment_pivot_deg").value
+        )
+        self.pivot_hold_sec = float(
+            self.get_parameter("pivot_hold_sec").value
+        )
+        self.marking_alignment_distance = float(
+            self.get_parameter("marking_alignment_distance_m").value
+        )
+        self.marking_no_pivot_distance = float(
+            self.get_parameter("marking_no_pivot_distance_m").value
+        )
+        self.final_bearing_lock_distance = float(
+            self.get_parameter("final_bearing_lock_distance_m").value
+        )
+        self.final_bearing_lock_error_deg = float(
+            self.get_parameter("final_bearing_lock_error_deg").value
+        )
+        self.pass_through_no_pivot_distance = float(
+            self.get_parameter("pass_through_no_pivot_distance_m").value
+        )
+        self.waypoint_tolerance = float(
+            self.get_parameter("waypoint_tolerance_m").value
+        )
+        self.waypoint_match_tolerance = float(
+            self.get_parameter("waypoint_match_tolerance_m").value
+        )
+        self.miss_margin = float(
+            self.get_parameter("miss_margin_m").value
+        )
+        self.odom_timeout_sec = float(
+            self.get_parameter("odom_timeout_sec").value
+        )
+        self.waypoint_timeout_sec = float(
+            self.get_parameter("waypoint_timeout_sec").value
+        )
+
+        self.validate_parameters()
+
+        self.current_x = None
+        self.current_y = None
+        self.current_yaw_enu = None
+        self.last_odom_time = None
+
+        self.target_x = None
+        self.target_y = None
+        self.target_frame_id = ""
+        self.last_waypoint_time = None
+        self.target_is_marking = False
+
+        self.marking_waypoints = []
+        self.marking_metadata_received = False
+
+        self.mission_enabled = False
+        self.emergency_stop = True
+        self.marking_active = False
+
+        self.pivot_active = False
+        self.pivot_direction = 0.0
+        self.pivot_hold_until = None
+
+        self.final_bearing_enu = None
+        self.closest_distance = math.inf
+        self.marking_missed = False
+        self.alignment_hold_active = False
+        self.waiting_for_post_marking_target = False
+
+        now = self.get_clock().now()
+        self.last_log_time = now
+        self.last_wait_log_time = now
+
+        odom_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        marking_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        command_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        self.create_subscription(
+            Odometry,
+            "/mavros/local_position/odom",
+            self.odom_callback,
+            odom_qos,
+        )
+        self.create_subscription(
+            PoseStamped,
+            "/active_waypoint",
+            self.waypoint_callback,
+            10,
+        )
+        self.create_subscription(
+            Path,
+            "/mission_waypoints",
+            self.marking_waypoints_callback,
+            marking_qos,
+        )
+        self.create_subscription(
+            Bool,
+            "/mission_enable",
+            self.mission_enable_callback,
+            10,
+        )
+        self.create_subscription(
+            Bool,
+            "/emergency_stop",
+            self.emergency_stop_callback,
+            10,
+        )
+        self.create_subscription(
+            Bool,
+            "/marking_active",
+            self.marking_active_callback,
+            10,
+        )
+
+        self.velocity_pub = self.create_publisher(
+            Vector3Stamped,
+            "/rpp/velocity_ned",
+            command_qos,
+        )
+
+        self.timer = self.create_timer(
+            1.0 / self.CONTROL_HZ,
+            self.control_loop,
+        )
+
+        self.get_logger().warn(
+            "===== PRECISION LOOKAHEAD RPP STARTED ====="
+        )
+        self.get_logger().warn(
+            "Motion policy: forward, stationary pivot, stop; no reverse"
+        )
+        self.get_logger().warn(
+            "Post-marking target handoff guard: enabled"
+        )
+        self.get_logger().warn(
+            "Marking speeds: "
+            f"{self.marking_approach_speed:.3f} m/s below "
+            f"{self.marking_no_pivot_distance:.2f} m, "
+            f"{self.marking_near_speed:.3f} m/s below "
+            f"{self.marking_near_distance:.2f} m"
+        )
+        self.get_logger().warn(
+            "Marking alignment/no-pivot: "
+            f"{self.marking_alignment_distance:.2f}/"
+            f"{self.marking_no_pivot_distance:.2f} m"
+        )
+        self.get_logger().warn(
+            "Final straight lock: "
+            f"distance<={self.final_bearing_lock_distance:.2f} m, "
+            f"heading_error<={self.final_bearing_lock_error_deg:.1f} deg"
+        )
+        self.get_logger().warn(
+            f"Pivot enter/exit: {self.pivot_enter_angle_deg:.0f}/"
+            f"{self.pivot_exit_angle_deg:.0f} deg"
+        )
+
+    def validate_parameters(self):
+        if not self.local_frame:
+            raise ValueError("local_frame must not be empty")
+
+        positive_values = {
+            "forward_speed_mps": self.forward_speed,
+            "turn_speed_mps": self.turn_speed,
+            "marking_approach_speed_mps": self.marking_approach_speed,
+            "marking_near_speed_mps": self.marking_near_speed,
+            "marking_near_distance_m": self.marking_near_distance,
+            "pivot_vector_speed_mps": self.pivot_vector_speed,
+            "slow_heading_error_deg": self.slow_heading_error_deg,
+            "pivot_enter_angle_deg": self.pivot_enter_angle_deg,
+            "pivot_exit_angle_deg": self.pivot_exit_angle_deg,
+            "marking_alignment_pivot_deg": (
+                self.marking_alignment_pivot_deg
+            ),
+            "pivot_hold_sec": self.pivot_hold_sec,
+            "marking_alignment_distance_m": (
+                self.marking_alignment_distance
+            ),
+            "marking_no_pivot_distance_m": (
+                self.marking_no_pivot_distance
+            ),
+            "final_bearing_lock_distance_m": (
+                self.final_bearing_lock_distance
+            ),
+            "final_bearing_lock_error_deg": (
+                self.final_bearing_lock_error_deg
+            ),
+            "pass_through_no_pivot_distance_m": (
+                self.pass_through_no_pivot_distance
+            ),
+            "waypoint_tolerance_m": self.waypoint_tolerance,
+            "waypoint_match_tolerance_m": self.waypoint_match_tolerance,
+            "miss_margin_m": self.miss_margin,
+            "odom_timeout_sec": self.odom_timeout_sec,
+            "waypoint_timeout_sec": self.waypoint_timeout_sec,
+        }
+        for name, value in positive_values.items():
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and > 0")
+
+        if self.marking_near_speed > self.marking_approach_speed:
+            raise ValueError(
+                "marking_near_speed_mps must be <= "
+                "marking_approach_speed_mps"
+            )
+        if self.marking_approach_speed > self.forward_speed:
+            raise ValueError(
+                "marking_approach_speed_mps must be <= forward_speed_mps"
+            )
+        if self.marking_near_distance <= self.waypoint_tolerance:
+            raise ValueError(
+                "marking_near_distance_m must be greater than "
+                "waypoint_tolerance_m"
+            )
+        if (
+            self.marking_no_pivot_distance
+            <= self.marking_near_distance
+        ):
+            raise ValueError(
+                "marking_no_pivot_distance_m must be greater than "
+                "marking_near_distance_m"
+            )
+        if (
+            self.marking_alignment_distance
+            <= self.marking_no_pivot_distance
+        ):
+            raise ValueError(
+                "marking_alignment_distance_m must be greater than "
+                "marking_no_pivot_distance_m"
+            )
+        if not (
+            self.marking_near_distance
+            < self.final_bearing_lock_distance
+            <= self.marking_no_pivot_distance
+        ):
+            raise ValueError(
+                "final_bearing_lock_distance_m must be greater than "
+                "marking_near_distance_m and less than or equal to "
+                "marking_no_pivot_distance_m"
+            )
+        if self.pivot_exit_angle_deg >= self.pivot_enter_angle_deg:
+            raise ValueError(
+                "pivot_exit_angle_deg must be less than "
+                "pivot_enter_angle_deg"
+            )
+        if (
+            self.marking_alignment_pivot_deg
+            < self.pivot_exit_angle_deg
+        ):
+            raise ValueError(
+                "marking_alignment_pivot_deg must be >= "
+                "pivot_exit_angle_deg"
+            )
+        if (
+            self.final_bearing_lock_error_deg
+            > self.marking_alignment_pivot_deg
+        ):
+            raise ValueError(
+                "final_bearing_lock_error_deg must be <= "
+                "marking_alignment_pivot_deg"
+            )
+
+    @staticmethod
+    def normalize_angle(angle):
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+    def age_seconds(self, timestamp):
+        if timestamp is None:
+            return math.inf
+        return (
+            self.get_clock().now() - timestamp
+        ).nanoseconds / 1e9
+
+    def is_fresh(self, timestamp, timeout_sec):
+        age = self.age_seconds(timestamp)
+        return math.isfinite(age) and 0.0 <= age <= timeout_sec
+
+    def log_waiting(self, reason):
+        now = self.get_clock().now()
+        if (
+            now - self.last_wait_log_time
+        ).nanoseconds < 1_000_000_000:
+            return
+        self.last_wait_log_time = now
+        self.get_logger().info(f"WAITING: {reason}")
+
+    def reset_target_state(self):
+        self.final_bearing_enu = None
+        self.closest_distance = math.inf
+        self.marking_missed = False
+        self.alignment_hold_active = False
+
+    def reset_motion_state(self):
+        self.pivot_active = False
+        self.pivot_direction = 0.0
+        self.pivot_hold_until = None
+
+    def odom_callback(self, msg):
+        x = float(msg.pose.pose.position.x)
+        y = float(msg.pose.pose.position.y)
+        q = msg.pose.pose.orientation
+        quaternion = (
+            float(q.x),
+            float(q.y),
+            float(q.z),
+            float(q.w),
+        )
+        if not all(math.isfinite(value) for value in (x, y, *quaternion)):
+            return
+
+        try:
+            _, _, yaw = euler_from_quaternion(quaternion)
+        except (TypeError, ValueError):
+            return
+
+        if not math.isfinite(yaw):
+            return
+
+        self.current_x = x
+        self.current_y = y
+        self.current_yaw_enu = yaw
+        self.last_odom_time = self.get_clock().now()
+
+    def marking_waypoints_callback(self, msg):
+        if msg.header.frame_id.strip() != self.local_frame:
+            return
+
+        points = []
+        for pose in msg.poses:
+            x = float(pose.pose.position.x)
+            y = float(pose.pose.position.y)
+            if not all(math.isfinite(value) for value in (x, y)):
+                return
+            points.append((x, y))
+
+        if not points:
+            return
+
+        self.marking_waypoints = points
+        self.marking_metadata_received = True
+        self.update_target_type()
+
+    def target_matches_marking(self, x, y):
+        return any(
+            math.hypot(x - mark_x, y - mark_y)
+            <= self.waypoint_match_tolerance
+            for mark_x, mark_y in self.marking_waypoints
+        )
+
+    def update_target_type(self):
+        if self.target_x is None or self.target_y is None:
+            self.target_is_marking = False
+            return
+        self.target_is_marking = self.target_matches_marking(
+            self.target_x,
+            self.target_y,
+        )
+
+    def waypoint_callback(self, msg):
+        frame_id = msg.header.frame_id.strip()
+        if frame_id != self.local_frame:
+            return
+
+        x = float(msg.pose.position.x)
+        y = float(msg.pose.position.y)
+        if not all(math.isfinite(value) for value in (x, y)):
+            return
+
+        changed = (
+            self.target_x is None
+            or self.target_y is None
+            or math.hypot(x - self.target_x, y - self.target_y)
+            > self.WAYPOINT_CHANGE_EPSILON_M
+        )
+
+        self.target_x = x
+        self.target_y = y
+        self.target_frame_id = frame_id
+        self.last_waypoint_time = self.get_clock().now()
+
+        if changed:
+            self.reset_target_state()
+            self.reset_motion_state()
+            self.update_target_type()
+
+            if self.waiting_for_post_marking_target:
+                self.waiting_for_post_marking_target = False
+                self.get_logger().warn(
+                    "POST-MARKING TARGET HANDOFF COMPLETE"
+                )
+
+            target_label = (
+                "MARKING" if self.target_is_marking else "LOOKAHEAD"
+            )
+            self.get_logger().info(
+                f"NEW {target_label} TARGET | "
+                f"E={x:.3f}, N={y:.3f}"
+            )
+
+    def mission_enable_callback(self, msg):
+        enabled = bool(msg.data)
+        if enabled != self.mission_enabled:
+            self.get_logger().warn(
+                "MISSION ENABLED" if enabled else "MISSION DISABLED"
+            )
+        self.mission_enabled = enabled
+        if not enabled:
+            self.waiting_for_post_marking_target = False
+            self.reset_motion_state()
+
+    def emergency_stop_callback(self, msg):
+        active = bool(msg.data)
+        state_changed = active != self.emergency_stop
+        if state_changed:
+            self.get_logger().warn(
+                "EMERGENCY STOP ACTIVE"
+                if active
+                else "EMERGENCY STOP RELEASED"
+            )
+        self.emergency_stop = active
+        if active and state_changed:
+            self.reset_motion_state()
+
+    def marking_active_callback(self, msg):
+        active = bool(msg.data)
+        was_active = self.marking_active
+
+        if active != was_active:
+            self.get_logger().warn(
+                "MARKING DWELL ACTIVE"
+                if active
+                else "MARKING DWELL RELEASED"
+            )
+
+        self.marking_active = active
+
+        if active:
+            self.waiting_for_post_marking_target = False
+            self.reset_motion_state()
+        elif was_active:
+            # /marking_active and /active_waypoint are different ROS topics,
+            # so their delivery order is not guaranteed. Hold zero after the
+            # dwell is released until a new target has been received. This
+            # prevents the completed marking point from being evaluated by
+            # the miss detector during the handoff.
+            if self.target_is_marking:
+                self.waiting_for_post_marking_target = True
+                self.get_logger().warn(
+                    "WAITING FOR POST-MARKING TARGET HANDOFF"
+                )
+            else:
+                self.waiting_for_post_marking_target = False
+            self.reset_motion_state()
+
+    def publish_velocity_ned(
+        self,
+        velocity_north,
+        velocity_east,
+        yaw_rate_enu=0.0,
+    ):
+        msg = Vector3Stamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "map_ned"
+        msg.vector.x = float(velocity_north)
+        msg.vector.y = float(velocity_east)
+
+        # vector.z is reserved for ENU yaw rate:
+        # positive = left / counter-clockwise
+        # negative = right / clockwise
+        msg.vector.z = float(yaw_rate_enu)
+
+        self.velocity_pub.publish(msg)
+
+    def publish_stop(self):
+        self.publish_velocity_ned(0.0, 0.0, 0.0)
+
+    def log_control(
+        self,
+        status,
+        distance,
+        heading_error,
+        speed,
+        velocity_north,
+        velocity_east,
+    ):
+        now = self.get_clock().now()
+        if (
+            now - self.last_log_time
+        ).nanoseconds < 1_000_000_000:
+            return
+        self.last_log_time = now
+        self.get_logger().info(
+            f"{status} | "
+            f"dist={distance:.3f}m | "
+            f"heading_error={math.degrees(heading_error):.1f}deg | "
+            f"speed={speed:.3f} | "
+            f"vN={velocity_north:.3f} | "
+            f"vE={velocity_east:.3f}"
+        )
+
+    def start_pivot(self, heading_error):
+        self.pivot_active = True
+        self.pivot_direction = 1.0 if heading_error >= 0.0 else -1.0
+        self.get_logger().warn(
+            "PIVOT LEFT START"
+            if self.pivot_direction > 0.0
+            else "PIVOT RIGHT START"
+        )
+
+    def publish_pivot(self, distance, heading_error):
+        # Genuine rotation in place.
+        #
+        # No North/East translation is generated. A proportional ENU
+        # yaw-rate command is sent through vector.z.
+        direction = 1.0 if heading_error >= 0.0 else -1.0
+        self.pivot_direction = direction
+
+        absolute_error = abs(heading_error)
+
+        minimum_yaw_rate = 0.08
+        maximum_yaw_rate = 0.35
+        yaw_rate_gain = 0.80
+
+        yaw_rate_magnitude = max(
+            minimum_yaw_rate,
+            min(
+                maximum_yaw_rate,
+                yaw_rate_gain * absolute_error,
+            ),
+        )
+
+        yaw_rate_enu = direction * yaw_rate_magnitude
+        pivot_side = "LEFT" if direction > 0.0 else "RIGHT"
+
+        self.publish_velocity_ned(
+            0.0,
+            0.0,
+            yaw_rate_enu,
+        )
+
+        self.log_control(
+            (
+                f"PIVOT {pivot_side} IN PLACE "
+                f"yaw_rate={yaw_rate_enu:+.3f}rad/s"
+            ),
+            distance,
+            heading_error,
+            0.0,
+            0.0,
+            0.0,
+        )
+
+    def control_loop(self):
+        if self.emergency_stop:
+            self.publish_stop()
+            self.log_waiting("emergency stop active")
+            return
+        if not self.mission_enabled:
+            self.publish_stop()
+            self.log_waiting("mission disabled")
+            return
+        if not self.marking_metadata_received:
+            self.publish_stop()
+            self.log_waiting("waiting for marking metadata")
+            return
+        if (
+            self.current_x is None
+            or self.current_y is None
+            or self.current_yaw_enu is None
+        ):
+            self.publish_stop()
+            self.log_waiting("waiting for odometry")
+            return
+        if not self.is_fresh(self.last_odom_time, self.odom_timeout_sec):
+            self.publish_stop()
+            self.log_waiting("odometry timeout")
+            return
+        if self.target_x is None or self.target_y is None:
+            self.publish_stop()
+            self.log_waiting("waiting for active waypoint")
+            return
+        if not self.is_fresh(
+            self.last_waypoint_time,
+            self.waypoint_timeout_sec,
+        ):
+            self.publish_stop()
+            self.log_waiting("active waypoint timeout")
+            return
+
+        delta_east = self.target_x - self.current_x
+        delta_north = self.target_y - self.current_y
+        distance = math.hypot(delta_east, delta_north)
+        if not math.isfinite(distance):
+            self.publish_stop()
+            self.log_waiting("invalid target distance")
+            return
+
+        if self.marking_active:
+            self.publish_stop()
+            self.log_control(
+                "MARKING DWELL / HOLDING",
+                distance,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+            return
+
+        if self.waiting_for_post_marking_target:
+            self.publish_stop()
+            self.log_waiting(
+                "waiting for post-marking target handoff"
+            )
+            return
+
+        if self.target_is_marking and self.marking_missed:
+            self.publish_stop()
+            self.log_waiting(
+                "marking capture missed; safe hold active"
+            )
+            return
+
+        direct_bearing_enu = math.atan2(delta_north, delta_east)
+        direct_heading_error = self.normalize_angle(
+            direct_bearing_enu - self.current_yaw_enu
+        )
+        direct_heading_error_deg = abs(
+            math.degrees(direct_heading_error)
+        )
+        now = self.get_clock().now()
+
+        if self.pivot_hold_until is not None:
+            if now < self.pivot_hold_until:
+                self.publish_stop()
+                self.log_control(
+                    "PIVOT ALIGNED / HOLDING",
+                    distance,
+                    direct_heading_error,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
+                return
+            self.pivot_hold_until = None
+
+        pivot_forbidden_near_marking = (
+            self.target_is_marking
+            and distance <= self.marking_no_pivot_distance
+        )
+
+        if self.pivot_active:
+            if pivot_forbidden_near_marking:
+                self.pivot_active = False
+                self.pivot_direction = 0.0
+                self.publish_stop()
+                self.get_logger().warn(
+                    "PIVOT CANCELLED AT NO-PIVOT BOUNDARY | "
+                    f"distance={distance:.3f}m"
+                )
+                return
+
+            if direct_heading_error_deg <= self.pivot_exit_angle_deg:
+                self.pivot_active = False
+                self.pivot_direction = 0.0
+                self.pivot_hold_until = now + Duration(
+                    seconds=self.pivot_hold_sec
+                )
+                self.publish_stop()
+                self.get_logger().warn(
+                    "PIVOT ALIGNED | "
+                    f"heading_error={direct_heading_error_deg:.1f}deg"
+                )
+                return
+
+            self.publish_pivot(distance, direct_heading_error)
+            return
+
+        if self.target_is_marking:
+            in_alignment_zone = (
+                self.marking_no_pivot_distance
+                < distance
+                <= self.marking_alignment_distance
+            )
+            if (
+                distance > self.marking_no_pivot_distance
+                and direct_heading_error_deg
+                >= (
+                    self.marking_alignment_pivot_deg
+                    if in_alignment_zone
+                    else self.pivot_enter_angle_deg
+                )
+            ):
+                self.start_pivot(direct_heading_error)
+                self.publish_pivot(distance, direct_heading_error)
+                return
+        else:
+            if (
+                distance <= self.pass_through_no_pivot_distance
+                and direct_heading_error_deg
+                >= self.pivot_enter_angle_deg
+            ):
+                self.publish_stop()
+                self.log_control(
+                    "LOOKAHEAD TARGET TOO CLOSE / WAITING FOR ADVANCE",
+                    distance,
+                    direct_heading_error,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
+                return
+            if direct_heading_error_deg >= self.pivot_enter_angle_deg:
+                self.start_pivot(direct_heading_error)
+                self.publish_pivot(distance, direct_heading_error)
+                return
+
+        if (
+            self.target_is_marking
+            and distance <= self.marking_no_pivot_distance
+            and self.final_bearing_enu is None
+        ):
+            # Keep using the live bearing between 0.50 m and the terminal
+            # lock distance. This allows forward-only cross-track correction
+            # without a stationary pivot near the marking coordinate.
+            if distance <= self.final_bearing_lock_distance:
+                if (
+                    direct_heading_error_deg
+                    <= self.final_bearing_lock_error_deg
+                ):
+                    self.alignment_hold_active = False
+                    self.final_bearing_enu = direct_bearing_enu
+                    self.closest_distance = distance
+                    self.get_logger().warn(
+                        "MARKING FINAL STRAIGHT LOCKED | "
+                        f"dist={distance:.3f}m | "
+                        f"heading_error={direct_heading_error_deg:.1f}deg | "
+                        f"bearing="
+                        f"{math.degrees(direct_bearing_enu):.1f}deg ENU"
+                    )
+                else:
+                    self.alignment_hold_active = True
+                    self.publish_stop()
+                    self.log_control(
+                        "MARKING TERMINAL ALIGNMENT ERROR / SAFE HOLD",
+                        distance,
+                        direct_heading_error,
+                        0.0,
+                        0.0,
+                        0.0,
+                    )
+                    return
+            else:
+                self.alignment_hold_active = False
+
+        guidance_bearing_enu = (
+            self.final_bearing_enu
+            if (
+                self.target_is_marking
+                and self.final_bearing_enu is not None
+            )
+            else direct_bearing_enu
+        )
+        heading_error = self.normalize_angle(
+            guidance_bearing_enu - self.current_yaw_enu
+        )
+        heading_error_deg = abs(math.degrees(heading_error))
+
+        if (
+            self.target_is_marking
+            and self.final_bearing_enu is not None
+        ):
+            if distance < self.closest_distance:
+                self.closest_distance = distance
+            elif distance > self.closest_distance + self.miss_margin:
+                missed_closest = self.closest_distance
+                self.marking_missed = True
+                self.publish_stop()
+                self.get_logger().error(
+                    "MARKING CAPTURE MISSED / SAFE HOLD | "
+                    f"closest={missed_closest:.3f}m | "
+                    f"current={distance:.3f}m"
+                )
+                return
+
+        if self.target_is_marking:
+            if distance <= self.marking_near_distance:
+                speed = self.marking_near_speed
+                status = "MARKING NEAR / STRAIGHT FORWARD"
+
+            elif distance <= self.marking_alignment_distance:
+                # Smooth cubic deceleration from forward_speed at the
+                # alignment boundary to marking_near_speed at the near
+                # boundary. The cubic smoothstep has no sudden slope
+                # change at either end of the deceleration zone.
+                ramp_span = (
+                    self.marking_alignment_distance
+                    - self.marking_near_distance
+                )
+                ramp_ratio = (
+                    distance - self.marking_near_distance
+                ) / ramp_span
+                ramp_ratio = max(0.0, min(1.0, ramp_ratio))
+
+                smooth_ratio = (
+                    ramp_ratio
+                    * ramp_ratio
+                    * (3.0 - 2.0 * ramp_ratio)
+                )
+
+                speed = (
+                    self.marking_near_speed
+                    + (
+                        self.forward_speed
+                        - self.marking_near_speed
+                    )
+                    * smooth_ratio
+                )
+
+                status = (
+                    "MARKING TERMINAL SMOOTH DECEL / FORWARD"
+                    if distance <= self.marking_no_pivot_distance
+                    else "MARKING SMOOTH DECEL / FORWARD"
+                )
+
+            elif heading_error_deg >= self.slow_heading_error_deg:
+                speed = self.turn_speed
+                status = "MARKING CRUISE / HEADING CORRECTION"
+            else:
+                speed = self.forward_speed
+                status = "MARKING CRUISE / FORWARD TRACKING"
+        elif heading_error_deg >= self.slow_heading_error_deg:
+            speed = self.turn_speed
+            status = "LOOKAHEAD / HEADING CORRECTION"
+        else:
+            speed = self.forward_speed
+            status = "LOOKAHEAD PASS-THROUGH / FORWARD"
+
+        velocity_east = speed * math.cos(guidance_bearing_enu)
+        velocity_north = speed * math.sin(guidance_bearing_enu)
+
+        self.publish_velocity_ned(velocity_north, velocity_east)
+        self.log_control(
+            status,
+            distance,
+            heading_error,
+            speed,
+            velocity_north,
+            velocity_east,
+        )
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = RPPController()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.publish_stop()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

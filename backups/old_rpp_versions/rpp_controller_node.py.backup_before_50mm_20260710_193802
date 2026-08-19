@@ -1,0 +1,803 @@
+#!/usr/bin/env python3
+
+import math
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import (
+    QoSProfile,
+    ReliabilityPolicy,
+    HistoryPolicy,
+)
+
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from std_msgs.msg import Bool
+
+from tf_transformations import euler_from_quaternion
+
+
+class RPPController(Node):
+    """
+    Safe waypoint velocity controller for the PX4 differential rover.
+
+    Inputs:
+        /mavros/local_position/odom
+        /active_waypoint
+        /mission_enable
+        /emergency_stop
+
+    Output:
+        /rpp/velocity_ned
+
+    Output convention:
+        vector.x = North velocity [m/s]
+        vector.y = East velocity  [m/s]
+        vector.z = Down velocity  [m/s]
+
+    IMPORTANT:
+        This node does not publish /cmd_vel.
+        This node does not publish directly to MAVROS.
+        cmd_vel_bridge remains the only PX4 setpoint publisher.
+    """
+
+    CONTROL_HZ = 20.0
+
+    # Input watchdogs.
+    ODOM_TIMEOUT_SEC = 0.50
+    WAYPOINT_TIMEOUT_SEC = 5.00
+
+    # Repeated publication of the same waypoint must not clear
+    # the WAYPOINT REACHED latch.
+    WAYPOINT_CHANGE_EPSILON_M = 0.01
+
+    def __init__(self):
+        super().__init__('rpp_controller')
+
+        # ---------------------------------------------------------
+        # Current rover state
+        # ---------------------------------------------------------
+
+        self.current_x = None
+        self.current_y = None
+        self.current_yaw_enu = None
+
+        self.odom_frame_id = ''
+        self.last_odom_time = None
+
+        # ---------------------------------------------------------
+        # Active waypoint
+        # ---------------------------------------------------------
+
+        self.target_x = None
+        self.target_y = None
+
+        self.target_frame_id = ''
+        self.last_waypoint_time = None
+
+        self.waypoint_reached = False
+
+        # ---------------------------------------------------------
+        # Safety state
+        # ---------------------------------------------------------
+
+        self.mission_enabled = False
+        self.emergency_stop = True
+
+        # True only while this controller is actively generating
+        # a non-zero autonomous command.
+        self.command_active = False
+
+        # ---------------------------------------------------------
+        # Current development speeds
+        #
+        # PX4:
+        # RO_SPEED_LIM = 0.10 m/s
+        #
+        # Therefore all controller speeds remain <= 0.10 m/s.
+        # ---------------------------------------------------------
+
+        self.forward_speed = 0.08
+        self.slow_forward_speed = 0.04
+        self.tight_turn_speed = 0.02
+
+        # ---------------------------------------------------------
+        # Heading regions
+        # ---------------------------------------------------------
+
+        self.tight_turn_angle_deg = 35.0
+        self.slow_turn_angle_deg = 12.0
+
+        # Current short-range development tolerance.
+        self.waypoint_tolerance = 0.50
+
+        # ---------------------------------------------------------
+        # Logging
+        # ---------------------------------------------------------
+
+        self.last_log_time = self.get_clock().now()
+        self.last_wait_log_time = self.get_clock().now()
+
+        # ---------------------------------------------------------
+        # QoS
+        # ---------------------------------------------------------
+
+        odom_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+
+        # ---------------------------------------------------------
+        # Subscriptions
+        # ---------------------------------------------------------
+
+        self.create_subscription(
+            Odometry,
+            '/mavros/local_position/odom',
+            self.odom_callback,
+            odom_qos,
+        )
+
+        self.create_subscription(
+            PoseStamped,
+            '/active_waypoint',
+            self.waypoint_callback,
+            10,
+        )
+
+        self.create_subscription(
+            Bool,
+            '/mission_enable',
+            self.mission_enable_callback,
+            10,
+        )
+
+        self.create_subscription(
+            Bool,
+            '/emergency_stop',
+            self.emergency_stop_callback,
+            10,
+        )
+
+        # ---------------------------------------------------------
+        # Autonomous velocity output only
+        # ---------------------------------------------------------
+
+        self.velocity_pub = self.create_publisher(
+            Vector3Stamped,
+            '/rpp/velocity_ned',
+            10,
+        )
+
+        self.timer = self.create_timer(
+            1.0 / self.CONTROL_HZ,
+            self.control_loop,
+        )
+
+        # ---------------------------------------------------------
+        # Startup information
+        # ---------------------------------------------------------
+
+        self.get_logger().warn(
+            '===== SAFE WAYPOINT NED CONTROLLER STARTED ====='
+        )
+
+        self.get_logger().warn(
+            'Position input   : /mavros/local_position/odom'
+        )
+
+        self.get_logger().warn(
+            'Waypoint input   : /active_waypoint'
+        )
+
+        self.get_logger().warn(
+            'Output           : /rpp/velocity_ned'
+        )
+
+        self.get_logger().warn(
+            f'Rate             : {self.CONTROL_HZ:.0f} Hz'
+        )
+
+        self.get_logger().warn(
+            f'Odom timeout     : {self.ODOM_TIMEOUT_SEC:.2f} s'
+        )
+
+        self.get_logger().warn(
+            f'Waypoint timeout : {self.WAYPOINT_TIMEOUT_SEC:.2f} s'
+        )
+
+        self.get_logger().warn(
+            'Waypoint reached : LATCHED until target changes'
+        )
+
+        self.get_logger().warn(
+            'NO /cmd_vel output'
+        )
+
+        self.get_logger().warn(
+            'NO direct MAVROS/PX4 output'
+        )
+
+    # =============================================================
+    # Utility functions
+    # =============================================================
+
+    @staticmethod
+    def normalize_angle_rad(angle):
+
+        return (
+            angle + math.pi
+        ) % (
+            2.0 * math.pi
+        ) - math.pi
+
+    def age_seconds(self, timestamp):
+
+        if timestamp is None:
+            return math.inf
+
+        return (
+            self.get_clock().now() - timestamp
+        ).nanoseconds / 1e9
+
+    def is_fresh(self, timestamp, timeout_sec):
+
+        age = self.age_seconds(timestamp)
+
+        return (
+            math.isfinite(age)
+            and 0.0 <= age <= timeout_sec
+        )
+
+    # =============================================================
+    # Odometry input
+    # =============================================================
+
+    def odom_callback(self, msg):
+
+        position = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+
+        values = (
+            position.x,
+            position.y,
+            q.x,
+            q.y,
+            q.z,
+            q.w,
+        )
+
+        if not all(
+            math.isfinite(value)
+            for value in values
+        ):
+            self.get_logger().error(
+                'Rejected non-finite odometry'
+            )
+            return
+
+        quaternion_norm = math.sqrt(
+            q.x * q.x
+            + q.y * q.y
+            + q.z * q.z
+            + q.w * q.w
+        )
+
+        if quaternion_norm < 1e-6:
+            self.get_logger().error(
+                'Rejected invalid odometry quaternion'
+            )
+            return
+
+        # Normalize quaternion before extracting yaw.
+        qx = q.x / quaternion_norm
+        qy = q.y / quaternion_norm
+        qz = q.z / quaternion_norm
+        qw = q.w / quaternion_norm
+
+        _, _, yaw_enu = euler_from_quaternion([
+            qx,
+            qy,
+            qz,
+            qw,
+        ])
+
+        if not math.isfinite(yaw_enu):
+            self.get_logger().error(
+                'Rejected invalid odometry yaw'
+            )
+            return
+
+        self.current_x = float(position.x)
+        self.current_y = float(position.y)
+        self.current_yaw_enu = float(yaw_enu)
+
+        self.odom_frame_id = (
+            msg.header.frame_id.strip()
+        )
+
+        self.last_odom_time = (
+            self.get_clock().now()
+        )
+
+    # =============================================================
+    # Waypoint input
+    # =============================================================
+
+    def waypoint_callback(self, msg):
+
+        target_x = float(
+            msg.pose.position.x
+        )
+
+        target_y = float(
+            msg.pose.position.y
+        )
+
+        if not all(
+            math.isfinite(value)
+            for value in (target_x, target_y)
+        ):
+            self.get_logger().error(
+                'Rejected non-finite /active_waypoint'
+            )
+            return
+
+        target_frame = (
+            msg.header.frame_id.strip()
+        )
+
+        # Both coordinate sources must use the same local frame.
+        if (
+            self.odom_frame_id
+            and target_frame
+            and target_frame != self.odom_frame_id
+        ):
+            self.get_logger().error(
+                'Rejected waypoint frame mismatch: '
+                f'odom={self.odom_frame_id} '
+                f'waypoint={target_frame}'
+            )
+            return
+
+        # Determine whether this is a genuinely new waypoint.
+        if (
+            self.target_x is None
+            or self.target_y is None
+        ):
+
+            target_changed = True
+
+        else:
+
+            target_change_distance = math.hypot(
+                target_x - self.target_x,
+                target_y - self.target_y,
+            )
+
+            target_changed = (
+                target_change_distance
+                > self.WAYPOINT_CHANGE_EPSILON_M
+            )
+
+        self.target_x = target_x
+        self.target_y = target_y
+        self.target_frame_id = target_frame
+
+        self.last_waypoint_time = (
+            self.get_clock().now()
+        )
+
+        if target_changed:
+
+            self.waypoint_reached = False
+
+            self.get_logger().info(
+                'NEW WAYPOINT | '
+                f'target_EN=({target_x:.3f},{target_y:.3f})'
+            )
+
+        # Repeated publication of the SAME target intentionally
+        # refreshes the timeout but does NOT clear waypoint_reached.
+
+    # =============================================================
+    # Safety inputs
+    # =============================================================
+
+    def mission_enable_callback(self, msg):
+
+        self.mission_enabled = bool(msg.data)
+
+        if not self.mission_enabled:
+            self.stop_active_command()
+
+    def emergency_stop_callback(self, msg):
+
+        self.emergency_stop = bool(msg.data)
+
+        if self.emergency_stop:
+            self.stop_active_command()
+
+    # =============================================================
+    # Output
+    # =============================================================
+
+    def publish_velocity_ned(
+        self,
+        velocity_north,
+        velocity_east,
+    ):
+
+        values = (
+            velocity_north,
+            velocity_east,
+        )
+
+        if not all(
+            math.isfinite(value)
+            for value in values
+        ):
+            self.get_logger().error(
+                'Refusing to publish non-finite NED velocity'
+            )
+
+            self.publish_stop()
+            return
+
+        msg = Vector3Stamped()
+
+        msg.header.stamp = (
+            self.get_clock().now().to_msg()
+        )
+
+        msg.header.frame_id = 'local_ned'
+
+        # Contract with cmd_vel_bridge:
+        #
+        # x = North
+        # y = East
+        # z = Down
+        msg.vector.x = float(velocity_north)
+        msg.vector.y = float(velocity_east)
+        msg.vector.z = 0.0
+
+        self.velocity_pub.publish(msg)
+
+    def publish_stop(self):
+
+        msg = Vector3Stamped()
+
+        msg.header.stamp = (
+            self.get_clock().now().to_msg()
+        )
+
+        msg.header.frame_id = 'local_ned'
+
+        msg.vector.x = 0.0
+        msg.vector.y = 0.0
+        msg.vector.z = 0.0
+
+        self.velocity_pub.publish(msg)
+
+    def stop_active_command(self):
+
+        if self.command_active:
+
+            self.publish_stop()
+            self.command_active = False
+
+    # =============================================================
+    # Logging
+    # =============================================================
+
+    def log_waiting(self, reason):
+
+        now = self.get_clock().now()
+
+        elapsed = (
+            now - self.last_wait_log_time
+        ).nanoseconds / 1e9
+
+        if elapsed < 1.0:
+            return
+
+        self.last_wait_log_time = now
+
+        self.get_logger().info(
+            f'WAITING: {reason} | '
+            'no autonomous velocity published'
+        )
+
+    def log_control(
+        self,
+        status,
+        distance,
+        heading_error,
+        speed,
+        velocity_north,
+        velocity_east,
+    ):
+
+        now = self.get_clock().now()
+
+        elapsed = (
+            now - self.last_log_time
+        ).nanoseconds / 1e9
+
+        if elapsed < 1.0:
+            return
+
+        self.last_log_time = now
+
+        self.get_logger().info(
+            f'{status} | '
+            f'pos_EN=({self.current_x:.2f},{self.current_y:.2f}) | '
+            f'target_EN=({self.target_x:.2f},{self.target_y:.2f}) | '
+            f'dist={distance:.2f}m | '
+            f'heading_error={math.degrees(heading_error):.1f}deg | '
+            f'speed={speed:.3f} | '
+            f'vN={velocity_north:.3f} | '
+            f'vE={velocity_east:.3f} | '
+            f'odom_age={self.age_seconds(self.last_odom_time):.2f}s | '
+            f'wp_age={self.age_seconds(self.last_waypoint_time):.2f}s'
+        )
+
+    # =============================================================
+    # Control loop
+    # =============================================================
+
+    def control_loop(self):
+
+        # ---------------------------------------------------------
+        # Safety gating
+        # ---------------------------------------------------------
+
+        if self.emergency_stop:
+
+            self.stop_active_command()
+            self.log_waiting(
+                'emergency stop active'
+            )
+            return
+
+        if not self.mission_enabled:
+
+            self.stop_active_command()
+            self.log_waiting(
+                'mission disabled'
+            )
+            return
+
+        # ---------------------------------------------------------
+        # Odometry validity
+        # ---------------------------------------------------------
+
+        if (
+            self.current_x is None
+            or self.current_y is None
+            or self.current_yaw_enu is None
+        ):
+
+            self.stop_active_command()
+            self.log_waiting(
+                'waiting for odometry'
+            )
+            return
+
+        if not self.is_fresh(
+            self.last_odom_time,
+            self.ODOM_TIMEOUT_SEC,
+        ):
+
+            self.stop_active_command()
+            self.log_waiting(
+                'odometry timeout'
+            )
+            return
+
+        # ---------------------------------------------------------
+        # Waypoint validity
+        # ---------------------------------------------------------
+
+        if (
+            self.target_x is None
+            or self.target_y is None
+        ):
+
+            self.stop_active_command()
+            self.log_waiting(
+                'waiting for /active_waypoint'
+            )
+            return
+
+        if not self.is_fresh(
+            self.last_waypoint_time,
+            self.WAYPOINT_TIMEOUT_SEC,
+        ):
+
+            self.stop_active_command()
+            self.log_waiting(
+                'active waypoint timeout'
+            )
+            return
+
+        if (
+            self.odom_frame_id
+            and self.target_frame_id
+            and self.odom_frame_id != self.target_frame_id
+        ):
+
+            self.stop_active_command()
+            self.log_waiting(
+                'coordinate frame mismatch'
+            )
+            return
+
+        # ---------------------------------------------------------
+        # Waypoint reached latch
+        # ---------------------------------------------------------
+
+        if self.waypoint_reached:
+
+            self.stop_active_command()
+            self.log_waiting(
+                'waypoint reached; waiting for new target'
+            )
+            return
+
+        # ---------------------------------------------------------
+        # Geometry
+        #
+        # MAVROS local coordinates:
+        #
+        # x = East
+        # y = North
+        # ---------------------------------------------------------
+
+        delta_east = (
+            self.target_x - self.current_x
+        )
+
+        delta_north = (
+            self.target_y - self.current_y
+        )
+
+        distance = math.hypot(
+            delta_east,
+            delta_north,
+        )
+
+        # ---------------------------------------------------------
+        # Arrival
+        # ---------------------------------------------------------
+
+        if distance <= self.waypoint_tolerance:
+
+            self.waypoint_reached = True
+
+            self.publish_stop()
+            self.command_active = False
+
+            self.log_control(
+                status='WAYPOINT REACHED',
+                distance=distance,
+                heading_error=0.0,
+                speed=0.0,
+                velocity_north=0.0,
+                velocity_east=0.0,
+            )
+
+            return
+
+        # ---------------------------------------------------------
+        # Desired travel bearing in ENU
+        # ---------------------------------------------------------
+
+        target_yaw_enu = math.atan2(
+            delta_north,
+            delta_east,
+        )
+
+        heading_error = self.normalize_angle_rad(
+            target_yaw_enu
+            - self.current_yaw_enu
+        )
+
+        heading_error_deg = abs(
+            math.degrees(heading_error)
+        )
+
+        # ---------------------------------------------------------
+        # Speed regulation according to turn severity
+        #
+        # The non-zero 0.02 m/s tight-turn vector is intentional.
+        #
+        # A zero velocity vector contains no travel bearing.
+        # PX4 needs a non-zero vector to know which direction
+        # the rover should rotate toward.
+        # ---------------------------------------------------------
+
+        if (
+            heading_error_deg
+            >= self.tight_turn_angle_deg
+        ):
+
+            speed = self.tight_turn_speed
+            status = 'TIGHT TURN'
+
+        elif (
+            heading_error_deg
+            >= self.slow_turn_angle_deg
+        ):
+
+            speed = self.slow_forward_speed
+            status = 'SLOW CURVE'
+
+        else:
+
+            speed = self.forward_speed
+            status = 'FORWARD TRACKING'
+
+        # ---------------------------------------------------------
+        # ENU geometry -> NED velocity contract
+        #
+        # delta_north -> vN
+        # delta_east  -> vE
+        # ---------------------------------------------------------
+
+        velocity_north = (
+            speed
+            * delta_north
+            / distance
+        )
+
+        velocity_east = (
+            speed
+            * delta_east
+            / distance
+        )
+
+        self.publish_velocity_ned(
+            velocity_north,
+            velocity_east,
+        )
+
+        self.command_active = True
+
+        self.log_control(
+            status=status,
+            distance=distance,
+            heading_error=heading_error,
+            speed=speed,
+            velocity_north=velocity_north,
+            velocity_east=velocity_east,
+        )
+
+
+def main(args=None):
+
+    rclpy.init(args=args)
+
+    node = RPPController()
+
+    try:
+        rclpy.spin(node)
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+
+        # Final neutral messages.
+        for _ in range(10):
+            node.publish_stop()
+
+        node.destroy_node()
+
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

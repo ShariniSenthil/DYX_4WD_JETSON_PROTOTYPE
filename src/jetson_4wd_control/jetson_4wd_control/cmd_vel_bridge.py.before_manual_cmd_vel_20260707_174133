@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+
+import math
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import (
+    QoSProfile,
+    ReliabilityPolicy,
+    DurabilityPolicy,
+    HistoryPolicy,
+)
+
+from geometry_msgs.msg import Vector3Stamped
+from std_msgs.msg import Bool
+from mavros_msgs.msg import PositionTarget, State
+
+
+class CmdVelBridge(Node):
+
+    STREAM_HZ = 50.0
+
+    # MAVLink MAV_FRAME_LOCAL_NED
+    FRAME_LOCAL_NED = 1
+
+    # PositionTarget mask:
+    #
+    # Use velocity only.
+    # Ignore:
+    #   position
+    #   acceleration
+    #   yaw
+    #   yaw rate
+    #
+    # 1 + 2 + 4
+    # + 64 + 128 + 256
+    # + 1024 + 2048
+    # = 3527
+    TYPE_MASK_VELOCITY_ONLY = 3527
+
+    def __init__(self):
+        super().__init__("cmd_vel_bridge")
+
+        # Safe defaults
+        self.mission_enabled = False
+        self.emergency_stop = True
+
+        self.connected = False
+        self.armed = False
+        self.mode = ""
+
+        self.latest_velocity = None
+        self.latest_velocity_time = None
+
+        self.input_timeout_sec = 0.20
+
+        self.last_debug_time = self.get_clock().now()
+
+        qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+
+        # RPP output:
+        #
+        # vector.x = North velocity
+        # vector.y = East velocity
+        # vector.z = Down velocity
+        self.create_subscription(
+            Vector3Stamped,
+            "/rpp/velocity_ned",
+            self.velocity_callback,
+            qos,
+        )
+
+        self.create_subscription(
+            Bool,
+            "/mission_enable",
+            self.mission_callback,
+            10,
+        )
+
+        self.create_subscription(
+            Bool,
+            "/emergency_stop",
+            self.estop_callback,
+            10,
+        )
+
+        self.create_subscription(
+            State,
+            "/mavros/state",
+            self.state_callback,
+            10,
+        )
+
+        self.setpoint_pub = self.create_publisher(
+            PositionTarget,
+            "/mavros/setpoint_raw/local",
+            qos,
+        )
+
+        self.timer = self.create_timer(
+            1.0 / self.STREAM_HZ,
+            self.control_loop,
+        )
+
+        self.get_logger().warn(
+            "===== PX4 VELOCITY OFFBOARD BRIDGE STARTED ====="
+        )
+        self.get_logger().warn(
+            "Input : /rpp/velocity_ned"
+        )
+        self.get_logger().warn(
+            "Output: /mavros/setpoint_raw/local"
+        )
+        self.get_logger().warn(
+            "Rate  : 50 Hz"
+        )
+        self.get_logger().warn(
+            "Mode  : OFFBOARD VELOCITY"
+        )
+        self.get_logger().warn(
+            "NO ActuatorControl"
+        )
+        self.get_logger().warn(
+            "NO AttitudeTarget heartbeat"
+        )
+        self.get_logger().warn(
+            "NO direct Motor 1 / Motor 2 command from Jetson"
+        )
+
+    def velocity_callback(self, msg):
+        values = (
+            msg.vector.x,
+            msg.vector.y,
+            msg.vector.z,
+        )
+
+        if not all(math.isfinite(value) for value in values):
+            self.get_logger().error(
+                "Rejected non-finite /rpp/velocity_ned command"
+            )
+            return
+
+        self.latest_velocity = msg
+        self.latest_velocity_time = self.get_clock().now()
+
+    def mission_callback(self, msg):
+        self.mission_enabled = msg.data
+
+    def estop_callback(self, msg):
+        self.emergency_stop = msg.data
+
+    def state_callback(self, msg):
+        self.connected = msg.connected
+        self.armed = msg.armed
+        self.mode = msg.mode
+
+    def publish_velocity_setpoint(
+        self,
+        velocity_north,
+        velocity_east,
+        velocity_down,
+    ):
+        msg = PositionTarget()
+
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = ""
+
+        msg.coordinate_frame = self.FRAME_LOCAL_NED
+        msg.type_mask = self.TYPE_MASK_VELOCITY_ONLY
+
+        # RPP input is NED:
+        #
+        # x = North
+        # y = East
+        # z = Down
+        #
+        # MAVROS ROS message convention is ENU:
+        #
+        # x = East
+        # y = North
+        # z = Up
+        #
+        # Convert NED -> ENU here.
+        msg.velocity.x = float(velocity_east)
+        msg.velocity.y = float(velocity_north)
+        msg.velocity.z = float(-velocity_down)
+
+        # Ignored by type mask
+        msg.position.x = 0.0
+        msg.position.y = 0.0
+        msg.position.z = 0.0
+
+        msg.acceleration_or_force.x = 0.0
+        msg.acceleration_or_force.y = 0.0
+        msg.acceleration_or_force.z = 0.0
+
+        msg.yaw = 0.0
+        msg.yaw_rate = 0.0
+
+        self.setpoint_pub.publish(msg)
+
+    def publish_zero(self):
+        self.publish_velocity_setpoint(
+            0.0,
+            0.0,
+            0.0,
+        )
+
+    def debug(
+        self,
+        reason,
+        velocity_north,
+        velocity_east,
+    ):
+        now = self.get_clock().now()
+
+        elapsed = (
+            now - self.last_debug_time
+        ).nanoseconds / 1e9
+
+        if elapsed < 1.0:
+            return
+
+        self.last_debug_time = now
+
+        self.get_logger().info(
+            f"reason={reason} "
+            f"connected={self.connected} "
+            f"armed={self.armed} "
+            f"mode={self.mode} "
+            f"mission={self.mission_enabled} "
+            f"estop={self.emergency_stop} "
+            f"vN={velocity_north:.3f} "
+            f"vE={velocity_east:.3f}"
+        )
+
+    def control_loop(self):
+
+        # Important:
+        #
+        # We ALWAYS publish a PositionTarget at 50 Hz.
+        #
+        # Safety states publish ZERO velocity instead of stopping
+        # the setpoint stream.
+        #
+        # This keeps the PX4 OFFBOARD signal alive.
+
+        if not self.connected:
+            self.publish_zero()
+            self.debug(
+                "fcu_not_connected",
+                0.0,
+                0.0,
+            )
+            return
+
+        if self.emergency_stop:
+            self.publish_zero()
+            self.debug(
+                "emergency_stop",
+                0.0,
+                0.0,
+            )
+            return
+
+        if not self.mission_enabled:
+            self.publish_zero()
+            self.debug(
+                "mission_disabled",
+                0.0,
+                0.0,
+            )
+            return
+
+        if (
+            self.latest_velocity is None
+            or self.latest_velocity_time is None
+        ):
+            self.publish_zero()
+            self.debug(
+                "waiting_for_rpp",
+                0.0,
+                0.0,
+            )
+            return
+
+        age = (
+            self.get_clock().now()
+            - self.latest_velocity_time
+        ).nanoseconds / 1e9
+
+        if age > self.input_timeout_sec:
+            self.publish_zero()
+            self.debug(
+                "rpp_timeout",
+                0.0,
+                0.0,
+            )
+            return
+
+        velocity_north = float(
+            self.latest_velocity.vector.x
+        )
+
+        velocity_east = float(
+            self.latest_velocity.vector.y
+        )
+
+        velocity_down = float(
+            self.latest_velocity.vector.z
+        )
+
+        self.publish_velocity_setpoint(
+            velocity_north,
+            velocity_east,
+            velocity_down,
+        )
+
+        self.debug(
+            "publishing_rpp_velocity",
+            velocity_north,
+            velocity_east,
+        )
+
+
+def main(args=None):
+
+    rclpy.init(args=args)
+
+    node = CmdVelBridge()
+
+    try:
+        rclpy.spin(node)
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        # Final neutral command
+        for _ in range(10):
+            node.publish_zero()
+
+        node.destroy_node()
+
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

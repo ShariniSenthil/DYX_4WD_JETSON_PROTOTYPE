@@ -1,0 +1,2382 @@
+#!/usr/bin/env python3
+
+import math
+
+import rclpy
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from nav_msgs.msg import Odometry, Path
+from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
+from std_msgs.msg import Bool
+from tf_transformations import euler_from_quaternion
+
+
+class RPPController(Node):
+    """
+    Generic straight-segment precision controller.
+
+    The desired PX4 rover heading is encoded by the horizontal velocity
+    vector. No yaw or yaw-rate command is used.
+
+    Mission behavior:
+      - Use the first generated 50 mm pass-through points of each new
+        segment as a moving line-entry alignment zone.
+      - Align while moving continuously; no yaw-rate-only PX4 command.
+      - Use deadband-aware line recovery only when large cross-track error
+        remains but the PX4 heading request falls below the measured
+        drivetrain turning threshold.
+      - Release to normal tracking when the rover follows the corrected
+        line-capture guidance within 3 degrees and cross-track is <=0.04 m.
+      - For the first marking point, lock one fixed C->P1 line from the
+        mission-enable rover position to the exact P1 coordinate.
+      - From 1.00 m before every marking point, perform heading and
+        cross-track alignment with a 0.08 m/s velocity-vector command.
+      - When true geometric guidance error is >=15 degrees, latch a fixed
+        60 degree PX4-native pivot request in the same turn direction.
+        Release it only when the true geometric bearing is within 3 degrees.
+      - Never manufacture a moving current-yaw-relative correction during
+        translation; all driving uses a fixed geometric line bearing.
+      - Below 0.30 m, translation recovery is reduced to 0.04 m/s.
+      - Below 0.15 m, after the 15 mm / 3 degree gate is valid, drive
+        straight on the fixed incoming bearing at 0.04 m/s continuously.
+        No pulse method and no yaw-rate-only command are used.
+      - Permit terminal marking handoff inside 0.25 m only after the rover
+        is forward-facing and inside the 40 mm incoming-line corridor.
+      - Use moving forward-heading recovery so PX4 cannot satisfy a large
+        heading error by driving the differential rover in reverse.
+      - Follow generated 50 mm pass-through points.
+      - Use the exact next CSV marking waypoint as the segment goal.
+      - Smoothly decelerate from cruise speed to 0.08 m/s.
+      - Use 0.08 m/s as the minimum nonzero final marking approach.
+      - Stop only after the measured marking distance is <= 0.03 m.
+      - Allow the mission manager to hold for
+        three continuous seconds.
+      - Enter safe hold immediately after a missed marking capture.
+
+    There is no A/A1 approach-point logic.
+    """
+
+    CONTROL_HZ = 20.0
+    WAYPOINT_CHANGE_EPSILON_M = 0.001
+
+    def __init__(self):
+        super().__init__("rpp_controller")
+
+        self.declare_parameter("local_frame", "map")
+        self.declare_parameter("cruise_speed_mps", 0.25)
+        self.declare_parameter("minimum_speed_mps", 0.08)
+        self.declare_parameter("segment_alignment_speed_mps", 0.08)
+        self.declare_parameter(
+            "segment_alignment_recovery_speed_mps",
+            0.12,
+        )
+        self.declare_parameter(
+            "segment_alignment_deadband_enter_cross_track_m",
+            0.12,
+        )
+        self.declare_parameter(
+            "segment_alignment_deadband_exit_cross_track_m",
+            0.08,
+        )
+        self.declare_parameter(
+            "segment_alignment_min_effective_heading_error_deg",
+            18.0,
+        )
+        self.declare_parameter(
+            "segment_alignment_correction_limit_deg",
+            35.0,
+        )
+        self.declare_parameter(
+            "segment_alignment_cross_track_tolerance_m",
+            0.04,
+        )
+        self.declare_parameter(
+            "segment_alignment_reentry_cross_track_m",
+            0.12,
+        )
+        self.declare_parameter(
+            "segment_alignment_max_cross_track_m",
+            0.60,
+        )
+        self.declare_parameter(
+            "terminal_line_entry_cross_track_m",
+            0.04,
+        )
+        self.declare_parameter("slow_distance_m", 0.70)
+        self.declare_parameter("final_speed_distance_m", 0.18)
+        self.declare_parameter("waypoint_tolerance_m", 0.03)
+
+        self.declare_parameter("pivot_enter_angle_deg", 15.0)
+        self.declare_parameter("pivot_exit_angle_deg", 3.0)
+        self.declare_parameter("alignment_hold_sec", 0.30)
+        self.declare_parameter(
+            "alignment_reentry_goal_distance_m",
+            0.60,
+        )
+
+        self.declare_parameter("path_correction_limit_deg", 12.0)
+        self.declare_parameter(
+            "terminal_line_correction_limit_deg",
+            10.0,
+        )
+        self.declare_parameter(
+            "terminal_line_alignment_distance_m",
+            1.00,
+        )
+        self.declare_parameter(
+            "line_tracking_lookahead_m",
+            0.35,
+        )
+        self.declare_parameter(
+            "alignment_release_accel_distance_m",
+            0.30,
+        )
+        self.declare_parameter("heading_full_speed_deg", 5.0)
+        self.declare_parameter("heading_min_speed_deg", 20.0)
+
+        self.declare_parameter(
+            "marking_terminal_speed_start_distance_m",
+            0.60,
+        )
+        self.declare_parameter(
+            "marking_terminal_max_speed_mps",
+            0.08,
+        )
+        self.declare_parameter(
+            "marking_final_creep_start_distance_m",
+            0.15,
+        )
+        self.declare_parameter(
+            "marking_final_creep_speed_mps",
+            0.04,
+        )
+        self.declare_parameter(
+            "marking_final_creep_cross_track_m",
+            0.02,
+        )
+        self.declare_parameter(
+            "terminal_capture_gate_cross_track_m",
+            0.015,
+        )
+        self.declare_parameter(
+            "terminal_capture_gate_heading_deg",
+            3.0,
+        )
+        self.declare_parameter(
+            "terminal_capture_gate_hold_sec",
+            0.30,
+        )
+        self.declare_parameter(
+            "terminal_recovery_min_heading_error_deg",
+            20.0,
+        )
+        self.declare_parameter(
+            "terminal_recovery_correction_limit_deg",
+            40.0,
+        )
+        self.declare_parameter(
+            "terminal_recovery_lookahead_min_m",
+            0.04,
+        )
+        self.declare_parameter(
+            "terminal_exact_target_start_distance_m",
+            0.15,
+        )
+        self.declare_parameter(
+            "terminal_native_pivot_enter_error_deg",
+            15.0,
+        )
+        self.declare_parameter(
+            "terminal_native_pivot_release_error_deg",
+            3.0,
+        )
+        self.declare_parameter(
+            "terminal_native_pivot_request_error_deg",
+            60.0,
+        )
+        self.declare_parameter(
+            "terminal_close_recovery_distance_m",
+            0.30,
+        )
+        self.declare_parameter(
+            "terminal_close_recovery_speed_mps",
+            0.04,
+        )
+        self.declare_parameter(
+            "terminal_unready_hold_along_m",
+            0.05,
+        )
+        self.declare_parameter(
+            "marking_stop_settle_timeout_sec",
+            2.0,
+        )
+        self.declare_parameter(
+            "stationary_speed_tolerance_mps",
+            0.01,
+        )
+
+        self.declare_parameter("marking_capture_arm_distance_m", 0.25)
+        self.declare_parameter("marking_capture_abort_distance_m", 0.35)
+        self.declare_parameter("miss_margin_m", 0.02)
+        self.declare_parameter(
+            "marking_along_track_abort_m",
+            0.05,
+        )
+
+        self.declare_parameter("waypoint_match_tolerance_m", 0.001)
+        self.declare_parameter("odom_timeout_sec", 0.50)
+        self.declare_parameter("waypoint_timeout_sec", 1.00)
+
+        self.local_frame = str(
+            self.get_parameter("local_frame").value
+        ).strip()
+        self.cruise_speed = float(
+            self.get_parameter("cruise_speed_mps").value
+        )
+        self.minimum_speed = float(
+            self.get_parameter("minimum_speed_mps").value
+        )
+        self.segment_alignment_speed = float(
+            self.get_parameter(
+                "segment_alignment_speed_mps"
+            ).value
+        )
+        self.segment_alignment_recovery_speed = float(
+            self.get_parameter(
+                "segment_alignment_recovery_speed_mps"
+            ).value
+        )
+        self.segment_alignment_deadband_enter_cross_track = float(
+            self.get_parameter(
+                "segment_alignment_deadband_enter_cross_track_m"
+            ).value
+        )
+        self.segment_alignment_deadband_exit_cross_track = float(
+            self.get_parameter(
+                "segment_alignment_deadband_exit_cross_track_m"
+            ).value
+        )
+        self.segment_alignment_min_effective_heading_error = (
+            math.radians(float(
+                self.get_parameter(
+                    "segment_alignment_min_effective_heading_error_deg"
+                ).value
+            ))
+        )
+        self.segment_alignment_correction_limit = math.radians(float(
+            self.get_parameter(
+                "segment_alignment_correction_limit_deg"
+            ).value
+        ))
+        self.segment_alignment_cross_track_tolerance = float(
+            self.get_parameter(
+                "segment_alignment_cross_track_tolerance_m"
+            ).value
+        )
+        self.segment_alignment_reentry_cross_track = float(
+            self.get_parameter(
+                "segment_alignment_reentry_cross_track_m"
+            ).value
+        )
+        self.segment_alignment_max_cross_track = float(
+            self.get_parameter(
+                "segment_alignment_max_cross_track_m"
+            ).value
+        )
+        self.terminal_line_entry_cross_track = float(
+            self.get_parameter(
+                "terminal_line_entry_cross_track_m"
+            ).value
+        )
+        self.slow_distance = float(
+            self.get_parameter("slow_distance_m").value
+        )
+        self.final_speed_distance = float(
+            self.get_parameter("final_speed_distance_m").value
+        )
+        self.waypoint_tolerance = float(
+            self.get_parameter("waypoint_tolerance_m").value
+        )
+
+        self.pivot_enter_angle = math.radians(float(
+            self.get_parameter("pivot_enter_angle_deg").value
+        ))
+        self.pivot_exit_angle = math.radians(float(
+            self.get_parameter("pivot_exit_angle_deg").value
+        ))
+        self.alignment_hold_sec = float(
+            self.get_parameter("alignment_hold_sec").value
+        )
+        self.alignment_reentry_goal_distance = float(
+            self.get_parameter(
+                "alignment_reentry_goal_distance_m"
+            ).value
+        )
+
+        self.path_correction_limit = math.radians(float(
+            self.get_parameter("path_correction_limit_deg").value
+        ))
+        self.terminal_line_correction_limit = math.radians(float(
+            self.get_parameter(
+                "terminal_line_correction_limit_deg"
+            ).value
+        ))
+        self.terminal_line_alignment_distance = float(
+            self.get_parameter(
+                "terminal_line_alignment_distance_m"
+            ).value
+        )
+        self.line_tracking_lookahead = float(
+            self.get_parameter(
+                "line_tracking_lookahead_m"
+            ).value
+        )
+        self.alignment_release_accel_distance = float(
+            self.get_parameter(
+                "alignment_release_accel_distance_m"
+            ).value
+        )
+        self.heading_full_speed = math.radians(float(
+            self.get_parameter("heading_full_speed_deg").value
+        ))
+        self.heading_min_speed = math.radians(float(
+            self.get_parameter("heading_min_speed_deg").value
+        ))
+
+        self.marking_terminal_speed_start_distance = float(
+            self.get_parameter(
+                "marking_terminal_speed_start_distance_m"
+            ).value
+        )
+        self.marking_terminal_max_speed = float(
+            self.get_parameter(
+                "marking_terminal_max_speed_mps"
+            ).value
+        )
+        self.marking_final_creep_start_distance = float(
+            self.get_parameter(
+                "marking_final_creep_start_distance_m"
+            ).value
+        )
+        self.marking_final_creep_speed = float(
+            self.get_parameter(
+                "marking_final_creep_speed_mps"
+            ).value
+        )
+        self.marking_final_creep_cross_track = float(
+            self.get_parameter(
+                "marking_final_creep_cross_track_m"
+            ).value
+        )
+        self.terminal_capture_gate_cross_track = float(
+            self.get_parameter(
+                "terminal_capture_gate_cross_track_m"
+            ).value
+        )
+        self.terminal_capture_gate_heading = math.radians(float(
+            self.get_parameter(
+                "terminal_capture_gate_heading_deg"
+            ).value
+        ))
+        self.terminal_capture_gate_hold_sec = float(
+            self.get_parameter(
+                "terminal_capture_gate_hold_sec"
+            ).value
+        )
+        self.terminal_recovery_min_heading_error = math.radians(float(
+            self.get_parameter(
+                "terminal_recovery_min_heading_error_deg"
+            ).value
+        ))
+        self.terminal_recovery_correction_limit = math.radians(float(
+            self.get_parameter(
+                "terminal_recovery_correction_limit_deg"
+            ).value
+        ))
+        self.terminal_recovery_lookahead_min = float(
+            self.get_parameter(
+                "terminal_recovery_lookahead_min_m"
+            ).value
+        )
+        self.terminal_exact_target_start_distance = float(
+            self.get_parameter(
+                "terminal_exact_target_start_distance_m"
+            ).value
+        )
+        self.terminal_native_pivot_enter_error = math.radians(float(
+            self.get_parameter(
+                "terminal_native_pivot_enter_error_deg"
+            ).value
+        ))
+        self.terminal_native_pivot_release_error = math.radians(float(
+            self.get_parameter(
+                "terminal_native_pivot_release_error_deg"
+            ).value
+        ))
+        self.terminal_native_pivot_request_error = math.radians(float(
+            self.get_parameter(
+                "terminal_native_pivot_request_error_deg"
+            ).value
+        ))
+        self.terminal_close_recovery_distance = float(
+            self.get_parameter(
+                "terminal_close_recovery_distance_m"
+            ).value
+        )
+        self.terminal_close_recovery_speed = float(
+            self.get_parameter(
+                "terminal_close_recovery_speed_mps"
+            ).value
+        )
+        self.terminal_unready_hold_along = float(
+            self.get_parameter(
+                "terminal_unready_hold_along_m"
+            ).value
+        )
+        self.marking_stop_settle_timeout_sec = float(
+            self.get_parameter(
+                "marking_stop_settle_timeout_sec"
+            ).value
+        )
+        self.stationary_speed_tolerance = float(
+            self.get_parameter(
+                "stationary_speed_tolerance_mps"
+            ).value
+        )
+
+        self.marking_capture_arm_distance = float(
+            self.get_parameter(
+                "marking_capture_arm_distance_m"
+            ).value
+        )
+        self.marking_capture_abort_distance = float(
+            self.get_parameter(
+                "marking_capture_abort_distance_m"
+            ).value
+        )
+        self.miss_margin = float(
+            self.get_parameter("miss_margin_m").value
+        )
+        self.marking_along_track_abort = float(
+            self.get_parameter(
+                "marking_along_track_abort_m"
+            ).value
+        )
+
+        self.waypoint_match_tolerance = float(
+            self.get_parameter(
+                "waypoint_match_tolerance_m"
+            ).value
+        )
+        self.odom_timeout_sec = float(
+            self.get_parameter("odom_timeout_sec").value
+        )
+        self.waypoint_timeout_sec = float(
+            self.get_parameter("waypoint_timeout_sec").value
+        )
+
+        self.validate_parameters()
+
+        odom_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        retained_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        command_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        self.create_subscription(
+            Odometry,
+            "/mavros/local_position/odom",
+            self.odom_callback,
+            odom_qos,
+        )
+        self.create_subscription(
+            PoseStamped,
+            "/active_waypoint",
+            self.waypoint_callback,
+            command_qos,
+        )
+        self.create_subscription(
+            PoseStamped,
+            "/segment_goal",
+            self.segment_goal_callback,
+            command_qos,
+        )
+        self.create_subscription(
+            Path,
+            "/mission_waypoints",
+            self.marking_waypoints_callback,
+            retained_qos,
+        )
+        self.create_subscription(
+            Bool,
+            "/mission_enable",
+            self.mission_enable_callback,
+            command_qos,
+        )
+        self.create_subscription(
+            Bool,
+            "/emergency_stop",
+            self.emergency_stop_callback,
+            command_qos,
+        )
+        self.create_subscription(
+            Bool,
+            "/marking_active",
+            self.marking_active_callback,
+            command_qos,
+        )
+
+        self.velocity_pub = self.create_publisher(
+            Vector3Stamped,
+            "/rpp/velocity_ned",
+            command_qos,
+        )
+
+        self.current_x = None
+        self.current_y = None
+        self.current_yaw = None
+        self.current_speed_mps = math.inf
+        self.last_odom_time = None
+
+        self.target_x = None
+        self.target_y = None
+        self.target_path_bearing = None
+        self.last_waypoint_time = None
+        self.target_is_marking = False
+
+        self.segment_goal_x = None
+        self.segment_goal_y = None
+        self.segment_goal_number = 0
+
+        self.marking_waypoints = []
+        self.marking_metadata_received = False
+
+        self.mission_enabled = False
+        self.emergency_stop = True
+        self.marking_active = False
+
+        self.segment_alignment_active = True
+        self.alignment_forward_heading_recovery_active = False
+        self.alignment_deadband_recovery_active = False
+        self.alignment_inside_since = None
+        self.alignment_release_x = None
+        self.alignment_release_y = None
+        self.alignment_safety_hold = False
+
+        self.marking_missed = False
+        self.capture_monitor_armed = False
+        self.closest_marking_distance = math.inf
+
+        self.marking_stop_latched = False
+        self.marking_stop_latched_at = None
+
+        # First marking state. C is captured when the mission is enabled.
+        self.first_marking_completed = False
+        self.first_marking_hold_seen = False
+        self.c_line_locked = False
+        self.c_line_start_x = None
+        self.c_line_start_y = None
+        self.c_line_bearing = None
+
+        # Continuous final-corridor gate.
+        self.terminal_gate_inside_since = None
+        self.terminal_gate_ready = False
+
+        # Latched PX4-native pivot request. A fixed auxiliary velocity
+        # direction is used only to keep PX4 in its native spot-turn state.
+        # Release is based on the separately latched true geometric bearing.
+        self.terminal_native_pivot_active = False
+        self.terminal_native_pivot_true_bearing = None
+        self.terminal_native_pivot_request_bearing = None
+        self.terminal_native_pivot_reason = ""
+
+        now = self.get_clock().now()
+        self.last_log_time = now
+        self.last_wait_log_time = now
+
+        self.timer = self.create_timer(
+            1.0 / self.CONTROL_HZ,
+            self.control_loop,
+        )
+
+        self.get_logger().warn(
+            "===== C->P1->PN INTERPOLATED PRECISION CONTROLLER STARTED ====="
+        )
+        self.get_logger().warn(
+            "First marking contract: mission-enable position C and exact P1 "
+            "define one fixed C->P1 line; generated P1->P2 and later points "
+            "remain pass-through guidance"
+        )
+        self.get_logger().warn(
+            f"Cruise speed         : {self.cruise_speed:.3f} m/s"
+        )
+        self.get_logger().warn(
+            f"Minimum non-zero     : {self.minimum_speed:.3f} m/s"
+        )
+        self.get_logger().warn(
+            "Moving segment entry : "
+            f"speed={self.segment_alignment_speed:.3f}m/s, "
+            f"correction="
+            f"{math.degrees(self.segment_alignment_correction_limit):.1f}deg, "
+            f"release xtrack<="
+            f"{self.segment_alignment_cross_track_tolerance:.3f}m"
+        )
+        self.get_logger().warn(
+            "Deadband-aware entry recovery: "
+            f"speed={self.segment_alignment_recovery_speed:.3f}m/s, "
+            f"enter xtrack>="
+            f"{self.segment_alignment_deadband_enter_cross_track:.3f}m, "
+            "hold until xtrack<="
+            f"{self.segment_alignment_cross_track_tolerance:.3f}m, "
+            f"minimum effective heading error="
+            f"{math.degrees(self.segment_alignment_min_effective_heading_error):.1f}deg"
+        )
+        self.get_logger().warn(
+            f"Marking tolerance    : {self.waypoint_tolerance:.3f} m"
+        )
+        self.get_logger().warn(
+            "Continuous line tracker: "
+            f"lookahead={self.line_tracking_lookahead:.2f}m, "
+            f"far correction="
+            f"{math.degrees(self.path_correction_limit):.1f}deg, "
+            f"terminal correction="
+            f"{math.degrees(self.terminal_line_correction_limit):.1f}deg"
+        )
+        self.get_logger().warn(
+            "Adaptive terminal capture: "
+            f"starts at {self.terminal_line_alignment_distance:.3f}m, "
+            f"line-ready xtrack<="
+            f"{self.terminal_line_entry_cross_track:.3f}m"
+        )
+        self.get_logger().warn(
+            "Terminal alignment corridor: starts at "
+            f"{self.terminal_line_alignment_distance:.2f}m, "
+            f"alignment vector={self.marking_terminal_max_speed:.3f}m/s, "
+            f"capture gate xtrack<={self.terminal_capture_gate_cross_track:.3f}m, "
+            f"heading<={math.degrees(self.terminal_capture_gate_heading):.1f}deg "
+            f"for {self.terminal_capture_gate_hold_sec:.2f}s"
+        )
+        self.get_logger().warn(
+            "Final straight approach: starts at "
+            f"{self.marking_final_creep_start_distance:.3f}m, "
+            f"speed={self.marking_final_creep_speed:.3f}m/s, "
+            "fixed incoming bearing, continuous command, no pulse"
+        )
+        self.get_logger().warn(
+            "Terminal steering contract: "
+            f"{self.marking_terminal_max_speed:.3f}m/s velocity vector; "
+            f"latched native-pivot enter="
+            f"{math.degrees(self.terminal_native_pivot_enter_error):.1f}deg, "
+            f"request="
+            f"{math.degrees(self.terminal_native_pivot_request_error):.1f}deg, "
+            f"release="
+            f"{math.degrees(self.terminal_native_pivot_release_error):.1f}deg; "
+            "PX4 native 45deg/12deg transition; no yaw-rate-only command"
+        )
+        self.get_logger().warn(
+            "Close terminal translation: "
+            f"{self.terminal_close_recovery_speed:.3f}m/s below "
+            f"{self.terminal_close_recovery_distance:.2f}m; "
+            "continuous command, no pulse"
+        )
+        self.get_logger().warn(
+            "Terminal forward-heading recovery: "
+            f"speed={self.segment_alignment_recovery_speed:.3f}m/s, "
+            f"minimum effective heading error="
+            f"{math.degrees(self.segment_alignment_min_effective_heading_error):.1f}deg"
+        )
+        self.get_logger().warn(
+            "Alignment state priority: cross-track recovery outside "
+            f"{self.segment_alignment_cross_track_tolerance:.3f}m, "
+            "then forward-heading correction"
+        )
+        self.get_logger().warn(
+            "Alignment safety hold: stop when abs(xtrack) >= "
+            f"{self.segment_alignment_max_cross_track:.3f}m"
+        )
+        self.get_logger().warn(
+            "Forward-heading correction: active inside the line corridor "
+            f"until path error <= {math.degrees(self.pivot_exit_angle):.1f}deg"
+        )
+        self.get_logger().warn(
+            "Forward marking gate: handoff requires "
+            f"path heading <= {math.degrees(self.pivot_exit_angle):.1f}deg "
+            "and cross-track <= "
+            f"{self.segment_alignment_cross_track_tolerance:.3f}m"
+        )
+        self.get_logger().warn(
+            "Exact marking zero: command zero only when "
+            f"distance <= {self.waypoint_tolerance:.3f}m"
+        )
+
+    def validate_parameters(self):
+        if not self.local_frame:
+            raise ValueError("local_frame must not be empty")
+
+        positive_values = {
+            "cruise_speed_mps": self.cruise_speed,
+            "minimum_speed_mps": self.minimum_speed,
+            "segment_alignment_speed_mps": (
+                self.segment_alignment_speed
+            ),
+            "segment_alignment_recovery_speed_mps": (
+                self.segment_alignment_recovery_speed
+            ),
+            "segment_alignment_deadband_enter_cross_track_m": (
+                self.segment_alignment_deadband_enter_cross_track
+            ),
+            "segment_alignment_deadband_exit_cross_track_m": (
+                self.segment_alignment_deadband_exit_cross_track
+            ),
+            "segment_alignment_min_effective_heading_error_deg": (
+                self.segment_alignment_min_effective_heading_error
+            ),
+            "segment_alignment_cross_track_tolerance_m": (
+                self.segment_alignment_cross_track_tolerance
+            ),
+            "segment_alignment_reentry_cross_track_m": (
+                self.segment_alignment_reentry_cross_track
+            ),
+            "segment_alignment_max_cross_track_m": (
+                self.segment_alignment_max_cross_track
+            ),
+            "terminal_line_entry_cross_track_m": (
+                self.terminal_line_entry_cross_track
+            ),
+            "slow_distance_m": self.slow_distance,
+            "final_speed_distance_m": self.final_speed_distance,
+            "waypoint_tolerance_m": self.waypoint_tolerance,
+            "alignment_hold_sec": self.alignment_hold_sec,
+            "alignment_reentry_goal_distance_m": (
+                self.alignment_reentry_goal_distance
+            ),
+            "terminal_line_alignment_distance_m": (
+                self.terminal_line_alignment_distance
+            ),
+            "line_tracking_lookahead_m": (
+                self.line_tracking_lookahead
+            ),
+            "alignment_release_accel_distance_m": (
+                self.alignment_release_accel_distance
+            ),
+            "marking_terminal_speed_start_distance_m": (
+                self.marking_terminal_speed_start_distance
+            ),
+            "marking_terminal_max_speed_mps": (
+                self.marking_terminal_max_speed
+            ),
+            "marking_final_creep_start_distance_m": (
+                self.marking_final_creep_start_distance
+            ),
+            "marking_final_creep_speed_mps": (
+                self.marking_final_creep_speed
+            ),
+            "marking_final_creep_cross_track_m": (
+                self.marking_final_creep_cross_track
+            ),
+            "terminal_capture_gate_cross_track_m": (
+                self.terminal_capture_gate_cross_track
+            ),
+            "terminal_capture_gate_heading_deg": (
+                self.terminal_capture_gate_heading
+            ),
+            "terminal_capture_gate_hold_sec": (
+                self.terminal_capture_gate_hold_sec
+            ),
+            "terminal_recovery_min_heading_error_deg": (
+                self.terminal_recovery_min_heading_error
+            ),
+            "terminal_recovery_correction_limit_deg": (
+                self.terminal_recovery_correction_limit
+            ),
+            "terminal_recovery_lookahead_min_m": (
+                self.terminal_recovery_lookahead_min
+            ),
+            "terminal_exact_target_start_distance_m": (
+                self.terminal_exact_target_start_distance
+            ),
+            "terminal_native_pivot_enter_error_deg": (
+                self.terminal_native_pivot_enter_error
+            ),
+            "terminal_native_pivot_release_error_deg": (
+                self.terminal_native_pivot_release_error
+            ),
+            "terminal_native_pivot_request_error_deg": (
+                self.terminal_native_pivot_request_error
+            ),
+            "terminal_close_recovery_distance_m": (
+                self.terminal_close_recovery_distance
+            ),
+            "terminal_close_recovery_speed_mps": (
+                self.terminal_close_recovery_speed
+            ),
+            "terminal_unready_hold_along_m": (
+                self.terminal_unready_hold_along
+            ),
+            "marking_stop_settle_timeout_sec": (
+                self.marking_stop_settle_timeout_sec
+            ),
+            "stationary_speed_tolerance_mps": (
+                self.stationary_speed_tolerance
+            ),
+            "marking_capture_arm_distance_m": (
+                self.marking_capture_arm_distance
+            ),
+            "marking_capture_abort_distance_m": (
+                self.marking_capture_abort_distance
+            ),
+            "miss_margin_m": self.miss_margin,
+            "marking_along_track_abort_m": (
+                self.marking_along_track_abort
+            ),
+            "waypoint_match_tolerance_m": (
+                self.waypoint_match_tolerance
+            ),
+            "odom_timeout_sec": self.odom_timeout_sec,
+            "waypoint_timeout_sec": self.waypoint_timeout_sec,
+        }
+        for name, value in positive_values.items():
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and > 0")
+
+        if self.minimum_speed > self.cruise_speed:
+            raise ValueError(
+                "minimum_speed_mps must be <= cruise_speed_mps"
+            )
+        if (
+            self.segment_alignment_speed
+            < self.minimum_speed
+        ):
+            raise ValueError(
+                "segment_alignment_speed_mps must be >= minimum speed"
+            )
+        if not (
+            self.segment_alignment_speed
+            <= self.segment_alignment_recovery_speed
+            <= self.cruise_speed
+        ):
+            raise ValueError(
+                "segment_alignment_recovery_speed_mps must be between "
+                "segment_alignment_speed_mps and cruise_speed_mps"
+            )
+        if not (
+            self.segment_alignment_cross_track_tolerance
+            < self.segment_alignment_deadband_exit_cross_track
+            < self.segment_alignment_deadband_enter_cross_track
+        ):
+            raise ValueError(
+                "deadband exit cross-track must be greater than the "
+                "alignment release tolerance and less than the deadband "
+                "entry cross-track"
+            )
+        if not (
+            self.pivot_exit_angle
+            < self.segment_alignment_min_effective_heading_error
+            <= self.segment_alignment_correction_limit
+        ):
+            raise ValueError(
+                "segment_alignment_min_effective_heading_error_deg must "
+                "be greater than pivot_exit_angle_deg and no greater than "
+                "segment_alignment_correction_limit_deg"
+            )
+        if not (
+            self.path_correction_limit
+            <= self.segment_alignment_correction_limit
+            < math.pi / 2.0
+        ):
+            raise ValueError(
+                "segment_alignment_correction_limit_deg must be "
+                ">= path_correction_limit_deg and < 90 degrees"
+            )
+        if (
+            self.segment_alignment_cross_track_tolerance
+            >= self.segment_alignment_reentry_cross_track
+        ):
+            raise ValueError(
+                "segment alignment release cross-track tolerance must "
+                "be less than re-entry cross-track threshold"
+            )
+        if (
+            self.segment_alignment_max_cross_track
+            <= self.segment_alignment_reentry_cross_track
+        ):
+            raise ValueError(
+                "segment_alignment_max_cross_track_m must be greater "
+                "than segment_alignment_reentry_cross_track_m"
+            )
+        if (
+            self.terminal_line_entry_cross_track
+            > self.segment_alignment_cross_track_tolerance
+        ):
+            raise ValueError(
+                "terminal_line_entry_cross_track_m must be <= "
+                "segment_alignment_cross_track_tolerance_m"
+            )
+        if self.final_speed_distance >= self.slow_distance:
+            raise ValueError(
+                "final_speed_distance_m must be less than slow_distance_m"
+            )
+        if self.waypoint_tolerance >= self.final_speed_distance:
+            raise ValueError(
+                "waypoint_tolerance_m must be less than "
+                "final_speed_distance_m"
+            )
+        if self.pivot_exit_angle >= self.pivot_enter_angle:
+            raise ValueError(
+                "pivot_exit_angle_deg must be less than "
+                "pivot_enter_angle_deg"
+            )
+        if self.heading_full_speed >= self.heading_min_speed:
+            raise ValueError(
+                "heading_full_speed_deg must be less than "
+                "heading_min_speed_deg"
+            )
+        if not (
+            0.0
+            < self.terminal_line_correction_limit
+            <= self.path_correction_limit
+            < math.pi / 2.0
+        ):
+            raise ValueError(
+                "terminal/far line correction limits are invalid"
+            )
+        if self.marking_terminal_max_speed < self.minimum_speed:
+            raise ValueError(
+                "marking_terminal_max_speed_mps must be >= "
+                "minimum_speed_mps"
+            )
+        if self.marking_terminal_max_speed > self.cruise_speed:
+            raise ValueError(
+                "marking_terminal_max_speed_mps must be <= "
+                "cruise_speed_mps"
+            )
+        if not (
+            self.waypoint_tolerance
+            < self.marking_final_creep_start_distance
+            < self.final_speed_distance
+        ):
+            raise ValueError(
+                "marking_final_creep_start_distance_m must be "
+                "greater than waypoint tolerance and less than "
+                "final_speed_distance_m"
+            )
+        if not (
+            0.0
+            < self.marking_final_creep_speed
+            <= self.minimum_speed
+        ):
+            raise ValueError(
+                "marking_final_creep_speed_mps must be finite, positive "
+                "and no greater than the 0.08m/s alignment speed"
+            )
+        if not (
+            0.0
+            < self.marking_final_creep_cross_track
+            <= self.terminal_line_entry_cross_track
+        ):
+            raise ValueError(
+                "marking_final_creep_cross_track_m must be positive "
+                "and <= terminal_line_entry_cross_track_m"
+            )
+        if not (
+            0.0
+            < self.terminal_capture_gate_cross_track
+            <= self.marking_final_creep_cross_track
+            <= self.terminal_line_entry_cross_track
+        ):
+            raise ValueError(
+                "terminal capture cross-track gates are inconsistent"
+            )
+        if not (
+            0.0
+            < self.terminal_capture_gate_heading
+            <= self.pivot_exit_angle
+        ):
+            raise ValueError(
+                "terminal_capture_gate_heading_deg must be positive "
+                "and <= pivot_exit_angle_deg"
+            )
+        if not (
+            self.pivot_exit_angle
+            < self.terminal_recovery_min_heading_error
+            < math.radians(45.0)
+        ):
+            raise ValueError(
+                "terminal_recovery_min_heading_error_deg must be "
+                "greater than the release gate and below 45 degrees"
+            )
+        if not (
+            self.terminal_recovery_min_heading_error
+            <= self.terminal_recovery_correction_limit
+            < math.radians(45.0)
+        ):
+            raise ValueError(
+                "terminal recovery correction limit must be below "
+                "the PX4 45 degree drive-to-turn threshold"
+            )
+        if not (
+            self.waypoint_tolerance
+            < self.terminal_exact_target_start_distance
+            <= self.terminal_line_alignment_distance
+        ):
+            raise ValueError(
+                "terminal_exact_target_start_distance_m must be between "
+                "waypoint tolerance and terminal alignment distance"
+            )
+        if self.terminal_recovery_lookahead_min > self.line_tracking_lookahead:
+            raise ValueError(
+                "terminal_recovery_lookahead_min_m must be <= "
+                "line_tracking_lookahead_m"
+            )
+        if not (
+            self.terminal_native_pivot_release_error
+            < self.terminal_native_pivot_enter_error
+            < math.radians(45.0)
+        ):
+            raise ValueError(
+                "native pivot release < enter < 45deg is required"
+            )
+        if not (
+            math.radians(45.0)
+            < self.terminal_native_pivot_request_error
+            < math.radians(90.0)
+        ):
+            raise ValueError(
+                "terminal_native_pivot_request_error_deg must be "
+                "between 45 and 90 degrees"
+            )
+        if not (
+            self.marking_final_creep_start_distance
+            < self.terminal_close_recovery_distance
+            < self.terminal_line_alignment_distance
+        ):
+            raise ValueError(
+                "terminal close recovery distance must be between "
+                "final creep start and terminal alignment distance"
+            )
+        if not (
+            0.0
+            < self.terminal_close_recovery_speed
+            <= self.marking_terminal_max_speed
+        ):
+            raise ValueError(
+                "terminal_close_recovery_speed_mps must be positive "
+                "and <= marking_terminal_max_speed_mps"
+            )
+        if (
+            self.marking_capture_arm_distance
+            >= self.marking_capture_abort_distance
+        ):
+            raise ValueError(
+                "marking_capture_arm_distance_m must be less than "
+                "marking_capture_abort_distance_m"
+            )
+
+    @staticmethod
+    def normalize_angle(angle):
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+    @staticmethod
+    def smoothstep(value):
+        value = max(0.0, min(1.0, value))
+        return value * value * (3.0 - 2.0 * value)
+
+    @staticmethod
+    def pose_bearing(msg):
+        q = msg.pose.orientation
+        quaternion = (
+            float(q.x),
+            float(q.y),
+            float(q.z),
+            float(q.w),
+        )
+        if not all(math.isfinite(value) for value in quaternion):
+            return None
+        norm_sq = sum(value * value for value in quaternion)
+        if norm_sq <= 1.0e-12:
+            return None
+        _, _, yaw = euler_from_quaternion(quaternion)
+        return yaw if math.isfinite(yaw) else None
+
+    def odom_callback(self, msg):
+        x = float(msg.pose.pose.position.x)
+        y = float(msg.pose.pose.position.y)
+        q = msg.pose.pose.orientation
+        linear = msg.twist.twist.linear
+        quaternion = (
+            float(q.x),
+            float(q.y),
+            float(q.z),
+            float(q.w),
+        )
+        speed_x = float(linear.x)
+        speed_y = float(linear.y)
+        if not all(
+            math.isfinite(value)
+            for value in (
+                x,
+                y,
+                *quaternion,
+                speed_x,
+                speed_y,
+            )
+        ):
+            return
+
+        try:
+            _, _, yaw = euler_from_quaternion(quaternion)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(yaw):
+            return
+
+        self.current_x = x
+        self.current_y = y
+        self.current_yaw = yaw
+        self.current_speed_mps = math.hypot(
+            speed_x,
+            speed_y,
+        )
+        self.last_odom_time = self.get_clock().now()
+
+    def marking_waypoints_callback(self, msg):
+        if msg.header.frame_id.strip() != self.local_frame:
+            return
+        points = []
+        for pose in msg.poses:
+            x = float(pose.pose.position.x)
+            y = float(pose.pose.position.y)
+            if not all(math.isfinite(value) for value in (x, y)):
+                return
+            points.append((x, y))
+        if not points:
+            return
+
+        previous_p1 = (
+            self.marking_waypoints[0]
+            if self.marking_waypoints
+            else None
+        )
+        self.marking_waypoints = points
+        self.marking_metadata_received = True
+
+        if (
+            previous_p1 is None
+            or math.hypot(
+                previous_p1[0] - points[0][0],
+                previous_p1[1] - points[0][1],
+            ) > self.waypoint_match_tolerance
+        ):
+            self.first_marking_completed = False
+            self.first_marking_hold_seen = False
+            self.c_line_locked = False
+            self.c_line_bearing = None
+
+        if self.mission_enabled and not self.first_marking_completed:
+            self.lock_c_to_p1_line("marking metadata received")
+
+    def target_matches_marking(self, x, y):
+        for marking_x, marking_y in self.marking_waypoints:
+            if math.hypot(
+                x - marking_x,
+                y - marking_y,
+            ) <= self.waypoint_match_tolerance:
+                return True
+        return False
+
+    def waypoint_callback(self, msg):
+        if msg.header.frame_id.strip() != self.local_frame:
+            return
+
+        x = float(msg.pose.position.x)
+        y = float(msg.pose.position.y)
+        if not all(math.isfinite(value) for value in (x, y)):
+            return
+
+        changed = (
+            self.target_x is None
+            or self.target_y is None
+            or math.hypot(
+                x - self.target_x,
+                y - self.target_y,
+            ) > self.WAYPOINT_CHANGE_EPSILON_M
+        )
+
+        self.target_x = x
+        self.target_y = y
+        self.target_path_bearing = self.pose_bearing(msg)
+        self.target_is_marking = self.target_matches_marking(x, y)
+        self.last_waypoint_time = self.get_clock().now()
+
+        if changed:
+            if not self.target_is_marking:
+                self.capture_monitor_armed = False
+                self.closest_marking_distance = math.inf
+                self.marking_stop_latched = False
+                self.marking_stop_latched_at = None
+            self.get_logger().info(
+                "NEW MARKING TARGET"
+                if self.target_is_marking
+                else "NEW PASS-THROUGH TARGET"
+            )
+
+    def segment_goal_callback(self, msg):
+        if msg.header.frame_id.strip() != self.local_frame:
+            return
+        x = float(msg.pose.position.x)
+        y = float(msg.pose.position.y)
+        if not all(math.isfinite(value) for value in (x, y)):
+            return
+
+        previous_number = self.segment_goal_number
+        changed = (
+            self.segment_goal_x is None
+            or self.segment_goal_y is None
+            or math.hypot(
+                x - self.segment_goal_x,
+                y - self.segment_goal_y,
+            ) > self.WAYPOINT_CHANGE_EPSILON_M
+        )
+        self.segment_goal_x = x
+        self.segment_goal_y = y
+
+        if not changed:
+            return
+
+        self.segment_goal_number = self.find_marking_number(x, y)
+
+        # Returning from a later point to P1 represents a new mission.
+        if self.segment_goal_number == 1 and previous_number != 1:
+            self.first_marking_completed = False
+            self.first_marking_hold_seen = False
+            self.c_line_locked = False
+            self.c_line_bearing = None
+
+        self.segment_alignment_active = (
+            self.segment_goal_number != 1
+            or self.first_marking_completed
+        )
+        self.alignment_forward_heading_recovery_active = False
+        self.alignment_deadband_recovery_active = False
+        self.alignment_inside_since = None
+        self.alignment_release_x = None
+        self.alignment_release_y = None
+
+        self.marking_missed = False
+        self.capture_monitor_armed = False
+        self.closest_marking_distance = math.inf
+        self.marking_stop_latched = False
+        self.marking_stop_latched_at = None
+        self.terminal_gate_inside_since = None
+        self.terminal_gate_ready = False
+        self.reset_terminal_native_pivot()
+
+        if (
+            self.segment_goal_number == 1
+            and not self.first_marking_completed
+        ):
+            if self.mission_enabled:
+                self.lock_c_to_p1_line("segment goal received")
+            self.get_logger().warn(
+                "STRAIGHT SEGMENT GOAL ACTIVE | P1 | "
+                "direct approach / fixed terminal capture line"
+            )
+        else:
+            self.get_logger().warn(
+                f"STRAIGHT SEGMENT GOAL ACTIVE | "
+                f"P{self.segment_goal_number or '?'} | "
+                "interpolated segment alignment required"
+            )
+
+    def find_marking_number(self, x, y):
+        for index, (marking_x, marking_y) in enumerate(
+            self.marking_waypoints,
+            start=1,
+        ):
+            if math.hypot(
+                x - marking_x,
+                y - marking_y,
+            ) <= self.waypoint_match_tolerance:
+                return index
+        return 0
+
+    def mission_enable_callback(self, msg):
+        enabled = bool(msg.data)
+        previous = self.mission_enabled
+        if enabled != previous:
+            self.get_logger().warn(
+                "MISSION ENABLED" if enabled else "MISSION DISABLED"
+            )
+        self.mission_enabled = enabled
+
+        if enabled and not previous:
+            self.terminal_gate_inside_since = None
+            self.terminal_gate_ready = False
+            if not self.first_marking_completed:
+                self.c_line_locked = False
+                self.c_line_bearing = None
+                self.lock_c_to_p1_line("mission enabled")
+        elif not enabled:
+            self.reset_motion_state()
+            if not self.first_marking_completed:
+                self.c_line_locked = False
+                self.c_line_bearing = None
+
+    def emergency_stop_callback(self, msg):
+        active = bool(msg.data)
+        if active != self.emergency_stop:
+            self.get_logger().warn(
+                "EMERGENCY STOP ACTIVE"
+                if active
+                else "EMERGENCY STOP RELEASED"
+            )
+        self.emergency_stop = active
+        if active:
+            self.publish_stop()
+
+    def marking_active_callback(self, msg):
+        active = bool(msg.data)
+        previous = self.marking_active
+        if active != previous:
+            self.get_logger().warn(
+                "MARKING HOLD ACTIVE"
+                if active
+                else "MARKING HOLD RELEASED"
+            )
+
+        if (
+            active
+            and not previous
+            and not self.first_marking_completed
+            and self.marking_waypoints
+            and self.current_x is not None
+            and self.current_y is not None
+            and math.hypot(
+                self.marking_waypoints[0][0] - self.current_x,
+                self.marking_waypoints[0][1] - self.current_y,
+            ) <= max(
+                self.waypoint_tolerance,
+                self.marking_capture_arm_distance,
+            )
+        ):
+            self.first_marking_hold_seen = True
+            self.first_marking_completed = True
+            self.c_line_locked = False
+            self.c_line_bearing = None
+            self.get_logger().warn(
+                "P1 MARKING HOLD CONFIRMED / "
+                "P1->P2 INTERPOLATED GUIDANCE RELEASED"
+            )
+
+        if active:
+            self.reset_terminal_native_pivot()
+
+        self.marking_active = active
+
+    def reset_motion_state(self):
+        self.segment_alignment_active = True
+        self.alignment_forward_heading_recovery_active = False
+        self.alignment_deadband_recovery_active = False
+        self.alignment_inside_since = None
+        self.alignment_release_x = None
+        self.alignment_release_y = None
+        self.alignment_safety_hold = False
+
+        self.marking_missed = False
+        self.capture_monitor_armed = False
+        self.closest_marking_distance = math.inf
+
+        self.marking_stop_latched = False
+        self.marking_stop_latched_at = None
+        self.terminal_gate_inside_since = None
+        self.terminal_gate_ready = False
+        self.reset_terminal_native_pivot()
+
+    def reset_terminal_native_pivot(self):
+        self.terminal_native_pivot_active = False
+        self.terminal_native_pivot_true_bearing = None
+        self.terminal_native_pivot_request_bearing = None
+        self.terminal_native_pivot_reason = ""
+
+    def terminal_native_pivot_command(
+        self,
+        true_bearing,
+        reason,
+    ):
+        true_error = self.normalize_angle(
+            true_bearing - self.current_yaw
+        )
+
+        if self.terminal_native_pivot_active:
+            latched_true_error = self.normalize_angle(
+                self.terminal_native_pivot_true_bearing
+                - self.current_yaw
+            )
+
+            if (
+                abs(latched_true_error)
+                <= self.terminal_native_pivot_release_error
+            ):
+                self.get_logger().warn(
+                    "TERMINAL NATIVE PIVOT RELEASED | "
+                    f"reason={self.terminal_native_pivot_reason} | "
+                    f"true_error="
+                    f"{math.degrees(latched_true_error):.1f}deg"
+                )
+                self.reset_terminal_native_pivot()
+                return False, None, latched_true_error
+
+            request_error = self.normalize_angle(
+                self.terminal_native_pivot_request_bearing
+                - self.current_yaw
+            )
+            return (
+                True,
+                self.terminal_native_pivot_request_bearing,
+                latched_true_error,
+            )
+
+        if abs(true_error) < self.terminal_native_pivot_enter_error:
+            return False, None, true_error
+
+        direction = 1.0 if true_error > 0.0 else -1.0
+
+        if abs(true_error) > math.radians(48.0):
+            request_bearing = true_bearing
+        else:
+            request_bearing = self.normalize_angle(
+                self.current_yaw
+                + direction
+                * self.terminal_native_pivot_request_error
+            )
+
+        self.terminal_native_pivot_active = True
+        self.terminal_native_pivot_true_bearing = true_bearing
+        self.terminal_native_pivot_request_bearing = request_bearing
+        self.terminal_native_pivot_reason = reason
+
+        self.get_logger().warn(
+            "TERMINAL NATIVE PIVOT LATCHED | "
+            f"reason={reason} | "
+            f"true_error={math.degrees(true_error):.1f}deg | "
+            f"request_error="
+            f"{math.degrees(self.normalize_angle(
+                request_bearing - self.current_yaw
+            )):.1f}deg"
+        )
+
+        return True, request_bearing, true_error
+
+    def lock_c_to_p1_line(self, reason):
+        if (
+            self.first_marking_completed
+            or not self.marking_waypoints
+            or self.current_x is None
+            or self.current_y is None
+        ):
+            return False
+
+        p1_x, p1_y = self.marking_waypoints[0]
+        delta_east = p1_x - self.current_x
+        delta_north = p1_y - self.current_y
+        distance = math.hypot(delta_east, delta_north)
+
+        if distance <= 1.0e-6:
+            return False
+
+        self.c_line_start_x = self.current_x
+        self.c_line_start_y = self.current_y
+        self.c_line_bearing = math.atan2(
+            delta_north,
+            delta_east,
+        )
+        self.c_line_locked = True
+        self.segment_alignment_active = False
+        self.alignment_inside_since = None
+
+        self.get_logger().warn(
+            "C->P1 FIXED LINE LOCKED | "
+            f"reason={reason} | "
+            f"C_E={self.c_line_start_x:.3f} | "
+            f"C_N={self.c_line_start_y:.3f} | "
+            f"distance={distance:.3f}m | "
+            f"bearing={math.degrees(self.c_line_bearing):.1f}deg"
+        )
+        return True
+
+    def first_marking_approach_active(self):
+        return (
+            not self.first_marking_completed
+            and self.c_line_locked
+            and self.c_line_bearing is not None
+            and bool(self.marking_waypoints)
+        )
+
+    def adaptive_terminal_line_guidance(
+        self,
+        path_bearing,
+        target_x,
+        target_y,
+        target_distance,
+    ):
+        delta_east = self.current_x - target_x
+        delta_north = self.current_y - target_y
+        signed_cross_track = (
+            -math.sin(path_bearing) * delta_east
+            + math.cos(path_bearing) * delta_north
+        )
+
+        lookahead = max(
+            self.terminal_recovery_lookahead_min,
+            min(
+                self.line_tracking_lookahead,
+                max(
+                    self.terminal_recovery_lookahead_min,
+                    target_distance * 0.65,
+                ),
+            ),
+        )
+        correction = -math.atan2(
+            signed_cross_track,
+            lookahead,
+        )
+        correction = max(
+            -self.terminal_recovery_correction_limit,
+            min(
+                self.terminal_recovery_correction_limit,
+                correction,
+            ),
+        )
+        return (
+            self.normalize_angle(path_bearing + correction),
+            signed_cross_track,
+        )
+
+    def amplify_terminal_moving_error(
+        self,
+        desired_bearing,
+        fallback_direction,
+    ):
+        error = self.normalize_angle(
+            desired_bearing - self.current_yaw
+        )
+        if abs(error) >= self.terminal_recovery_min_heading_error:
+            return desired_bearing, error
+
+        if abs(error) > 1.0e-6:
+            direction = 1.0 if error > 0.0 else -1.0
+        else:
+            direction = fallback_direction
+
+        error = (
+            direction
+            * self.terminal_recovery_min_heading_error
+        )
+        desired_bearing = self.normalize_angle(
+            self.current_yaw + error
+        )
+        return desired_bearing, error
+
+    def is_fresh(self, timestamp, timeout):
+        if timestamp is None:
+            return False
+        age = (
+            self.get_clock().now() - timestamp
+        ).nanoseconds / 1e9
+        return age <= timeout
+
+    def publish_velocity_ned(self, north, east):
+        msg = Vector3Stamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "map_ned"
+        msg.vector.x = float(north)
+        msg.vector.y = float(east)
+        msg.vector.z = 0.0
+        self.velocity_pub.publish(msg)
+
+    def publish_stop(self):
+        self.publish_velocity_ned(0.0, 0.0)
+
+    def log_waiting(self, reason):
+        now = self.get_clock().now()
+        if (
+            now - self.last_wait_log_time
+        ).nanoseconds < 1_000_000_000:
+            return
+        self.last_wait_log_time = now
+        self.get_logger().info(f"WAITING: {reason}")
+
+    def log_control(
+        self,
+        status,
+        target_distance,
+        goal_distance,
+        heading_error,
+        speed,
+        north,
+        east,
+    ):
+        now = self.get_clock().now()
+        if (
+            now - self.last_log_time
+        ).nanoseconds < 1_000_000_000:
+            return
+        self.last_log_time = now
+        self.get_logger().info(
+            f"{status} | "
+            f"target_dist={target_distance:.3f}m | "
+            f"goal_dist={goal_distance:.3f}m | "
+            f"heading_error={math.degrees(heading_error):.1f}deg | "
+            f"speed={speed:.3f} | "
+            f"vN={north:.3f} | vE={east:.3f}"
+        )
+
+    def goal_distance_and_bearing(self):
+        if (
+            self.segment_goal_x is None
+            or self.segment_goal_y is None
+            or self.current_x is None
+            or self.current_y is None
+        ):
+            return math.inf, None
+
+        delta_east = self.segment_goal_x - self.current_x
+        delta_north = self.segment_goal_y - self.current_y
+        distance = math.hypot(delta_east, delta_north)
+        bearing = math.atan2(delta_north, delta_east)
+        return distance, bearing
+
+    def speed_for_goal_distance(self, goal_distance):
+        if goal_distance >= self.slow_distance:
+            return self.cruise_speed
+        if goal_distance <= self.final_speed_distance:
+            return self.minimum_speed
+
+        ratio = (
+            goal_distance - self.final_speed_distance
+        ) / (
+            self.slow_distance - self.final_speed_distance
+        )
+        smooth_ratio = self.smoothstep(ratio)
+        return (
+            self.minimum_speed
+            + (
+                self.cruise_speed - self.minimum_speed
+            ) * smooth_ratio
+        )
+
+    def apply_heading_speed_limit(self, base_speed, heading_error):
+        absolute_error = abs(heading_error)
+        if absolute_error >= self.heading_min_speed:
+            return self.minimum_speed
+        if absolute_error <= self.heading_full_speed:
+            return base_speed
+
+        ratio = (
+            self.heading_min_speed - absolute_error
+        ) / (
+            self.heading_min_speed - self.heading_full_speed
+        )
+        smooth_ratio = self.smoothstep(ratio)
+        return (
+            self.minimum_speed
+            + (base_speed - self.minimum_speed) * smooth_ratio
+        )
+
+    def bounded_bearing(self, base_bearing, desired_bearing, limit):
+        correction = self.normalize_angle(
+            desired_bearing - base_bearing
+        )
+        correction = max(-limit, min(limit, correction))
+        return self.normalize_angle(base_bearing + correction)
+
+    def line_guidance(
+        self,
+        line_bearing,
+        line_point_x,
+        line_point_y,
+        correction_limit,
+    ):
+        """
+        Follow the infinite straight line through the active generated point.
+        All 50 mm points in one segment share this bearing, so advancing the
+        lookahead target does not create a heading discontinuity.
+        """
+        delta_east = self.current_x - line_point_x
+        delta_north = self.current_y - line_point_y
+
+        signed_cross_track = (
+            -math.sin(line_bearing) * delta_east
+            + math.cos(line_bearing) * delta_north
+        )
+
+        correction = -math.atan2(
+            signed_cross_track,
+            self.line_tracking_lookahead,
+        )
+        correction = max(
+            -correction_limit,
+            min(correction_limit, correction),
+        )
+
+        guidance_bearing = self.normalize_angle(
+            line_bearing + correction
+        )
+        return guidance_bearing, signed_cross_track
+
+    def along_track_remaining(
+        self,
+        path_bearing,
+        target_x,
+        target_y,
+    ):
+        """Return signed remaining distance along the incoming segment."""
+        delta_east = target_x - self.current_x
+        delta_north = target_y - self.current_y
+
+        return (
+            math.cos(path_bearing) * delta_east
+            + math.sin(path_bearing) * delta_north
+        )
+
+    def apply_alignment_release_ramp(self, requested_speed):
+        if (
+            self.alignment_release_x is None
+            or self.alignment_release_y is None
+        ):
+            return self.minimum_speed
+
+        distance_since_release = math.hypot(
+            self.current_x - self.alignment_release_x,
+            self.current_y - self.alignment_release_y,
+        )
+        ratio = (
+            distance_since_release
+            / self.alignment_release_accel_distance
+        )
+        smooth_ratio = self.smoothstep(ratio)
+
+        ramp_limit = (
+            self.minimum_speed
+            + (
+                requested_speed - self.minimum_speed
+            ) * smooth_ratio
+        )
+        return min(requested_speed, ramp_limit)
+
+    def latch_exact_marking_stop(
+        self,
+        target_distance,
+    ):
+        """
+        Latch zero only after the measured master-antenna distance has
+        actually entered the configured 30 mm marking tolerance.
+        """
+        if (
+            not self.marking_stop_latched
+            and target_distance <= self.waypoint_tolerance
+        ):
+            self.marking_stop_latched = True
+            self.marking_stop_latched_at = self.get_clock().now()
+            self.get_logger().warn(
+                "MARKING EXACT 30MM STOP LATCHED | "
+                f"distance={target_distance:.3f}m | "
+                f"tolerance={self.waypoint_tolerance:.3f}m"
+            )
+
+        return self.marking_stop_latched
+
+    def evaluate_latched_marking_stop(self, target_distance):
+        self.publish_stop()
+
+        if self.marking_stop_latched_at is None:
+            return
+
+        elapsed = (
+            self.get_clock().now() - self.marking_stop_latched_at
+        ).nanoseconds / 1e9
+
+        if (
+            elapsed >= self.marking_stop_settle_timeout_sec
+            and self.current_speed_mps
+            <= self.stationary_speed_tolerance
+            and target_distance > self.waypoint_tolerance
+        ):
+            self.marking_missed = True
+            self.get_logger().error(
+                "MARKING PRESTOP SETTLED OUTSIDE 30MM / SAFE HOLD | "
+                f"distance={target_distance:.3f}m | "
+                f"speed={self.current_speed_mps:.3f}m/s"
+            )
+
+    def control_loop(self):
+        if self.emergency_stop:
+            self.publish_stop()
+            self.log_waiting("emergency stop active")
+            return
+        if not self.mission_enabled:
+            self.publish_stop()
+            self.log_waiting("mission disabled")
+            return
+        if self.marking_active:
+            self.publish_stop()
+            self.log_waiting("continuous marking hold")
+            return
+        if not self.marking_metadata_received:
+            self.publish_stop()
+            self.log_waiting("waiting for marking metadata")
+            return
+        if (
+            self.current_x is None
+            or self.current_y is None
+            or self.current_yaw is None
+        ):
+            self.publish_stop()
+            self.log_waiting("waiting for odometry")
+            return
+        if not self.is_fresh(
+            self.last_odom_time,
+            self.odom_timeout_sec,
+        ):
+            self.publish_stop()
+            self.log_waiting("odometry timeout")
+            return
+        if self.marking_missed:
+            self.publish_stop()
+            self.log_waiting("marking capture safe hold active")
+            return
+        if self.alignment_safety_hold:
+            self.publish_stop()
+            self.log_waiting("alignment cross-track safe hold active")
+            return
+
+        first_approach = self.first_marking_approach_active()
+        if (
+            not first_approach
+            and not self.first_marking_completed
+            and self.segment_goal_number == 1
+        ):
+            if self.lock_c_to_p1_line("control-loop readiness"):
+                first_approach = True
+
+        if first_approach:
+            target_x, target_y = self.marking_waypoints[0]
+            target_is_marking = True
+            path_bearing = self.c_line_bearing
+            goal_distance = math.hypot(
+                target_x - self.current_x,
+                target_y - self.current_y,
+            )
+            mode_prefix = (
+                "C->P1 FIXED C-LINE / P1 FORCED TARGET / "
+            )
+        else:
+            if self.target_x is None or self.target_y is None:
+                self.publish_stop()
+                self.log_waiting("waiting for active waypoint")
+                return
+            if not self.is_fresh(
+                self.last_waypoint_time,
+                self.waypoint_timeout_sec,
+            ):
+                self.publish_stop()
+                self.log_waiting("active waypoint timeout")
+                return
+
+            target_x = self.target_x
+            target_y = self.target_y
+            target_is_marking = self.target_is_marking
+            goal_distance, goal_bearing = (
+                self.goal_distance_and_bearing()
+            )
+            if not math.isfinite(goal_distance):
+                goal_distance = math.hypot(
+                    target_x - self.current_x,
+                    target_y - self.current_y,
+                )
+                goal_bearing = math.atan2(
+                    target_y - self.current_y,
+                    target_x - self.current_x,
+                )
+
+            path_bearing = self.target_path_bearing
+            if path_bearing is None:
+                path_bearing = goal_bearing
+            mode_prefix = ""
+
+        if path_bearing is None:
+            self.publish_stop()
+            self.log_waiting("waiting for fixed segment bearing")
+            return
+
+        delta_east = target_x - self.current_x
+        delta_north = target_y - self.current_y
+        target_distance = math.hypot(
+            delta_east,
+            delta_north,
+        )
+        direct_target_bearing = math.atan2(
+            delta_north,
+            delta_east,
+        )
+        path_heading_error = self.normalize_angle(
+            path_bearing - self.current_yaw
+        )
+
+        if target_is_marking and self.marking_stop_latched:
+            self.evaluate_latched_marking_stop(target_distance)
+            self.log_control(
+                mode_prefix + "MARKING EXACT 30MM ZERO / SETTLING",
+                target_distance,
+                goal_distance,
+                path_heading_error,
+                0.0,
+                0.0,
+                0.0,
+            )
+            return
+
+        # Measured radial distance remains the primary marking contract.
+        if (
+            target_is_marking
+            and self.latch_exact_marking_stop(target_distance)
+        ):
+            self.evaluate_latched_marking_stop(target_distance)
+            self.log_control(
+                mode_prefix + "MARKING EXACT 30MM ZERO / SETTLING",
+                target_distance,
+                goal_distance,
+                path_heading_error,
+                0.0,
+                0.0,
+                0.0,
+            )
+            return
+
+        # --------------------------------------------------------------
+        # Segment-entry alignment for P1->P2 and later segments only.
+        # C->P1 has its own fixed line and never uses an outgoing segment.
+        # --------------------------------------------------------------
+        if (
+            not first_approach
+            and self.segment_alignment_active
+            and goal_distance > self.terminal_line_alignment_distance
+        ):
+            (
+                alignment_bearing,
+                alignment_cross_track,
+            ) = self.line_guidance(
+                path_bearing,
+                target_x,
+                target_y,
+                self.segment_alignment_correction_limit,
+            )
+            alignment_error = self.normalize_angle(
+                alignment_bearing - self.current_yaw
+            )
+
+            if (
+                abs(alignment_cross_track)
+                >= self.segment_alignment_max_cross_track
+            ):
+                self.alignment_safety_hold = True
+                self.publish_stop()
+                self.get_logger().error(
+                    "SEGMENT ALIGNMENT CROSS-TRACK LIMIT / SAFE HOLD | "
+                    f"xtrack={alignment_cross_track:.3f}m | "
+                    f"limit={self.segment_alignment_max_cross_track:.3f}m | "
+                    f"path_error="
+                    f"{math.degrees(path_heading_error):.1f}deg"
+                )
+                return
+
+            alignment_ready = (
+                abs(alignment_cross_track)
+                <= self.segment_alignment_cross_track_tolerance
+                and abs(path_heading_error)
+                <= self.pivot_exit_angle
+            )
+
+            if alignment_ready:
+                if self.alignment_inside_since is None:
+                    self.alignment_inside_since = self.get_clock().now()
+                elapsed = (
+                    self.get_clock().now()
+                    - self.alignment_inside_since
+                ).nanoseconds / 1e9
+                if elapsed >= self.alignment_hold_sec:
+                    self.segment_alignment_active = False
+                    self.alignment_inside_since = None
+                    self.alignment_release_x = self.current_x
+                    self.alignment_release_y = self.current_y
+                    self.get_logger().warn(
+                        "SEGMENT ENTRY ALIGNED / "
+                        "INTERPOLATED GUIDANCE RELEASED | "
+                        f"path_error="
+                        f"{math.degrees(path_heading_error):.1f}deg | "
+                        f"xtrack={alignment_cross_track:.3f}m"
+                    )
+            else:
+                self.alignment_inside_since = None
+
+            if self.segment_alignment_active:
+                recovery_required = (
+                    abs(alignment_cross_track)
+                    > self.segment_alignment_cross_track_tolerance
+                    or abs(path_heading_error)
+                    > self.pivot_exit_angle
+                )
+                speed = (
+                    self.segment_alignment_recovery_speed
+                    if recovery_required
+                    else self.segment_alignment_speed
+                )
+                speed = min(speed, self.cruise_speed)
+                north = speed * math.sin(alignment_bearing)
+                east = speed * math.cos(alignment_bearing)
+                self.publish_velocity_ned(north, east)
+                self.log_control(
+                    (
+                        "SEGMENT ENTRY TRUE SEGMENT VECTOR / "
+                        "PX4 NATIVE 45-12 | "
+                        f"path_error="
+                        f"{math.degrees(path_heading_error):.1f}deg | "
+                        f"xtrack={alignment_cross_track:.3f}m"
+                    ),
+                    target_distance,
+                    goal_distance,
+                    alignment_error,
+                    speed,
+                    north,
+                    east,
+                )
+                return
+
+        # --------------------------------------------------------------
+        # Continuous terminal marking corridor.
+        #
+        # Native pivot request vector: 0.08 m/s.
+        # Close translation and final straight approach: 0.04 m/s.
+        # No pulse method and no yaw-rate-only command.
+        # --------------------------------------------------------------
+        terminal_active = (
+            target_is_marking
+            and goal_distance
+            <= self.terminal_line_alignment_distance
+        )
+
+        if terminal_active:
+            (
+                guidance_bearing,
+                signed_cross_track,
+            ) = self.adaptive_terminal_line_guidance(
+                path_bearing,
+                target_x,
+                target_y,
+                target_distance,
+            )
+
+            path_gate_valid = (
+                abs(path_heading_error)
+                <= self.terminal_capture_gate_heading
+            )
+            cross_track_gate_valid = (
+                abs(signed_cross_track)
+                <= self.terminal_capture_gate_cross_track
+            )
+            gate_geometry_valid = (
+                path_gate_valid
+                and cross_track_gate_valid
+            )
+
+            if gate_geometry_valid:
+                if self.terminal_gate_inside_since is None:
+                    self.terminal_gate_inside_since = (
+                        self.get_clock().now()
+                    )
+                gate_elapsed = (
+                    self.get_clock().now()
+                    - self.terminal_gate_inside_since
+                ).nanoseconds / 1e9
+                self.terminal_gate_ready = (
+                    gate_elapsed
+                    >= self.terminal_capture_gate_hold_sec
+                )
+            else:
+                self.terminal_gate_inside_since = None
+                self.terminal_gate_ready = False
+
+            # Closest-distance safety monitoring is independent of the
+            # precision gate. The gate controls final release, not whether
+            # overshoot protection is available.
+            if (
+                not self.capture_monitor_armed
+                and target_distance
+                <= self.marking_capture_arm_distance
+            ):
+                self.capture_monitor_armed = True
+                self.closest_marking_distance = target_distance
+                self.get_logger().warn(
+                    "MARKING CAPTURE SAFETY MONITOR ARMED | "
+                    f"distance={target_distance:.3f}m | "
+                    f"xtrack={signed_cross_track:.3f}m | "
+                    f"path_error="
+                    f"{math.degrees(path_heading_error):.1f}deg | "
+                    f"gate_ready={self.terminal_gate_ready}"
+                )
+
+            along_remaining = self.along_track_remaining(
+                path_bearing,
+                target_x,
+                target_y,
+            )
+
+            # Do not allow the rover to cross the marking plane while the
+            # 15 mm / 3 degree precision gate is still invalid.
+            if (
+                not self.terminal_gate_ready
+                and along_remaining
+                <= self.terminal_unready_hold_along
+                and target_distance > self.waypoint_tolerance
+            ):
+                self.marking_missed = True
+                self.reset_terminal_native_pivot()
+                self.publish_stop()
+                self.get_logger().error(
+                    "MARKING ALIGNMENT NOT READY BEFORE P1 / SAFE HOLD | "
+                    f"distance={target_distance:.3f}m | "
+                    f"xtrack={signed_cross_track:.3f}m | "
+                    f"path_error="
+                    f"{math.degrees(path_heading_error):.1f}deg | "
+                    f"along_remaining={along_remaining:.3f}m"
+                )
+                return
+
+            if self.terminal_gate_ready:
+                self.reset_terminal_native_pivot()
+
+                guidance_bearing = path_bearing
+                heading_error = path_heading_error
+
+                if (
+                    target_distance
+                    <= self.marking_final_creep_start_distance
+                ):
+                    speed = self.marking_final_creep_speed
+                    status = (
+                        "MARKING FINAL STRAIGHT APPROACH 0.04MPS / "
+                        "15MM-3DEG GATE LOCKED / CONTINUOUS"
+                    )
+                else:
+                    speed = self.marking_terminal_max_speed
+                    status = (
+                        "MARKING TERMINAL STRAIGHT 0.08MPS / "
+                        "15MM-3DEG GATE LOCKED"
+                    )
+
+            else:
+                if not cross_track_gate_valid:
+                    true_bearing = guidance_bearing
+                    recovery_reason = "CROSS-TRACK"
+                else:
+                    true_bearing = path_bearing
+                    recovery_reason = "PATH-HEADING"
+
+                (
+                    pivot_active,
+                    pivot_request_bearing,
+                    true_error,
+                ) = self.terminal_native_pivot_command(
+                    true_bearing,
+                    recovery_reason,
+                )
+
+                if pivot_active:
+                    speed = self.marking_terminal_max_speed
+                    guidance_bearing = pivot_request_bearing
+                    heading_error = self.normalize_angle(
+                        guidance_bearing - self.current_yaw
+                    )
+                    north = speed * math.sin(guidance_bearing)
+                    east = speed * math.cos(guidance_bearing)
+                    self.publish_velocity_ned(north, east)
+                    self.log_control(
+                        (
+                            "TERMINAL PX4 NATIVE PIVOT REQUEST "
+                            "0.08MPS / LATCHED FIXED VECTOR | "
+                            f"reason={self.terminal_native_pivot_reason} | "
+                            f"true_error="
+                            f"{math.degrees(true_error):.1f}deg | "
+                            f"xtrack={signed_cross_track:.3f}m"
+                        ),
+                        target_distance,
+                        goal_distance,
+                        heading_error,
+                        speed,
+                        north,
+                        east,
+                    )
+                    return
+
+                # Translation always uses the fixed geometric true bearing.
+                # There is no current-yaw-relative moving target.
+                guidance_bearing = true_bearing
+                heading_error = self.normalize_angle(
+                    guidance_bearing - self.current_yaw
+                )
+
+                if (
+                    target_distance
+                    <= self.terminal_close_recovery_distance
+                ):
+                    speed = self.terminal_close_recovery_speed
+                    status = (
+                        "MARKING CLOSE ALIGNMENT RECOVERY 0.04MPS / "
+                        "FIXED GEOMETRIC BEARING | "
+                        f"xtrack={signed_cross_track:.3f}m | "
+                        f"path_error="
+                        f"{math.degrees(path_heading_error):.1f}deg"
+                    )
+                else:
+                    speed = self.marking_terminal_max_speed
+                    status = (
+                        "MARKING TERMINAL ALIGNMENT RECOVERY 0.08MPS / "
+                        "FIXED GEOMETRIC BEARING | "
+                        f"xtrack={signed_cross_track:.3f}m | "
+                        f"path_error="
+                        f"{math.degrees(path_heading_error):.1f}deg"
+                    )
+
+            if self.capture_monitor_armed:
+                self.closest_marking_distance = min(
+                    self.closest_marking_distance,
+                    target_distance,
+                )
+                radial_increased = (
+                    target_distance
+                    > self.closest_marking_distance
+                    + self.miss_margin
+                )
+                confirmed_overshoot = (
+                    along_remaining
+                    < -self.marking_along_track_abort
+                )
+                if radial_increased and confirmed_overshoot:
+                    self.marking_missed = True
+                    self.reset_terminal_native_pivot()
+                    self.publish_stop()
+                    self.get_logger().error(
+                        "MARKING CAPTURE MISSED / SAFE HOLD | "
+                        f"closest="
+                        f"{self.closest_marking_distance:.3f}m | "
+                        f"current={target_distance:.3f}m | "
+                        f"xtrack={signed_cross_track:.3f}m | "
+                        f"along_remaining={along_remaining:.3f}m"
+                    )
+                    return
+
+            north = speed * math.sin(guidance_bearing)
+            east = speed * math.cos(guidance_bearing)
+            self.publish_velocity_ned(north, east)
+            self.log_control(
+                mode_prefix + status,
+                target_distance,
+                goal_distance,
+                heading_error,
+                speed,
+                north,
+                east,
+            )
+            return
+
+        # --------------------------------------------------------------
+        # Normal pass-through and non-terminal movement.
+        # --------------------------------------------------------------
+        (
+            guidance_bearing,
+            signed_cross_track,
+        ) = self.line_guidance(
+            path_bearing,
+            target_x,
+            target_y,
+            self.path_correction_limit,
+        )
+        heading_error = self.normalize_angle(
+            guidance_bearing - self.current_yaw
+        )
+
+        if first_approach:
+            # Preserve the field-tested continuous C->P1 speed outside the
+            # final corridor; terminal speed remains exactly the same.
+            speed = self.minimum_speed
+            status = (
+                "C->P1 FIXED C-LINE / P1 FORCED TARGET / "
+                "STRAIGHT PATH / CONTINUOUS LINE TRACKING | "
+                f"xtrack={signed_cross_track:.3f}m"
+            )
+        else:
+            base_speed = self.speed_for_goal_distance(goal_distance)
+            speed = self.apply_heading_speed_limit(
+                base_speed,
+                heading_error,
+            )
+            speed = self.apply_alignment_release_ramp(speed)
+            speed = max(
+                self.minimum_speed,
+                min(self.cruise_speed, speed),
+            )
+            status = (
+                "INTERPOLATED STRAIGHT PATH / "
+                "CONTINUOUS LINE TRACKING | "
+                f"xtrack={signed_cross_track:.3f}m"
+            )
+
+        north = speed * math.sin(guidance_bearing)
+        east = speed * math.cos(guidance_bearing)
+        self.publish_velocity_ned(north, east)
+        self.log_control(
+            status,
+            target_distance,
+            goal_distance,
+            heading_error,
+            speed,
+            north,
+            east,
+        )
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = RPPController()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.publish_stop()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

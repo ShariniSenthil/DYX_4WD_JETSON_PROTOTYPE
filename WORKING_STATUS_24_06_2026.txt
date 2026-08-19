@@ -1,0 +1,37 @@
+WORKING STATUS - 24 June 2026
+
+Result:
+- Jetson ROS2 to PX4 OFFBOARD control worked.
+- /cmd_vel became non-zero.
+- /mavros/setpoint_velocity/cmd_vel became non-zero after mission enable.
+- PX4 entered OFFBOARD and armed.
+- Wheels spun successfully in lifted-wheel test.
+
+Important fix:
+- corner_controller_node.py was fixed with MAVROS odom QoS.
+- Controller now receives:
+  /nav_path
+  /mavros/local_position/odom
+- Controller publishes:
+  /cmd_vel
+
+Working command observed:
+linear.x = 0.05
+angular.z = -0.20
+
+Architecture:
+csv_path_publisher -> /nav_path
+corner_controller -> /cmd_vel
+cmd_vel_bridge -> /mavros/setpoint_velocity/cmd_vel
+PX4 OFFBOARD -> RoboClaw -> wheels
+
+Frame:
+- GPS/path/odom navigation uses local map frame.
+- MAVROS velocity command should remain BODY_NED for rover forward/turn command.
+
+Tomorrow:
+1. Start launch.
+2. Confirm /cmd_vel non-zero.
+3. Enable mission.
+4. Check OFFBOARD + armed.
+5. Continue outdoor GPS/RTK test only after lifted-wheel test is stable.

@@ -1,0 +1,44 @@
+# ROS 2 generated folders
+build/
+install/
+log/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Backups / archives
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.gz
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# Environment / secrets
+.env
+.env.*
+*.key
+*.pem
+*.jks
+
+# Colcon metadata
+.colcon/

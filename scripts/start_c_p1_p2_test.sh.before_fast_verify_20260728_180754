@@ -1,0 +1,1280 @@
+#!/usr/bin/env bash
+
+# Production C -> P1 -> P2 precision field test.
+#
+# Canonical baseline:
+#   rover_ws_full_backup_20260723_132953.tar.gz
+#
+# This script:
+# - uses rover_backend REST operations for prepare/start/stop;
+# - does not use rover_gate_keeper.py;
+# - does not publish /mission_enable or /emergency_stop directly;
+# - does not modify mission.csv;
+# - temporarily injects a two-point runtime path:
+#       fresh C -> P1 -> P2
+#   with generated spacing <= 0.05 m;
+# - waits for production mission-manager COMPLETED events at P1 and P2;
+# - always asserts E-stop, stops the mission, disarms and requests MANUAL;
+# - restores the normal full prepared mission only after a temporary
+#   test-path supervisor has been started.
+# - verifies the 0.40 m/s PX4 native velocity-vector pivot contract.
+
+source /opt/ros/humble/setup.bash
+source "$HOME/rover_ws/install/setup.bash"
+
+set -Eeuo pipefail
+
+BACKEND_BASE_URL="${DYX_TEST_BACKEND_URL:-http://127.0.0.1:5001}"
+LOG_FILE="${DYX_TEST_ROVER_LOG:-$HOME/rover_test.log}"
+SUPERVISOR="$HOME/rover_ws/scripts/c_p1_p2_test_supervisor.py"
+
+RUNTIME_DIR="/tmp/dyx_c_p1_p2_test"
+READY_FILE="$RUNTIME_DIR/ready.json"
+RESULT_FILE="$RUNTIME_DIR/result.json"
+EVENT_FILE="$RUNTIME_DIR/events.jsonl"
+SUPERVISOR_LOG="$RUNTIME_DIR/supervisor.log"
+SUPERVISOR_PID_FILE="$RUNTIME_DIR/supervisor.pid"
+
+TEST_TIMEOUT_SEC="${DYX_TEST_TIMEOUT_SEC:-180}"
+HEADING_TOLERANCE_DEG="${DYX_TEST_HEADING_TOLERANCE_DEG:-4.0}"
+
+TOKEN=""
+SUPERVISOR_PID=""
+START_LINE=1
+FINAL_RESULT="ABORTED"
+CLEANUP_STARTED=0
+TEST_PATH_STARTED=0
+
+BACKEND_PID=""
+CREDENTIAL_SOURCE=""
+DYX_STATIC_USERNAME=""
+DYX_STATIC_PASSWORD=""
+
+
+json_get() {
+    local expression="$1"
+
+    python3 -c '
+import json
+import sys
+
+expression = sys.argv[1]
+payload = json.load(sys.stdin)
+
+value = payload
+for token in expression.split("."):
+    if token == "":
+        continue
+    if isinstance(value, dict):
+        value = value.get(token)
+    else:
+        value = None
+        break
+
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif value is None:
+    print("")
+elif isinstance(value, (dict, list)):
+    print(json.dumps(value, separators=(",", ":"), sort_keys=True))
+else:
+    print(value)
+' "$expression"
+}
+
+
+find_running_backend_pid() {
+    local pid=""
+    local cmdline=""
+
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        [[ -r "/proc/$pid/cmdline" ]] || continue
+
+        cmdline="$(
+            tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null ||
+            true
+        )"
+
+        if [[ "$cmdline" == *"/lib/rover_backend/rover_backend"* ]] ||
+           [[ "$cmdline" == *"rover_backend.main"* ]]; then
+            BACKEND_PID="$pid"
+            return 0
+        fi
+    done < <(
+        pgrep -f "rover_backend" 2>/dev/null || true
+    )
+
+    echo "ABORT: unable to locate the running rover_backend process"
+    return 1
+}
+
+
+read_process_environment_value() {
+    local pid="$1"
+    local variable_name="$2"
+
+    python3 - "$pid" "$variable_name" <<'PY'
+from pathlib import Path
+import sys
+
+pid = sys.argv[1]
+variable_name = sys.argv[2]
+prefix = (variable_name + "=").encode("utf-8")
+
+try:
+    entries = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+except OSError:
+    raise SystemExit(0)
+
+for entry in entries:
+    if entry.startswith(prefix):
+        value = entry[len(prefix):].decode(
+            "utf-8",
+            errors="surrogateescape",
+        )
+        print(value, end="")
+        break
+PY
+}
+
+
+load_backend_credentials() {
+    # Explicit field-test override has highest priority.
+    if [[ -n "${DYX_TEST_USERNAME:-}" ]] ||
+       [[ -n "${DYX_TEST_PASSWORD:-}" ]]; then
+
+        if [[ -z "${DYX_TEST_USERNAME:-}" ]] ||
+           [[ -z "${DYX_TEST_PASSWORD:-}" ]]; then
+            echo "ABORT: set both DYX_TEST_USERNAME and DYX_TEST_PASSWORD"
+            return 1
+        fi
+
+        DYX_STATIC_USERNAME="$DYX_TEST_USERNAME"
+        DYX_STATIC_PASSWORD="$DYX_TEST_PASSWORD"
+        CREDENTIAL_SOURCE="DYX_TEST_USERNAME/DYX_TEST_PASSWORD override"
+        return 0
+    fi
+
+    find_running_backend_pid
+
+    # The ROS launch starts rover_backend directly. It inherits the launch
+    # terminal environment; it does not automatically load the systemd
+    # EnvironmentFile. Read the actual process environment, which is the
+    # source of truth for this running process.
+    DYX_STATIC_USERNAME="$(
+        read_process_environment_value \
+            "$BACKEND_PID" \
+            DYX_STATIC_USERNAME
+    )"
+
+    DYX_STATIC_PASSWORD="$(
+        read_process_environment_value \
+            "$BACKEND_PID" \
+            DYX_STATIC_PASSWORD
+    )"
+
+    # These are the validated defaults in rover_backend/config.py. A missing
+    # process variable means the running backend used the corresponding
+    # default.
+    if [[ -z "$DYX_STATIC_USERNAME" ]]; then
+        DYX_STATIC_USERNAME="admin"
+    fi
+
+    if [[ -z "$DYX_STATIC_PASSWORD" ]]; then
+        DYX_STATIC_PASSWORD="dyx@2026"
+    fi
+
+    CREDENTIAL_SOURCE=(
+        "running rover_backend process PID "
+        "$BACKEND_PID environment plus backend defaults"
+    )
+}
+
+
+api_login() {
+    local response_file=""
+    local http_status=""
+    local response=""
+    local detail=""
+
+    response_file="$(mktemp)"
+
+    http_status="$(
+        curl \
+            --silent \
+            --show-error \
+            --connect-timeout 3 \
+            --max-time 15 \
+            --output "$response_file" \
+            --write-out "%{http_code}" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            "$BACKEND_BASE_URL/api/auth/login" \
+            --data "$(
+                DYX_USER="$DYX_STATIC_USERNAME" \
+                DYX_PASS="$DYX_STATIC_PASSWORD" \
+                python3 - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "username": os.environ["DYX_USER"],
+    "password": os.environ["DYX_PASS"],
+}))
+PY
+            )" ||
+        true
+    )"
+
+    response="$(cat "$response_file" 2>/dev/null || true)"
+    rm -f "$response_file"
+
+    if [[ "$http_status" != "200" ]]; then
+        detail="$(
+            printf '%s' "$response" |
+            python3 -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    print("")
+else:
+    print(payload.get("detail", ""))
+' 2>/dev/null || true
+        )"
+
+        echo "ABORT: backend login failed"
+        echo "HTTP status: ${http_status:-no response}"
+        echo "Credential source: $CREDENTIAL_SOURCE"
+
+        if [[ -n "$detail" ]]; then
+            echo "Backend detail: $detail"
+        fi
+
+        if [[ "$http_status" == "401" ]]; then
+            echo
+            echo "The running backend rejected the username/password."
+            echo "Do not keep retrying the old script: five failed attempts"
+            echo "cause a temporary 15-minute authentication lockout."
+            echo
+            echo "Either restart rover.launch.py from a terminal that exports"
+            echo "the intended DYX_STATIC_USERNAME/DYX_STATIC_PASSWORD, or run:"
+            echo
+            echo "  DYX_TEST_USERNAME='<actual username>' \\"
+            echo "  DYX_TEST_PASSWORD='<actual password>' \\"
+            echo "  bash ~/rover_ws/scripts/start_c_p1_p2_test.sh"
+        elif [[ "$http_status" == "429" ]]; then
+            echo
+            echo "Authentication is temporarily locked after repeated failures."
+            echo "Wait for the Retry-After period before testing again."
+        fi
+
+        return 1
+    fi
+
+    TOKEN="$(printf '%s' "$response" | json_get token)"
+
+    if [[ -z "$TOKEN" ]]; then
+        echo "ABORT: backend login succeeded but returned no token"
+        return 1
+    fi
+
+    # Confirm the token before any mission or safety operation.
+    local session_file=""
+    local session_status=""
+
+    session_file="$(mktemp)"
+
+    session_status="$(
+        curl \
+            --silent \
+            --show-error \
+            --connect-timeout 3 \
+            --max-time 10 \
+            --output "$session_file" \
+            --write-out "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            "$BACKEND_BASE_URL/api/auth/session" ||
+        true
+    )"
+
+    rm -f "$session_file"
+
+    if [[ "$session_status" != "200" ]]; then
+        TOKEN=""
+        echo "ABORT: login token failed session validation"
+        echo "HTTP status: ${session_status:-no response}"
+        return 1
+    fi
+
+    echo "Backend authentication successful."
+    echo "Credential source: $CREDENTIAL_SOURCE"
+}
+
+
+api_request() {
+    local method="$1"
+    local path="$2"
+
+    if [[ -z "$TOKEN" ]]; then
+        echo "ABORT: backend token is unavailable" >&2
+        return 1
+    fi
+
+    curl \
+        --silent \
+        --show-error \
+        --fail-with-body \
+        --connect-timeout 3 \
+        --max-time 45 \
+        -H "Authorization: Bearer $TOKEN" \
+        -X "$method" \
+        "$BACKEND_BASE_URL$path"
+}
+
+
+best_effort_api_post() {
+    local path="$1"
+
+    if [[ -n "$TOKEN" ]]; then
+        api_request POST "$path" >/dev/null 2>&1 || true
+    fi
+}
+
+
+fallback_px4_safe() {
+    timeout 8s ros2 service call \
+        /mavros/cmd/arming \
+        mavros_msgs/srv/CommandBool \
+        "{value: false}" \
+        >/dev/null 2>&1 || true
+
+    timeout 8s ros2 service call \
+        /mavros/set_mode \
+        mavros_msgs/srv/SetMode \
+        "{base_mode: 0, custom_mode: 'MANUAL'}" \
+        >/dev/null 2>&1 || true
+}
+
+
+stop_supervisor() {
+    if [[ -n "$SUPERVISOR_PID" ]]; then
+        kill -TERM "$SUPERVISOR_PID" 2>/dev/null || true
+        wait "$SUPERVISOR_PID" 2>/dev/null || true
+        SUPERVISOR_PID=""
+    elif [[ -f "$SUPERVISOR_PID_FILE" ]]; then
+        local pid
+        pid="$(cat "$SUPERVISOR_PID_FILE" 2>/dev/null || true)"
+        if [[ -n "$pid" ]]; then
+            kill -TERM "$pid" 2>/dev/null || true
+        fi
+    fi
+}
+
+
+restore_full_prepared_mission() {
+    echo
+    echo "===== RESTORE NORMAL FULL PREPARED MISSION ====="
+
+    if [[ -z "$TOKEN" ]]; then
+        echo "Skipped: backend token unavailable"
+        return
+    fi
+
+    if [[ "$TEST_PATH_STARTED" -ne 1 ]]; then
+        echo "Skipped: temporary C->P1->P2 path was never started."
+        echo "The normal mission path was not replaced."
+        return
+    fi
+
+    local response
+
+    if response="$(api_request POST /api/mission/prepare 2>&1)"; then
+        printf '%s\n' "$response" | python3 -m json.tool || true
+        echo "Normal mission.csv trajectory restored."
+    else
+        echo "WARNING: unable to restore full prepared trajectory:"
+        echo "$response"
+    fi
+}
+
+
+cleanup() {
+    local exit_code=$?
+
+    if [[ "$CLEANUP_STARTED" -eq 1 ]]; then
+        return
+    fi
+    CLEANUP_STARTED=1
+
+    set +e
+
+    echo
+    echo "===== PRODUCTION SAFETY CLEANUP ====="
+
+    best_effort_api_post /api/estop
+    best_effort_api_post /api/mission/stop
+
+    stop_supervisor
+    fallback_px4_safe
+
+    sleep 2
+
+    echo
+    echo "===== FINAL PX4 STATE ====="
+    timeout 5s ros2 topic echo \
+        /mavros/state \
+        --once 2>/dev/null || true
+
+    restore_full_prepared_mission
+
+    rm -f "$SUPERVISOR_PID_FILE"
+
+    if [[ "$exit_code" -ne 0 && "$FINAL_RESULT" == "ABORTED" ]]; then
+        FINAL_RESULT="SCRIPT_ERROR"
+    fi
+
+    echo
+    echo "===== FINAL TEST RESULT: $FINAL_RESULT ====="
+
+    return "$exit_code"
+}
+
+
+trap cleanup EXIT INT TERM
+
+
+echo "===== C -> P1 -> P2 PRODUCTION TEST ====="
+echo "Physical E-stop must remain ready."
+echo
+echo "Contract:"
+echo "  Every non-zero RPP velocity command = 0.40 m/s"
+echo "  No creep, deceleration or reduced-speed state"
+echo "  C -> P1 straight generated spacing <= 0.05 m"
+echo "  P1 marking distance <= 0.03 m"
+echo "  P1 continuous stationary hold >= 3.00 s"
+echo "  P1 -> P2 straight generated spacing <= 0.05 m"
+echo "  P2 marking distance <= 0.03 m"
+echo "  P2 continuous stationary hold >= 3.00 s"
+echo "  Master-antenna heading check <= ${HEADING_TOLERANCE_DEG} deg"
+
+
+echo
+echo "===== REMOVE OLD TEST GATE KEEPER ====="
+
+pkill -TERM -f "$HOME/rover_ws/scripts/rover_gate_keeper.py" \
+    2>/dev/null || true
+pkill -TERM -f "/tmp/hold_rover_gate.py" \
+    2>/dev/null || true
+rm -f "$HOME/rover_ws/.rover_gate_state"
+
+sleep 1
+
+if pgrep -f "rover_gate_keeper.py" >/dev/null; then
+    echo "ABORT: old rover_gate_keeper.py is still running"
+    exit 1
+fi
+
+
+echo
+echo "===== PRE-FLIGHT FILE CHECK ====="
+
+for required_file in \
+    "$SUPERVISOR" \
+    "$HOME/rover_ws/missions/mission.csv" \
+    "$LOG_FILE"
+do
+    if [[ ! -f "$required_file" ]]; then
+        echo "ABORT: missing file $required_file"
+        exit 1
+    fi
+done
+
+if [[ ! -x "$SUPERVISOR" ]]; then
+    chmod +x "$SUPERVISOR"
+fi
+
+python3 -m py_compile "$SUPERVISOR"
+
+
+echo
+echo "===== PRE-FLIGHT NODE CHECK ====="
+
+NODE_LIST="$(ros2 node list 2>/dev/null || true)"
+
+for required_node in \
+    /rover_backend \
+    /cmd_vel_bridge \
+    /trajectory_generator \
+    /mission_manager \
+    /rpp_controller
+do
+    if ! grep -qx "$required_node" <<<"$NODE_LIST"; then
+        echo "ABORT: missing node $required_node"
+        exit 1
+    fi
+done
+
+LAUNCH_COUNT="$(
+    pgrep -fc "ros2 launch rover_bringup rover.launch.py" || true
+)"
+echo "Rover launch count: $LAUNCH_COUNT"
+
+if [[ "$LAUNCH_COUNT" -ne 1 ]]; then
+    echo "ABORT: expected exactly one production rover launch"
+    exit 1
+fi
+
+
+echo
+echo "===== BACKEND LOGIN ====="
+
+load_backend_credentials
+api_login
+
+PING_RESPONSE="$(
+    curl \
+        --silent \
+        --show-error \
+        --fail-with-body \
+        --connect-timeout 3 \
+        --max-time 10 \
+        "$BACKEND_BASE_URL/api/ping"
+)"
+printf '%s\n' "$PING_RESPONSE" | python3 -m json.tool
+
+
+echo
+echo "===== FORCE SAFE INITIAL STATE ====="
+
+best_effort_api_post /api/estop
+best_effort_api_post /api/mission/stop
+fallback_px4_safe
+sleep 2
+
+INITIAL_STATE="$(
+    timeout 5s ros2 topic echo \
+        /mavros/state \
+        --once 2>/dev/null || true
+)"
+echo "$INITIAL_STATE"
+
+if ! grep -q "armed: false" <<<"$INITIAL_STATE"; then
+    echo "ABORT: PX4 is still armed"
+    exit 1
+fi
+
+if ! grep -q "mode: MANUAL" <<<"$INITIAL_STATE"; then
+    echo "ABORT: PX4 is not in MANUAL"
+    exit 1
+fi
+
+
+echo
+echo "===== VERIFY PRODUCTION PARAMETERS ====="
+
+TG_SPACING="$(
+    ros2 param get \
+        /trajectory_generator \
+        interpolation_spacing_m
+)"
+MM_TOLERANCE="$(
+    ros2 param get \
+        /mission_manager \
+        marking_tolerance_m
+)"
+MM_HOLD="$(
+    ros2 param get \
+        /mission_manager \
+        marking_hold_sec
+)"
+MM_STATIONARY="$(
+    ros2 param get \
+        /mission_manager \
+        stationary_speed_tolerance_mps
+)"
+RPP_CRUISE="$(
+    ros2 param get \
+        /rpp_controller \
+        cruise_speed_mps
+)"
+RPP_MINIMUM="$(
+    ros2 param get \
+        /rpp_controller \
+        minimum_speed_mps
+)"
+RPP_ALIGNMENT="$(
+    ros2 param get \
+        /rpp_controller \
+        segment_alignment_speed_mps
+)"
+RPP_ALIGNMENT_RECOVERY="$(
+    ros2 param get \
+        /rpp_controller \
+        segment_alignment_recovery_speed_mps
+)"
+RPP_XTRACK="$(
+    ros2 param get \
+        /rpp_controller \
+        xtrack_priority_speed_mps
+)"
+RPP_TERMINAL="$(
+    ros2 param get \
+        /rpp_controller \
+        marking_terminal_max_speed_mps
+)"
+RPP_FINAL="$(
+    ros2 param get \
+        /rpp_controller \
+        marking_final_creep_speed_mps
+)"
+RPP_CLOSE="$(
+    ros2 param get \
+        /rpp_controller \
+        terminal_close_recovery_speed_mps
+)"
+BRIDGE_MAXIMUM="$(
+    ros2 param get \
+        /cmd_vel_bridge \
+        maximum_speed_mps
+)"
+RPP_MAX_YAW="$(
+    ros2 param get \
+        /rpp_controller \
+        maximum_yaw_rate_radps
+)"
+RPP_MIN_YAW="$(
+    ros2 param get \
+        /rpp_controller \
+        minimum_yaw_rate_radps
+)"
+RPP_PIVOT_KP="$(
+    ros2 param get \
+        /rpp_controller \
+        pivot_yaw_kp
+)"
+RPP_PIVOT_ENTER="$(
+    ros2 param get \
+        /rpp_controller \
+        pivot_enter_angle_deg
+)"
+RPP_PIVOT_RELEASE="$(
+    ros2 param get \
+        /rpp_controller \
+        pivot_exit_angle_deg
+)"
+RPP_PATH_CORRECTION="$(
+    ros2 param get \
+        /rpp_controller \
+        path_correction_limit_deg
+)"
+RPP_SEGMENT_CORRECTION="$(
+    ros2 param get \
+        /rpp_controller \
+        segment_alignment_correction_limit_deg
+)"
+RPP_XTRACK_CORRECTION="$(
+    ros2 param get \
+        /rpp_controller \
+        xtrack_priority_correction_limit_deg
+)"
+RPP_XTRACK_ENTER="$(
+    ros2 param get \
+        /rpp_controller \
+        xtrack_priority_enter_m
+)"
+RPP_XTRACK_EXIT="$(
+    ros2 param get \
+        /rpp_controller \
+        xtrack_priority_exit_m
+)"
+RPP_XTRACK_LOOKAHEAD="$(
+    ros2 param get \
+        /rpp_controller \
+        xtrack_priority_lookahead_m
+)"
+RPP_TERMINAL_RECOVERY_CORRECTION="$(
+    ros2 param get \
+        /rpp_controller \
+        terminal_recovery_correction_limit_deg
+)"
+RPP_XTRACK_PREDICTION="$(
+    ros2 param get \
+        /rpp_controller \
+        xtrack_prediction_time_sec
+)"
+RPP_XTRACK_RATE_ALPHA="$(
+    ros2 param get \
+        /rpp_controller \
+        xtrack_rate_filter_alpha
+)"
+RPP_XTRACK_SLEW="$(
+    ros2 param get \
+        /rpp_controller \
+        xtrack_correction_slew_rate_degps
+)"
+RPP_XTRACK_NEUTRAL_BAND="$(
+    ros2 param get \
+        /rpp_controller \
+        xtrack_neutral_crossing_band_m
+)"
+RPP_TERMINAL_LOOKAHEAD_MIN="$(
+    ros2 param get \
+        /rpp_controller \
+        terminal_recovery_lookahead_min_m
+)"
+RPP_TERMINAL_INTERCEPT_DISTANCE="$(
+    ros2 param get \
+        /rpp_controller \
+        terminal_goal_intercept_distance_m
+)"
+RPP_TERMINAL_INTERCEPT_LIMIT="$(
+    ros2 param get \
+        /rpp_controller \
+        terminal_goal_intercept_bearing_limit_deg
+)"
+RPP_TERMINAL_XTRACK_LOOKAHEAD="$(
+    ros2 param get \
+        /rpp_controller \
+        terminal_xtrack_lookahead_m
+)"
+RPP_TERMINAL_XTRACK_CORRECTION="$(
+    ros2 param get \
+        /rpp_controller \
+        terminal_xtrack_correction_limit_deg
+)"
+RPP_TERMINAL_XTRACK_PREDICTION="$(
+    ros2 param get \
+        /rpp_controller \
+        terminal_xtrack_prediction_time_sec
+)"
+RPP_TERMINAL_XTRACK_NEUTRAL="$(
+    ros2 param get \
+        /rpp_controller \
+        terminal_xtrack_neutral_crossing_band_m
+)"
+RPP_TERMINAL_XTRACK_SLEW="$(
+    ros2 param get \
+        /rpp_controller \
+        terminal_xtrack_correction_slew_rate_degps
+)"
+RPP_TERMINAL_XTRACK_UNWIND_SLEW="$(
+    ros2 param get \
+        /rpp_controller \
+        terminal_xtrack_unwind_slew_rate_degps
+)"
+RPP_TERMINAL_XTRACK_AWAY_LOOKAHEAD="$(
+    ros2 param get \
+        /rpp_controller \
+        terminal_xtrack_away_lookahead_m
+)"
+RPP_TERMINAL_XTRACK_AWAY_LIMIT="$(
+    ros2 param get \
+        /rpp_controller \
+        terminal_xtrack_away_correction_limit_deg
+)"
+RPP_TERMINAL_XTRACK_AWAY_RATE="$(
+    ros2 param get \
+        /rpp_controller \
+        terminal_xtrack_away_rate_threshold_mps
+)"
+BRIDGE_MAX_YAW="$(
+    ros2 param get \
+        /cmd_vel_bridge \
+        maximum_yaw_rate_radps
+)"
+RPP_TOLERANCE="$(
+    ros2 param get \
+        /rpp_controller \
+        waypoint_tolerance_m
+)"
+
+printf '%s\n' \
+    "$TG_SPACING" \
+    "$MM_TOLERANCE" \
+    "$MM_HOLD" \
+    "$MM_STATIONARY" \
+    "$RPP_CRUISE" \
+    "$RPP_MINIMUM" \
+    "$RPP_ALIGNMENT" \
+    "$RPP_ALIGNMENT_RECOVERY" \
+    "$RPP_XTRACK" \
+    "$RPP_TERMINAL" \
+    "$RPP_FINAL" \
+    "$RPP_CLOSE" \
+    "$BRIDGE_MAXIMUM" \
+    "$RPP_MAX_YAW" \
+    "$RPP_MIN_YAW" \
+    "$RPP_PIVOT_KP" \
+    "$RPP_PIVOT_ENTER" \
+    "$RPP_PIVOT_RELEASE" \
+    "$RPP_PATH_CORRECTION" \
+    "$RPP_SEGMENT_CORRECTION" \
+    "$RPP_XTRACK_CORRECTION" \
+    "$RPP_XTRACK_ENTER" \
+    "$RPP_XTRACK_EXIT" \
+    "$RPP_XTRACK_LOOKAHEAD" \
+    "$RPP_TERMINAL_RECOVERY_CORRECTION" \
+    "$RPP_XTRACK_PREDICTION" \
+    "$RPP_XTRACK_RATE_ALPHA" \
+    "$RPP_XTRACK_SLEW" \
+    "$RPP_XTRACK_NEUTRAL_BAND" \
+    "$RPP_TERMINAL_LOOKAHEAD_MIN" \
+    "$RPP_TERMINAL_INTERCEPT_DISTANCE" \
+    "$RPP_TERMINAL_INTERCEPT_LIMIT" \
+    "$RPP_TERMINAL_XTRACK_LOOKAHEAD" \
+    "$RPP_TERMINAL_XTRACK_CORRECTION" \
+    "$RPP_TERMINAL_XTRACK_PREDICTION" \
+    "$RPP_TERMINAL_XTRACK_NEUTRAL" \
+    "$RPP_TERMINAL_XTRACK_SLEW" \
+    "$RPP_TERMINAL_XTRACK_UNWIND_SLEW" \
+    "$RPP_TERMINAL_XTRACK_AWAY_LOOKAHEAD" \
+    "$RPP_TERMINAL_XTRACK_AWAY_LIMIT" \
+    "$RPP_TERMINAL_XTRACK_AWAY_RATE" \
+    "$BRIDGE_MAX_YAW" \
+    "$RPP_TOLERANCE"
+
+assert_ros_double() {
+    local label="$1"
+    local output="$2"
+    local expected="$3"
+
+    ROS_PARAM_OUTPUT="$output" \
+    ROS_PARAM_EXPECTED="$expected" \
+    python3 - "$label" <<'PY'
+import math
+import os
+import re
+import sys
+
+label = sys.argv[1]
+output = os.environ["ROS_PARAM_OUTPUT"]
+expected = float(os.environ["ROS_PARAM_EXPECTED"])
+
+matches = re.findall(
+    r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?",
+    output,
+)
+if not matches:
+    raise SystemExit(f"ABORT: unable to parse {label}: {output!r}")
+
+actual = float(matches[-1])
+if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1.0e-9):
+    raise SystemExit(
+        f"ABORT: {label} is {actual}, expected {expected}"
+    )
+PY
+}
+
+assert_ros_double "trajectory spacing" "$TG_SPACING" 0.05
+assert_ros_double "mission marking tolerance" "$MM_TOLERANCE" 0.03
+assert_ros_double "mission marking hold" "$MM_HOLD" 3.0
+assert_ros_double "stationary speed tolerance" "$MM_STATIONARY" 0.01
+
+assert_ros_double "RPP cruise speed" "$RPP_CRUISE" 0.40
+assert_ros_double "RPP minimum speed" "$RPP_MINIMUM" 0.40
+assert_ros_double "RPP segment alignment speed" "$RPP_ALIGNMENT" 0.40
+assert_ros_double \
+    "RPP segment alignment recovery speed" \
+    "$RPP_ALIGNMENT_RECOVERY" \
+    0.40
+assert_ros_double "RPP cross-track recovery speed" "$RPP_XTRACK" 0.40
+assert_ros_double "RPP terminal speed" "$RPP_TERMINAL" 0.40
+assert_ros_double "RPP final approach speed" "$RPP_FINAL" 0.40
+assert_ros_double "RPP close recovery speed" "$RPP_CLOSE" 0.40
+assert_ros_double "cmd_vel_bridge maximum speed" "$BRIDGE_MAXIMUM" 0.40
+assert_ros_double "RPP maximum yaw rate" "$RPP_MAX_YAW" 0.20
+assert_ros_double "RPP minimum yaw rate" "$RPP_MIN_YAW" 0.06
+assert_ros_double "RPP pivot yaw Kp" "$RPP_PIVOT_KP" 1.00
+assert_ros_double "RPP native pivot enter" "$RPP_PIVOT_ENTER" 45.0
+assert_ros_double "RPP native pivot release" "$RPP_PIVOT_RELEASE" 12.0
+assert_ros_double \
+    "RPP path correction limit" \
+    "$RPP_PATH_CORRECTION" \
+    12.0
+assert_ros_double \
+    "RPP segment correction limit" \
+    "$RPP_SEGMENT_CORRECTION" \
+    12.0
+assert_ros_double \
+    "RPP xtrack correction limit" \
+    "$RPP_XTRACK_CORRECTION" \
+    20.0
+assert_ros_double \
+    "RPP xtrack recovery enter" \
+    "$RPP_XTRACK_ENTER" \
+    0.005
+assert_ros_double \
+    "RPP xtrack recovery exit" \
+    "$RPP_XTRACK_EXIT" \
+    0.003
+assert_ros_double \
+    "RPP xtrack recovery lookahead" \
+    "$RPP_XTRACK_LOOKAHEAD" \
+    0.25
+assert_ros_double \
+    "RPP terminal recovery correction limit" \
+    "$RPP_TERMINAL_RECOVERY_CORRECTION" \
+    20.0
+assert_ros_double \
+    "RPP xtrack prediction time" \
+    "$RPP_XTRACK_PREDICTION" \
+    0.80
+assert_ros_double \
+    "RPP xtrack rate filter alpha" \
+    "$RPP_XTRACK_RATE_ALPHA" \
+    0.25
+assert_ros_double \
+    "RPP xtrack correction slew" \
+    "$RPP_XTRACK_SLEW" \
+    40.0
+assert_ros_double \
+    "RPP xtrack neutral crossing band" \
+    "$RPP_XTRACK_NEUTRAL_BAND" \
+    0.04
+assert_ros_double \
+    "RPP terminal recovery minimum lookahead" \
+    "$RPP_TERMINAL_LOOKAHEAD_MIN" \
+    0.20
+assert_ros_double \
+    "RPP exact-goal intercept distance" \
+    "$RPP_TERMINAL_INTERCEPT_DISTANCE" \
+    1.50
+assert_ros_double \
+    "RPP exact-goal intercept bearing limit" \
+    "$RPP_TERMINAL_INTERCEPT_LIMIT" \
+    25.0
+assert_ros_double \
+    "RPP terminal xtrack lookahead" \
+    "$RPP_TERMINAL_XTRACK_LOOKAHEAD" \
+    0.22
+assert_ros_double \
+    "RPP terminal xtrack correction limit" \
+    "$RPP_TERMINAL_XTRACK_CORRECTION" \
+    25.0
+assert_ros_double \
+    "RPP terminal xtrack prediction time" \
+    "$RPP_TERMINAL_XTRACK_PREDICTION" \
+    1.20
+assert_ros_double \
+    "RPP terminal xtrack neutral band" \
+    "$RPP_TERMINAL_XTRACK_NEUTRAL" \
+    0.003
+assert_ros_double \
+    "RPP terminal xtrack correction slew" \
+    "$RPP_TERMINAL_XTRACK_SLEW" \
+    90.0
+assert_ros_double \
+    "RPP terminal xtrack unwind slew" \
+    "$RPP_TERMINAL_XTRACK_UNWIND_SLEW" \
+    120.0
+assert_ros_double \
+    "RPP terminal xtrack away lookahead" \
+    "$RPP_TERMINAL_XTRACK_AWAY_LOOKAHEAD" \
+    0.12
+assert_ros_double \
+    "RPP terminal xtrack away correction limit" \
+    "$RPP_TERMINAL_XTRACK_AWAY_LIMIT" \
+    35.0
+assert_ros_double \
+    "RPP terminal xtrack away rate threshold" \
+    "$RPP_TERMINAL_XTRACK_AWAY_RATE" \
+    0.005
+assert_ros_double "cmd_vel_bridge compatibility yaw rate" "$BRIDGE_MAX_YAW" 0.20
+
+assert_ros_double "RPP waypoint tolerance" "$RPP_TOLERANCE" 0.03
+
+echo "0.40 m/s + 45/12 pivot + adaptive final 1.50m away-boost/capture profile verified."
+
+
+echo
+echo "===== RTK AND GPS CHECK ====="
+
+RTK_HEALTH="$(
+    timeout 5s ros2 topic echo \
+        /rtk_correction_bridge/healthy \
+        --once 2>/dev/null || true
+)"
+echo "$RTK_HEALTH"
+
+if ! grep -q "data: true" <<<"$RTK_HEALTH"; then
+    echo "ABORT: RTK correction bridge is not healthy"
+    exit 1
+fi
+
+GPS_FIX="$(
+    timeout 5s ros2 topic echo \
+        /mavros/gpsstatus/gps1/raw \
+        --once \
+        --field fix_type 2>/dev/null || true
+)"
+echo "GPS fix type: $GPS_FIX"
+
+if ! grep -q "^6$" <<<"$GPS_FIX"; then
+    echo "ABORT: GPS fix_type is not 6"
+    exit 1
+fi
+
+
+echo
+echo "===== PREPARE PRODUCTION SOURCE MISSION ====="
+
+PREPARE_RESPONSE="$(
+    api_request POST /api/mission/prepare
+)"
+printf '%s\n' "$PREPARE_RESPONSE" | python3 -m json.tool
+
+SOURCE_TOTAL="$(
+    printf '%s' "$PREPARE_RESPONSE" |
+    json_get mission.total_points
+)"
+
+if [[ -z "$SOURCE_TOTAL" || "$SOURCE_TOTAL" -lt 2 ]]; then
+    echo "ABORT: prepared mission has fewer than two marking points"
+    exit 1
+fi
+
+
+echo
+echo "===== START TEST-PATH SUPERVISOR ====="
+
+rm -rf "$RUNTIME_DIR"
+mkdir -p "$RUNTIME_DIR"
+
+python3 "$SUPERVISOR" \
+    --spacing-m 0.05 \
+    --position-tolerance-m 0.03 \
+    --hold-required-sec 3.0 \
+    --heading-tolerance-deg "$HEADING_TOLERANCE_DEG" \
+    --odom-timeout-sec 0.50 \
+    --ready-file "$READY_FILE" \
+    --result-file "$RESULT_FILE" \
+    --event-file "$EVENT_FILE" \
+    >"$SUPERVISOR_LOG" 2>&1 &
+
+SUPERVISOR_PID=$!
+TEST_PATH_STARTED=1
+printf '%s\n' "$SUPERVISOR_PID" > "$SUPERVISOR_PID_FILE"
+
+
+echo
+echo "===== WAIT FOR TEMPORARY C->P1->P2 PATH ====="
+
+for _ in $(seq 1 300); do
+    if [[ -f "$RESULT_FILE" ]]; then
+        break
+    fi
+    if [[ -f "$READY_FILE" ]]; then
+        break
+    fi
+    if ! kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+        echo "ABORT: test supervisor exited unexpectedly"
+        cat "$SUPERVISOR_LOG" || true
+        exit 1
+    fi
+    sleep 0.1
+done
+
+if [[ -f "$RESULT_FILE" && ! -f "$READY_FILE" ]]; then
+    cat "$RESULT_FILE" | python3 -m json.tool
+    echo "ABORT: supervisor could not build/load test path"
+    exit 1
+fi
+
+if [[ ! -f "$READY_FILE" ]]; then
+    echo "ABORT: timed out waiting for temporary test path"
+    cat "$SUPERVISOR_LOG" || true
+    exit 1
+fi
+
+cat "$READY_FILE" | python3 -m json.tool
+
+MAX_SPACING="$(
+    cat "$READY_FILE" |
+    json_get maximum_generated_spacing_m
+)"
+
+python3 - "$MAX_SPACING" <<'PY'
+import sys
+
+spacing = float(sys.argv[1])
+if spacing > 0.05 + 1.0e-9:
+    raise SystemExit(
+        f"Generated spacing is too large: {spacing}"
+    )
+PY
+
+
+echo
+echo "===== CONFIRM TWO-POINT MISSION MANAGER STATE ====="
+
+STATUS_RESPONSE="$(
+    api_request GET /api/mission/status
+)"
+printf '%s\n' "$STATUS_RESPONSE" | python3 -m json.tool
+
+TEST_TOTAL="$(
+    printf '%s' "$STATUS_RESPONSE" |
+    json_get mission.total_points
+)"
+TEST_READY="$(
+    printf '%s' "$STATUS_RESPONSE" |
+    json_get mission.ready
+)"
+TEST_STATE="$(
+    printf '%s' "$STATUS_RESPONSE" |
+    json_get mission.state
+)"
+
+if [[ "$TEST_TOTAL" != "2" ]]; then
+    echo "ABORT: mission manager did not load exactly P1 and P2"
+    exit 1
+fi
+
+if [[ "$TEST_READY" != "true" || "$TEST_STATE" != "READY" ]]; then
+    echo "ABORT: mission manager is not READY with the test path"
+    exit 1
+fi
+
+
+START_LINE=$(( $(wc -l < "$LOG_FILE") + 1 ))
+
+
+echo
+echo "===== START THROUGH PRODUCTION BACKEND ====="
+
+START_RESPONSE="$(
+    api_request POST /api/mission/start
+)"
+printf '%s\n' "$START_RESPONSE" | python3 -m json.tool
+
+
+echo
+echo "===== WAIT FOR ARMED OFFBOARD ====="
+
+ARMED_OFFBOARD=0
+
+for _ in $(seq 1 30); do
+    STATE="$(
+        timeout 4s ros2 topic echo \
+            /mavros/state \
+            --once 2>/dev/null || true
+    )"
+
+    if grep -q "armed: true" <<<"$STATE" &&
+       grep -q "mode: OFFBOARD" <<<"$STATE"; then
+        echo "$STATE"
+        ARMED_OFFBOARD=1
+        break
+    fi
+
+    sleep 0.5
+done
+
+if [[ "$ARMED_OFFBOARD" -ne 1 ]]; then
+    echo "ABORT: PX4 did not reach armed OFFBOARD"
+    exit 1
+fi
+
+
+echo
+echo "===== TEST RUNNING ====="
+echo "Do not move the rover or either GNSS antenna."
+echo "Physical E-stop must remain ready."
+
+START_EPOCH="$(date +%s)"
+
+while true; do
+    sleep 0.2
+
+    if [[ -f "$RESULT_FILE" ]]; then
+        FINAL_RESULT="$(
+            cat "$RESULT_FILE" |
+            json_get result
+        )"
+        break
+    fi
+
+    NEW_LOG="$(
+        sed -n "${START_LINE},\$p" "$LOG_FILE"
+    )"
+
+    if grep -qiE \
+        "MARKING CAPTURE MISSED / SAFE HOLD|SAFE HOLD|entered ERROR|MISSION ERROR" \
+        <<<"$NEW_LOG"; then
+        FINAL_RESULT="SAFE_HOLD_OR_ERROR"
+        break
+    fi
+
+    NOW_EPOCH="$(date +%s)"
+    ELAPSED=$((NOW_EPOCH - START_EPOCH))
+
+    if (( ELAPSED >= TEST_TIMEOUT_SEC )); then
+        FINAL_RESULT="TIMEOUT"
+        break
+    fi
+
+    if (( ELAPSED > 0 && ELAPSED % 5 == 0 )); then
+        if [[ "${LAST_PRINTED_ELAPSED:-}" != "$ELAPSED" ]]; then
+            LAST_PRINTED_ELAPSED="$ELAPSED"
+
+            echo
+            echo "===== RUNNING: ${ELAPSED} SECONDS ====="
+
+            sed -n "${START_LINE},\$p" "$LOG_FILE" |
+            grep -E \
+                "STRAIGHT SEGMENT GOAL|SEGMENT ALIGNMENT|SEGMENT ALIGNED|ABSOLUTE YAW PIVOT|50MM LOOKAHEAD|EXACT MARKING CONVERGENCE|MARKING CAPTURE|MARKING FINAL|Holding at marking|completed|MISSION COMPLETED|ERROR" |
+            tail -n 25 || true
+
+            api_request GET /api/mission/status |
+            python3 -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)["mission"]
+
+print(
+    "state={state} active={active} completed={completed}/2 "
+    "marking_active={marking} hold={hold:.2f}/{required:.2f}".format(
+        state=payload.get("state"),
+        active=payload.get("active_point_id"),
+        completed=payload.get("completed_points", 0),
+        marking=payload.get("marking_active", False),
+        hold=float(payload.get("hold_elapsed_sec", 0.0) or 0.0),
+        required=float(payload.get("hold_required_sec", 3.0) or 3.0),
+    )
+)
+' || true
+        fi
+    fi
+done
+
+
+echo
+echo "===== TEST SUPERVISOR RESULT ====="
+
+if [[ -f "$RESULT_FILE" ]]; then
+    cat "$RESULT_FILE" | python3 -m json.tool
+else
+    echo "No supervisor result file."
+    echo "Result detected from runtime: $FINAL_RESULT"
+fi
+
+
+echo
+echo "===== RELEVANT ROVER LOG ====="
+
+sed -n "${START_LINE},\$p" "$LOG_FILE" |
+grep -E \
+    "STRAIGHT SEGMENT GOAL|SEGMENT ALIGNMENT|SEGMENT ALIGNED|ABSOLUTE YAW PIVOT|50MM LOOKAHEAD|EXACT MARKING CONVERGENCE|MARKING CAPTURE|MARKING FINAL|Holding at marking|Marking P|completed|MISSION COMPLETED|SAFE HOLD|ERROR" |
+tail -n 400 || true
+
+
+if [[ "$FINAL_RESULT" == "PASS" ]]; then
+    exit 0
+fi
+
+exit 1
