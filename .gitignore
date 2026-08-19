@@ -39,6 +39,13 @@ Thumbs.db
 *.key
 *.pem
 *.jks
+config/bag_autorecord.env
+config/bag_autorecord.token
+
+# Field bags / logs (never commit)
+/bags/
+/bags_jet/
+/field_logs/
 
 # Colcon metadata
 .colcon/

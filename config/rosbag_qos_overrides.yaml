@@ -1,0 +1,181 @@
+# rosbag2 QoS overrides for the DYX 4WD marking stack.
+#
+# TRANSIENT_LOCAL topics are published once at prepare/start, before the
+# auto-recorder subscribes. Default ros2 bag record is VOLATILE and misses them.
+# BEST_EFFORT publishers are incompatible with a RELIABLE recorder subscription.
+#
+# Passed as: ros2 bag record --qos-profile-overrides-path <this>
+
+# --- latched path / sequencer (RELIABLE + TRANSIENT_LOCAL) ---
+/nav_path:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/mission_waypoints:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/trajectory_generator/path_types:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/trajectory_generator/marking_indices:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/trajectory_generator/ready:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/trajectory_generator/status:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/runtime_nav_path:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/mission_complete:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/mission_manager/status:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/mission_manager/execution_mode:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/spray/active:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/spray/complete:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/spray/result:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/spray/status:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/spray/config:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/rpp/acceleration_active:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/rpp/deceleration_active:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/rpp/terminal_precision_armed:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/rpp/terminal_bearing_frozen:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/rpp/xtrack_mm:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/rpp/goal_distance_mm:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/rpp/along_track_remaining_mm:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/rpp/closest_goal_distance_mm:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/rpp/accuracy:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/cmd_vel_bridge/backend_heartbeat_healthy:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/rtk_correction_bridge/healthy:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/rtk_correction_bridge/correction_age_sec:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/mavros/global_position/gp_origin:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+
+# --- BEST_EFFORT sensors / setpoints ---
+/mavros/local_position/odom:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/mavros/setpoint_raw/local:
+  history: keep_last
+  depth: 1
+  reliability: best_effort
+  durability: volatile
+/mavros/gpsstatus/gps1/raw:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/mavros/global_position/raw/fix:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/mavros/global_position/global:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/mavros/imu/data:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile

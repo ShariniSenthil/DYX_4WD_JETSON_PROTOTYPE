@@ -1464,6 +1464,10 @@ class RoverBackendRosNode(Node):
             ),
             "spray_controller_state": payload.get("spray_controller_state"),
             "spray_fault_reason": payload.get("spray_fault_reason"),
+            "start_stage": str(
+                payload.get("start_stage") or "IDLE"
+            ).strip().upper(),
+            "start_failed_stage": payload.get("start_failed_stage"),
             "arrival_settle_elapsed_sec": max(
                 0.0,
                 _finite_float(

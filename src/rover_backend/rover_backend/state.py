@@ -303,6 +303,8 @@ class RoverState:
                 "spray_controller_ready": False,
                 "spray_controller_state": "UNKNOWN",
                 "spray_fault_reason": None,
+                "start_stage": "IDLE",
+                "start_failed_stage": None,
                 "arrival_settle_elapsed_sec": 0.0,
                 "arrival_settle_required_sec": 0.30,
                 # Legacy aliases: arrival settle only; spray duration is owned
@@ -1020,6 +1022,8 @@ class RoverState:
                 "spray_controller_ready": False,
                 "spray_controller_state": "UNKNOWN",
                 "spray_fault_reason": None,
+                "start_stage": "IDLE",
+                "start_failed_stage": None,
                 "arrival_settle_elapsed_sec": 0.0,
                 "arrival_settle_required_sec": (
                     mission.get(
