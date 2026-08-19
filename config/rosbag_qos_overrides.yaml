@@ -179,3 +179,53 @@
   depth: 10
   reliability: best_effort
   durability: volatile
+/mavros/imu/mag:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/mavros/extended_state:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/mavros/estimator_status:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/mavros/sys_status:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/mavros/battery:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/mavros/statustext/recv:
+  history: keep_last
+  depth: 10
+  reliability: reliable
+  durability: volatile
+/mavros/rc/in:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/mavros/manual_control/control:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/mavros/global_position/compass_hdg:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/mavros/home_position/home:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
