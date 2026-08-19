@@ -35,6 +35,7 @@ from starlette.types import Send
 
 from rover_backend.auth import authentication_store
 from rover_backend.auth import auth_router
+from rover_backend.beacon import rover_beacon
 from rover_backend.config import client_ip_is_allowed
 from rover_backend.config import settings
 from rover_backend.mission_routes import mission_router
@@ -258,6 +259,7 @@ async def startup_backend() -> None:
 
     realtime_started = False
     ros_started = False
+    beacon_started = False
 
     try:
         await asyncio.to_thread(authentication_store.initialize)
@@ -288,6 +290,14 @@ async def startup_backend() -> None:
         await start_realtime()
         realtime_started = True
 
+        try:
+            rover_beacon.start()
+            beacon_started = rover_beacon.running or not settings.beacon_enabled
+        except Exception:
+            LOGGER.exception(
+                "UDP discovery beacon failed to start; HTTP API remains available"
+            )
+
         rover_state.mark_backend_online(version=(settings.application_version))
 
         LOGGER.warning(
@@ -308,12 +318,25 @@ async def startup_backend() -> None:
             settings.mission_file,
         )
 
+        if settings.beacon_enabled:
+            LOGGER.warning(
+                "Discovery beacon: UDP %d every %.1fs",
+                settings.beacon_port,
+                settings.beacon_interval_sec,
+            )
+
     except Exception as error:
         LOGGER.exception("Backend startup failed")
 
         rover_state.mark_backend_offline(error=str(error))
 
         rover_state.force_safe_runtime_state("BACKEND_STARTUP_FAILED")
+
+        if beacon_started or rover_beacon.running:
+            try:
+                rover_beacon.stop()
+            except Exception:
+                LOGGER.exception("UDP discovery beacon cleanup failed after startup error")
 
         if realtime_started:
             try:
@@ -336,6 +359,11 @@ async def shutdown_backend() -> None:
     )
 
     await _force_safe_before_shutdown()
+
+    try:
+        rover_beacon.stop()
+    except Exception:
+        LOGGER.exception("UDP discovery beacon shutdown failed")
 
     try:
         await stop_realtime()

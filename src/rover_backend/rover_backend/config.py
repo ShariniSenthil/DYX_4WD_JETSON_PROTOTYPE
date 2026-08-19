@@ -84,6 +84,30 @@ def _read_int(
     return value
 
 
+def _read_bool(
+    name: str,
+    default: bool,
+) -> bool:
+    """Read a boolean environment variable."""
+
+    raw_value = os.getenv(name)
+
+    if raw_value is None:
+        return default
+
+    normalised = raw_value.strip().lower()
+
+    if normalised in {"1", "true", "yes", "on"}:
+        return True
+
+    if normalised in {"0", "false", "no", "off"}:
+        return False
+
+    raise RuntimeError(
+        f"{name} must be true or false"
+    )
+
+
 def _read_float(
     name: str,
     default: float,
@@ -233,6 +257,10 @@ class Settings:
 
     telemetry_broadcast_hz: float
     socket_path: str
+
+    beacon_enabled: bool
+    beacon_port: int
+    beacon_interval_sec: float
 
     @property
     def application_name(self) -> str:
@@ -475,6 +503,24 @@ def load_settings() -> Settings:
         ),
 
         socket_path=socket_path,
+
+        beacon_enabled=_read_bool(
+            "DYX_BEACON_ENABLE",
+            True,
+        ),
+
+        beacon_port=_read_int(
+            "DYX_BEACON_PORT",
+            5002,
+            minimum=1,
+            maximum=65535,
+        ),
+
+        beacon_interval_sec=_read_float(
+            "DYX_BEACON_INTERVAL_SEC",
+            2.0,
+            minimum=0.5,
+        ),
     )
 
     required_directories = {
