@@ -53,8 +53,8 @@ class MissionManager(Node):
 
     FCU_STATE_STALE_SEC = 3.0
     GPS_FIX_STALE_SEC = 2.0
-    RTK_STATUS_STALE_SEC = 5.0
-    MAX_RTK_CORRECTION_AGE_SEC = 2.0
+    RTK_STATUS_STALE_SEC = 15.0
+    MAX_RTK_CORRECTION_AGE_SEC = 15.0
     OFFBOARD_STREAM_SETTLE_SEC = 0.60
     SERVICE_DISCOVERY_TIMEOUT_SEC = 3.0
     SERVICE_RESPONSE_TIMEOUT_SEC = 5.0
@@ -413,7 +413,11 @@ class MissionManager(Node):
             f"{self.arrival_settle_sec:.2f}s arrival settle, {self.marking_hold_sec:.2f}s marking hold"
         )
         self.get_logger().warn(
-            "RTK runtime rule: FLOAT/lost => PAUSE; FIXED return => READY TO RESUME; no auto-resume"
+            "RTK mission gate: fresh fix_type=6 => RUN; FLOAT/lost/stale GPS => PAUSE. "
+            "Correction age/health, backend heartbeat and spray status are monitoring only."
+        )
+        self.get_logger().warn(
+            f"RTK correction-age monitor threshold: {self.MAX_RTK_CORRECTION_AGE_SEC:.1f}s"
         )
 
     # ==============================================================
@@ -740,12 +744,14 @@ class MissionManager(Node):
             self._spray_fault_reason = str(reason) if reason else None
 
     def _spray_result_callback(self, message: String) -> None:
+        """Monitor spray result without blocking rover path progression."""
         try:
             payload = json.loads(message.data)
         except Exception:
             return
         if not isinstance(payload, dict):
             return
+
         run_id = payload.get("mission_run_id")
         point_id = payload.get("point_id")
         result = str(payload.get("result", "")).upper()
@@ -753,30 +759,35 @@ class MissionManager(Node):
             return
         if not isinstance(point_id, str) or not point_id:
             return
+
         with self._lock:
             if run_id != self._mission_run_id:
                 return
+
             key = (run_id, point_id)
             if result == "SUCCESS":
                 self._spray_success_keys.add(key)
                 self._spray_failure_keys.pop(key, None)
-                self._last_message = f"Spray confirmed for {point_id}"
+                self._last_message = (
+                    f"Spray SUCCESS monitored for {point_id}; "
+                    "mission progression is independent of spray result"
+                )
                 self._publish_status(force=True)
-            elif result == "FAILED":
+                return
+
+            if result == "FAILED":
                 reason = str(payload.get("reason", "UNKNOWN_SPRAY_FAILURE"))
                 self._spray_failure_keys[key] = reason
-                if self._current_point_id() == point_id and self._state == "RUNNING":
-                    marking_number = self._active_marking_number
-                    if marking_number is None:
-                        marking_number = self._current_or_next_marking_number()
-                    if marking_number is not None:
-                        self._fail_marking_point(
-                            marking_number,
-                            self._current_path_index,
-                            f"Spray failed at {point_id}: {reason}",
-                        )
-                    else:
-                        self._enter_error(f"Spray failed at {point_id}: {reason}")
+                self._spray_success_keys.discard(key)
+                self._last_message = (
+                    f"Spray FAILED monitored for {point_id}: {reason}; "
+                    "mission progression is not blocked"
+                )
+                self._emit_system_event(
+                    "SPRAY_FAILED_MONITOR_ONLY",
+                    self._last_message,
+                )
+                self._publish_status(force=True)
 
     def _spray_status_age_sec(self) -> float:
         if self._spray_status_last_rx_monotonic is None:
@@ -814,38 +825,64 @@ class MissionManager(Node):
         return "NO_FIX"
 
     def _rtk_motion_ok(self) -> tuple[bool, str]:
-        # Do not trust an old FIXED value. The GPS fix status itself must be fresh.
-        if self._age(self._last_gps_fix_rx_monotonic) > self.GPS_FIX_STALE_SEC:
-            return False, "RTK GPS fix status stale"
+        """Allow mission motion only with a fresh MAVROS GPSRAW fix_type == 6.
+
+        RTK correction-health and correction-age are still monitored and
+        reported, but they do not independently stop the rover while the
+        receiver/PX4 remains RTK FIXED.
+        """
+        gps_age = self._age(self._last_gps_fix_rx_monotonic)
+        if gps_age > self.GPS_FIX_STALE_SEC:
+            return False, f"RTK GPS fix status stale ({gps_age:.2f}s)"
+
         if self._gps_fix_type != 6:
-            return False, f"RTK {self._rtk_state()} (fix_type={self._gps_fix_type})"
+            return False, (
+                f"RTK {self._rtk_state()} " f"(fix_type={self._gps_fix_type})"
+            )
 
-        # The correction-health topic and correction-age topic are checked
-        # independently so one fresh topic cannot hide a stale second topic.
-        if self._age(self._last_rtk_health_rx_monotonic) > self.RTK_STATUS_STALE_SEC:
-            return False, "RTK correction health status stale"
-        if not self._rtk_healthy:
-            return False, "RTK correction stream unhealthy"
+        monitor_notes: list[str] = []
 
-        if self._age(self._last_rtk_age_rx_monotonic) > self.RTK_STATUS_STALE_SEC:
-            return False, "RTK correction age status stale"
-        age = self._rtk_correction_age_sec
-        if age is None or age < 0.0 or age > self.MAX_RTK_CORRECTION_AGE_SEC:
-            return False, f"RTK correction age invalid ({age})"
+        health_age = self._age(self._last_rtk_health_rx_monotonic)
+        if health_age > self.RTK_STATUS_STALE_SEC:
+            monitor_notes.append(f"correction-health status stale {health_age:.1f}s")
+        elif not self._rtk_healthy:
+            monitor_notes.append("correction stream unhealthy")
 
-        return True, "RTK FIXED + fresh corrections"
+        age_status_age = self._age(self._last_rtk_age_rx_monotonic)
+        if age_status_age > self.RTK_STATUS_STALE_SEC:
+            monitor_notes.append(f"correction-age status stale {age_status_age:.1f}s")
+
+        correction_age = self._rtk_correction_age_sec
+        if correction_age is None or correction_age < 0.0:
+            monitor_notes.append("correction age unavailable")
+        elif correction_age > self.MAX_RTK_CORRECTION_AGE_SEC:
+            monitor_notes.append(
+                f"correction age {correction_age:.1f}s > "
+                f"{self.MAX_RTK_CORRECTION_AGE_SEC:.1f}s"
+            )
+
+        if monitor_notes:
+            return (
+                True,
+                "RTK FIXED (fix_type=6); monitor only: " + "; ".join(monitor_notes),
+            )
+
+        if correction_age is None:
+            return True, "RTK FIXED (fix_type=6)"
+
+        return (
+            True,
+            f"RTK FIXED (fix_type=6); correction age={correction_age:.1f}s",
+        )
 
     def _monitor_runtime_rtk(self) -> None:
-        """Soft-pause a RUNNING mission when RTK motion health is lost.
+        """Pause a RUNNING mission only when RTK FIXED is actually lost.
 
-        Recovery while PAUSED is handled by _monitor_pause_recovery(), which
-        checks the complete pre-motion health bundle (RTK + odom + FCU +
-        backend heartbeat + spray readiness) before advertising Resume.
+        Fresh fix_type=6 keeps running. FLOAT, lower fix types, or stale GPSRAW
+        disable motion and pause. Correction-age/health remain monitor-only.
         """
         ok, reason = self._rtk_motion_ok()
         if self._state == "RUNNING" and not ok:
-            # Soft pause only. E-stop stays released. cmd_vel_bridge/RPP must
-            # output zero while mission_enable is false.
             self._mission_enable = False
             self._pause_reason = "RTK_LOST"
             self._resume_available = False
@@ -853,59 +890,74 @@ class MissionManager(Node):
             self._reset_arrival_state()
             self._publish_marking_active(False)
             self._publish_safety()
-            self._last_message = f"{reason}; mission paused automatically"
+            self._last_message = f"{reason}; rover stopped and mission paused"
             self._emit_system_event("RTK_PAUSED", reason)
             self._publish_status(force=True)
 
     def _motion_health_status(
         self, *, require_ready_state: bool, require_estop_released: bool = False
     ) -> tuple[bool, str]:
-        """Return the authoritative health result required before enabling motion.
+        """Simple Mission Manager movement gate for rover behavior testing.
 
-        This is deliberately the same bundle used by START/RESUME/NEXT:
-        validated mission, fresh FCU state, fresh odometry, RTK FIXED, fresh
-        correction status, acceptable correction age, backend heartbeat and
-        spray-controller readiness.
+        Blocking:
+          * validated prepared mission exists;
+          * lifecycle state is correct;
+          * E-stop is released when movement is being re-enabled;
+          * fresh MAVROS GPSRAW fix_type == 6.
+
+        Monitoring only here:
+          * RTK correction-health and correction-age;
+          * backend heartbeat;
+          * spray readiness/fault;
+          * FCU freshness precheck;
+          * odometry freshness precheck.
+
+        PX4 still must accept OFFBOARD and ARM service commands.
         """
         if not self._navigation_path or not self._trajectory_ready:
             return False, "No validated prepared mission is ready"
+
+        if require_ready_state and self._state != "READY":
+            return False, f"Mission manager is not READY (state={self._state})"
+
         if require_estop_released and self._emergency_stop:
             return (
                 False,
                 "Emergency stop is active; release E-stop before enabling motion",
             )
-        if require_ready_state and self._state != "READY":
-            return False, f"Mission manager is not READY (state={self._state})"
-        if not self._fcu_connected:
-            return False, "PX4/MAVROS disconnected"
-        if self._age(self._last_fcu_rx_monotonic) > self.FCU_STATE_STALE_SEC:
-            return False, "PX4/MAVROS state stale"
-        if self._age(self._last_odom_monotonic) > self.odom_timeout_sec:
-            return False, "Local odometry unavailable/stale"
+
         rtk_ok, rtk_reason = self._rtk_motion_ok()
         if not rtk_ok:
             return False, f"RTK FIXED required: {rtk_reason}"
-        if not self._backend_heartbeat_healthy:
-            return False, "Backend heartbeat unhealthy at cmd_vel_bridge"
-        if not self._spray_ready_for_mission_start():
-            reason = self._spray_fault_reason or "spray controller not ready/stale"
-            return False, f"Spray controller not ready: {reason}"
-        return True, "Motion health OK"
+
+        return True, (
+            "Prepared mission + fresh RTK FIXED; "
+            "remaining Mission Manager health fields are monitoring only"
+        )
 
     def _monitor_pause_recovery(self) -> None:
-        """Update Resume availability without ever restarting motion automatically."""
+        """Advertise Resume when the condition that caused the pause recovers."""
         if self._state != "PAUSED":
             return
 
-        # A latched E-stop must first be explicitly released.
         if self._pause_reason == "ESTOP" and self._emergency_stop:
             if self._resume_available:
                 self._resume_available = False
                 self._publish_status(force=True)
             return
 
+        # Keep the existing runtime odometry protection: waypoint arrival
+        # cannot be evaluated correctly from a frozen local position.
+        if self._pause_reason == "ODOM_STALE":
+            if self._age(self._last_odom_monotonic) > self.odom_timeout_sec:
+                if self._resume_available:
+                    self._resume_available = False
+                    self._publish_status(force=True)
+                return
+
         ok, reason = self._motion_health_status(
-            require_ready_state=False, require_estop_released=True
+            require_ready_state=False,
+            require_estop_released=True,
         )
         if not ok:
             if self._resume_available:
@@ -920,30 +972,33 @@ class MissionManager(Node):
             return
 
         self._resume_available = True
+
         if self._pause_reason == "RTK_LOST":
-            self._last_message = "RTK and motion health recovered; mission remains paused. You can resume now"
+            self._last_message = (
+                "RTK FIXED (fix_type=6) recovered; mission remains paused. "
+                "You can resume now"
+            )
             self._emit_system_event(
-                "RTK_RECOVERED", "Full motion health restored - ready to resume"
+                "RTK_RECOVERED",
+                "Fresh fix_type=6 restored - ready to resume",
             )
         elif self._pause_reason == "ODOM_STALE":
-            self._last_message = "Odometry and motion health recovered; mission remains paused. You can resume now"
-            self._emit_system_event(
-                "ODOM_RECOVERED", "Full motion health restored - ready to resume"
+            self._last_message = (
+                "Local odometry recovered and RTK is FIXED; mission remains paused. "
+                "You can resume now"
             )
         elif self._pause_reason == "ESTOP":
-            self._last_message = "Emergency stop released and motion health is valid; mission remains paused. You can resume now"
-            self._emit_system_event(
-                "ESTOP_RECOVERY_READY", "Full motion health restored - ready to resume"
+            self._last_message = (
+                "Emergency stop released and RTK is FIXED; mission remains paused. "
+                "You can resume now"
             )
         else:
             self._last_message = (
-                "Mission remains paused; motion health is valid. You can resume now"
+                "Mission remains paused; RTK is FIXED. You can resume now"
             )
+
         self._publish_status(force=True)
 
-    # ==============================================================
-    # Safety / PX4 orchestration
-    # ==============================================================
     def _publish_safety(self) -> None:
         m = Bool()
         m.data = bool(self._mission_enable)
@@ -1043,7 +1098,9 @@ class MissionManager(Node):
         try:
             with self._lock:
                 if self._state == "RUNNING":
-                    raise RuntimeError("Previous mission is still RUNNING; STOP the current mission before START")
+                    raise RuntimeError(
+                        "Previous mission is still RUNNING; STOP the current mission before START"
+                    )
                 if self._state == "PAUSED":
                     raise RuntimeError("Mission paused; use Resume")
                 if self._state == "WAITING_FOR_NEXT":
@@ -1179,7 +1236,7 @@ class MissionManager(Node):
     def _next_point_service(
         self, _request: Trigger.Request, response: Trigger.Response
     ) -> Trigger.Response:
-        """Advance a MANUAL mission only after the full motion-health gate passes."""
+        """Advance MANUAL mission after prepared-path + RTK FIXED gate passes."""
         try:
             with self._lock:
                 if self._execution_mode != "MANUAL":
@@ -1196,8 +1253,8 @@ class MissionManager(Node):
                     response.message = "Mission completed"
                     return response
 
-            # NEXT can re-enable movement, so it must pass exactly the same
-            # health bundle used by RESUME before mission_enable becomes true.
+            # NEXT can re-enable movement, so it must pass the same simple
+            # prepared-path + RTK FIXED gate used by RESUME.
             self._require_motion_health(
                 require_ready_state=False, require_estop_released=True
             )
@@ -1212,8 +1269,7 @@ class MissionManager(Node):
                 self._request_arm(True)
             self._wait_for_vehicle_state(expected_mode="OFFBOARD", expected_armed=True)
 
-            # Re-check immediately before enabling motion in case RTK/odom
-            # changed while OFFBOARD/arming was being established.
+            # Re-check RTK FIXED immediately before enabling motion.
             self._require_motion_health(
                 require_ready_state=False, require_estop_released=True
             )
@@ -1309,16 +1365,12 @@ class MissionManager(Node):
             elif previous_state == "WAITING_FOR_NEXT":
                 self._state = "WAITING_FOR_NEXT"
                 self._set_safety(emergency_stop=False, mission_enable=False)
-            elif self._execution_mode == "MANUAL":
-                # A RUNNING MANUAL mission waits for the operator after SKIP.
-                self._state = "WAITING_FOR_NEXT"
+            else:
+                # RUNNING AUTO and RUNNING MANUAL both continue immediately
+                # after SKIP. Successful MANUAL completion still waits for NEXT.
+                self._state = "RUNNING"
                 self._pause_reason = None
                 self._resume_available = False
-                self._set_safety(emergency_stop=False, mission_enable=False)
-            else:
-                # RUNNING AUTO stays RUNNING. Runtime RTK/odom monitoring
-                # continues to own motion safety.
-                self._state = "RUNNING"
 
             self._last_message = f"P{marking_number+1:04d} skipped"
             self._publish_goal()
@@ -1628,9 +1680,7 @@ class MissionManager(Node):
             if self._point_status[marking_number] not in self.TERMINAL_POINT_STATES:
                 self._point_status[marking_number] = "FAILED"
         self._enter_error(reason)
-        self._emit_point_event(
-            "FAILED", marking_number, path_index, reason=reason
-        )
+        self._emit_point_event("FAILED", marking_number, path_index, reason=reason)
         # _enter_error() already publishes status, but publish again after the
         # point event so frontend/backend observers see the final FAILED count.
         self._publish_status(force=True)
@@ -1698,6 +1748,12 @@ class MissionManager(Node):
             "rtk_motion_ok": rtk_ok,
             "rtk_reason": rtk_reason,
             "rtk_correction_age_sec": self._rtk_correction_age_sec,
+            "rtk_correction_age_limit_sec": self.MAX_RTK_CORRECTION_AGE_SEC,
+            "rtk_correction_age_over_limit": (
+                self._rtk_correction_age_sec is not None
+                and self._rtk_correction_age_sec > self.MAX_RTK_CORRECTION_AGE_SEC
+            ),
+            "rtk_gate_mode": "FRESH_FIX_TYPE_6_ONLY",
             "gps_fix_status_age_sec": round(
                 self._age(self._last_gps_fix_rx_monotonic), 3
             ),
@@ -1709,6 +1765,7 @@ class MissionManager(Node):
             ),
             "backend_heartbeat_healthy": self._backend_heartbeat_healthy,
             "spray_required": self.spray_required,
+            "spray_gates_mission_progress": False,
             "spray_controller_ready": self._spray_controller_ready,
             "spray_controller_state": self._spray_controller_state,
             "spray_fault_reason": self._spray_fault_reason,
@@ -1864,9 +1921,7 @@ class MissionManager(Node):
             if point_type == self.POINT_DUMMY_ALIGNMENT:
                 self._publish_marking_active(False)
                 self._reset_arrival_state()
-                inside_extension_radius = (
-                    distance <= self.dummy_arrival_tolerance_m
-                )
+                inside_extension_radius = distance <= self.dummy_arrival_tolerance_m
                 extension_stationary = (
                     self._speed_mps <= self.stationary_speed_tolerance_mps
                 )
@@ -1980,43 +2035,31 @@ class MissionManager(Node):
                     0.0, time.monotonic() - self._marking_hold_started
                 )
 
-            if self.spray_required:
-                failure = self._spray_failure_keys.get(spray_key)
-                if failure is not None:
-                    self._fail_marking_point(
-                        marking_number,
-                        self._current_path_index,
-                        f"Spray failed at {point_id}: {failure}",
-                    )
-                    return
-                if spray_key not in self._spray_success_keys:
-                    if (
-                        self._spray_request_started is not None
-                        and time.monotonic() - self._spray_request_started
-                        > self.spray_confirmation_timeout_sec
-                    ):
-                        self._publish_marking_active(False)
-                        self._fail_marking_point(
-                            marking_number,
-                            self._current_path_index,
-                            f"Spray confirmation timeout at {point_id}",
-                        )
-                    return
+            # Rover-behavior test: spray SUCCESS/FAILED/timeout is monitor-only.
+            # The separate spray controller retains its own actuator safety.
 
-            # Spray SUCCESS may arrive well before the requested 3.0 s marking
-            # hold is finished (normal spray ON time is only 0.5 s). Keep
-            # /marking_active TRUE so RPP continues commanding exact ZERO until
-            # the complete marking hold expires.
+            # Keep the existing marking hold. Spray result is monitor-only,
+            # so navigation does not wait for spray SUCCESS.
             if self._marking_hold_elapsed_sec < self.marking_hold_sec:
-                remaining = max(0.0, self.marking_hold_sec - self._marking_hold_elapsed_sec)
+                remaining = max(
+                    0.0, self.marking_hold_sec - self._marking_hold_elapsed_sec
+                )
+                spray_failure = self._spray_failure_keys.get(spray_key)
+                if spray_failure is not None:
+                    spray_note = f"spray FAILED monitor={spray_failure}"
+                elif spray_key in self._spray_success_keys:
+                    spray_note = "spray SUCCESS monitored"
+                else:
+                    spray_note = "spray result pending/ignored"
+
                 self._last_message = (
-                    f"{point_id} spray complete; holding position "
-                    f"{remaining:.2f}s more"
+                    f"{point_id} marking hold active; "
+                    f"{remaining:.2f}s remaining; {spray_note}"
                 )
                 return
 
-            # Full marking hold is complete and spray has succeeded. Only now
-            # clear marking_active and advance to the next marking point.
+            # Full marking hold is complete. Clear marking_active and advance.
+            # Spray SUCCESS is not required for rover path progression.
             self._publish_marking_active(False)
             self._point_status[marking_number] = "COMPLETED"
             self._last_completed_marking_number = marking_number
