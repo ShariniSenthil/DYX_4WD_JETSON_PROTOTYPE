@@ -631,6 +631,20 @@ def _require_ros_bridge() -> None:
         )
 
 
+@system_router.get("/api/health")
+async def health() -> dict[str, Any]:
+    """Unauthenticated discovery presence. UDP is only a hint."""
+
+    return {
+        "ok": True,
+        "type": "rover_backend",
+        "rover_id": settings.rover_id,
+        "rover_name": settings.rover_name,
+        "port": settings.backend_port,
+        "version": settings.application_version,
+    }
+
+
 @system_router.get("/api/ping")
 async def ping() -> dict[str, Any]:
     """Public endpoint used to identify the rover backend."""

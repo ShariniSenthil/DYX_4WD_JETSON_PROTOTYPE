@@ -19,9 +19,11 @@ to ROS. A send failure must not take the HTTP/Socket.IO server down.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import socket
+import struct
 import threading
 import time
 from typing import Any
@@ -64,8 +66,62 @@ def _detect_local_ip() -> str:
     return configured or "127.0.0.1"
 
 
+def _netmask_for_ipv4(ip: str) -> str | None:
+    """Read the interface netmask that owns this IPv4 address (Linux)."""
+
+    try:
+        import fcntl
+    except ImportError:
+        return None
+
+    try:
+        names = socket.if_nameindex()
+    except OSError:
+        return None
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _index, name in names:
+            ifname = name.encode("utf-8")[:15]
+            try:
+                if_addr = socket.inet_ntoa(
+                    fcntl.ioctl(
+                        probe.fileno(),
+                        0x8915,
+                        struct.pack("256s", ifname),
+                    )[20:24]
+                )
+                if_mask = socket.inet_ntoa(
+                    fcntl.ioctl(
+                        probe.fileno(),
+                        0x891B,
+                        struct.pack("256s", ifname),
+                    )[20:24]
+                )
+            except OSError:
+                continue
+            if if_addr == ip:
+                return if_mask
+    finally:
+        probe.close()
+
+    return None
+
+
 def _broadcast_targets(ip: str) -> tuple[str, ...]:
     targets = ["255.255.255.255"]
+
+    netmask = _netmask_for_ipv4(ip)
+    if netmask and _is_usable_ipv4(ip):
+        try:
+            network = ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False)
+            broadcast = str(network.broadcast_address)
+            if broadcast not in targets:
+                targets.append(broadcast)
+            return tuple(targets)
+        except ValueError:
+            pass
+
     parts = ip.split(".")
     if len(parts) == 4 and _is_usable_ipv4(ip):
         subnet = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
@@ -174,29 +230,31 @@ class RoverBeacon:
         interval = max(0.5, float(settings.beacon_interval_sec))
         port = int(settings.beacon_port)
 
-        while not self._stop.is_set():
-            ip = _detect_local_ip()
-            message = self._payload(ip)
-
-            for target in _broadcast_targets(ip):
-                try:
-                    sock.sendto(message, (target, port))
-                except OSError as error:
-                    LOGGER.warning(
-                        "UDP discovery beacon send failed %s:%d: %s",
-                        target,
-                        port,
-                        error,
-                    )
-
-            self._stop.wait(interval)
-
         try:
-            sock.close()
-        except OSError:
-            pass
-        if self._socket is sock:
-            self._socket = None
+            while not self._stop.is_set():
+                try:
+                    ip = _detect_local_ip()
+                    message = self._payload(ip)
+                    for target in _broadcast_targets(ip):
+                        try:
+                            sock.sendto(message, (target, port))
+                        except OSError:
+                            LOGGER.exception(
+                                "Beacon send failed target=%s:%s",
+                                target,
+                                port,
+                            )
+                except Exception:
+                    LOGGER.exception("Beacon loop iteration failed")
+
+                self._stop.wait(interval)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            if self._socket is sock:
+                self._socket = None
 
 
 rover_beacon = RoverBeacon()
