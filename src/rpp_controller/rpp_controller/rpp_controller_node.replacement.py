@@ -2,6 +2,7 @@
 
 import json
 import math
+import uuid
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
@@ -37,8 +38,11 @@ class RPPController(Node):
       - Pass-through/interpolation points never activate terminal deceleration.
       - Command exact zero when radial distance to the semantic stop goal is
         <= waypoint_tolerance_m (30 mm in rover.launch.py).
-      - If a semantic stop goal is crossed without entering the 30 mm circle,
-        stop in safe hold; do not reverse automatically.
+      - If a semantic goal is crossed, is confirmed moving away, or remains
+        stationary in the armed terminal zone without entering the 30 mm
+        circle, command a zero evaluation hold; never reverse automatically.
+      - Publish one retained, goal-identified terminal event. Mission Manager
+        owns the three-second decision window, spraying, and point outcome.
 
     Node name, executable, topics, and tablet launch contract are unchanged.
     """
@@ -47,6 +51,8 @@ class RPPController(Node):
     MAXIMUM_MOVING_SPEED_MPS = 1.00
     MAX_MOVING_HEADING_ERROR_RAD = math.radians(30.0)
     WAYPOINT_CHANGE_EPSILON_M = 0.001
+    MISSION_STATUS_TIMEOUT_SEC = 2.0
+    TERMINAL_STATUS_HEARTBEAT_SEC = 0.50
 
     def __init__(self):
         super().__init__("rpp_controller")
@@ -401,6 +407,8 @@ class RPPController(Node):
         self.declare_parameter("marking_capture_arm_distance_m", 0.30)
         self.declare_parameter("marking_capture_abort_distance_m", 0.45)
         self.declare_parameter("miss_margin_m", 0.02)
+        self.declare_parameter("terminal_moving_away_confirm_sec", 0.25)
+        self.declare_parameter("terminal_stall_confirm_sec", 0.50)
         self.declare_parameter(
             "marking_along_track_abort_m",
             0.05,
@@ -782,6 +790,12 @@ class RPPController(Node):
             self.get_parameter("marking_capture_abort_distance_m").value
         )
         self.miss_margin = float(self.get_parameter("miss_margin_m").value)
+        self.terminal_moving_away_confirm_sec = float(
+            self.get_parameter("terminal_moving_away_confirm_sec").value
+        )
+        self.terminal_stall_confirm_sec = float(
+            self.get_parameter("terminal_stall_confirm_sec").value
+        )
         self.marking_along_track_abort = float(
             self.get_parameter("marking_along_track_abort_m").value
         )
@@ -883,6 +897,12 @@ class RPPController(Node):
             self.point_event_callback,
             command_qos,
         )
+        self.create_subscription(
+            String,
+            "/mission_manager/status",
+            self.mission_status_callback,
+            retained_qos,
+        )
 
         self.velocity_pub = self.create_publisher(
             Vector3Stamped,
@@ -977,13 +997,12 @@ class RPPController(Node):
             retained_qos,
         )
 
-        # Explicit terminal-result handshake to Mission Manager.
-        # Motion ownership stays in RPP; Mission Manager still performs the
-        # authoritative 3-second verification before ACHIEVED/FAILED.
-        self.terminal_result_pub = self.create_publisher(
+        # Goal-identified terminal zero-hold status for Mission Manager.
+        # Publishing this state never changes the RPP motion command.
+        self.terminal_stop_state_pub = self.create_publisher(
             String,
-            "/rpp/terminal_result",
-            command_qos,
+            "/rpp/terminal_stop_state",
+            retained_qos,
         )
 
         self.current_x = None
@@ -1027,6 +1046,36 @@ class RPPController(Node):
         self.emergency_stop = True
         self.marking_active = False
 
+        # Mission Manager identity used to prevent a retained stop from one
+        # point or run from activating another point's evaluation window.
+        self.controller_instance_id = uuid.uuid4().hex
+        self.manager_status_rx_sequence = 0
+        self.manager_status_floor_sequence = 0
+        self.last_manager_status_time = None
+        self.manager_mission_state = ""
+        self.manager_mission_run_id = ""
+        self.manager_execution_mode = ""
+        self.manager_mission_enable = False
+        self.manager_current_path_index = None
+        self.manager_current_point_id = ""
+        self.manager_current_point_index = None
+        self.manager_current_point_state = ""
+
+        # One semantic goal owns at most one terminal event. The event ID is
+        # stable while the retained state changes from BRAKING to STATIONARY.
+        self.terminal_goal_generation = 0
+        self.terminal_event_counter = 0
+        self.terminal_event_id = None
+        self.terminal_event_identity = None
+        self.terminal_event_trigger = None
+        self.terminal_event_entered_ros_ns = None
+        self.terminal_event_published = False
+        self.terminal_last_phase = None
+        self.terminal_trigger_metrics = {}
+        self.terminal_publish_sequence = 0
+        self.terminal_last_publish_ros_ns = None
+        self.terminal_stop_consumed = False
+
         self.segment_alignment_active = True
         self.segment_alignment_pivot_complete = False
         self.segment_pivot_keeper_started_at = None
@@ -1051,11 +1100,12 @@ class RPPController(Node):
         self.marking_missed = False
         self.capture_monitor_armed = False
         self.closest_marking_distance = math.inf
+        self.terminal_moving_away_started_at = None
+        self.terminal_stall_started_at = None
 
         self.marking_stop_latched = False
         self.marking_stop_latched_at = None
         self.marking_stop_trigger_radius = None
-        self._terminal_result_sent = None
 
         # First marking state. C is captured when the mission is enabled.
         self.first_marking_completed = False
@@ -1118,6 +1168,10 @@ class RPPController(Node):
             1.0 / self.CONTROL_HZ,
             self.control_loop,
         )
+        self._clear_terminal_evaluation_hold(
+            "RPP controller initialized",
+            force=True,
+        )
         self.publish_motion_profile_monitor(0.0)
 
         self.get_logger().warn(
@@ -1127,7 +1181,8 @@ class RPPController(Node):
             "MM monitor topics: /rpp/xtrack_mm, "
             "/rpp/goal_distance_mm, "
             "/rpp/along_track_remaining_mm, "
-            "/rpp/closest_goal_distance_mm"
+            "/rpp/closest_goal_distance_mm, "
+            "/rpp/terminal_stop_state"
         )
         self.get_logger().warn(
             "First marking contract: pre-pivot C defines alignment bearing; "
@@ -1438,6 +1493,10 @@ class RPPController(Node):
             "marking_capture_arm_distance_m": (self.marking_capture_arm_distance),
             "marking_capture_abort_distance_m": (self.marking_capture_abort_distance),
             "miss_margin_m": self.miss_margin,
+            "terminal_moving_away_confirm_sec": (
+                self.terminal_moving_away_confirm_sec
+            ),
+            "terminal_stall_confirm_sec": self.terminal_stall_confirm_sec,
             "marking_along_track_abort_m": (self.marking_along_track_abort),
             "waypoint_match_tolerance_m": (self.waypoint_match_tolerance),
             "odom_timeout_sec": self.odom_timeout_sec,
@@ -1929,9 +1988,16 @@ class RPPController(Node):
                 "terminal_close_recovery_speed_mps must be positive "
                 "and <= marking_terminal_max_speed_mps"
             )
-        if self.marking_capture_arm_distance >= self.marking_capture_abort_distance:
+        if not (
+            0.0
+            < self.waypoint_tolerance
+            < self.marking_capture_arm_distance
+            < self.marking_capture_abort_distance
+        ):
             raise ValueError(
-                "marking_capture_arm_distance_m must be less than "
+                "terminal distance parameters must satisfy: "
+                "0 < waypoint_tolerance_m < "
+                "marking_capture_arm_distance_m < "
                 "marking_capture_abort_distance_m"
             )
 
@@ -2025,6 +2091,9 @@ class RPPController(Node):
             points.append((x, y))
 
         if not points:
+            self._begin_new_terminal_goal_context(
+                "Navigation path cleared"
+            )
             self.nav_path_points = []
             self.nav_path_received = False
             self.nav_path_segment_start_index = 0
@@ -2298,6 +2367,13 @@ class RPPController(Node):
                 return
             points.append((x, y))
         if not points:
+            self._begin_new_terminal_goal_context(
+                "Marking waypoint metadata cleared"
+            )
+            self.marking_waypoints = []
+            self.marking_metadata_received = False
+            self.segment_goal_number = 0
+            self.target_is_marking = False
             return
 
         previous_p1 = self.marking_waypoints[0] if self.marking_waypoints else None
@@ -2313,6 +2389,9 @@ class RPPController(Node):
                 self.segment_goal_y,
             )
             if detected_number != self.segment_goal_number:
+                self._begin_new_terminal_goal_context(
+                    "Semantic goal classification changed"
+                )
                 self.segment_goal_number = detected_number
                 self.target_is_marking = detected_number > 0
                 self.get_logger().warn(
@@ -2442,6 +2521,14 @@ class RPPController(Node):
             > self.WAYPOINT_CHANGE_EPSILON_M
         )
 
+        if changed:
+            # Invalidate the retained event while the OLD goal identity is
+            # still available, then require a fresh Manager status for the
+            # newly received semantic goal.
+            self._begin_new_terminal_goal_context(
+                "Semantic goal changed"
+            )
+
         new_number = self.find_marking_number(x, y)
 
         # Make /segment_goal sufficient by itself. This also removes any
@@ -2531,10 +2618,11 @@ class RPPController(Node):
         self.marking_missed = False
         self.capture_monitor_armed = False
         self.closest_marking_distance = math.inf
+        self.terminal_moving_away_started_at = None
+        self.terminal_stall_started_at = None
         self.marking_stop_latched = False
         self.marking_stop_latched_at = None
         self.marking_stop_trigger_radius = None
-        self._terminal_result_sent = None
         self.terminal_gate_inside_since = None
         self.terminal_gate_ready = False
         self.reset_terminal_precision_state()
@@ -2584,6 +2672,11 @@ class RPPController(Node):
             self.get_logger().warn("MISSION ENABLED" if enabled else "MISSION DISABLED")
         self.mission_enabled = enabled
 
+        if enabled != previous:
+            self._begin_new_terminal_goal_context(
+                "Mission enabled" if enabled else "Mission disabled"
+            )
+
         if enabled and not previous:
             self.terminal_gate_inside_since = None
             self.terminal_gate_ready = False
@@ -2606,14 +2699,18 @@ class RPPController(Node):
             )
         self.emergency_stop = active
         if active:
+            self._clear_terminal_evaluation_hold(
+                "Emergency stop activated",
+                consume=True,
+            )
             self.publish_stop()
 
     def marking_active_callback(self, msg):
-        """Track the active marking/spray hold.
+        """Track the physical marking/spray transaction.
 
-        /marking_active means the mission manager is currently timing a hold.
-        It is not a completion signal. P1 guidance is released only after a
-        COMPLETED point event is received from /mission_manager/point_event.
+        The three-second evaluation keeps /marking_active false. It becomes
+        true only after Mission Manager has accepted position accuracy and is
+        requesting the spray transaction. It is not a completion signal.
         """
         active = bool(msg.data)
         previous = self.marking_active
@@ -2623,9 +2720,511 @@ class RPPController(Node):
             )
 
         if active:
+            self._clear_terminal_evaluation_hold(
+                "Mission Manager accepted evaluation and started marking",
+                consume=True,
+            )
             self.reset_terminal_native_pivot()
 
         self.marking_active = active
+
+    @staticmethod
+    def _finite_or_none(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    @staticmethod
+    def _int_or_none(value):
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def mission_status_callback(self, msg):
+        """Receive authoritative run, point, and dense-path identity."""
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self.get_logger().error(
+                "IGNORED INVALID /mission_manager/status JSON"
+            )
+            return
+
+        if not isinstance(payload, dict):
+            return
+
+        run_id = payload.get("mission_run_id")
+        point_id = payload.get("current_point_id")
+
+        self.manager_mission_run_id = (
+            run_id.strip() if isinstance(run_id, str) else ""
+        )
+        self.manager_current_point_id = (
+            point_id.strip() if isinstance(point_id, str) else ""
+        )
+        self.manager_mission_state = str(
+            payload.get("state") or ""
+        ).strip().upper()
+        self.manager_execution_mode = str(
+            payload.get("execution_mode") or ""
+        ).strip().upper()
+        self.manager_current_point_state = str(
+            payload.get("current_point_state") or ""
+        ).strip().upper()
+
+        self.manager_mission_enable = payload.get("mission_enable") is True
+        self.manager_current_path_index = self._int_or_none(
+            payload.get("current_path_index")
+        )
+        self.manager_current_point_index = self._int_or_none(
+            payload.get("current_point_index")
+        )
+
+        self.manager_status_rx_sequence += 1
+        self.last_manager_status_time = self.get_clock().now()
+
+        # If RPP entered its hold before the matching retained Manager status
+        # arrived, the queued event is published here. If ownership changed,
+        # this call clears the old retained event instead.
+        self._service_terminal_evaluation_hold()
+
+    def _terminal_goal_identity(self):
+        """Return identity only when Manager and RPP own the same goal."""
+        if not self.mission_enabled or not self.manager_mission_enable:
+            return None
+
+        if not self.is_fresh(
+            self.last_manager_status_time,
+            self.MISSION_STATUS_TIMEOUT_SEC,
+        ):
+            return None
+
+        # A status older than the current semantic goal is never accepted.
+        if (
+            self.manager_status_rx_sequence
+            <= self.manager_status_floor_sequence
+        ):
+            return None
+
+        if self.manager_mission_state != "RUNNING":
+            return None
+
+        if not self.manager_mission_run_id:
+            return None
+
+        if self.nav_path_goal_index is None:
+            return None
+
+        if self.manager_current_path_index != self.nav_path_goal_index:
+            return None
+
+        goal_type = (
+            "MARKING"
+            if self.segment_goal_number is not None
+            and self.segment_goal_number > 0
+            else "DUMMY"
+        )
+
+        point_id = None
+        point_index = None
+        if goal_type == "MARKING":
+            point_index = int(self.segment_goal_number) - 1
+            point_id = f"P{int(self.segment_goal_number):04d}"
+
+            if self.manager_current_point_state not in {
+                "PENDING",
+                "ACTIVE",
+            }:
+                return None
+
+            if (
+                self.manager_current_point_index != point_index
+                or self.manager_current_point_id != point_id
+            ):
+                return None
+
+        goal_instance_id = (
+            f"{self.manager_mission_run_id}:"
+            f"{int(self.nav_path_goal_index)}:"
+            f"{point_id or 'DUMMY'}:"
+            f"{self.controller_instance_id}:"
+            f"{self.terminal_goal_generation}"
+        )
+
+        return {
+            "mission_run_id": self.manager_mission_run_id,
+            "goal_instance_id": goal_instance_id,
+            "path_index": int(self.nav_path_goal_index),
+            "point_id": point_id,
+            "point_index": point_index,
+            "goal_type": goal_type,
+            "goal_frame_id": self.local_frame,
+            "goal_number": (
+                int(self.segment_goal_number)
+                if self.segment_goal_number is not None
+                else 0
+            ),
+            "goal_x_m": self._finite_or_none(self.segment_goal_x),
+            "goal_y_m": self._finite_or_none(self.segment_goal_y),
+        }
+
+    @staticmethod
+    def _terminal_identity_key(identity):
+        if identity is None:
+            return None
+        return (
+            identity.get("mission_run_id"),
+            identity.get("goal_instance_id"),
+            identity.get("path_index"),
+            identity.get("point_id"),
+            identity.get("point_index"),
+            identity.get("goal_type"),
+        )
+
+    def _terminal_metrics(self):
+        radial_m = None
+        cross_m = None
+        along_m = None
+
+        if (
+            self.segment_goal_x is not None
+            and self.segment_goal_y is not None
+            and self.current_x is not None
+            and self.current_y is not None
+        ):
+            delta_east = self.current_x - self.segment_goal_x
+            delta_north = self.current_y - self.segment_goal_y
+            radial_m = math.hypot(delta_east, delta_north)
+
+            path_bearing = self.target_path_bearing
+            if (
+                path_bearing is None
+                and self.segment_start_x is not None
+                and self.segment_start_y is not None
+            ):
+                segment_east = self.segment_goal_x - self.segment_start_x
+                segment_north = self.segment_goal_y - self.segment_start_y
+                if math.hypot(segment_east, segment_north) > 1.0e-9:
+                    path_bearing = math.atan2(
+                        segment_north,
+                        segment_east,
+                    )
+
+            if path_bearing is not None and math.isfinite(path_bearing):
+                cross_m = (
+                    -math.sin(path_bearing) * delta_east
+                    + math.cos(path_bearing) * delta_north
+                )
+                along_m = self.along_track_remaining(
+                    path_bearing,
+                    self.segment_goal_x,
+                    self.segment_goal_y,
+                )
+
+        closest_m = self._finite_or_none(self.closest_marking_distance)
+        if closest_m is None:
+            closest_m = radial_m
+
+        speed_mps = self._finite_or_none(self.current_speed_mps)
+        odom_fresh = self.is_fresh(
+            self.last_odom_time,
+            self.odom_timeout_sec,
+        )
+        stationary = bool(
+            odom_fresh
+            and speed_mps is not None
+            and speed_mps <= self.stationary_speed_tolerance
+        )
+
+        return {
+            "rover_x_m": self._finite_or_none(self.current_x),
+            "rover_y_m": self._finite_or_none(self.current_y),
+            "radial_error_m": self._finite_or_none(radial_m),
+            "cross_track_error_m": self._finite_or_none(cross_m),
+            "along_track_remaining_m": self._finite_or_none(along_m),
+            "closest_radial_error_m": self._finite_or_none(closest_m),
+            "speed_mps": speed_mps,
+            "odom_fresh": odom_fresh,
+            "stationary": stationary,
+            "inside_tolerance": bool(
+                radial_m is not None
+                and radial_m <= self.waypoint_tolerance
+            ),
+        }
+
+    def _publish_terminal_json(self, payload):
+        message = String()
+        message.data = json.dumps(
+            payload,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        )
+        self.terminal_stop_state_pub.publish(message)
+
+    def _clear_terminal_evaluation_hold(
+        self,
+        reason,
+        *,
+        consume=False,
+        force=False,
+    ):
+        """Overwrite any retained terminal event with an INACTIVE state."""
+        should_publish = (
+            force
+            or self.terminal_event_id is not None
+            or self.terminal_event_published
+        )
+
+        if should_publish:
+            identity = self.terminal_event_identity or {}
+            self.terminal_publish_sequence += 1
+            payload = {
+                "schema_version": 1,
+                "event": "RPP_TERMINAL_STOP_STATE",
+                "event_id": self.terminal_event_id,
+                "state": "INACTIVE",
+                "phase": "NONE",
+                "transition": "CLEARED",
+                "stop_cause": "NONE",
+                "reason": str(reason),
+                "stop_commanded": False,
+                "start_evaluation_timer": False,
+                "mission_run_id": identity.get("mission_run_id"),
+                "goal_instance_id": identity.get("goal_instance_id"),
+                "path_index": identity.get("path_index"),
+                "point_id": identity.get("point_id"),
+                "point_index": identity.get("point_index"),
+                "goal_type": identity.get("goal_type"),
+                "goal_frame_id": identity.get("goal_frame_id"),
+                "goal_number": identity.get("goal_number"),
+                "goal_x_m": identity.get("goal_x_m"),
+                "goal_y_m": identity.get("goal_y_m"),
+                "execution_mode": self.manager_execution_mode or None,
+                "stationary": False,
+                "inside_tolerance": False,
+                "publish_sequence": self.terminal_publish_sequence,
+                "timestamp_ros_ns": self.get_clock().now().nanoseconds,
+            }
+            self._publish_terminal_json(payload)
+
+        self.terminal_event_id = None
+        self.terminal_event_identity = None
+        self.terminal_event_trigger = None
+        self.terminal_event_entered_ros_ns = None
+        self.terminal_event_published = False
+        self.terminal_last_phase = None
+        self.terminal_trigger_metrics = {}
+        self.terminal_last_publish_ros_ns = None
+        self.terminal_moving_away_started_at = None
+        self.terminal_stall_started_at = None
+
+        if consume:
+            self.terminal_stop_consumed = True
+
+    def _begin_new_terminal_goal_context(self, reason):
+        self._clear_terminal_evaluation_hold(reason, force=True)
+        self.terminal_goal_generation += 1
+        self.manager_status_floor_sequence = self.manager_status_rx_sequence
+        self.terminal_stop_consumed = False
+
+    def _enter_terminal_evaluation_hold(
+        self,
+        stop_cause,
+        *,
+        radial_error_m,
+        cross_track_error_m,
+        along_track_remaining_m,
+    ):
+        """Create one terminal event after RPP has commanded exact zero."""
+        if self.terminal_stop_consumed:
+            return False
+
+        if self.terminal_event_trigger is not None:
+            return False
+
+        if self.segment_goal_x is None or self.segment_goal_y is None:
+            return False
+
+        self.terminal_event_counter += 1
+        self.terminal_event_trigger = str(stop_cause).strip().upper()
+        self.terminal_event_entered_ros_ns = (
+            self.get_clock().now().nanoseconds
+        )
+        self.terminal_trigger_metrics = {
+            "radial_error_m": self._finite_or_none(radial_error_m),
+            "cross_track_error_m": self._finite_or_none(
+                cross_track_error_m
+            ),
+            "along_track_remaining_m": self._finite_or_none(
+                along_track_remaining_m
+            ),
+        }
+
+        # Usually publishes immediately. If DDS status ordering is delayed,
+        # the event remains queued until matching Manager status arrives.
+        self._service_terminal_evaluation_hold(force=True)
+        return True
+
+    def _service_terminal_evaluation_hold(self, force=False):
+        """Publish entry once, then only braking/stationary phase changes."""
+        if self.terminal_event_trigger is None:
+            return False
+
+        identity = self._terminal_goal_identity()
+        if self.terminal_event_identity is None:
+            if identity is None:
+                self.log_waiting(
+                    "terminal zero hold queued; waiting for matching "
+                    "Mission Manager run/point/path identity"
+                )
+                return False
+            self.terminal_event_identity = identity
+            self.terminal_event_id = (
+                f"{identity['goal_instance_id']}:"
+                f"terminal:{self.terminal_event_counter}"
+            )
+        elif (
+            identity is not None
+            and self._terminal_identity_key(identity)
+            != self._terminal_identity_key(self.terminal_event_identity)
+        ):
+            self._clear_terminal_evaluation_hold(
+                "Mission Manager changed goal ownership",
+                consume=True,
+            )
+            return False
+        elif (
+            identity is None
+            and self.is_fresh(
+                self.last_manager_status_time,
+                self.MISSION_STATUS_TIMEOUT_SEC,
+            )
+        ):
+            self._clear_terminal_evaluation_hold(
+                "Mission Manager no longer owns the terminal goal",
+                consume=True,
+            )
+            return False
+
+        metrics = self._terminal_metrics()
+        phase = "STATIONARY" if metrics["stationary"] else "BRAKING"
+        first_publish = not self.terminal_event_published
+        now_ns = self.get_clock().now().nanoseconds
+        heartbeat_period_ns = int(
+            self.TERMINAL_STATUS_HEARTBEAT_SEC * 1.0e9
+        )
+        heartbeat_due = (
+            self.terminal_last_publish_ros_ns is None
+            or now_ns < self.terminal_last_publish_ros_ns
+            or now_ns - self.terminal_last_publish_ros_ns
+            >= heartbeat_period_ns
+        )
+
+        if (
+            not force
+            and not first_publish
+            and phase == self.terminal_last_phase
+            and not heartbeat_due
+        ):
+            return False
+
+        identity = self.terminal_event_identity
+        radial_m = metrics["radial_error_m"]
+        cross_m = metrics["cross_track_error_m"]
+        along_m = metrics["along_track_remaining_m"]
+        closest_m = metrics["closest_radial_error_m"]
+        cause_reason = {
+            "RADIUS_CAPTURE": "RPP entered exact waypoint zero hold",
+            "GOAL_PASSED_MOVING_AWAY": (
+                "RPP passed or moved away from the terminal goal; "
+                "zero hold commanded"
+            ),
+            "STATIONARY_OUTSIDE_TOLERANCE": (
+                "Rover remained stationary in the terminal zone but outside "
+                "the waypoint tolerance; zero hold commanded"
+            ),
+        }.get(
+            self.terminal_event_trigger,
+            "RPP entered terminal zero hold",
+        )
+
+        self.terminal_publish_sequence += 1
+        payload = {
+            "schema_version": 1,
+            "event": "RPP_TERMINAL_STOP_STATE",
+            "event_id": self.terminal_event_id,
+            "state": "EVALUATION_HOLD",
+            "phase": phase,
+            "transition": "ENTERED" if first_publish else "STATUS",
+            "stop_cause": self.terminal_event_trigger,
+            "reason": cause_reason,
+            "stop_commanded": True,
+            # This remains true in every retained MARKING hold snapshot so a
+            # late/restarted Manager can recover it. Manager must de-duplicate
+            # by event_id and use entered_ros_ns as the timer origin.
+            # Dummies never start point evaluation or spraying.
+            "start_evaluation_timer": identity["goal_type"] == "MARKING",
+            **identity,
+            "execution_mode": self.manager_execution_mode or None,
+            "tolerance_m": float(self.waypoint_tolerance),
+            "tolerance_mm": float(self.waypoint_tolerance) * 1000.0,
+            "rover_x_m": metrics["rover_x_m"],
+            "rover_y_m": metrics["rover_y_m"],
+            "speed_mps": metrics["speed_mps"],
+            "odom_fresh": metrics["odom_fresh"],
+            "stationary": metrics["stationary"],
+            "inside_tolerance": metrics["inside_tolerance"],
+            "radial_error_m": radial_m,
+            "radial_error_mm": (
+                radial_m * 1000.0 if radial_m is not None else None
+            ),
+            "cross_track_error_m": cross_m,
+            "cross_track_error_mm": (
+                cross_m * 1000.0 if cross_m is not None else None
+            ),
+            "along_track_remaining_m": along_m,
+            "along_track_remaining_mm": (
+                along_m * 1000.0 if along_m is not None else None
+            ),
+            "closest_radial_error_m": closest_m,
+            "closest_radial_error_mm": (
+                closest_m * 1000.0 if closest_m is not None else None
+            ),
+            "trigger_radial_error_m": self.terminal_trigger_metrics.get(
+                "radial_error_m"
+            ),
+            "trigger_cross_track_error_m": self.terminal_trigger_metrics.get(
+                "cross_track_error_m"
+            ),
+            "trigger_along_track_remaining_m": (
+                self.terminal_trigger_metrics.get(
+                    "along_track_remaining_m"
+                )
+            ),
+            "entered_ros_ns": self.terminal_event_entered_ros_ns,
+            "publish_sequence": self.terminal_publish_sequence,
+            "timestamp_ros_ns": now_ns,
+        }
+        self._publish_terminal_json(payload)
+
+        if first_publish:
+            self.get_logger().warn(
+                "RPP TERMINAL EVALUATION HOLD PUBLISHED | "
+                f"event_id={self.terminal_event_id} | "
+                f"goal_type={identity['goal_type']} | "
+                f"point={identity['point_id']} | "
+                f"path_index={identity['path_index']} | "
+                f"cause={self.terminal_event_trigger}"
+            )
+
+        self.terminal_event_published = True
+        self.terminal_last_phase = phase
+        self.terminal_last_publish_ros_ns = now_ns
+        return True
 
     def point_event_callback(self, msg):
         """Release P1 guidance only after the verified completion event."""
@@ -2640,6 +3239,50 @@ class RPPController(Node):
             point_index = int(payload.get("point_index", -1))
         except (TypeError, ValueError):
             point_index = -1
+
+        event_run_id = payload.get("mission_run_id")
+        event_point_id = payload.get("point_id")
+        event_path_index = self._int_or_none(payload.get("path_index"))
+        event_run_id = (
+            event_run_id.strip()
+            if isinstance(event_run_id, str)
+            else ""
+        )
+        event_point_id = (
+            event_point_id.strip()
+            if isinstance(event_point_id, str)
+            else ""
+        )
+
+        identity = self.terminal_event_identity
+        same_terminal_point = bool(
+            identity is not None
+            and event_run_id == identity.get("mission_run_id")
+            and event_point_id == identity.get("point_id")
+            and event_path_index == identity.get("path_index")
+        )
+
+        matching_termination = bool(
+            event == "MISSION_TERMINATED"
+            and (
+                identity is None
+                or event_run_id == identity.get("mission_run_id")
+            )
+        )
+
+        if matching_termination or (
+            event in {
+                "COMPLETED",
+                "FAILED",
+                "ACCURACY_FAILED",
+                "SKIPPED",
+            }
+            and same_terminal_point
+        ):
+            self._clear_terminal_evaluation_hold(
+                f"Point resolved by Mission Manager: {event}",
+                consume=True,
+            )
 
         # Every successful marking ends at an exact zero-speed hold.
         # Re-arm the distance-based acceleration profile so the NEXT leg
@@ -2689,6 +3332,8 @@ class RPPController(Node):
         self.marking_missed = False
         self.capture_monitor_armed = False
         self.closest_marking_distance = math.inf
+        self.terminal_moving_away_started_at = None
+        self.terminal_stall_started_at = None
 
         self.marking_stop_latched = False
         self.marking_stop_latched_at = None
@@ -4062,57 +4707,6 @@ class RPPController(Node):
         """Compatibility helper; preserve the configured acceleration slew."""
         return self.command_speed_slew_limit(requested_speed)
 
-    def publish_terminal_result(
-        self,
-        outcome,
-        *,
-        reason,
-        target_distance,
-        signed_cross_track,
-        along_remaining,
-    ):
-        """Publish one terminal result for the active semantic goal.
-
-        This is a handshake only. Mission Manager remains authoritative for
-        the fixed 3-second verification and final ACHIEVED/FAILED decision.
-        """
-        outcome = str(outcome).strip().upper()
-        if outcome not in {"CAPTURED", "MISSED"}:
-            return
-        if self._terminal_result_sent == outcome:
-            return
-        if self.segment_goal_x is None or self.segment_goal_y is None:
-            return
-
-        payload = {
-            "outcome": outcome,
-            "reason": str(reason or ""),
-            "goal_x": float(self.segment_goal_x),
-            "goal_y": float(self.segment_goal_y),
-            "marking_number": int(self.segment_goal_number or 0),
-            "is_marking": bool((self.segment_goal_number or 0) > 0),
-            "radial_error_m": float(target_distance),
-            "cross_track_error_m": float(signed_cross_track),
-            "along_track_remaining_m": float(along_remaining),
-            "speed_mps": (
-                float(self.current_speed_mps)
-                if math.isfinite(self.current_speed_mps)
-                else None
-            ),
-            "stop_commanded": True,
-            "timestamp_unix_ns": self.get_clock().now().nanoseconds,
-        }
-        msg = String()
-        msg.data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-        self.terminal_result_pub.publish(msg)
-        self._terminal_result_sent = outcome
-        self.get_logger().warn(
-            "RPP TERMINAL RESULT -> MISSION MANAGER | "
-            f"outcome={outcome} | reason={reason} | "
-            f"radial={target_distance * 1000.0:.1f}mm | "
-            f"along={along_remaining * 1000.0:+.1f}mm"
-        )
-
     def latch_exact_marking_stop(
         self,
         target_distance,
@@ -4137,13 +4731,6 @@ class RPPController(Node):
                 f"radial={target_distance * 1000.0:.1f}mm | "
                 f"xtrack={signed_cross_track * 1000.0:+.1f}mm | "
                 f"along={along_remaining * 1000.0:+.1f}mm"
-            )
-            self.publish_terminal_result(
-                "CAPTURED",
-                reason="RADIUS_30MM_ENTRY",
-                target_distance=target_distance,
-                signed_cross_track=signed_cross_track,
-                along_remaining=along_remaining,
             )
 
         return self.marking_stop_latched
@@ -4171,6 +4758,8 @@ class RPPController(Node):
             )
 
     def control_loop(self):
+        self._service_terminal_evaluation_hold()
+
         if self.emergency_stop:
             self.publish_stop()
             self.log_waiting("emergency stop active")
@@ -4377,6 +4966,12 @@ class RPPController(Node):
 
         if goal_requires_precision_stop and self.marking_stop_latched:
             self.evaluate_latched_marking_stop(goal_distance)
+            self._enter_terminal_evaluation_hold(
+                "RADIUS_CAPTURE",
+                radial_error_m=goal_distance,
+                cross_track_error_m=goal_signed_cross_track,
+                along_track_remaining_m=goal_along_remaining,
+            )
             self.log_control(
                 mode_prefix
                 + "EXACT WP_RADIUS 30MM / ZERO LATCH / WAIT MISSION MANAGER",
@@ -4397,6 +4992,12 @@ class RPPController(Node):
             goal_along_remaining,
         ):
             self.evaluate_latched_marking_stop(goal_distance)
+            self._enter_terminal_evaluation_hold(
+                "RADIUS_CAPTURE",
+                radial_error_m=goal_distance,
+                cross_track_error_m=goal_signed_cross_track,
+                along_track_remaining_m=goal_along_remaining,
+            )
             self.log_control(
                 mode_prefix
                 + "EXACT WP_RADIUS 30MM / ZERO LATCH / WAIT MISSION MANAGER",
@@ -4431,34 +5032,104 @@ class RPPController(Node):
                     goal_distance,
                 )
 
-            crossed_goal_plane = goal_along_remaining < -self.marking_along_track_abort
-            moving_away_after_capture = (
+            terminal_now = self.get_clock().now()
+            crossed_goal_plane = (
+                goal_along_remaining < -self.marking_along_track_abort
+            )
+            moving_away_candidate = (
                 self.capture_monitor_armed
-                and goal_distance > self.closest_marking_distance + self.miss_margin
+                and goal_distance
+                > self.closest_marking_distance + self.miss_margin
             )
 
-            if crossed_goal_plane and (
-                moving_away_after_capture or not self.capture_monitor_armed
+            if moving_away_candidate:
+                if self.terminal_moving_away_started_at is None:
+                    self.terminal_moving_away_started_at = terminal_now
+                moving_away_elapsed = max(
+                    0.0,
+                    (
+                        terminal_now
+                        - self.terminal_moving_away_started_at
+                    ).nanoseconds
+                    / 1.0e9,
+                )
+            else:
+                self.terminal_moving_away_started_at = None
+                moving_away_elapsed = 0.0
+
+            moving_away_confirmed = (
+                moving_away_candidate
+                and moving_away_elapsed
+                >= self.terminal_moving_away_confirm_sec
+            )
+
+            # A physical stall inside the armed terminal zone but outside the
+            # 30 mm circle must also resolve. Do not classify stationary pivot
+            # or segment-alignment time as a terminal stall.
+            stationary_outside_candidate = (
+                self.capture_monitor_armed
+                and self.waypoint_tolerance < goal_distance
+                <= self.marking_capture_arm_distance
+                and math.isfinite(self.current_speed_mps)
+                and self.current_speed_mps
+                <= self.stationary_speed_tolerance
+                and not self.segment_alignment_active
+                and not self.terminal_native_pivot_active
+            )
+            if stationary_outside_candidate:
+                if self.terminal_stall_started_at is None:
+                    self.terminal_stall_started_at = terminal_now
+                terminal_stall_elapsed = max(
+                    0.0,
+                    (
+                        terminal_now - self.terminal_stall_started_at
+                    ).nanoseconds
+                    / 1.0e9,
+                )
+            else:
+                self.terminal_stall_started_at = None
+                terminal_stall_elapsed = 0.0
+
+            stationary_outside_confirmed = (
+                stationary_outside_candidate
+                and terminal_stall_elapsed
+                >= self.terminal_stall_confirm_sec
+            )
+            jumped_past_goal_plane = (
+                crossed_goal_plane and not self.capture_monitor_armed
+            )
+
+            if (
+                jumped_past_goal_plane
+                or moving_away_confirmed
+                or stationary_outside_confirmed
             ):
                 if not math.isfinite(self.closest_marking_distance):
                     self.closest_marking_distance = goal_distance
+                stop_cause = (
+                    "STATIONARY_OUTSIDE_TOLERANCE"
+                    if stationary_outside_confirmed
+                    else "GOAL_PASSED_MOVING_AWAY"
+                )
                 self.marking_missed = True
                 self.reset_terminal_native_pivot()
                 self.publish_stop()
-                self.publish_terminal_result(
-                    "MISSED",
-                    reason="GOAL_PASSED_MOVING_AWAY",
-                    target_distance=goal_distance,
-                    signed_cross_track=goal_signed_cross_track,
-                    along_remaining=goal_along_remaining,
+                self._enter_terminal_evaluation_hold(
+                    stop_cause,
+                    radial_error_m=goal_distance,
+                    cross_track_error_m=goal_signed_cross_track,
+                    along_track_remaining_m=goal_along_remaining,
                 )
                 self.get_logger().error(
-                    "EXACT PRECISION GOAL CROSSED / SAFE HOLD | "
+                    "PRECISION GOAL TERMINAL MISS / ZERO HOLD | "
+                    f"cause={stop_cause} | "
                     f"closest="
                     f"{self.closest_marking_distance * 1000.0:.1f}mm | "
                     f"current={goal_distance * 1000.0:.1f}mm | "
                     f"along_remaining="
-                    f"{goal_along_remaining * 1000.0:+.1f}mm"
+                    f"{goal_along_remaining * 1000.0:+.1f}mm | "
+                    f"moving_away_hold={moving_away_elapsed:.2f}s | "
+                    f"stationary_hold={terminal_stall_elapsed:.2f}s"
                 )
                 return
 
@@ -4882,47 +5553,6 @@ class RPPController(Node):
                     f"along={along_remaining * 1000.0:+.1f}mm"
                 )
 
-            if (
-                not self.capture_monitor_armed
-                and goal_distance <= self.marking_capture_arm_distance
-            ):
-                self.capture_monitor_armed = True
-                self.closest_marking_distance = goal_distance
-                self.get_logger().warn(
-                    "PRECISION-GOAL CAPTURE SAFETY MONITOR ARMED | "
-                    f"distance={goal_distance:.3f}m | "
-                    f"along={along_remaining:.3f}m"
-                )
-
-            if self.capture_monitor_armed:
-                self.closest_marking_distance = min(
-                    self.closest_marking_distance,
-                    goal_distance,
-                )
-                radial_increased = (
-                    goal_distance > self.closest_marking_distance + self.miss_margin
-                )
-                confirmed_overshoot = along_remaining < -self.marking_along_track_abort
-                if radial_increased and confirmed_overshoot:
-                    self.marking_missed = True
-                    self.reset_terminal_native_pivot()
-                    self.publish_stop()
-                    self.publish_terminal_result(
-                        "MISSED",
-                        reason="GOAL_PASSED_MOVING_AWAY",
-                        target_distance=goal_distance,
-                        signed_cross_track=signed_cross_track,
-                        along_remaining=along_remaining,
-                    )
-                    self.get_logger().error(
-                        "PRECISION GOAL PASSED WITHOUT 30MM ENTRY / SAFE HOLD | "
-                        f"closest={self.closest_marking_distance:.3f}m | "
-                        f"current={goal_distance:.3f}m | "
-                        f"along={along_remaining:.3f}m"
-                    )
-                    self.publish_terminal_state()
-                    return
-
             guidance_bearing = self.terminal_bounded_guidance(
                 path_bearing,
                 xtrack_guidance_bearing,
@@ -5033,6 +5663,11 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node._clear_terminal_evaluation_hold(
+            "RPP controller shutting down",
+            consume=True,
+            force=True,
+        )
         node.publish_stop()
         node.destroy_node()
         if rclpy.ok():

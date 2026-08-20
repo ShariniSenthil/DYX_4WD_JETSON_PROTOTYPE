@@ -24,6 +24,7 @@ deceleration, pivot commands, heading alignment or cross-track correction.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import threading
@@ -60,6 +61,7 @@ class MissionManager(Node):
     SERVICE_RESPONSE_TIMEOUT_SEC = 5.0
     VEHICLE_STATE_CONFIRM_TIMEOUT_SEC = 3.0
     OFFBOARD_BEFORE_ARM_SETTLE_SEC = 0.50
+    GOAL_PLANE_OVERSHOOT_TRIGGER_M = 0.020
 
     POINT_PASS_THROUGH = 0
     POINT_DUMMY_ALIGNMENT = 1
@@ -241,6 +243,13 @@ class MissionManager(Node):
             retained_qos,
             callback_group=self._io_group,
         )
+        self.create_subscription(
+            String,
+            "/rpp/terminal_result",
+            self._rpp_terminal_result_callback,
+            command_qos,
+            callback_group=self._io_group,
+        )
 
         # ----------------------------------------------------------
         # Outputs
@@ -329,6 +338,14 @@ class MissionManager(Node):
         self._marking_path_index_by_number: list[int] = []
         self._semantic_path_indices: list[int] = []  # dummy + real marking only
         self._point_status: list[str] = []
+        # Accuracy snapshots are captured exactly once for each uploaded CSV
+        # point.  They are intentionally independent from the live working
+        # metrics so safety-gate changes cannot erase the evidence used by the
+        # final mission report.
+        self._point_accuracy_snapshots: list[Optional[dict[str, Any]]] = []
+        self._point_results: list[Optional[dict[str, Any]]] = []
+        self._last_point_result: Optional[dict[str, Any]] = None
+        self._last_termination_report: Optional[dict[str, Any]] = None
 
         # ----------------------------------------------------------
         # Mission runtime
@@ -344,6 +361,7 @@ class MissionManager(Node):
         self._active_marking_number: Optional[int] = None
         self._last_completed_marking_number: Optional[int] = None
         self._mission_run_id = ""
+        self._mission_started_unix_ns: Optional[int] = None
 
         # Precision point transaction:
         #   1) first exact arrival starts a FIXED 3-second verification window;
@@ -367,6 +385,12 @@ class MissionManager(Node):
         self._marking_combined_error_m = math.inf
         self._marking_radial_error_m = math.inf
         self._marking_error_valid = False
+
+        # Latest explicit RPP terminal handshake for the current semantic goal.
+        # It can start the same 3-second verification after an RPP miss, but it
+        # never bypasses Mission Manager's own final position/speed re-check.
+        self._rpp_terminal_result: Optional[dict[str, Any]] = None
+        self._rpp_terminal_result_last_rx_monotonic: Optional[float] = None
 
         self._spray_controller_ready = False
         self._spray_controller_state: Optional[str] = None
@@ -565,7 +589,6 @@ class MissionManager(Node):
                     "RUNNING",
                     "PAUSED",
                     "WAITING_FOR_NEXT",
-                    "WAITING_FOR_SKIP",
                 }:
                     self._enter_error("Trajectory readiness lost during active mission")
                 return
@@ -577,7 +600,7 @@ class MissionManager(Node):
         self._pending_mission_waypoints = None
         self._pending_path_types = None
         self._pending_marking_indices = None
-        if self._state in {"RUNNING", "PAUSED", "WAITING_FOR_NEXT", "WAITING_FOR_SKIP"}:
+        if self._state in {"RUNNING", "PAUSED", "WAITING_FOR_NEXT"}:
             self._enter_error(f"Prepared trajectory cleared while active: {reason}")
             return
         self._clear_loaded_runtime(reason)
@@ -599,7 +622,7 @@ class MissionManager(Node):
         path_types = list(self._pending_path_types or [])
         marking_indices = list(self._pending_marking_indices or [])
 
-        if self._state in {"RUNNING", "PAUSED", "WAITING_FOR_NEXT", "WAITING_FOR_SKIP"}:
+        if self._state in {"RUNNING", "PAUSED", "WAITING_FOR_NEXT"}:
             self.get_logger().error("Rejected replacement mission while active")
             return
         if not navigation_path or not mission_waypoints:
@@ -663,6 +686,9 @@ class MissionManager(Node):
         self._marking_path_index_by_number = marking_path_index_by_number
         self._semantic_path_indices = semantic_indices
         self._point_status = ["PENDING"] * len(mission_waypoints)
+        self._point_accuracy_snapshots = [None] * len(mission_waypoints)
+        self._point_results = [None] * len(mission_waypoints)
+        self._last_point_result = None
         self._reset_execution_progress()
         self._state = "READY"
         self._last_error = None
@@ -730,7 +756,6 @@ class MissionManager(Node):
                 "RUNNING",
                 "PAUSED",
                 "WAITING_FOR_NEXT",
-                "WAITING_FOR_SKIP",
             }:
                 self.get_logger().warn(
                     "Execution mode cannot change during active mission"
@@ -739,6 +764,42 @@ class MissionManager(Node):
             self._execution_mode = mode
             self._last_message = f"Execution mode set to {mode}"
             self._publish_status(force=True)
+
+    def _rpp_terminal_result_callback(self, message: String) -> None:
+        """Receive RPP CAPTURED/MISSED stop results for the active goal.
+
+        This result is only a terminal trigger. The Mission Manager still
+        waits for a stationary chassis and then runs its fixed 3-second
+        verification before deciding ACHIEVED versus FAILED.
+        """
+        try:
+            payload = json.loads(message.data)
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+
+        outcome = str(payload.get("outcome", "")).strip().upper()
+        if outcome not in {"CAPTURED", "MISSED"}:
+            return
+        try:
+            goal_x = float(payload.get("goal_x"))
+            goal_y = float(payload.get("goal_y"))
+        except (TypeError, ValueError):
+            return
+        if not all(math.isfinite(v) for v in (goal_x, goal_y)):
+            return
+
+        with self._lock:
+            if not self._navigation_path:
+                return
+            if not (0 <= self._current_path_index < len(self._navigation_path)):
+                return
+            current = self._navigation_path[self._current_path_index]
+            if math.hypot(goal_x - current[0], goal_y - current[1]) > 0.005:
+                return
+            self._rpp_terminal_result = copy.deepcopy(payload)
+            self._rpp_terminal_result_last_rx_monotonic = time.monotonic()
 
     # ==============================================================
     # Spray controller handshake
@@ -1067,7 +1128,6 @@ class MissionManager(Node):
         self._emergency_stop = bool(emergency_stop)
         self._mission_enable = bool(mission_enable) and not self._emergency_stop
         if not self._mission_enable:
-            self._reset_arrival_state()
             self._publish_marking_active(False)
         self._publish_safety()
 
@@ -1129,7 +1189,7 @@ class MissionManager(Node):
             f"PX4 state confirmation timeout: mode={self._px4_mode}, armed={self._px4_armed}"
         )
 
-    def _best_effort_px4_disarm_only(self) -> list[str]:
+    def _best_effort_px4_disarm_only(self) -> tuple[bool, list[str]]:
         """Best-effort DISARM without changing PX4 flight mode.
 
         Mission Manager is never allowed to request MANUAL. Mode changes after
@@ -1142,7 +1202,22 @@ class MissionManager(Node):
                 self._wait_for_vehicle_state(expected_armed=False)
         except Exception as exc:
             warnings.append(f"disarm warning: {exc}")
-        return warnings
+        # A service ACK (or the default False value before any state message)
+        # is not evidence. Only a fresh, connected MAVROS state confirming
+        # armed=False authorizes a "disarmed" claim.
+        state_age = self._age(self._last_fcu_rx_monotonic)
+        disarm_confirmed = (
+            self._fcu_connected
+            and state_age <= self.FCU_STATE_STALE_SEC
+            and not self._px4_armed
+        )
+        if not disarm_confirmed:
+            warnings.append(
+                "disarm confirmation unavailable: "
+                f"connected={self._fcu_connected}, armed={self._px4_armed}, "
+                f"state_age_sec={state_age:.2f}"
+            )
+        return disarm_confirmed, warnings
 
     def _clear_after_stop(self, *, completed: bool, message: str) -> None:
         """Clear all Mission Manager mission/runtime state after STOP.
@@ -1163,11 +1238,15 @@ class MissionManager(Node):
         self._marking_path_index_by_number = []
         self._semantic_path_indices = []
         self._point_status = []
+        self._point_accuracy_snapshots = []
+        self._point_results = []
+        self._last_point_result = None
 
         self._current_path_index = 0
         self._active_marking_number = None
         self._last_completed_marking_number = None
         self._mission_run_id = ""
+        self._mission_started_unix_ns = None
 
         self._spray_success_keys.clear()
         self._spray_failure_keys.clear()
@@ -1191,7 +1270,9 @@ class MissionManager(Node):
             self._publish_mission_complete(False)
         self._publish_status(force=True)
 
-    def _execute_stop_cleanup(self, *, completed: bool, source: str) -> list[str]:
+    def _execute_stop_cleanup(
+        self, *, completed: bool, source: str
+    ) -> tuple[bool, list[str]]:
         """Physical STOP contract shared by operator STOP and auto-completion.
 
         Contract:
@@ -1200,8 +1281,9 @@ class MissionManager(Node):
           marking_active = false
           PX4 DISARM
           PX4 MODE UNCHANGED BY MISSION MANAGER
-          clear Mission Manager runtime -> EMPTY
+          clear Mission Manager runtime -> EMPTY only after DISARM confirmation
         """
+        self._reset_point_timers()
         self._set_safety(emergency_stop=True, mission_enable=False)
         self._publish_marking_active(False)
 
@@ -1216,22 +1298,58 @@ class MissionManager(Node):
                 "Operator STOP requested before normal mission completion",
             )
 
-        warnings = self._best_effort_px4_disarm_only()
+        disarm_confirmed, warnings = self._best_effort_px4_disarm_only()
 
         with self._lock:
             if completed:
-                message = (
-                    "Mission completed; automatic STOP executed; PX4 disarmed; "
-                    "PX4 mode unchanged by Mission Manager"
-                )
+                if disarm_confirmed:
+                    message = (
+                        "Mission completed; automatic STOP executed; PX4 disarm "
+                        "confirmed; PX4 mode unchanged by Mission Manager"
+                    )
+                else:
+                    message = (
+                        "Mission completed; automatic STOP executed; PX4 DISARM "
+                        "NOT CONFIRMED; hard stop remains asserted; PX4 mode "
+                        "unchanged by Mission Manager"
+                    )
             else:
-                message = (
-                    "Mission stopped by operator; PX4 disarmed; "
-                    "PX4 mode unchanged by Mission Manager"
+                if disarm_confirmed:
+                    message = (
+                        "Mission stopped by operator; PX4 disarm confirmed; "
+                        "PX4 mode unchanged by Mission Manager"
+                    )
+                else:
+                    message = (
+                        "Mission stopped by operator; PX4 DISARM NOT CONFIRMED; "
+                        "hard stop remains asserted; PX4 mode unchanged by "
+                        "Mission Manager"
+                    )
+            if not disarm_confirmed:
+                # The mission is not terminated until MAVROS confirms DISARM.
+                # Retain all runtime/results so STOP can be retried and the
+                # failure can be diagnosed while the hard stop stays asserted.
+                if not completed:
+                    self._state = "ERROR"
+                self._last_error = message
+                self._last_message = message + "; press STOP to retry disarm"
+                self._emit_system_event(
+                    "MISSION_TERMINATION_BLOCKED",
+                    self._last_message,
                 )
+                self._publish_status(force=True)
+                return False, warnings
+
+            self._emit_mission_terminated(
+                completed=completed,
+                source=source,
+                disarm_confirmed=True,
+                warnings=warnings,
+                message=message,
+            )
             self._clear_after_stop(completed=completed, message=message)
 
-        return warnings
+        return True, warnings
 
     # ==============================================================
     # Services
@@ -1253,8 +1371,6 @@ class MissionManager(Node):
                     raise RuntimeError("Manual mission waiting for NEXT")
                 if self._state == "ERROR":
                     raise RuntimeError("Mission in ERROR; clear/prepare again")
-                if self._state == "WAITING_FOR_SKIP":
-                    raise RuntimeError("Point waiting for SKIP; use SKIP or STOP")
                 if self._px4_armed:
                     raise RuntimeError(
                         "START requires PX4 disarmed so sequence is OFFBOARD then ARM"
@@ -1298,8 +1414,13 @@ class MissionManager(Node):
 
             with self._lock:
                 self._point_status = ["PENDING"] * len(self._mission_waypoints)
+                self._point_accuracy_snapshots = [None] * len(self._mission_waypoints)
+                self._point_results = [None] * len(self._mission_waypoints)
+                self._last_point_result = None
+                self._last_termination_report = None
                 self._reset_execution_progress()
                 self._mission_run_id = uuid.uuid4().hex
+                self._mission_started_unix_ns = time.time_ns()
                 self._spray_success_keys.clear()
                 self._spray_failure_keys.clear()
                 self._pause_reason = None
@@ -1319,7 +1440,7 @@ class MissionManager(Node):
         except Exception as exc:
             failed_stage = self._start_stage
             self._set_safety(emergency_stop=True, mission_enable=False)
-            cleanup = self._best_effort_px4_disarm_only()
+            cleanup_disarm_confirmed, cleanup = self._best_effort_px4_disarm_only()
             with self._lock:
                 if (
                     self._navigation_path
@@ -1331,7 +1452,10 @@ class MissionManager(Node):
                 self._last_message = f"Start blocked at {failed_stage}: {exc}"
                 self._start_failed_stage = failed_stage
                 self._start_stage = "FAILED"
-                self._start_debug = {"cleanup_warnings": cleanup}
+                self._start_debug = {
+                    "cleanup_disarm_confirmed": cleanup_disarm_confirmed,
+                    "cleanup_warnings": cleanup,
+                }
                 self._publish_status(force=True)
             response.success = False
             response.message = self._last_message
@@ -1348,6 +1472,7 @@ class MissionManager(Node):
             self._pause_reason = "OPERATOR"
             self._resume_available = True
             self._state = "PAUSED"
+            self._reset_point_timers()
             self._set_safety(emergency_stop=False, mission_enable=False)
             self._last_message = "Mission paused by operator; progress preserved"
             self._publish_goal()
@@ -1482,17 +1607,12 @@ class MissionManager(Node):
     def _skip_point_service(
         self, _request: Trigger.Request, response: Trigger.Response
     ) -> Trigger.Response:
-        """Skip the current marking without imposing an RTK/motion-health gate.
-
-        SKIP changes mission sequencing only. If the mission was already
-        PAUSED, it stays PAUSED and motion stays disabled.
-        """
+        """Resolve the current point as SKIPPED, including an active point."""
         with self._lock:
             if self._state not in {
                 "RUNNING",
                 "PAUSED",
                 "WAITING_FOR_NEXT",
-                "WAITING_FOR_SKIP",
             }:
                 response.success = False
                 response.message = "Mission is not active"
@@ -1512,12 +1632,70 @@ class MissionManager(Node):
                 response.message = "Current point already terminal"
                 return response
 
-            self._point_status[marking_number] = "SKIPPED"
             path_index = self._marking_path_index_by_number[marking_number]
-            self._emit_point_event("SKIPPED", marking_number, path_index)
+            # SKIP removes spray permission immediately, even if requested
+            # while the current point transaction is active.
+            self._publish_marking_active(False)
+            (
+                self._marking_xtrack_m,
+                self._marking_along_error_m,
+                self._marking_combined_error_m,
+                self._marking_radial_error_m,
+            ) = self._marking_error_components(marking_number)
+            accuracy = self._capture_accuracy_snapshot(
+                marking_number=marking_number,
+                path_index=path_index,
+                outcome="NOT_EVALUATED",
+                reason="OPERATOR_SKIP",
+            )
+            point_id = f"P{marking_number+1:04d}"
+            spray_key = (self._mission_run_id, point_id)
+            if spray_key in self._spray_success_keys:
+                spray = self._spray_outcome_snapshot(
+                    attempted=True,
+                    outcome="SUCCESS",
+                )
+            elif spray_key in self._spray_failure_keys:
+                spray = self._spray_outcome_snapshot(
+                    attempted=True,
+                    outcome="FAILED",
+                    reason=self._spray_failure_keys[spray_key],
+                )
+            elif self._spray_request_started is not None:
+                spray = self._spray_outcome_snapshot(
+                    attempted=True,
+                    outcome="ABORTED_BY_SKIP",
+                    reason="OPERATOR_SKIP",
+                )
+            else:
+                spray = self._spray_outcome_snapshot(
+                    attempted=False,
+                    outcome="NOT_ATTEMPTED_SKIPPED",
+                    reason="OPERATOR_SKIP",
+                )
+
+            self._point_status[marking_number] = "SKIPPED"
+            point_result = self._store_point_result(
+                marking_number=marking_number,
+                path_index=path_index,
+                point_outcome="SKIPPED",
+                accuracy=accuracy,
+                spray=spray,
+            )
+            self._emit_point_event(
+                "SKIPPED",
+                marking_number,
+                path_index,
+                reason="OPERATOR_SKIP",
+                accuracy=accuracy,
+                spray=spray,
+                point_result=point_result,
+            )
             if self._current_path_index <= path_index:
                 self._current_path_index = self._next_semantic_index(path_index + 1)
 
+            # This is an actual point advance, so live per-point working state
+            # can now be reset. Immutable snapshots/results remain in history.
             self._reset_arrival_state()
             self._publish_marking_active(False)
 
@@ -1526,7 +1704,21 @@ class MissionManager(Node):
                 response.message = f"P{marking_number+1:04d} skipped; mission completed"
                 return response
 
-            if previous_state == "PAUSED":
+            if self._execution_mode == "MANUAL":
+                self._state = "WAITING_FOR_NEXT"
+                self._pause_reason = None
+                self._resume_available = False
+                # SKIP selects the next point; it must never release an
+                # independently asserted emergency-stop latch.
+                self._set_safety(
+                    emergency_stop=self._emergency_stop,
+                    mission_enable=False,
+                )
+                self._last_message = (
+                    f"{point_id} skipped; next point selected with motion "
+                    "disabled; waiting for NEXT"
+                )
+            elif previous_state == "PAUSED":
                 # Preserve the reason that caused the pause.
                 self._state = "PAUSED"
                 self._pause_reason = previous_pause_reason
@@ -1535,13 +1727,14 @@ class MissionManager(Node):
                     emergency_stop=self._emergency_stop,
                     mission_enable=False,
                 )
+                self._last_message = f"{point_id} skipped; mission remains paused"
             elif previous_state == "WAITING_FOR_NEXT":
                 self._state = "WAITING_FOR_NEXT"
                 self._set_safety(emergency_stop=False, mission_enable=False)
-            elif previous_state == "WAITING_FOR_SKIP":
-                # User explicitly chose SKIP after the 3-second verification
-                # failed. If RTK + PX4 control are still healthy, immediately
-                # continue to the next point; no extra NEXT press is required.
+                self._last_message = f"{point_id} skipped; waiting for NEXT"
+            else:
+                # AUTO SKIP resumes the next point immediately when the control
+                # contract is healthy; otherwise it remains safely PAUSED.
                 rtk_ok, rtk_reason = self._rtk_motion_ok()
                 if (
                     rtk_ok
@@ -1556,6 +1749,7 @@ class MissionManager(Node):
                         emergency_stop=False,
                         mission_enable=True,
                     )
+                    self._last_message = f"{point_id} skipped; continuing automatically"
                 else:
                     self._state = "PAUSED"
                     self._pause_reason = "SKIP_HEALTH_BLOCK"
@@ -1569,13 +1763,7 @@ class MissionManager(Node):
                         f"is paused: RTK={rtk_reason}, mode={self._px4_mode}, "
                         f"armed={self._px4_armed}"
                     )
-            else:
-                # RUNNING mission: SKIP immediately selects the next point.
-                self._state = "RUNNING"
-                self._pause_reason = None
-                self._resume_available = False
 
-            self._last_message = f"P{marking_number+1:04d} skipped"
             self._publish_goal()
             self._publish_runtime_path()
             self._publish_status(force=True)
@@ -1589,17 +1777,18 @@ class MissionManager(Node):
     ) -> Trigger.Response:
         """Operator STOP at any point in the mission.
 
-        STOP never requests MANUAL. It commands zero via the safety gates,
-        disarms PX4, clears the active/prepared Mission Manager mission and
-        leaves PX4 mode ownership to the RC/operator/PX4.
+        STOP never requests MANUAL. It disables mission motion, asserts the
+        hard-stop output, and requests PX4 DISARM. Runtime is cleared only
+        after MAVROS confirms the disarm; PX4 mode ownership remains with the
+        RC/operator/PX4.
         """
         was_completed = self._state == "COMPLETED"
-        warnings = self._execute_stop_cleanup(
+        terminated, warnings = self._execute_stop_cleanup(
             completed=was_completed,
             source="OPERATOR",
         )
 
-        response.success = True
+        response.success = terminated
         response.message = self._last_message
         if warnings:
             response.message += "; " + "; ".join(warnings)
@@ -1613,7 +1802,6 @@ class MissionManager(Node):
                 "RUNNING",
                 "PAUSED",
                 "WAITING_FOR_NEXT",
-                "WAITING_FOR_SKIP",
             }:
                 response.success = False
                 response.message = "Stop mission before Clear"
@@ -1634,6 +1822,7 @@ class MissionManager(Node):
         self, _request: Trigger.Request, response: Trigger.Response
     ) -> Trigger.Response:
         with self._lock:
+            self._reset_point_timers()
             self._set_safety(emergency_stop=True, mission_enable=False)
             if self._state == "RUNNING":
                 self._state = "PAUSED"
@@ -1715,17 +1904,24 @@ class MissionManager(Node):
         number = self._current_or_next_marking_number()
         return f"P{number+1:04d}" if number is not None else None
 
-    def _reset_arrival_state(self) -> None:
+    def _reset_point_timers(self) -> None:
+        """Reset transient timing/actuation state, never accuracy history."""
         self._arrival_settle_started = None
         self._arrival_settle_elapsed_sec = 0.0
         self._marking_hold_started = None
         self._marking_hold_elapsed_sec = 0.0
         self._spray_request_started = None
+
+    def _reset_arrival_state(self) -> None:
+        """Reset working state after an actual point/mission transition."""
+        self._reset_point_timers()
         self._marking_error_valid = False
         self._marking_xtrack_m = math.inf
         self._marking_along_error_m = math.inf
         self._marking_combined_error_m = math.inf
         self._marking_radial_error_m = math.inf
+        self._rpp_terminal_result = None
+        self._rpp_terminal_result_last_rx_monotonic = None
 
     def _reset_execution_progress(self) -> None:
         self._current_path_index = self._next_semantic_index(0)
@@ -1743,8 +1939,12 @@ class MissionManager(Node):
         self._marking_path_index_by_number = []
         self._semantic_path_indices = []
         self._point_status = []
+        self._point_accuracy_snapshots = []
+        self._point_results = []
+        self._last_point_result = None
         self._state = "EMPTY"
         self._mission_run_id = ""
+        self._mission_started_unix_ns = None
         self._current_path_index = 0
         self._active_marking_number = None
         self._last_error = None
@@ -1768,11 +1968,25 @@ class MissionManager(Node):
         dy = self._y - target[1]
         radial = math.hypot(dx, dy)
 
-        if marking_number == 0:
-            # P1 has no previous CSV marking segment. Reporting only.
+        # Accuracy is resolved in the final incoming NAVIGATION segment, not
+        # the previous CSV-marking segment.  This handles P1 correctly because
+        # trajectory_generator includes the prepared rover-start approach in
+        # /nav_path, and it also handles dummy/extension geometry between CSV
+        # points.  Scan backwards over any coincident samples defensively.
+        if not (0 <= marking_number < len(self._marking_path_index_by_number)):
             return 0.0, radial, radial, radial
 
-        start = self._mission_waypoints[marking_number - 1]
+        path_index = self._marking_path_index_by_number[marking_number]
+        start: Optional[tuple[float, float]] = None
+        for candidate_index in range(path_index - 1, -1, -1):
+            candidate = self._navigation_path[candidate_index]
+            if self._distance(candidate, target) > 1.0e-9:
+                start = candidate
+                break
+
+        if start is None:
+            return 0.0, radial, radial, radial
+
         sx = target[0] - start[0]
         sy = target[1] - start[1]
         length = math.hypot(sx, sy)
@@ -1784,6 +1998,107 @@ class MissionManager(Node):
         xtrack = -dx * uy + dy * ux
         combined = math.hypot(xtrack, along)
         return xtrack, along, combined, radial
+
+    @staticmethod
+    def _finite_number(value: float) -> Optional[float]:
+        value = float(value)
+        return value if math.isfinite(value) else None
+
+    def _capture_accuracy_snapshot(
+        self,
+        *,
+        marking_number: int,
+        path_index: int,
+        outcome: str,
+        reason: Optional[str],
+    ) -> dict[str, Any]:
+        """Capture one immutable accuracy decision for a CSV point."""
+        if 0 <= marking_number < len(self._point_accuracy_snapshots):
+            existing = self._point_accuracy_snapshots[marking_number]
+            if existing is not None:
+                return copy.deepcopy(existing)
+
+        radial_m = self._finite_number(self._marking_radial_error_m)
+        xtrack_m = self._finite_number(self._marking_xtrack_m)
+        along_m = self._finite_number(self._marking_along_error_m)
+        combined_m = self._finite_number(self._marking_combined_error_m)
+        snapshot: dict[str, Any] = {
+            "outcome": str(outcome).upper(),
+            "reason": reason,
+            "point_id": f"P{marking_number+1:04d}",
+            "point_index": marking_number,
+            "path_index": path_index,
+            "timestamp_unix_ns": time.time_ns(),
+            "tolerance_m": self.marking_tolerance_m,
+            "tolerance_mm": self.marking_tolerance_m * 1000.0,
+            "radial_error_m": radial_m,
+            "radial_error_mm": radial_m * 1000.0 if radial_m is not None else None,
+            "cross_track_error_m": xtrack_m,
+            "cross_track_error_mm": (
+                xtrack_m * 1000.0 if xtrack_m is not None else None
+            ),
+            "along_track_error_m": along_m,
+            "along_track_error_mm": along_m * 1000.0 if along_m is not None else None,
+            "combined_error_m": combined_m,
+            "combined_error_mm": (
+                combined_m * 1000.0 if combined_m is not None else None
+            ),
+            "speed_mps": self._finite_number(self._speed_mps),
+            "stationary": (
+                math.isfinite(self._speed_mps)
+                and self._speed_mps <= self.stationary_speed_tolerance_mps
+            ),
+            "verification_elapsed_sec": self._marking_hold_elapsed_sec,
+            "verification_required_sec": self.marking_hold_sec,
+        }
+        if 0 <= marking_number < len(self._point_accuracy_snapshots):
+            self._point_accuracy_snapshots[marking_number] = copy.deepcopy(snapshot)
+        return copy.deepcopy(snapshot)
+
+    def _spray_outcome_snapshot(
+        self,
+        *,
+        attempted: bool,
+        outcome: str,
+        reason: Optional[str] = None,
+    ) -> dict[str, Any]:
+        elapsed_sec = 0.0
+        if attempted and self._spray_request_started is not None:
+            elapsed_sec = max(
+                0.0,
+                time.monotonic() - self._spray_request_started,
+            )
+        return {
+            "attempted": bool(attempted),
+            "outcome": str(outcome).upper(),
+            "reason": reason,
+            "required": self.spray_required,
+            "elapsed_sec": elapsed_sec,
+            "timestamp_unix_ns": time.time_ns(),
+        }
+
+    def _store_point_result(
+        self,
+        *,
+        marking_number: int,
+        path_index: int,
+        point_outcome: str,
+        accuracy: dict[str, Any],
+        spray: dict[str, Any],
+    ) -> dict[str, Any]:
+        result = {
+            "point_id": f"P{marking_number+1:04d}",
+            "point_index": marking_number,
+            "path_index": path_index,
+            "point_outcome": str(point_outcome).upper(),
+            "timestamp_unix_ns": time.time_ns(),
+            "accuracy": copy.deepcopy(accuracy),
+            "spray": copy.deepcopy(spray),
+        }
+        if 0 <= marking_number < len(self._point_results):
+            self._point_results[marking_number] = copy.deepcopy(result)
+        self._last_point_result = copy.deepcopy(result)
+        return copy.deepcopy(result)
 
     # ==============================================================
     # Publishers / events / status
@@ -1842,7 +2157,60 @@ class MissionManager(Node):
         path_index: int,
         *,
         reason: Optional[str] = None,
+        accuracy: Optional[dict[str, Any]] = None,
+        spray: Optional[dict[str, Any]] = None,
+        point_result: Optional[dict[str, Any]] = None,
     ) -> None:
+        accuracy_payload = (
+            copy.deepcopy(accuracy)
+            if accuracy is not None
+            else {
+                "outcome": "UNSPECIFIED",
+                "reason": reason,
+                "tolerance_m": self.marking_tolerance_m,
+                "tolerance_mm": self.marking_tolerance_m * 1000.0,
+                "radial_error_m": self._finite_number(self._marking_radial_error_m),
+                "radial_error_mm": (
+                    self._marking_radial_error_m * 1000.0
+                    if math.isfinite(self._marking_radial_error_m)
+                    else None
+                ),
+                "cross_track_error_m": self._finite_number(self._marking_xtrack_m),
+                "cross_track_error_mm": (
+                    self._marking_xtrack_m * 1000.0
+                    if math.isfinite(self._marking_xtrack_m)
+                    else None
+                ),
+                "along_track_error_m": self._finite_number(self._marking_along_error_m),
+                "along_track_error_mm": (
+                    self._marking_along_error_m * 1000.0
+                    if math.isfinite(self._marking_along_error_m)
+                    else None
+                ),
+                "combined_error_m": self._finite_number(self._marking_combined_error_m),
+                "combined_error_mm": (
+                    self._marking_combined_error_m * 1000.0
+                    if math.isfinite(self._marking_combined_error_m)
+                    else None
+                ),
+                "speed_mps": self._finite_number(self._speed_mps),
+            }
+        )
+        spray_payload = (
+            copy.deepcopy(spray)
+            if spray is not None
+            else {
+                "attempted": self._spray_request_started is not None,
+                "outcome": "UNSPECIFIED",
+                "reason": None,
+                "required": self.spray_required,
+                "elapsed_sec": (
+                    max(0.0, time.monotonic() - self._spray_request_started)
+                    if self._spray_request_started is not None
+                    else 0.0
+                ),
+            }
+        )
         payload = {
             "event": event,
             "mission_run_id": self._mission_run_id or None,
@@ -1851,22 +2219,19 @@ class MissionManager(Node):
             "path_index": path_index,
             "state": self._state,
             "timestamp_unix_ns": time.time_ns(),
-            "radial_error_m": (
-                round(self._marking_radial_error_m, 6)
-                if math.isfinite(self._marking_radial_error_m)
-                else None
-            ),
+            "radial_error_m": accuracy_payload.get("radial_error_m"),
+            "radial_error_mm": accuracy_payload.get("radial_error_mm"),
             "reason": reason,
-            "xtrack_m": (
-                round(self._marking_xtrack_m, 6)
-                if math.isfinite(self._marking_xtrack_m)
-                else None
-            ),
-            "along_error_m": (
-                round(self._marking_along_error_m, 6)
-                if math.isfinite(self._marking_along_error_m)
-                else None
-            ),
+            "xtrack_m": accuracy_payload.get("cross_track_error_m"),
+            "xtrack_mm": accuracy_payload.get("cross_track_error_mm"),
+            "along_error_m": accuracy_payload.get("along_track_error_m"),
+            "along_error_mm": accuracy_payload.get("along_track_error_mm"),
+            "combined_error_m": accuracy_payload.get("combined_error_m"),
+            "combined_error_mm": accuracy_payload.get("combined_error_mm"),
+            "accuracy": accuracy_payload,
+            "spray": spray_payload,
+            "spray_outcome": spray_payload.get("outcome"),
+            "point_result": copy.deepcopy(point_result),
         }
         msg = String()
         msg.data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
@@ -1897,10 +2262,77 @@ class MissionManager(Node):
         msg.data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
         self.point_event_pub.publish(msg)
 
+    def _emit_mission_terminated(
+        self,
+        *,
+        completed: bool,
+        source: str,
+        disarm_confirmed: bool,
+        warnings: list[str],
+        message: str,
+    ) -> None:
+        """Publish the final, post-disarm-attempt record before runtime is cleared."""
+        terminated_at_unix_ns = time.time_ns()
+        completed_count = self._point_status.count("COMPLETED")
+        skipped_count = self._point_status.count("SKIPPED")
+        failed_count = self._point_status.count("FAILED")
+        total_count = len(self._point_status)
+        resolved_count = completed_count + skipped_count + failed_count
+        mission_summary = {
+            "mission_run_id": self._mission_run_id or None,
+            "state": self._state,
+            "execution_mode": self._execution_mode,
+            "normal_completion": bool(completed),
+            "termination_source": source,
+            "started_at_unix_ns": self._mission_started_unix_ns,
+            "terminated_at_unix_ns": terminated_at_unix_ns,
+            "point_status": list(self._point_status),
+            "point_accuracy_snapshots": copy.deepcopy(self._point_accuracy_snapshots),
+            "point_results": copy.deepcopy(self._point_results),
+            "total_points": total_count,
+            "resolved_points": resolved_count,
+            "completed_points": completed_count,
+            "skipped_points": skipped_count,
+            "failed_points": failed_count,
+            "remaining_points": max(0, total_count - resolved_count),
+            "progress_percent": (
+                round(100.0 * resolved_count / total_count, 2) if total_count else 0.0
+            ),
+            "disarm_confirmed": bool(disarm_confirmed),
+            "px4_mode": self._px4_mode,
+            "px4_armed": self._px4_armed,
+        }
+        payload = {
+            "event": "MISSION_TERMINATED",
+            "mission_run_id": self._mission_run_id or None,
+            "state": self._state,
+            "source": source,
+            "completed": bool(completed),
+            "disarm_confirmed": bool(disarm_confirmed),
+            "px4_mode": self._px4_mode,
+            "px4_armed": self._px4_armed,
+            "message": message,
+            "warnings": list(warnings),
+            "mission_summary": mission_summary,
+            "point_status": list(self._point_status),
+            "point_accuracy_snapshots": copy.deepcopy(self._point_accuracy_snapshots),
+            "point_results": copy.deepcopy(self._point_results),
+            "timestamp_unix_ns": terminated_at_unix_ns,
+        }
+        self._last_termination_report = copy.deepcopy(payload)
+        msg = String()
+        msg.data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        self.point_event_pub.publish(msg)
+
     def _status_payload(self) -> dict[str, Any]:
         completed = self._point_status.count("COMPLETED")
         skipped = self._point_status.count("SKIPPED")
         failed = self._point_status.count("FAILED")
+        accuracy_failed = sum(
+            1
+            for snapshot in self._point_accuracy_snapshots
+            if snapshot is not None and snapshot.get("outcome") == "FAILED"
+        )
         total = len(self._point_status)
         processed = completed + skipped + failed
         active_number = self._current_or_next_marking_number()
@@ -1919,6 +2351,7 @@ class MissionManager(Node):
             "message": self._last_message,
             "error": self._last_error,
             "mission_run_id": self._mission_run_id or None,
+            "mission_started_unix_ns": self._mission_started_unix_ns,
             "execution_mode": self._execution_mode,
             "pause_reason": self._pause_reason,
             "resume_available": self._resume_available,
@@ -1933,9 +2366,14 @@ class MissionManager(Node):
             "completed_points": completed,
             "skipped_points": skipped,
             "failed_points": failed,
+            "accuracy_failed_points": accuracy_failed,
             "remaining_points": max(0, total - processed),
             "progress_percent": round(100.0 * processed / total, 2) if total else 0.0,
             "point_status": list(self._point_status),
+            "point_accuracy_snapshots": copy.deepcopy(self._point_accuracy_snapshots),
+            "point_results": copy.deepcopy(self._point_results),
+            "last_point_result": copy.deepcopy(self._last_point_result),
+            "last_termination_report": copy.deepcopy(self._last_termination_report),
             "mission_enable": self._mission_enable,
             "emergency_stop": self._emergency_stop,
             "px4_connected": self._fcu_connected,
@@ -1979,13 +2417,14 @@ class MissionManager(Node):
             "marking_hold_required_sec": self.marking_hold_sec,
             "verification_hold_elapsed_sec": round(self._marking_hold_elapsed_sec, 3),
             "verification_hold_required_sec": self.marking_hold_sec,
-            "waiting_for_skip": self._state == "WAITING_FOR_SKIP",
             # Compatibility names retained for current frontend/backend.
             # hold_* now represents the 3-second PRE-MARK verification.
             "hold_elapsed_sec": round(self._marking_hold_elapsed_sec, 3),
             "hold_required_sec": self.marking_hold_sec,
             "marking_error_mode": "RADIAL_2D",
             "marking_tolerance_m": self.marking_tolerance_m,
+            "goal_plane_overshoot_trigger_m": self.GOAL_PLANE_OVERSHOOT_TRIGGER_M,
+            "rpp_terminal_result": copy.deepcopy(self._rpp_terminal_result),
             "marking_xtrack_m": (
                 round(self._marking_xtrack_m, 6)
                 if math.isfinite(self._marking_xtrack_m)
@@ -2041,7 +2480,10 @@ class MissionManager(Node):
         if self._auto_stop_pending:
             return
 
-        self._set_safety(emergency_stop=False, mission_enable=False)
+        # Completion is a terminal hard stop immediately; disarm is then
+        # attempted outside this lock on the next timer tick.
+        self._reset_point_timers()
+        self._set_safety(emergency_stop=True, mission_enable=False)
         self._state = "COMPLETED"
         self._pause_reason = None
         self._resume_available = False
@@ -2066,10 +2508,15 @@ class MissionManager(Node):
 
         # Clear the pending flag before doing service calls so this is one-shot.
         self._auto_stop_pending = False
-        warnings = self._execute_stop_cleanup(
+        terminated, warnings = self._execute_stop_cleanup(
             completed=True,
             source="AUTO_COMPLETE",
         )
+        if not terminated:
+            self.get_logger().error(
+                "Automatic STOP is hard-stopped but PX4 DISARM is not confirmed; "
+                "mission state retained for operator retry"
+            )
         if warnings:
             self.get_logger().warn(
                 "Automatic STOP completed with warnings: " + "; ".join(warnings)
@@ -2112,7 +2559,6 @@ class MissionManager(Node):
                 "RUNNING",
                 "PAUSED",
                 "WAITING_FOR_NEXT",
-                "WAITING_FOR_SKIP",
             }:
                 return
 
@@ -2216,23 +2662,40 @@ class MissionManager(Node):
             # ------------------------------------------------------
             # EXACT USER-CONTRACT MARKING SEQUENCE
             # ------------------------------------------------------
-            # 1) First exact arrival (<=30 mm + stationary) starts ONE fixed
-            #    3-second verification window.
+            # 1) First exact arrival (<=30 mm + stationary), or a stationary
+            #    crossing >=20 mm beyond the incoming goal plane, starts ONE
+            #    fixed 3-second window. The plane trigger lets a precision miss
+            #    resolve FAILED instead of waiting forever.
             # 2) Spray remains OFF during those 3 seconds.
-            # 3) At exactly the end, re-check position + stationary + RTK +
-            #    PX4 OFFBOARD/ARMED.
+            # 3) At the end, re-check only the 30 mm position contract and
+            #    stationary state. Runtime RTK/PX4 monitors remain independent
+            #    motion-safety gates, not accuracy-result gates.
             # 4) If still valid -> trigger spray, wait for its SUCCESS/FAILED
             #    result (failure is monitor-only), then move to next point.
-            # 5) If invalid at the 3-second check -> stop and wait for SKIP.
+            # 5) If invalid at the 3-second check -> record FAILED with spray
+            #    OFF; AUTO advances, MANUAL advances and waits for NEXT.
             now = time.monotonic()
             point_id = f"P{marking_number+1:04d}"
             spray_key = (self._mission_run_id, point_id)
+            past_goal_plane = (
+                math.isfinite(self._marking_along_error_m)
+                and self._marking_along_error_m >= self.GOAL_PLANE_OVERSHOOT_TRIGGER_M
+            )
+            rpp_terminal_outcome = (
+                str(self._rpp_terminal_result.get("outcome", "")).upper()
+                if isinstance(self._rpp_terminal_result, dict)
+                else ""
+            )
+            rpp_terminal_trigger = rpp_terminal_outcome in {"CAPTURED", "MISSED"}
 
             # PHASE A: waiting to first reach the exact point.
             if self._marking_hold_started is None:
                 self._publish_marking_active(False)
 
-                if not (inside_30mm and stationary):
+                if not (
+                    stationary
+                    and (inside_30mm or past_goal_plane or rpp_terminal_trigger)
+                ):
                     self._arrival_settle_started = None
                     self._arrival_settle_elapsed_sec = 0.0
                     self._marking_hold_elapsed_sec = 0.0
@@ -2242,11 +2705,20 @@ class MissionManager(Node):
                 self._arrival_settle_started = now
                 self._arrival_settle_elapsed_sec = 0.0
                 self._marking_hold_elapsed_sec = 0.0
+                if inside_30mm:
+                    trigger = f"reached <= {self.marking_tolerance_m*1000.0:.0f}mm"
+                elif rpp_terminal_outcome == "CAPTURED":
+                    trigger = "RPP reported 30mm CAPTURED and rover is stationary"
+                elif rpp_terminal_outcome == "MISSED":
+                    trigger = "RPP reported terminal MISSED and rover is stationary"
+                else:
+                    trigger = (
+                        "crossed incoming goal plane by "
+                        f"{self._marking_along_error_m*1000.0:.1f}mm"
+                    )
                 self._last_message = (
-                    f"{point_id} reached <= "
-                    f"{self.marking_tolerance_m*1000.0:.0f}mm and is stationary; "
-                    f"starting {self.marking_hold_sec:.1f}s verification; "
-                    "spray remains OFF"
+                    f"{point_id} {trigger} and is stationary; starting "
+                    f"{self.marking_hold_sec:.1f}s verification; spray remains OFF"
                 )
                 self._publish_status(force=True)
                 return
@@ -2274,40 +2746,108 @@ class MissionManager(Node):
 
                 # The 3-second timer has expired. NOW perform the authoritative
                 # point-achieved decision.
-                rtk_ok, rtk_reason = self._rtk_motion_ok()
-                px4_ok = (
-                    self._fcu_connected
-                    and self._px4_mode == "OFFBOARD"
-                    and self._px4_armed
-                )
-
-                if not (inside_30mm and stationary and rtk_ok and px4_ok):
-                    self._point_status[marking_number] = "WAITING_FOR_SKIP"
-                    self._state = "WAITING_FOR_SKIP"
-                    self._pause_reason = "POINT_NOT_ACHIEVED"
-                    self._resume_available = False
-                    self._set_safety(
-                        emergency_stop=False,
-                        mission_enable=False,
+                if not (inside_30mm and stationary):
+                    failed_reasons: list[str] = []
+                    if not inside_30mm:
+                        failed_reasons.append("RADIAL_OUTSIDE_30MM")
+                    if not stationary:
+                        failed_reasons.append("ROVER_NOT_STATIONARY")
+                    failure_reason = "+".join(failed_reasons)
+                    accuracy = self._capture_accuracy_snapshot(
+                        marking_number=marking_number,
+                        path_index=self._current_path_index,
+                        outcome="FAILED",
+                        reason=failure_reason,
                     )
-                    self._publish_marking_active(False)
+                    spray = self._spray_outcome_snapshot(
+                        attempted=False,
+                        outcome="NOT_ATTEMPTED_ACCURACY_FAILED",
+                        reason=failure_reason,
+                    )
+                    self._point_status[marking_number] = "FAILED"
+                    point_result = self._store_point_result(
+                        marking_number=marking_number,
+                        path_index=self._current_path_index,
+                        point_outcome="FAILED",
+                        accuracy=accuracy,
+                        spray=spray,
+                    )
+                    radial_mm = accuracy.get("radial_error_mm")
+                    radial_text = (
+                        f"{radial_mm:.1f}mm" if radial_mm is not None else "unavailable"
+                    )
                     self._last_message = (
                         f"{point_id} NOT achieved at the end of "
                         f"{self.marking_hold_sec:.1f}s verification: "
-                        f"radial={self._marking_radial_error_m*1000.0:.1f}mm, "
-                        f"speed={self._speed_mps:.3f}m/s, "
-                        f"RTK={rtk_reason}, mode={self._px4_mode}, "
-                        f"armed={self._px4_armed}. Press SKIP to continue."
+                        f"radial={radial_text}, speed={self._speed_mps:.3f}m/s"
                     )
-                    self._emit_system_event(
-                        "POINT_WAITING_FOR_SKIP",
-                        self._last_message,
+                    # Publish the immutable measured result before disabling
+                    # motion; safety transitions must never erase this record.
+                    self._emit_point_event(
+                        "ACCURACY_FAILED",
+                        marking_number,
+                        self._current_path_index,
+                        reason=failure_reason,
+                        accuracy=accuracy,
+                        spray=spray,
+                        point_result=point_result,
                     )
+                    self._publish_marking_active(False)
+
+                    # Accuracy failure is a resolved terminal point. Advance
+                    # only after its immutable report has been published.
+                    self._current_path_index = self._next_semantic_index(
+                        self._current_path_index + 1
+                    )
+                    self._reset_arrival_state()
+                    self._publish_runtime_path()
+
+                    if self._finish_if_done():
+                        return
+
+                    if self._execution_mode == "MANUAL":
+                        self._state = "WAITING_FOR_NEXT"
+                        self._pause_reason = None
+                        self._resume_available = False
+                        self._set_safety(
+                            emergency_stop=False,
+                            mission_enable=False,
+                        )
+                        self._last_message = (
+                            f"{point_id} FAILED accuracy ({radial_text}); "
+                            "waiting for NEXT"
+                        )
+                    else:
+                        self._state = "RUNNING"
+                        self._pause_reason = None
+                        self._resume_available = False
+                        self._last_message = (
+                            f"{point_id} FAILED accuracy ({radial_text}); "
+                            "continuing automatically"
+                        )
+                        self._publish_goal()
                     self._publish_status(force=True)
                     return
 
                 # Verified after the full 3 seconds. Only NOW is physical
                 # marking requested.
+                accuracy = self._capture_accuracy_snapshot(
+                    marking_number=marking_number,
+                    path_index=self._current_path_index,
+                    outcome="ACHIEVED",
+                    reason=None,
+                )
+                pending_spray = self._spray_outcome_snapshot(
+                    attempted=self.spray_required,
+                    outcome="PENDING" if self.spray_required else "DISABLED",
+                )
+                self._emit_point_event(
+                    "ACCURACY_ACHIEVED",
+                    marking_number,
+                    self._current_path_index,
+                    accuracy=accuracy,
+                    spray=pending_spray,
+                )
                 self._spray_request_started = now
                 self._publish_marking_active(True)
                 self._last_message = (
@@ -2364,13 +2904,60 @@ class MissionManager(Node):
             # spray disabled). Spray failure never aborts the whole mission.
             self._publish_marking_active(False)
 
-            final_mm = self._marking_radial_error_m * 1000.0
+            accuracy = copy.deepcopy(self._point_accuracy_snapshots[marking_number])
+            if accuracy is None:
+                # Defensive fallback; the normal path captures this exactly at
+                # the end of the fixed verification window.
+                accuracy = self._capture_accuracy_snapshot(
+                    marking_number=marking_number,
+                    path_index=self._current_path_index,
+                    outcome="ACHIEVED",
+                    reason=None,
+                )
+            if not self.spray_required:
+                spray = self._spray_outcome_snapshot(
+                    attempted=False,
+                    outcome="DISABLED",
+                )
+            elif spray_success:
+                spray = self._spray_outcome_snapshot(
+                    attempted=True,
+                    outcome="SUCCESS",
+                )
+            elif spray_failure is not None:
+                spray = self._spray_outcome_snapshot(
+                    attempted=True,
+                    outcome="FAILED",
+                    reason=spray_failure,
+                )
+            else:
+                spray = self._spray_outcome_snapshot(
+                    attempted=True,
+                    outcome="TIMEOUT",
+                    reason=(
+                        f"No spray result within "
+                        f"{self.spray_confirmation_timeout_sec:.1f}s"
+                    ),
+                )
+
+            final_mm = accuracy.get("radial_error_mm")
+            final_text = f"{final_mm:.1f}mm" if final_mm is not None else "unavailable"
             self._point_status[marking_number] = "COMPLETED"
             self._last_completed_marking_number = marking_number
+            point_result = self._store_point_result(
+                marking_number=marking_number,
+                path_index=self._current_path_index,
+                point_outcome="COMPLETED",
+                accuracy=accuracy,
+                spray=spray,
+            )
             self._emit_point_event(
                 "COMPLETED",
                 marking_number,
                 self._current_path_index,
+                accuracy=accuracy,
+                spray=spray,
+                point_result=point_result,
             )
 
             self._current_path_index = self._next_semantic_index(
@@ -2391,15 +2978,14 @@ class MissionManager(Node):
                     mission_enable=False,
                 )
                 self._last_message = (
-                    f"{point_id} COMPLETED at {final_mm:.1f}mm; waiting for NEXT"
+                    f"{point_id} COMPLETED at {final_text}; waiting for NEXT"
                 )
             else:
                 self._state = "RUNNING"
                 self._pause_reason = None
                 self._resume_available = False
                 self._last_message = (
-                    f"{point_id} COMPLETED at {final_mm:.1f}mm; "
-                    "continuing automatically"
+                    f"{point_id} COMPLETED at {final_text}; " "continuing automatically"
                 )
                 self._publish_goal()
 

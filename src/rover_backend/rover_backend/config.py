@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-
 _ALLOWED_LOG_LEVELS: Final = {
     "critical",
     "error",
@@ -61,25 +60,15 @@ def _read_int(
     raw_value = os.getenv(name)
 
     try:
-        value = (
-            default
-            if raw_value is None
-            else int(raw_value)
-        )
+        value = default if raw_value is None else int(raw_value)
     except ValueError as error:
-        raise RuntimeError(
-            f"{name} must be an integer"
-        ) from error
+        raise RuntimeError(f"{name} must be an integer") from error
 
     if minimum is not None and value < minimum:
-        raise RuntimeError(
-            f"{name} must be at least {minimum}"
-        )
+        raise RuntimeError(f"{name} must be at least {minimum}")
 
     if maximum is not None and value > maximum:
-        raise RuntimeError(
-            f"{name} must be at most {maximum}"
-        )
+        raise RuntimeError(f"{name} must be at most {maximum}")
 
     return value
 
@@ -103,9 +92,7 @@ def _read_bool(
     if normalised in {"0", "false", "no", "off"}:
         return False
 
-    raise RuntimeError(
-        f"{name} must be true or false"
-    )
+    raise RuntimeError(f"{name} must be true or false")
 
 
 def _read_float(
@@ -119,20 +106,12 @@ def _read_float(
     raw_value = os.getenv(name)
 
     try:
-        value = (
-            default
-            if raw_value is None
-            else float(raw_value)
-        )
+        value = default if raw_value is None else float(raw_value)
     except ValueError as error:
-        raise RuntimeError(
-            f"{name} must be a number"
-        ) from error
+        raise RuntimeError(f"{name} must be a number") from error
 
     if value < minimum:
-        raise RuntimeError(
-            f"{name} must be at least {minimum}"
-        )
+        raise RuntimeError(f"{name} must be at least {minimum}")
 
     return value
 
@@ -145,11 +124,7 @@ def _read_path(
 
     raw_value = os.getenv(name)
 
-    path = (
-        Path(raw_value).expanduser()
-        if raw_value
-        else default.expanduser()
-    )
+    path = Path(raw_value).expanduser() if raw_value else default.expanduser()
 
     return path.resolve(strict=False)
 
@@ -167,9 +142,7 @@ def _read_networks(
         ",".join(_DEFAULT_PRIVATE_SUBNETS),
     )
 
-    networks: list[
-        ipaddress.IPv4Network | ipaddress.IPv6Network
-    ] = []
+    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
 
     for subnet_value in raw_value.split(","):
         subnet_text = subnet_value.strip()
@@ -183,16 +156,12 @@ def _read_networks(
                 strict=False,
             )
         except ValueError as error:
-            raise RuntimeError(
-                f"Invalid network in {name}: {subnet_text}"
-            ) from error
+            raise RuntimeError(f"Invalid network in {name}: {subnet_text}") from error
 
         networks.append(network)
 
     if not networks:
-        raise RuntimeError(
-            f"{name} must contain at least one network"
-        )
+        raise RuntimeError(f"{name} must contain at least one network")
 
     return tuple(networks)
 
@@ -209,11 +178,7 @@ def _read_cors_origins() -> tuple[str, ...]:
         "",
     )
 
-    return tuple(
-        origin.strip()
-        for origin in raw_value.split(",")
-        if origin.strip()
-    )
+    return tuple(origin.strip() for origin in raw_value.split(",") if origin.strip())
 
 
 @dataclass(
@@ -251,6 +216,7 @@ class Settings:
     mission_file: Path
     mission_metadata_file: Path
     runtime_directory: Path
+    mission_report_file: Path
 
     maximum_upload_bytes: int
     extension_trigger_distance_m: float
@@ -287,21 +253,22 @@ class Settings:
         return 2.0
 
     @property
-    def marking_hold_seconds(self) -> float:
-        """Legacy alias for the marking arrival-settle window."""
+    def arrival_settle_seconds(self) -> float:
+        """Initial stationary-arrival confirmation window."""
 
-        # The 3-second interval belongs to spray_controller's physical spray
-        # hold. Mission arrival validation is intentionally only 0.30 s.
         return 0.30
+
+    @property
+    def marking_hold_seconds(self) -> float:
+        """Full pre-mark positional verification hold."""
+
+        return 3.0
 
     @property
     def mission_runtime_file(self) -> Path:
         """Separate runtime-state persistence file."""
 
-        return (
-            self.runtime_directory
-            / "mission_runtime.json"
-        )
+        return self.runtime_directory / "mission_runtime.json"
 
     @property
     def login_failure_limit(self) -> int:
@@ -323,12 +290,10 @@ class Settings:
         """Maximum number of marking points accepted in one mission."""
         return 10000
 
-
     @property
     def row_transition_threshold_m(self) -> float:
         """Distance threshold used to detect short row transitions."""
         return self.extension_trigger_distance_m
-
 
     @property
     def default_dummy_point_distance_m(self) -> float:
@@ -348,10 +313,7 @@ def load_settings() -> Settings:
 
     data_directory = _read_path(
         "DYX_DATA_DIRECTORY",
-        home_directory
-        / ".local"
-        / "share"
-        / "dyx_rover",
+        home_directory / ".local" / "share" / "dyx_rover",
     )
 
     runtime_directory = _read_path(
@@ -361,10 +323,7 @@ def load_settings() -> Settings:
 
     mission_file = _read_path(
         "DYX_MISSION_FILE",
-        home_directory
-        / "rover_ws"
-        / "missions"
-        / "mission.csv",
+        home_directory / "rover_ws" / "missions" / "mission.csv",
     )
 
     database_file = _read_path(
@@ -383,10 +342,7 @@ def load_settings() -> Settings:
     )
 
     if len(password) < 8:
-        raise RuntimeError(
-            "DYX_STATIC_PASSWORD must contain "
-            "at least 8 characters"
-        )
+        raise RuntimeError("DYX_STATIC_PASSWORD must contain " "at least 8 characters")
 
     log_level = _read_text(
         "DYX_LOG_LEVEL",
@@ -394,14 +350,9 @@ def load_settings() -> Settings:
     ).lower()
 
     if log_level not in _ALLOWED_LOG_LEVELS:
-        allowed_values = ", ".join(
-            sorted(_ALLOWED_LOG_LEVELS)
-        )
+        allowed_values = ", ".join(sorted(_ALLOWED_LOG_LEVELS))
 
-        raise RuntimeError(
-            "DYX_LOG_LEVEL must be one of: "
-            f"{allowed_values}"
-        )
+        raise RuntimeError("DYX_LOG_LEVEL must be one of: " f"{allowed_values}")
 
     socket_path = _read_text(
         "DYX_SOCKET_PATH",
@@ -411,51 +362,37 @@ def load_settings() -> Settings:
     if not socket_path.startswith("/"):
         socket_path = f"/{socket_path}"
 
-    socket_path = (
-        socket_path.rstrip("/")
-        or "/socket.io"
-    )
+    socket_path = socket_path.rstrip("/") or "/socket.io"
 
     settings = Settings(
         app_version="2.0.0",
-
         rover_id=_read_text(
             "DYX_ROVER_ID",
             "dyx-4wd-001",
         ),
-
         rover_name=_read_text(
             "DYX_ROVER_NAME",
             "DYX 4WD Rover",
         ),
-
         rover_ip=_read_text(
             "DYX_ROVER_IP",
             "192.168.3.101",
         ),
-
         backend_host=_read_text(
             "DYX_BACKEND_HOST",
             "0.0.0.0",
         ),
-
         backend_port=_read_int(
             "DYX_BACKEND_PORT",
             5001,
             minimum=1,
             maximum=65535,
         ),
-
         log_level=log_level,
-
         cors_origins=_read_cors_origins(),
-
         allowed_subnets=_read_networks(),
-
         static_username=username,
-
         static_password=password,
-
         # Ten years by default. This provides persistent tablet
         # login while retaining expires_at and ttl_s in the API.
         session_ttl_seconds=_read_int(
@@ -463,59 +400,50 @@ def load_settings() -> Settings:
             315_360_000,
             minimum=3_600,
         ),
-
         maximum_active_sessions=_read_int(
             "DYX_MAXIMUM_ACTIVE_SESSIONS",
             5,
             minimum=1,
             maximum=50,
         ),
-
         database_file=database_file,
-
         mission_file=mission_file,
-
         mission_metadata_file=_read_path(
             "DYX_MISSION_METADATA_FILE",
-            runtime_directory
-            / "mission_metadata.json",
+            runtime_directory / "mission_metadata.json",
         ),
-
         runtime_directory=runtime_directory,
-
+        mission_report_file=_read_path(
+            "DYX_MISSION_REPORT_FILE",
+            data_directory / "last_mission_report.json",
+        ),
         maximum_upload_bytes=_read_int(
             "DYX_MAXIMUM_UPLOAD_BYTES",
             5 * 1024 * 1024,
             minimum=1_024,
             maximum=50 * 1024 * 1024,
         ),
-
         extension_trigger_distance_m=_read_float(
             "DYX_EXTENSION_TRIGGER_DISTANCE_M",
             2.0,
             minimum=0.1,
         ),
-
         telemetry_broadcast_hz=_read_float(
             "DYX_TELEMETRY_BROADCAST_HZ",
             5.0,
             minimum=0.5,
         ),
-
         socket_path=socket_path,
-
         beacon_enabled=_read_bool(
             "DYX_BEACON_ENABLE",
             True,
         ),
-
         beacon_port=_read_int(
             "DYX_BEACON_PORT",
             5002,
             minimum=1,
             maximum=65535,
         ),
-
         beacon_interval_sec=_read_float(
             "DYX_BEACON_INTERVAL_SEC",
             2.0,
@@ -528,6 +456,7 @@ def load_settings() -> Settings:
         settings.mission_file.parent,
         settings.mission_metadata_file.parent,
         settings.runtime_directory,
+        settings.mission_report_file.parent,
     }
 
     for directory in required_directories:
@@ -549,16 +478,12 @@ def client_ip_is_allowed(
         return False
 
     try:
-        client_ip = ipaddress.ip_address(
-            client_ip_text
-        )
+        client_ip = ipaddress.ip_address(client_ip_text)
     except ValueError:
         return False
 
     return any(
-        client_ip in allowed_network
-        for allowed_network
-        in settings.allowed_subnets
+        client_ip in allowed_network for allowed_network in settings.allowed_subnets
     )
 
 

@@ -57,7 +57,6 @@ from rover_backend.state import utc_now_iso
 from rover_backend.system_routes import build_mission_status_payload
 from rover_backend.system_routes import build_telemetry_payload
 
-
 LOGGER = logging.getLogger(__name__)
 
 
@@ -65,9 +64,7 @@ LOGGER = logging.getLogger(__name__)
 # admission and token authentication are still enforced below. React Native
 # clients commonly connect without a browser Origin header.
 _SOCKET_CORS_ORIGINS: list[str] = (
-    list(settings.cors_origins)
-    if settings.cors_origins
-    else []
+    list(settings.cors_origins) if settings.cors_origins else []
 )
 
 
@@ -132,18 +129,13 @@ def _client_ip(environ: dict[str, Any]) -> str | None:
     if isinstance(scope, dict):
         client = scope.get("client")
 
-        if (
-            isinstance(client, (tuple, list))
-            and len(client) >= 1
-        ):
+        if isinstance(client, (tuple, list)) and len(client) >= 1:
             value = _normalise_ip(client[0])
 
             if value:
                 return value
 
-    return _normalise_ip(
-        environ.get("REMOTE_ADDR")
-    )
+    return _normalise_ip(environ.get("REMOTE_ADDR"))
 
 
 def _extract_socket_token(
@@ -163,30 +155,17 @@ def _extract_socket_token(
             if isinstance(value, str) and value.strip():
                 return value.strip()
 
-    header_token = environ.get(
-        "HTTP_X_ROVER_TOKEN"
-    )
+    header_token = environ.get("HTTP_X_ROVER_TOKEN")
 
-    if (
-        isinstance(header_token, str)
-        and header_token.strip()
-    ):
+    if isinstance(header_token, str) and header_token.strip():
         return header_token.strip()
 
-    authorization = environ.get(
-        "HTTP_AUTHORIZATION"
-    )
+    authorization = environ.get("HTTP_AUTHORIZATION")
 
     if isinstance(authorization, str):
-        scheme, separator, value = (
-            authorization.strip().partition(" ")
-        )
+        scheme, separator, value = authorization.strip().partition(" ")
 
-        if (
-            separator
-            and scheme.lower() == "bearer"
-            and value.strip()
-        ):
+        if separator and scheme.lower() == "bearer" and value.strip():
             return value.strip()
 
     return None
@@ -194,22 +173,16 @@ def _extract_socket_token(
 
 async def _update_frontend_connection_state() -> None:
     async with _socket_lock:
-        connected_count = len(
-            _socket_sessions
-        )
+        connected_count = len(_socket_sessions)
 
     rover_state.update(
         "network",
-        frontend_connected=(
-            connected_count > 0
-        ),
+        frontend_connected=(connected_count > 0),
         socket_clients=connected_count,
         last_client_seen_at=(
             utc_now_iso()
             if connected_count > 0
-            else rover_state.section(
-                "network"
-            ).get("last_client_seen_at")
+            else rover_state.section("network").get("last_client_seen_at")
         ),
     )
 
@@ -221,13 +194,9 @@ async def _socket_record(
         return _socket_sessions.get(sid)
 
 
-async def _all_socket_records() -> list[
-    tuple[str, SocketSession]
-]:
+async def _all_socket_records() -> list[tuple[str, SocketSession]]:
     async with _socket_lock:
-        return list(
-            _socket_sessions.items()
-        )
+        return list(_socket_sessions.items())
 
 
 # ---------------------------------------------------------------------------
@@ -245,17 +214,13 @@ async def connect(
 
     client_ip = _client_ip(environ)
 
-    if not client_ip_is_allowed(
-        client_ip
-    ):
+    if not client_ip_is_allowed(client_ip):
         LOGGER.warning(
             "Rejected Socket.IO client outside allowed network: ip=%s",
             client_ip,
         )
 
-        raise SocketConnectionRefusedError(
-            "Client network is not allowed"
-        )
+        raise SocketConnectionRefusedError("Client network is not allowed")
 
     token = _extract_socket_token(
         environ,
@@ -263,22 +228,15 @@ async def connect(
     )
 
     if token is None:
-        raise SocketConnectionRefusedError(
-            "Authentication token is required"
-        )
+        raise SocketConnectionRefusedError("Authentication token is required")
 
-    session = (
-        authentication_store
-        .authenticate_token(
-            token,
-            touch=True,
-        )
+    session = authentication_store.authenticate_token(
+        token,
+        touch=True,
     )
 
     if session is None:
-        raise SocketConnectionRefusedError(
-            "Session is invalid, expired or logged out"
-        )
+        raise SocketConnectionRefusedError("Session is invalid, expired or logged out")
 
     record = SocketSession(
         token=token,
@@ -321,9 +279,7 @@ async def connect(
 
     await sio.emit(
         "mission_progress",
-        _mission_progress_payload(
-            mission
-        ),
+        _mission_progress_payload(mission),
         to=sid,
     )
 
@@ -378,29 +334,18 @@ async def client_ping(
 ) -> dict[str, Any]:
     """Authenticated application-level liveness acknowledgement."""
 
-    record = await _socket_record(
-        sid
-    )
+    record = await _socket_record(sid)
 
     if record is None:
-        raise SocketConnectionRefusedError(
-            "Socket session is unavailable"
-        )
+        raise SocketConnectionRefusedError("Socket session is unavailable")
 
-    if not (
-        authentication_store
-        .session_is_active(
-            record.token
-        )
-    ):
+    if not (authentication_store.session_is_active(record.token)):
         await _disconnect_socket(
             sid,
             reason="session_revoked",
         )
 
-        raise SocketConnectionRefusedError(
-            "Authentication session is no longer active"
-        )
+        raise SocketConnectionRefusedError("Authentication session is no longer active")
 
     rover_state.update(
         "network",
@@ -442,9 +387,7 @@ def _mission_progress_payload(
     """Return the compact progress contract consumed by mission screens."""
 
     return {
-        "mission_id": mission.get(
-            "mission_id"
-        ),
+        "mission_id": mission.get("mission_id"),
         "state": mission.get(
             "state",
             "EMPTY",
@@ -473,25 +416,15 @@ def _mission_progress_payload(
             "progress_percent",
             0.0,
         ),
-        "active_point_id": mission.get(
-            "active_point_id"
-        ),
-        "active_point_index": mission.get(
-            "active_point_index"
-        ),
-        "active_point_number": mission.get(
-            "active_point_number"
-        ),
-        "active_point_state": mission.get(
-            "active_point_state"
-        ),
+        "active_point_id": mission.get("active_point_id"),
+        "active_point_index": mission.get("active_point_index"),
+        "active_point_number": mission.get("active_point_number"),
+        "active_point_state": mission.get("active_point_state"),
         "marking_active": mission.get(
             "marking_active",
             False,
         ),
-        "pause_reason": mission.get(
-            "pause_reason"
-        ),
+        "pause_reason": mission.get("pause_reason"),
         "resume_available": mission.get(
             "resume_available",
             False,
@@ -511,11 +444,11 @@ def _mission_progress_payload(
         "emergency_stop": mission.get("emergency_stop", True),
         "arrival_settle_elapsed_sec": mission.get(
             "arrival_settle_elapsed_sec",
-            mission.get("hold_elapsed_sec", 0.0),
+            0.0,
         ),
         "arrival_settle_required_sec": mission.get(
             "arrival_settle_required_sec",
-            mission.get("hold_required_sec", settings.marking_hold_seconds),
+            settings.arrival_settle_seconds,
         ),
         "alignment_active": mission.get(
             "alignment_active",
@@ -529,18 +462,17 @@ def _mission_progress_payload(
             "hold_required_sec",
             settings.marking_hold_seconds,
         ),
-        "updated_at": mission.get(
-            "updated_at"
-        ),
+        "report": mission.get("report"),
+        "terminal_cleanup_status": mission.get("terminal_cleanup_status"),
+        "terminal_cleanup_error": mission.get("terminal_cleanup_error"),
+        "updated_at": mission.get("updated_at"),
     }
 
 
 def _point_event_name(
     point_event: dict[str, Any],
 ) -> str:
-    event_name = str(
-        point_event.get("event", "")
-    ).strip().upper()
+    event_name = str(point_event.get("event", "")).strip().upper()
 
     return {
         "COMPLETED": "point_completed",
@@ -564,9 +496,7 @@ async def _disconnect_socket(
 ) -> None:
     """Notify and disconnect one socket without raising into callers."""
 
-    record = await _socket_record(
-        sid
-    )
+    record = await _socket_record(sid)
 
     if record is None:
         return
@@ -576,9 +506,7 @@ async def _disconnect_socket(
             "auth_revoked",
             {
                 "reason": reason,
-                "session_id": (
-                    record.session_id
-                ),
+                "session_id": (record.session_id),
             },
             to=sid,
         )
@@ -606,11 +534,7 @@ async def disconnect_session(
 
     records = await _all_socket_records()
 
-    matching_sids = [
-        sid
-        for sid, record in records
-        if record.session_id == session_id
-    ]
+    matching_sids = [sid for sid, record in records if record.session_id == session_id]
 
     if matching_sids:
         await asyncio.gather(
@@ -632,10 +556,7 @@ def _schedule_revoked_session_disconnect(
 
     loop = _event_loop
 
-    if (
-        loop is None
-        or loop.is_closed()
-    ):
+    if loop is None or loop.is_closed():
         return
 
     def create_disconnect_task() -> None:
@@ -644,16 +565,11 @@ def _schedule_revoked_session_disconnect(
                 session_id,
                 reason="logout",
             ),
-            name=(
-                "rover-auth-revocation-"
-                f"{session_id[:8]}"
-            ),
+            name=("rover-auth-revocation-" f"{session_id[:8]}"),
         )
 
     try:
-        loop.call_soon_threadsafe(
-            create_disconnect_task
-        )
+        loop.call_soon_threadsafe(create_disconnect_task)
     except RuntimeError:
         # The ASGI event loop is shutting down.
         return
@@ -670,12 +586,7 @@ async def _revalidate_socket_sessions() -> None:
     revoked_sids = [
         sid
         for sid, record in records
-        if not (
-            authentication_store
-            .session_is_active(
-                record.token
-            )
-        )
+        if not (authentication_store.session_is_active(record.token))
     ]
 
     if revoked_sids:
@@ -699,14 +610,10 @@ async def _broadcast_loop() -> None:
 
     frequency_hz = max(
         0.2,
-        float(
-            settings.telemetry_broadcast_hz
-        ),
+        float(settings.telemetry_broadcast_hz),
     )
 
-    interval_seconds = (
-        1.0 / frequency_hz
-    )
+    interval_seconds = 1.0 / frequency_hz
 
     validation_interval_ticks = max(
         1,
@@ -725,17 +632,11 @@ async def _broadcast_loop() -> None:
             records = await _all_socket_records()
 
             if records:
-                telemetry = (
-                    build_telemetry_payload()
-                )
+                telemetry = build_telemetry_payload()
 
-                mission = (
-                    build_mission_status_payload()
-                )
+                mission = build_mission_status_payload()
 
-                safety = rover_state.section(
-                    "safety"
-                )
+                safety = rover_state.section("safety")
 
                 await sio.emit(
                     "telemetry",
@@ -747,103 +648,64 @@ async def _broadcast_loop() -> None:
                     mission,
                 )
 
-                progress = (
-                    _mission_progress_payload(
-                        mission
-                    )
-                )
+                progress = _mission_progress_payload(mission)
 
-                progress_signature = (
-                    _stable_signature(
-                        progress
-                    )
-                )
+                progress_signature = _stable_signature(progress)
 
-                if (
-                    progress_signature
-                    != previous_progress_signature
-                ):
-                    previous_progress_signature = (
-                        progress_signature
-                    )
+                if progress_signature != previous_progress_signature:
+                    previous_progress_signature = progress_signature
 
                     await sio.emit(
                         "mission_progress",
                         progress,
                     )
 
-                safety_signature = (
-                    _stable_signature(
-                        safety
-                    )
-                )
+                safety_signature = _stable_signature(safety)
 
-                if (
-                    safety_signature
-                    != previous_safety_signature
-                ):
-                    previous_safety_signature = (
-                        safety_signature
-                    )
+                if safety_signature != previous_safety_signature:
+                    previous_safety_signature = safety_signature
 
                     await sio.emit(
                         "safety_state",
                         safety,
                     )
 
-                point_event = mission.get(
-                    "last_point_event"
-                )
+                point_event = mission.get("last_point_event")
 
                 if isinstance(
                     point_event,
                     dict,
                 ):
-                    point_event_signature = (
-                        _stable_signature(
-                            point_event
-                        )
-                    )
+                    point_event_signature = _stable_signature(point_event)
 
-                    if (
-                        point_event_signature
-                        != previous_point_event_signature
-                    ):
-                        previous_point_event_signature = (
-                            point_event_signature
-                        )
+                    if point_event_signature != previous_point_event_signature:
+                        previous_point_event_signature = point_event_signature
 
                         await sio.emit(
-                            _point_event_name(
-                                point_event
-                            ),
+                            _point_event_name(point_event),
                             point_event,
                         )
 
-                mission_state = str(
-                    mission.get(
-                        "state",
-                        "EMPTY",
+                mission_state = (
+                    str(
+                        mission.get(
+                            "state",
+                            "EMPTY",
+                        )
                     )
-                ).strip().upper()
+                    .strip()
+                    .upper()
+                )
 
-                if (
-                    mission_state
-                    != previous_mission_state
-                ):
-                    previous_mission_state = (
-                        mission_state
-                    )
+                if mission_state != previous_mission_state:
+                    previous_mission_state = mission_state
 
                     await sio.emit(
                         "mission_state",
                         mission,
                     )
 
-                    if (
-                        mission_state
-                        == "COMPLETED"
-                    ):
+                    if mission_state == "COMPLETED":
                         await sio.emit(
                             "mission_completed",
                             mission,
@@ -851,10 +713,7 @@ async def _broadcast_loop() -> None:
 
             validation_tick += 1
 
-            if (
-                validation_tick
-                >= validation_interval_ticks
-            ):
+            if validation_tick >= validation_interval_ticks:
                 validation_tick = 0
                 await _revalidate_socket_sessions()
 
@@ -862,9 +721,7 @@ async def _broadcast_loop() -> None:
             raise
 
         except Exception:
-            LOGGER.exception(
-                "Realtime broadcast iteration failed"
-            )
+            LOGGER.exception("Realtime broadcast iteration failed")
 
         try:
             await asyncio.wait_for(
@@ -889,15 +746,10 @@ async def start_realtime() -> None:
     global _stop_event
 
     async with _lifecycle_lock:
-        if (
-            _broadcast_task is not None
-            and not _broadcast_task.done()
-        ):
+        if _broadcast_task is not None and not _broadcast_task.done():
             return
 
-        _event_loop = (
-            asyncio.get_running_loop()
-        )
+        _event_loop = asyncio.get_running_loop()
 
         _stop_event = asyncio.Event()
 
@@ -951,11 +803,7 @@ async def stop_realtime() -> None:
 
         if records:
             await asyncio.gather(
-                *(
-                    sio.disconnect(sid)
-                    for sid, _record
-                    in records
-                ),
+                *(sio.disconnect(sid) for sid, _record in records),
                 return_exceptions=True,
             )
 
@@ -972,9 +820,7 @@ async def stop_realtime() -> None:
         _stop_event = None
         _event_loop = None
 
-        LOGGER.info(
-            "Realtime broadcaster stopped"
-        )
+        LOGGER.info("Realtime broadcaster stopped")
 
 
 def make_asgi_app(
@@ -985,7 +831,5 @@ def make_asgi_app(
     return socketio.ASGIApp(
         sio,
         other_asgi_app=fastapi_app,
-        socketio_path=(
-            settings.socket_path.strip("/")
-        ),
+        socketio_path=(settings.socket_path.strip("/")),
     )

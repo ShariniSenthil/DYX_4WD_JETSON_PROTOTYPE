@@ -39,6 +39,7 @@ from rover_backend.beacon import rover_beacon
 from rover_backend.config import client_ip_is_allowed
 from rover_backend.config import settings
 from rover_backend.mission_routes import mission_router
+from rover_backend.mission_report import mission_report_store
 from rover_backend.mission_store import MissionValidationError
 from rover_backend.mission_store import mission_store
 from rover_backend.realtime import make_asgi_app
@@ -280,6 +281,8 @@ async def startup_backend() -> None:
                 error=str(error),
             )
 
+        await asyncio.to_thread(mission_report_store.restore_state)
+
         await asyncio.to_thread(ros_bridge.start)
 
         ros_started = True
@@ -336,7 +339,9 @@ async def startup_backend() -> None:
             try:
                 rover_beacon.stop()
             except Exception:
-                LOGGER.exception("UDP discovery beacon cleanup failed after startup error")
+                LOGGER.exception(
+                    "UDP discovery beacon cleanup failed after startup error"
+                )
 
         if realtime_started:
             try:

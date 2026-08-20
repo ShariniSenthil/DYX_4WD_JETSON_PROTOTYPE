@@ -59,19 +59,22 @@ def generate_launch_description() -> LaunchDescription:
         output="screen",
     )
 
+    rover_backend_node = Node(
+        package="rover_backend",
+        executable="rover_backend",
+        name="rover_backend",
+        output="screen",
+        emulate_tty=True,
+        # Keep one visible backend process during manual testing. If it exits,
+        # the operator can inspect the error without a bind-failure respawn loop.
+        respawn=False,
+    )
+
     rover_backend = TimerAction(
         period=4.0,
         actions=[
             LogInfo(msg=("Starting production " "rover_backend")),
-            Node(
-                package="rover_backend",
-                executable="rover_backend",
-                name="rover_backend",
-                output="screen",
-                emulate_tty=True,
-                respawn=True,
-                respawn_delay=2.0,
-            ),
+            rover_backend_node,
         ],
     )
 
@@ -221,8 +224,9 @@ def generate_launch_description() -> LaunchDescription:
                         # 30 mm waypoint radius as marking points, but is never
                         # sprayed or counted as a marking point.
                         "dummy_arrival_tolerance_m": 0.03,
-                        # A marking point cannot become COMPLETED until the
-                        # separate spray controller confirms SUCCESS.
+                        # Spray is requested only after positional verification.
+                        # Its SUCCESS/FAILED/TIMEOUT outcome is reported for
+                        # monitoring and does not gate mission progression.
                         "spray_required": True,
                         "spray_confirmation_timeout_sec": 7.0,
                         "spray_status_timeout_sec": 2.0,

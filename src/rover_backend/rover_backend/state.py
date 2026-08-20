@@ -99,6 +99,7 @@ def _safe_int(
 def _calculate_progress(
     completed_points: int,
     skipped_points: int,
+    failed_points: int,
     total_points: int,
 ) -> float:
     """Calculate mission progress from terminal point states."""
@@ -108,7 +109,7 @@ def _calculate_progress(
 
     handled_points = max(
         0,
-        completed_points + skipped_points,
+        completed_points + skipped_points + failed_points,
     )
 
     progress = handled_points / total_points * 100.0
@@ -260,6 +261,7 @@ class RoverState:
             },
             "mission": {
                 "mission_id": None,
+                "mission_run_id": None,
                 "filename": None,
                 "checksum_sha256": None,
                 "coordinate_mode": None,
@@ -272,6 +274,7 @@ class RoverState:
                 "loaded": False,
                 "total_points": 0,
                 "navigation_point_count": 0,
+                "dummy_point_count": 0,
                 "active_point_id": None,
                 "active_point_index": None,
                 "active_point_number": None,
@@ -303,14 +306,21 @@ class RoverState:
                 "spray_controller_ready": False,
                 "spray_controller_state": "UNKNOWN",
                 "spray_fault_reason": None,
+                "spray_enabled": False,
+                "spray_gates_mission_progress": False,
+                "current_point_spray_confirmed": None,
                 "start_stage": "IDLE",
                 "start_failed_stage": None,
                 "arrival_settle_elapsed_sec": 0.0,
                 "arrival_settle_required_sec": 0.30,
-                # Legacy aliases: arrival settle only; spray duration is owned
-                # by spray_controller and is exposed through /api/spray/status.
                 "hold_elapsed_sec": 0.0,
-                "hold_required_sec": 0.30,
+                "hold_required_sec": 3.0,
+                "alignment_active": False,
+                "path_frame_id": None,
+                "navigation_path_preview": [],
+                "navigation_path_preview_truncated": False,
+                "active_waypoint": None,
+                "point_status": [],
                 "uploaded_at": None,
                 "prepared_at": None,
                 "started_at": None,
@@ -320,6 +330,21 @@ class RoverState:
                 "error": None,
                 "last_point_event": None,
                 "point_results": {},
+                "terminal_cleanup_status": None,
+                "terminal_cleanup_error": None,
+                "updated_at": now,
+            },
+            "report": {
+                "available": False,
+                "terminal_available": False,
+                "status": "UNAVAILABLE",
+                "mission_id": None,
+                "termination": None,
+                "cleanup_complete": False,
+                "error": None,
+                "report_url": None,
+                "download_url": None,
+                "generated_at": None,
                 "updated_at": now,
             },
         }
@@ -415,6 +440,7 @@ class RoverState:
         mission["progress_percent"] = _calculate_progress(
             completed_points=(mission["completed_points"]),
             skipped_points=(mission["skipped_points"]),
+            failed_points=(mission["failed_points"]),
             total_points=total_points,
         )
 
@@ -747,6 +773,7 @@ class RoverState:
         self.update(
             "mission",
             mission_id=mission_id,
+            mission_run_id=None,
             filename=filename,
             checksum_sha256=(checksum_sha256),
             coordinate_mode=(coordinate_mode),
@@ -758,6 +785,7 @@ class RoverState:
             loaded=True,
             total_points=total_points,
             navigation_point_count=0,
+            dummy_point_count=0,
             active_point_id=None,
             active_point_index=None,
             active_point_number=None,
@@ -773,7 +801,20 @@ class RoverState:
             arrival_settle_elapsed_sec=0.0,
             arrival_settle_required_sec=0.30,
             hold_elapsed_sec=0.0,
-            hold_required_sec=0.30,
+            hold_required_sec=3.0,
+            alignment_active=False,
+            path_frame_id=None,
+            navigation_path_preview=[],
+            navigation_path_preview_truncated=False,
+            active_waypoint=None,
+            point_status=[],
+            last_point_event=None,
+            point_results={},
+            terminal_cleanup_status=None,
+            terminal_cleanup_error=None,
+            spray_enabled=False,
+            spray_gates_mission_progress=False,
+            current_point_spray_confirmed=None,
             uploaded_at=uploaded_at,
             prepared_at=None,
             started_at=None,
@@ -904,7 +945,6 @@ class RoverState:
 
         values: dict[str, Any] = {
             "marking_active": bool(active),
-            "arrival_settle_elapsed_sec": elapsed,
             "hold_elapsed_sec": elapsed,
         }
 
@@ -917,7 +957,6 @@ class RoverState:
                 )
                 or 0.0,
             )
-            values["arrival_settle_required_sec"] = required
             values["hold_required_sec"] = required
 
         self.update(
@@ -972,6 +1011,7 @@ class RoverState:
 
             replacement = {
                 "mission_id": None,
+                "mission_run_id": None,
                 "filename": None,
                 "checksum_sha256": None,
                 "coordinate_mode": None,
@@ -991,6 +1031,7 @@ class RoverState:
                 "loaded": bool(retain_loaded_file),
                 "total_points": total_points,
                 "navigation_point_count": 0,
+                "dummy_point_count": 0,
                 "active_point_id": None,
                 "active_point_index": None,
                 "active_point_number": None,
@@ -1022,6 +1063,9 @@ class RoverState:
                 "spray_controller_ready": False,
                 "spray_controller_state": "UNKNOWN",
                 "spray_fault_reason": None,
+                "spray_enabled": False,
+                "spray_gates_mission_progress": False,
+                "current_point_spray_confirmed": None,
                 "start_stage": "IDLE",
                 "start_failed_stage": None,
                 "arrival_settle_elapsed_sec": 0.0,
@@ -1032,12 +1076,13 @@ class RoverState:
                     )
                 ),
                 "hold_elapsed_sec": 0.0,
-                "hold_required_sec": (
-                    mission.get(
-                        "arrival_settle_required_sec",
-                        mission.get("hold_required_sec", 0.30),
-                    )
-                ),
+                "hold_required_sec": 3.0,
+                "alignment_active": False,
+                "path_frame_id": None,
+                "navigation_path_preview": [],
+                "navigation_path_preview_truncated": False,
+                "active_waypoint": None,
+                "point_status": [],
                 "uploaded_at": None,
                 "prepared_at": None,
                 "started_at": None,
@@ -1049,6 +1094,10 @@ class RoverState:
                     else "No mission loaded"
                 ),
                 "error": None,
+                "last_point_event": None,
+                "point_results": {},
+                "terminal_cleanup_status": None,
+                "terminal_cleanup_error": None,
                 "updated_at": utc_now_iso(),
             }
 

@@ -20,8 +20,11 @@ geometry. All path planning remains inside trajectory_generator.
 
 from __future__ import annotations
 
+import asyncio
+
 from pathlib import Path
 from typing import Any
+from typing import AsyncIterator
 from typing import Callable
 
 from fastapi import APIRouter
@@ -37,6 +40,8 @@ from starlette.concurrency import run_in_threadpool
 from rover_backend.auth import AuthenticatedSession
 from rover_backend.auth import require_auth
 from rover_backend.config import settings
+from rover_backend.mission_report import MissionReportError
+from rover_backend.mission_report import mission_report_store
 from rover_backend.mission_store import MissionValidationError
 from rover_backend.mission_store import mission_store
 from rover_backend.ros_bridge import ros_bridge
@@ -53,11 +58,19 @@ ACTIVE_MISSION_STATES = {
     "PAUSED",
     "WAITING_FOR_NEXT",
 }
-
-
 CONTROL_CONFLICT_STATES = {
     "PREPARING",
 }
+
+
+_mission_mutation_lock = asyncio.Lock()
+
+
+async def _serialize_mission_mutation() -> AsyncIterator[None]:
+    """Keep mission file checks and ROS control mutations in one transaction."""
+
+    async with _mission_mutation_lock:
+        yield
 
 
 class ExecutionModeRequest(BaseModel):
@@ -157,6 +170,7 @@ async def upload_mission(
     extension_mode: str = Form(...),
     dummy_point_distance_m: float | None = Form(None),
     _session: AuthenticatedSession = Depends(require_auth),
+    _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
     """Store one validated CSV and prepare its trajectory automatically.
 
@@ -194,7 +208,7 @@ async def upload_mission(
 
     try:
         metadata = await run_in_threadpool(
-            mission_store.save,
+            mission_report_store.save_new_mission,
             raw_bytes=raw_bytes,
             filename=(file.filename or "mission.csv"),
             extension_mode=extension_mode,
@@ -209,6 +223,11 @@ async def upload_mission(
         raise HTTPException(
             status_code=500,
             detail=("The mission could not be stored safely: " f"{error}"),
+        ) from error
+    except MissionReportError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
         ) from error
 
     # A valid upload always triggers trajectory calculation. The rover is not
@@ -254,7 +273,10 @@ async def upload_mission(
 
     return {
         "success": True,
-        "message": ("Mission uploaded; trajectory preparation started and will complete automatically when RTK is FIXED."),
+        "message": (
+            "Mission uploaded; trajectory preparation started and will "
+            "complete automatically when RTK is FIXED."
+        ),
         "upload": metadata,
         "mission": mission,
     }
@@ -263,6 +285,7 @@ async def upload_mission(
 @mission_router.post("/prepare")
 async def prepare_mission(
     _session: AuthenticatedSession = Depends(require_auth),
+    _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
     """Re-read the stored mission.csv and prepare the trajectory again."""
 
@@ -289,7 +312,17 @@ def mission_status(
     return {
         "success": True,
         "mission": _mission_state(),
+        "report": mission_report_store.status(),
     }
+
+
+def _clear_and_delete_active_mission() -> bool:
+    """Serialize manual trajectory clear and active-file deletion."""
+
+    with mission_report_store.lifecycle_transaction():
+        if ros_bridge.running:
+            ros_bridge.clear_mission()
+        return mission_store.delete()
 
 
 @mission_router.get("/loaded-path")
@@ -339,34 +372,60 @@ def download_mission_file(
     )
 
 
+@mission_router.get("/report")
+def mission_report(
+    _session: AuthenticatedSession = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return the backend-owned live or terminal report for display."""
+
+    report = mission_report_store.current_report()
+    return {
+        "success": True,
+        "available": report is not None,
+        "report": report,
+    }
+
+
+@mission_router.get("/report/download")
+def download_mission_report(
+    _session: AuthenticatedSession = Depends(require_auth),
+) -> FileResponse:
+    """Download the durable backend report after mission termination."""
+
+    report_path = Path(settings.mission_report_file)
+
+    terminal_report = mission_report_store.terminal_report()
+    if terminal_report is None or not report_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="No terminal mission report is available.",
+        )
+
+    return FileResponse(
+        path=str(report_path),
+        media_type="application/json; charset=utf-8",
+        filename="last-mission-report.json",
+    )
+
+
 @mission_router.delete("/file")
 async def delete_mission_file(
     _session: AuthenticatedSession = Depends(require_auth),
+    _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
     """Delete the single mission.csv after clearing prepared ROS state."""
 
     _require_not_active(operation="delete mission.csv")
 
-    # Clear any latched prepared trajectory before deleting its source file.
-    if ros_bridge.running:
-        try:
-            await run_in_threadpool(ros_bridge.clear_mission)
-        except RuntimeError as error:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Unable to clear the prepared ROS trajectory; "
-                    "mission.csv was not deleted: "
-                    f"{error}"
-                ),
-            ) from error
-
     try:
-        existed = await run_in_threadpool(mission_store.delete)
+        existed = await run_in_threadpool(_clear_and_delete_active_mission)
     except RuntimeError as error:
         raise HTTPException(
-            status_code=500,
-            detail=str(error),
+            status_code=409,
+            detail=(
+                "Unable to clear the prepared ROS trajectory or delete "
+                f"the active mission; active artifacts were retained: {error}"
+            ),
         ) from error
 
     return {
@@ -385,6 +444,7 @@ async def delete_mission_file(
 async def set_execution_mode(
     request: ExecutionModeRequest,
     _session: AuthenticatedSession = Depends(require_auth),
+    _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
     """Select AUTO or operator-stepped MANUAL mission execution."""
 
@@ -408,6 +468,7 @@ async def set_execution_mode(
 @mission_router.post("/start")
 async def start_mission(
     _session: AuthenticatedSession = Depends(require_auth),
+    _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
     return await _run_ros_operation(
         "start",
@@ -418,6 +479,7 @@ async def start_mission(
 @mission_router.post("/pause")
 async def pause_mission(
     _session: AuthenticatedSession = Depends(require_auth),
+    _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
     return await _run_ros_operation(
         "pause",
@@ -428,6 +490,7 @@ async def pause_mission(
 @mission_router.post("/resume")
 async def resume_mission(
     _session: AuthenticatedSession = Depends(require_auth),
+    _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
     return await _run_ros_operation(
         "resume",
@@ -438,6 +501,7 @@ async def resume_mission(
 @mission_router.post("/next-point")
 async def next_point(
     _session: AuthenticatedSession = Depends(require_auth),
+    _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
     return await _run_ros_operation(
         "next-point",
@@ -448,6 +512,7 @@ async def next_point(
 @mission_router.post("/skip-point")
 async def skip_point(
     _session: AuthenticatedSession = Depends(require_auth),
+    _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
     return await _run_ros_operation(
         "skip-point",
@@ -458,16 +523,46 @@ async def skip_point(
 @mission_router.post("/stop")
 async def stop_mission(
     _session: AuthenticatedSession = Depends(require_auth),
+    _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
-    return await _run_ros_operation(
+    mission_id = str(_mission_state().get("mission_id") or "")
+
+    response = await _run_ros_operation(
         "stop",
         ros_bridge.stop_mission,
     )
+
+    report = None
+    if mission_id:
+        report = await run_in_threadpool(
+            mission_report_store.wait_for_report,
+            mission_id,
+            10.0,
+        )
+
+    report_status = mission_report_store.status()
+    report_ready = bool(
+        report is not None and report_status.get("cleanup_complete", False)
+    )
+
+    response["manager_stop_success"] = True
+    response["report_ready"] = report_ready
+    response["report"] = report_status
+
+    if mission_id and not report_ready:
+        response["success"] = False
+        response["message"] = str(
+            report_status.get("error")
+            or "Mission Manager stopped the mission, but terminal report cleanup did not complete."
+        )
+
+    return response
 
 
 @mission_router.post("/clear")
 async def clear_mission(
     _session: AuthenticatedSession = Depends(require_auth),
+    _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
     """Clear generated ROS paths and progress while retaining mission.csv."""
 

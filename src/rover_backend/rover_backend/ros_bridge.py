@@ -16,6 +16,7 @@ It never reads or rewrites mission.csv and never performs path planning.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -52,6 +53,10 @@ from std_msgs.msg import UInt64
 from std_srvs.srv import Trigger
 
 from rover_backend.config import settings
+from rover_backend.mission_report import MissionReportError
+from rover_backend.mission_report import StaleMissionTerminalEvent
+from rover_backend.mission_report import mission_report_store
+from rover_backend.mission_store import mission_store
 from rover_backend.state import rover_state
 from rover_backend.state import utc_now_iso
 
@@ -245,6 +250,8 @@ class RoverBackendRosNode(Node):
 
         self._command_lock = threading.RLock()
         self._runtime_lock = threading.RLock()
+        self._terminal_cleanup_lock = threading.Lock()
+        self._terminal_cleanup_keys: set[str] = set()
 
         # The backend always starts safe.
         self._mission_enable = False
@@ -1464,6 +1471,18 @@ class RoverBackendRosNode(Node):
             ),
             "spray_controller_state": payload.get("spray_controller_state"),
             "spray_fault_reason": payload.get("spray_fault_reason"),
+            "spray_enabled": bool(
+                payload.get(
+                    "spray_enabled",
+                    payload.get("spray_required", False),
+                )
+            ),
+            "spray_gates_mission_progress": bool(
+                payload.get("spray_gates_mission_progress", False)
+            ),
+            "current_point_spray_confirmed": payload.get(
+                "current_point_spray_confirmed"
+            ),
             "start_stage": str(
                 payload.get("start_stage") or "IDLE"
             ).strip().upper(),
@@ -1471,10 +1490,7 @@ class RoverBackendRosNode(Node):
             "arrival_settle_elapsed_sec": max(
                 0.0,
                 _finite_float(
-                    payload.get(
-                        "arrival_settle_elapsed_sec",
-                        payload.get("hold_elapsed_sec"),
-                    ),
+                    payload.get("arrival_settle_elapsed_sec"),
                     0.0,
                 )
                 or 0.0,
@@ -1482,22 +1498,20 @@ class RoverBackendRosNode(Node):
             "arrival_settle_required_sec": max(
                 0.0,
                 _finite_float(
-                    payload.get(
-                        "arrival_settle_required_sec",
-                        payload.get("hold_required_sec"),
-                    ),
-                    0.30,
+                    payload.get("arrival_settle_required_sec"),
+                    settings.arrival_settle_seconds,
                 )
-                or 0.30,
+                or settings.arrival_settle_seconds,
             ),
-            # Legacy aliases retained for older frontend builds. They now mean
-            # arrival validation time, NOT the 3-second spray duration.
             "hold_elapsed_sec": max(
                 0.0,
                 _finite_float(
                     payload.get(
-                        "arrival_settle_elapsed_sec",
-                        payload.get("hold_elapsed_sec"),
+                        "marking_hold_elapsed_sec",
+                        payload.get(
+                            "verification_hold_elapsed_sec",
+                            payload.get("hold_elapsed_sec"),
+                        ),
                     ),
                     0.0,
                 )
@@ -1507,12 +1521,15 @@ class RoverBackendRosNode(Node):
                 0.0,
                 _finite_float(
                     payload.get(
-                        "arrival_settle_required_sec",
-                        payload.get("hold_required_sec"),
+                        "marking_hold_required_sec",
+                        payload.get(
+                            "verification_hold_required_sec",
+                            payload.get("hold_required_sec"),
+                        ),
                     ),
-                    0.30,
+                    settings.marking_hold_seconds,
                 )
-                or 0.30,
+                or settings.marking_hold_seconds,
             ),
             "alignment_active": bool(
                 payload.get(
@@ -1527,6 +1544,12 @@ class RoverBackendRosNode(Node):
             "message": payload.get("message"),
             "error": payload.get("error"),
         }
+
+        manager_run_id = str(
+            payload.get("mission_run_id") or ""
+        ).strip()
+        if manager_run_id:
+            mission_updates["mission_run_id"] = manager_run_id
 
         if preparation_in_progress and state_name == "EMPTY":
             # Preserve the uploaded mission metadata and the trajectory
@@ -1589,12 +1612,7 @@ class RoverBackendRosNode(Node):
         self,
         message: String,
     ) -> None:
-        """
-        Store the mission point event together with the backend
-        accuracy snapshot for that exact marking point.
-
-        This callback does not change mission control logic.
-        """
+        """Store structured point evidence without changing mission control."""
 
         self._mark_ros_message()
 
@@ -1603,136 +1621,138 @@ class RoverBackendRosNode(Node):
             return
 
         payload["received_at"] = utc_now_iso()
-
         event_name = str(payload.get("event") or "").strip().upper()
-
         point_index_raw = payload.get("point_index")
-
         point_index = (
-            _safe_int(
-                point_index_raw,
-                -1,
-            )
+            _safe_int(point_index_raw, -1)
             if point_index_raw is not None
             else -1
         )
-
         point_number = point_index + 1 if point_index >= 0 else 0
 
-        accuracy = rover_state.section("accuracy")
+        # Mission Manager's immutable nested snapshot is authoritative.  Flat
+        # capture fields and live RPP accuracy remain compatibility fallbacks.
+        manager_accuracy = payload.get("accuracy")
+        accuracy_snapshot: dict[str, Any] | None = None
 
-        accuracy_available = bool(
-            accuracy.get(
-                "available",
-                False,
+        if isinstance(manager_accuracy, dict):
+            accuracy_snapshot = copy.deepcopy(manager_accuracy)
+            radial_mm = _finite_float(
+                accuracy_snapshot.get("radial_error_mm")
             )
-        )
+            xtrack_mm = _finite_float(
+                accuracy_snapshot.get("cross_track_error_mm")
+            )
+            along_mm = _finite_float(
+                accuracy_snapshot.get("along_track_error_mm")
+            )
+            tolerance_mm = _finite_float(
+                accuracy_snapshot.get("tolerance_mm"),
+                30.0,
+            )
+            accuracy_outcome = str(
+                accuracy_snapshot.get("outcome") or "UNSPECIFIED"
+            ).strip().upper()
 
-        accuracy_goal_number = _safe_int(
-            accuracy.get("goal_number"),
-            0,
-        )
+            accuracy_snapshot.update(
+                {
+                    "available": radial_mm is not None,
+                    "goal_number": point_number,
+                    "cross_track_error_mm": xtrack_mm,
+                    "cross_track_abs_mm": (
+                        abs(xtrack_mm) if xtrack_mm is not None else None
+                    ),
+                    "front_back_error_mm": along_mm,
+                    "front_back_abs_mm": (
+                        abs(along_mm) if along_mm is not None else None
+                    ),
+                    "radial_error_mm": radial_mm,
+                    "closest_radial_error_mm": radial_mm,
+                    "overall_accuracy_mm": radial_mm,
+                    "accuracy_target_mm": tolerance_mm,
+                    "accuracy_status": accuracy_outcome,
+                    "accuracy_pass": accuracy_outcome in {
+                        "ACHIEVED",
+                        "PASSED",
+                        "ACCURACY_PASS",
+                    },
+                    "captured_at": payload["received_at"],
+                }
+            )
 
-        accuracy_matches_point = point_number > 0 and (
-            accuracy_goal_number == 0 or accuracy_goal_number == point_number
-        )
+        else:
+            capture_radial_mm = _finite_float(
+                payload.get("capture_radial_error_mm")
+            )
+            capture_xtrack_mm = _finite_float(
+                payload.get("capture_cross_track_error_mm")
+            )
+            capture_along_mm = _finite_float(
+                payload.get("capture_along_track_error_mm")
+            )
 
-        should_capture_accuracy = (
-            event_name
-            in {
-                "REACHED",
-                "MARKED",
-                "COMPLETED",
-                "SKIPPED",
-                "MANUAL_BYPASS",
-            }
-            and accuracy_available
-            and accuracy_matches_point
-        )
-
-        capture_radial_mm = _finite_float(
-            payload.get("capture_radial_error_mm")
-        )
-        capture_xtrack_mm = _finite_float(
-            payload.get("capture_cross_track_error_mm")
-        )
-        capture_along_mm = _finite_float(
-            payload.get("capture_along_track_error_mm")
-        )
-        capture_available = bool(
-            payload.get("capture_accuracy_available", False)
-            and capture_radial_mm is not None
-        )
-
-        if capture_available:
-            accuracy_snapshot = {
-                "available": True,
-                "goal_number": point_number,
-                "cross_track_error_mm": capture_xtrack_mm,
-                "cross_track_abs_mm": (
-                    abs(capture_xtrack_mm)
-                    if capture_xtrack_mm is not None
-                    else None
-                ),
-                "front_back_error_mm": capture_along_mm,
-                "front_back_abs_mm": (
-                    abs(capture_along_mm)
-                    if capture_along_mm is not None
-                    else None
-                ),
-                "radial_error_mm": capture_radial_mm,
-                "closest_radial_error_mm": capture_radial_mm,
-                "overall_accuracy_mm": capture_radial_mm,
-                "accuracy_target_mm": 30.0,
-                "accuracy_status": (
-                    "ACCURACY_PASS"
-                    if capture_radial_mm <= 30.0
-                    else "OUTSIDE_TOLERANCE"
-                ),
-                "accuracy_pass": capture_radial_mm <= 30.0,
-                "captured_at": utc_now_iso(),
-            }
-            payload["accuracy"] = accuracy_snapshot
-            payload.update(accuracy_snapshot)
-            payload["accuracy_remarks"] = f"{capture_radial_mm:.1f} mm"
-
-        elif should_capture_accuracy:
-            accuracy_snapshot = {
-                "available": True,
-                "goal_number": accuracy_goal_number,
-                "cross_track_error_mm": accuracy.get("cross_track_error_mm"),
-                "cross_track_abs_mm": accuracy.get("cross_track_abs_mm"),
-                "cross_track_side": accuracy.get("cross_track_side"),
-                "front_back_error_mm": accuracy.get("front_back_error_mm"),
-                "front_back_abs_mm": accuracy.get("front_back_abs_mm"),
-                "front_back_position": accuracy.get("front_back_position"),
-                "radial_error_mm": accuracy.get("radial_error_mm"),
-                "overall_accuracy_mm": (
-                    accuracy.get("closest_radial_error_mm")
-                    if accuracy.get("closest_radial_error_mm") is not None
-                    else accuracy.get("radial_error_mm")
-                ),
-                "closest_radial_error_mm": accuracy.get("closest_radial_error_mm"),
-                "accuracy_target_mm": accuracy.get("accuracy_target_mm"),
-                "test_tolerance_mm": accuracy.get("test_tolerance_mm"),
-                "accuracy_status": accuracy.get("accuracy_status"),
-                "accuracy_pass": bool(
-                    accuracy.get(
-                        "accuracy_pass",
-                        False,
+            if bool(
+                payload.get("capture_accuracy_available", False)
+                and capture_radial_mm is not None
+            ):
+                accuracy_snapshot = {
+                    "available": True,
+                    "goal_number": point_number,
+                    "cross_track_error_mm": capture_xtrack_mm,
+                    "cross_track_abs_mm": (
+                        abs(capture_xtrack_mm)
+                        if capture_xtrack_mm is not None
+                        else None
+                    ),
+                    "front_back_error_mm": capture_along_mm,
+                    "front_back_abs_mm": (
+                        abs(capture_along_mm)
+                        if capture_along_mm is not None
+                        else None
+                    ),
+                    "radial_error_mm": capture_radial_mm,
+                    "closest_radial_error_mm": capture_radial_mm,
+                    "overall_accuracy_mm": capture_radial_mm,
+                    "accuracy_target_mm": 30.0,
+                    "accuracy_status": (
+                        "ACCURACY_PASS"
+                        if capture_radial_mm <= 30.0
+                        else "FAILED"
+                    ),
+                    "accuracy_pass": capture_radial_mm <= 30.0,
+                    "captured_at": payload["received_at"],
+                }
+            else:
+                live_accuracy = rover_state.section("accuracy")
+                live_goal = _safe_int(live_accuracy.get("goal_number"), 0)
+                live_matches = point_number > 0 and (
+                    live_goal == 0 or live_goal == point_number
+                )
+                if (
+                    event_name
+                    in {
+                        "ACCURACY_FAILED",
+                        "FAILED",
+                        "COMPLETED",
+                        "SKIPPED",
+                        "MARKED",
+                    }
+                    and bool(live_accuracy.get("available", False))
+                    and live_matches
+                ):
+                    accuracy_snapshot = copy.deepcopy(live_accuracy)
+                    accuracy_snapshot["captured_at"] = payload["received_at"]
+                    accuracy_snapshot["overall_accuracy_mm"] = (
+                        live_accuracy.get("closest_radial_error_mm")
+                        if live_accuracy.get("closest_radial_error_mm") is not None
+                        else live_accuracy.get("radial_error_mm")
                     )
-                ),
-                "within_test_tolerance": bool(
-                    accuracy.get(
-                        "within_test_tolerance",
-                        False,
-                    )
-                ),
-                "captured_at": utc_now_iso(),
-            }
 
+        if accuracy_snapshot is not None:
             payload["accuracy"] = accuracy_snapshot
-            payload.update(accuracy_snapshot)
+            payload["overall_accuracy_mm"] = accuracy_snapshot.get(
+                "overall_accuracy_mm"
+            )
             overall_mm = _finite_float(
                 accuracy_snapshot.get("overall_accuracy_mm")
             )
@@ -1742,33 +1762,266 @@ class RoverBackendRosNode(Node):
                 else "Unavailable"
             )
 
+        manager_spray = payload.get("spray")
+        if isinstance(manager_spray, dict):
+            spray = copy.deepcopy(manager_spray)
+            spray_attempted = bool(spray.get("attempted", False))
+            spray_outcome = str(
+                spray.get("outcome") or "UNKNOWN"
+            ).strip().upper()
+            spray_reason = spray.get("reason")
+            spray_elapsed_sec = _finite_float(
+                spray.get("elapsed_sec")
+            )
+        else:
+            spray_attempted = bool(
+                payload.get("spray_attempted", False)
+            )
+            spray_outcome = str(
+                payload.get("spray_outcome") or "UNKNOWN"
+            ).strip().upper()
+            spray_reason = payload.get("spray_failure_reason")
+            spray_elapsed_sec = _finite_float(
+                payload.get("spray_elapsed_sec")
+            )
+            spray = {
+                "attempted": spray_attempted,
+                "outcome": spray_outcome,
+                "reason": spray_reason,
+                "elapsed_sec": spray_elapsed_sec,
+            }
+
+        spray_confirmed = (
+            True
+            if spray_outcome == "SUCCESS"
+            else False
+            if spray_outcome in {"FAILED", "TIMEOUT"}
+            else None
+        )
+
         mission = rover_state.section("mission")
         point_results = dict(mission.get("point_results") or {})
-        point_id = str(payload.get("point_id") or "")
+        point_id = str(payload.get("point_id") or "").strip()
+
         if point_id:
-            point_results[point_id] = {
-                "point_id": point_id,
-                "point_index": point_index,
-                "event": event_name,
-                "spray_confirmed": bool(
-                    payload.get("spray_confirmed", False)
-                ),
-                "overall_accuracy_mm": payload.get(
-                    "overall_accuracy_mm"
-                ),
-                "accuracy_remarks": payload.get(
-                    "accuracy_remarks",
-                    "Unavailable",
-                ),
-                "accuracy": payload.get("accuracy"),
-                "received_at": payload["received_at"],
-            }
+            existing = point_results.get(point_id)
+            existing = existing if isinstance(existing, dict) else {}
+            event_history = list(existing.get("event_history") or [])
+            event_history.append(
+                {
+                    "event": event_name,
+                    "state": payload.get("state"),
+                    "reason": payload.get("reason"),
+                    "timestamp_unix_ns": payload.get("timestamp_unix_ns"),
+                    "received_at": payload["received_at"],
+                    "accuracy": copy.deepcopy(accuracy_snapshot),
+                    "spray": copy.deepcopy(spray),
+                }
+            )
+
+            manager_result = payload.get("point_result")
+            result = (
+                copy.deepcopy(manager_result)
+                if isinstance(manager_result, dict)
+                else {}
+            )
+            result.update(
+                {
+                    "point_id": point_id,
+                    "point_index": point_index,
+                    "event": event_name,
+                    "mission_run_id": payload.get("mission_run_id"),
+                    "point_outcome": str(
+                        result.get("point_outcome") or event_name
+                    ).strip().upper(),
+                    "spray": copy.deepcopy(spray),
+                    "spray_attempted": spray_attempted,
+                    "spray_outcome": spray_outcome,
+                    "spray_confirmed": spray_confirmed,
+                    "spray_failure_reason": spray_reason,
+                    "spray_elapsed_sec": spray_elapsed_sec,
+                    "spray_monitor_only": True,
+                    "overall_accuracy_mm": (
+                        accuracy_snapshot.get("overall_accuracy_mm")
+                        if accuracy_snapshot is not None
+                        else None
+                    ),
+                    "accuracy_remarks": payload.get(
+                        "accuracy_remarks",
+                        "Unavailable",
+                    ),
+                    "accuracy": copy.deepcopy(accuracy_snapshot),
+                    "event_history": event_history,
+                    "received_at": payload["received_at"],
+                }
+            )
+
+            accuracy_outcome = str(
+                (accuracy_snapshot or {}).get("outcome") or ""
+            ).strip().upper()
+            if accuracy_outcome == "FAILED" or event_name == "ACCURACY_FAILED":
+                result["accuracy_failure"] = copy.deepcopy(accuracy_snapshot)
+            elif existing.get("accuracy_failure") is not None:
+                result["accuracy_failure"] = copy.deepcopy(
+                    existing["accuracy_failure"]
+                )
+
+            point_results[point_id] = result
 
         rover_state.update(
             "mission",
             last_point_event=payload,
             point_results=point_results,
         )
+
+        # Reporting is monitor-only, but each point transition is durably
+        # checkpointed so a backend restart cannot erase completed, skipped,
+        # or failed rows from the frontend report.
+        try:
+            mission_report_store.checkpoint_live_report()
+        except MissionReportError as error:
+            reason = f"Mission report checkpoint failed: {error}"
+            rover_state.update(
+                "report",
+                status="CHECKPOINT_FAILED",
+                error=reason,
+            )
+            self.get_logger().error(reason)
+
+        if event_name == "MISSION_TERMINATED":
+            self._schedule_terminal_mission_cleanup(payload)
+
+    def _schedule_terminal_mission_cleanup(
+        self,
+        terminal_event: dict[str, Any],
+    ) -> None:
+        """Run terminal service/file work outside the ROS subscription callback."""
+
+        cleanup_key = str(
+            terminal_event.get("mission_run_id")
+            or terminal_event.get("timestamp_unix_ns")
+            or "unknown-terminal-event"
+        )
+
+        with self._terminal_cleanup_lock:
+            if cleanup_key in self._terminal_cleanup_keys:
+                return
+            self._terminal_cleanup_keys.add(cleanup_key)
+
+        cleanup_thread = threading.Thread(
+            target=self._finalize_terminal_mission,
+            args=(copy.deepcopy(terminal_event),),
+            name=f"mission-terminal-cleanup-{cleanup_key[:12]}",
+            daemon=True,
+        )
+        cleanup_thread.start()
+
+    def _finalize_terminal_mission(
+        self,
+        terminal_event: dict[str, Any],
+    ) -> None:
+        """Archive a terminal mission, then clear ROS and active files."""
+
+        if not bool(
+            terminal_event.get("disarm_confirmed", False)
+        ):
+            reason = str(
+                terminal_event.get("message")
+                or (
+                    "Mission Manager did not confirm PX4 disarm; active "
+                    "mission artifacts were retained."
+                )
+            )
+            mission_report_store.expose_failure(reason)
+            self.get_logger().error(reason)
+            return
+
+        with mission_report_store.lifecycle_transaction():
+            try:
+                report = mission_report_store.write_terminal_report(
+                    terminal_event
+                )
+            except StaleMissionTerminalEvent as error:
+                self.get_logger().warn(str(error))
+                return
+            except MissionReportError as error:
+                reason = str(error)
+                mission_report_store.expose_failure(reason)
+                self.get_logger().error(reason)
+                return
+
+            trajectory_cleared = False
+            accepted, clear_message = self._call_trigger(
+                client=self._trajectory_clear_client,
+                service_name="/trajectory_generator/clear",
+            )
+
+            if not accepted:
+                reason = (
+                    "Terminal report was preserved, but the trajectory "
+                    f"could not be cleared: {clear_message}. "
+                    "Active mission artifacts were retained."
+                )
+                try:
+                    mission_report_store.update_cleanup(
+                        report,
+                        status="TRAJECTORY_CLEAR_FAILED",
+                        complete=False,
+                        trajectory_cleared=False,
+                        active_artifacts_deleted=False,
+                        error=reason,
+                    )
+                except MissionReportError:
+                    self.get_logger().exception(
+                        "Unable to record trajectory-clear failure in the mission report"
+                    )
+                mission_report_store.expose_failure(reason)
+                self.get_logger().error(reason)
+                return
+
+            trajectory_cleared = True
+
+            try:
+                mission_store.delete()
+            except RuntimeError as error:
+                reason = (
+                    "Terminal report was preserved and the trajectory was "
+                    f"cleared, but active mission artifacts could not be deleted: {error}"
+                )
+                try:
+                    mission_report_store.update_cleanup(
+                        report,
+                        status="ARTIFACT_DELETE_FAILED",
+                        complete=False,
+                        trajectory_cleared=trajectory_cleared,
+                        active_artifacts_deleted=False,
+                        error=reason,
+                    )
+                except MissionReportError:
+                    self.get_logger().exception(
+                        "Unable to record artifact-delete failure in the mission report"
+                    )
+                mission_report_store.expose_failure(reason)
+                self.get_logger().error(reason)
+                return
+
+            try:
+                mission_report_store.update_cleanup(
+                    report,
+                    status="READY",
+                    complete=True,
+                    trajectory_cleared=True,
+                    active_artifacts_deleted=True,
+                    error=None,
+                )
+            except MissionReportError:
+                # The original report was already written before cleanup.  Do
+                # not recreate deleted active artifacts merely because the
+                # final cleanup marker could not be persisted.
+                self.get_logger().exception(
+                    "Mission artifacts were cleaned, but the report cleanup "
+                    "marker could not be updated"
+                )
 
     def _marking_active_callback(
         self,
@@ -1811,10 +2064,28 @@ class RoverBackendRosNode(Node):
         self,
         manager_payload: dict[str, Any],
     ) -> None:
+        mission_id = rover_state.section("mission").get("mission_id")
+
+        # mission_manager continues to publish EMPTY status after terminal
+        # cleanup.  Never let those periodic messages recreate a deleted
+        # mission_runtime.json.
+        if (
+            not mission_id
+            or not settings.mission_file.is_file()
+            or not settings.mission_metadata_file.is_file()
+        ):
+            try:
+                settings.mission_runtime_file.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.exception(
+                    "Unable to remove stale mission runtime state"
+                )
+            return
+
         runtime_payload = {
             "schema_version": 1,
             "saved_at": utc_now_iso(),
-            "mission_id": rover_state.section("mission").get("mission_id"),
+            "mission_id": mission_id,
             "runtime": manager_payload,
         }
 
@@ -2133,14 +2404,10 @@ class RoverBackendRosNode(Node):
         return self._proxy_manager_operation("skip_point")
 
     def stop_mission(self) -> dict[str, Any]:
-        result = self._proxy_manager_operation("stop")
-        rover_state.clear_mission_runtime(retain_loaded_file=True)
-        rover_state.update(
-            "mission",
-            loaded=True,
-            ready=False,
-        )
-        return result
+        # Mission Manager owns disarm and emits MISSION_TERMINATED only after
+        # its STOP contract finishes.  That event drives report-first cleanup.
+        self._proxy_manager_operation("stop")
+        return rover_state.section("mission")
 
     def clear_mission(self) -> dict[str, Any]:
         manager_ok, manager_message = self._manager_command("clear")
