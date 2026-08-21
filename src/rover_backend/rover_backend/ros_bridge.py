@@ -313,7 +313,6 @@ class RoverBackendRosNode(Node):
         # Safety and heartbeat publishers
         # ======================================================
 
-
         self._heartbeat_pub = self.create_publisher(
             UInt64,
             "/rover_backend/heartbeat",
@@ -523,11 +522,9 @@ class RoverBackendRosNode(Node):
             for command in sorted(MISSION_MANAGER_COMMANDS)
         }
 
-
         # ======================================================
         # Timers and safe initialization
         # ======================================================
-
 
         self.create_timer(
             1.0 / settings.backend_heartbeat_hz,
@@ -776,28 +773,16 @@ class RoverBackendRosNode(Node):
             ValueError,
             OverflowError,
         ):
-            LOGGER.exception(
-                "Failed to decode MAVLink ESTIMATOR_STATUS"
-            )
+            LOGGER.exception("Failed to decode MAVLink ESTIMATOR_STATUS")
             return
 
-        horizontal_accuracy_m = _finite_float(
-            pos_horiz_accuracy
-        )
-        vertical_accuracy_m = _finite_float(
-            pos_vert_accuracy
-        )
+        horizontal_accuracy_m = _finite_float(pos_horiz_accuracy)
+        vertical_accuracy_m = _finite_float(pos_vert_accuracy)
 
-        if (
-            horizontal_accuracy_m is not None
-            and horizontal_accuracy_m <= 0.0
-        ):
+        if horizontal_accuracy_m is not None and horizontal_accuracy_m <= 0.0:
             horizontal_accuracy_m = None
 
-        if (
-            vertical_accuracy_m is not None
-            and vertical_accuracy_m <= 0.0
-        ):
+        if vertical_accuracy_m is not None and vertical_accuracy_m <= 0.0:
             vertical_accuracy_m = None
 
         horizontal_accuracy_mm = (
@@ -806,9 +791,7 @@ class RoverBackendRosNode(Node):
             else None
         )
         vertical_accuracy_mm = (
-            vertical_accuracy_m * 1000.0
-            if vertical_accuracy_m is not None
-            else None
+            vertical_accuracy_m * 1000.0 if vertical_accuracy_m is not None else None
         )
         estimator_flags = int(flags)
         absolute_horizontal_valid = bool(estimator_flags & 16)
@@ -816,8 +799,7 @@ class RoverBackendRosNode(Node):
         gps_glitch = bool(estimator_flags & 1024)
         accel_error = bool(estimator_flags & 2048)
         available = (
-            horizontal_accuracy_m is not None
-            and vertical_accuracy_m is not None
+            horizontal_accuracy_m is not None and vertical_accuracy_m is not None
         )
         healthy = (
             absolute_horizontal_valid
@@ -1063,14 +1045,7 @@ class RoverBackendRosNode(Node):
 
         span = cls.SPRAY_PWM_MAX_US - cls.SPRAY_PWM_MIN_US
 
-        return (
-            2.0
-            * (
-                (pwm - cls.SPRAY_PWM_MIN_US)
-                / span
-            )
-            - 1.0
-        )
+        return 2.0 * ((pwm - cls.SPRAY_PWM_MIN_US) / span) - 1.0
 
     @classmethod
     def _spray_actuator_value_to_pwm(
@@ -1087,10 +1062,7 @@ class RoverBackendRosNode(Node):
 
         span = cls.SPRAY_PWM_MAX_US - cls.SPRAY_PWM_MIN_US
 
-        pwm = (
-            cls.SPRAY_PWM_MIN_US
-            + ((actuator_value + 1.0) / 2.0) * span
-        )
+        pwm = cls.SPRAY_PWM_MIN_US + ((actuator_value + 1.0) / 2.0) * span
 
         return int(round(pwm))
 
@@ -1099,52 +1071,28 @@ class RoverBackendRosNode(Node):
     ) -> dict[str, Any]:
         with self._runtime_lock:
             status = dict(self._spray_status)
-            status_age_sec = self._monotonic_age(
-                self._spray_status_monotonic
-            )
+            status_age_sec = self._monotonic_age(self._spray_status_monotonic)
 
-        press_value = _finite_float(
-            status.get("press_value")
-        )
-        release_value = _finite_float(
-            status.get("release_value")
-        )
+        press_value = _finite_float(status.get("press_value"))
+        release_value = _finite_float(status.get("release_value"))
 
         return {
             "available": bool(status),
             "status_age_sec": (
-                None
-                if not math.isfinite(status_age_sec)
-                else round(status_age_sec, 3)
+                None if not math.isfinite(status_age_sec) else round(status_age_sec, 3)
             ),
-            "press_pwm_us": (
-                self._spray_actuator_value_to_pwm(
-                    press_value
-                )
-            ),
-            "release_pwm_us": (
-                self._spray_actuator_value_to_pwm(
-                    release_value
-                )
-            ),
+            "press_pwm_us": (self._spray_actuator_value_to_pwm(press_value)),
+            "release_pwm_us": (self._spray_actuator_value_to_pwm(release_value)),
             "press_value": press_value,
             "release_value": release_value,
-            "spray_duration_sec": _finite_float(
-                status.get("spray_duration_sec")
-            ),
-            "spray_elapsed_sec": _finite_float(
-                status.get("spray_elapsed_sec")
-            ),
-            "spray_remaining_sec": _finite_float(
-                status.get("spray_remaining_sec")
-            ),
+            "spray_duration_sec": _finite_float(status.get("spray_duration_sec")),
+            "spray_elapsed_sec": _finite_float(status.get("spray_elapsed_sec")),
+            "spray_remaining_sec": _finite_float(status.get("spray_remaining_sec")),
             "spraying": bool(status.get("spraying", False)),
             "marking_active": bool(status.get("marking_active", False)),
             "controller_state": status.get("controller_state"),
             "ready": bool(status.get("ready", False)),
-            "fault_latched": bool(
-                status.get("fault_latched", False)
-            ),
+            "fault_latched": bool(status.get("fault_latched", False)),
             "fault_reason": status.get("fault_reason"),
             "config_request_id": status.get("config_request_id"),
             "config_result": status.get("config_result"),
@@ -1161,12 +1109,8 @@ class RoverBackendRosNode(Node):
     ) -> dict[str, Any]:
         """Publish spray PWM configuration and wait for controller ACK."""
 
-        press_value = self._spray_pwm_to_actuator_value(
-            press_pwm_us
-        )
-        release_value = self._spray_pwm_to_actuator_value(
-            release_pwm_us
-        )
+        press_value = self._spray_pwm_to_actuator_value(press_pwm_us)
+        release_value = self._spray_pwm_to_actuator_value(release_pwm_us)
 
         request_id = uuid.uuid4().hex
 
@@ -1185,41 +1129,26 @@ class RoverBackendRosNode(Node):
 
         self._spray_config_pub.publish(message)
 
-        deadline = (
-            time.monotonic()
-            + self.SPRAY_CONFIG_ACK_TIMEOUT_SEC
-        )
+        deadline = time.monotonic() + self.SPRAY_CONFIG_ACK_TIMEOUT_SEC
 
         while time.monotonic() < deadline:
             with self._runtime_lock:
                 status = dict(self._spray_status)
 
-            if (
-                str(status.get("config_request_id") or "")
-                == request_id
-            ):
-                result = str(
-                    status.get("config_result") or ""
-                ).strip().upper()
+            if str(status.get("config_request_id") or "") == request_id:
+                result = str(status.get("config_result") or "").strip().upper()
 
                 if result == "ACCEPTED":
                     return self.get_spray_config()
 
-                reason = str(
-                    status.get("config_reason")
-                    or "UNKNOWN_REASON"
-                )
+                reason = str(status.get("config_reason") or "UNKNOWN_REASON")
 
-                raise RuntimeError(
-                    "Spray configuration rejected: "
-                    f"{reason}"
-                )
+                raise RuntimeError("Spray configuration rejected: " f"{reason}")
 
             time.sleep(0.05)
 
         raise RuntimeError(
-            "Timed out waiting for spray controller "
-            "configuration acknowledgement"
+            "Timed out waiting for spray controller " "configuration acknowledgement"
         )
 
     def _battery_callback(
@@ -1559,10 +1488,7 @@ class RoverBackendRosNode(Node):
         mission_updates: dict[str, Any] = {
             "state": effective_state_name,
             "execution_mode": execution_mode,
-            "ready": bool(
-                effective_state_name == "READY"
-                and manager_ready
-            ),
+            "ready": bool(effective_state_name == "READY" and manager_ready),
             "manager_ready": bool(self._mission_manager_ready),
             "total_points": total,
             "active_point_id": payload.get("current_point_id"),
@@ -1636,9 +1562,7 @@ class RoverBackendRosNode(Node):
             "current_point_spray_confirmed": payload.get(
                 "current_point_spray_confirmed"
             ),
-            "start_stage": str(
-                payload.get("start_stage") or "IDLE"
-            ).strip().upper(),
+            "start_stage": str(payload.get("start_stage") or "IDLE").strip().upper(),
             "start_failed_stage": payload.get("start_failed_stage"),
             "arrival_settle_elapsed_sec": max(
                 0.0,
@@ -1698,9 +1622,7 @@ class RoverBackendRosNode(Node):
             "error": payload.get("error"),
         }
 
-        manager_run_id = str(
-            payload.get("mission_run_id") or ""
-        ).strip()
+        manager_run_id = str(payload.get("mission_run_id") or "").strip()
         if manager_run_id:
             mission_updates["mission_run_id"] = manager_run_id
 
@@ -1735,9 +1657,7 @@ class RoverBackendRosNode(Node):
         # non-zero committed path. A zero must not erase the count that was
         # already received directly from /nav_path.
         if manager_navigation_point_count > 0:
-            mission_updates["navigation_point_count"] = (
-                manager_navigation_point_count
-            )
+            mission_updates["navigation_point_count"] = manager_navigation_point_count
 
         if effective_state_name == "RUNNING":
             current = rover_state.section("mission")
@@ -1761,288 +1681,235 @@ class RoverBackendRosNode(Node):
         # mission_manager is the sole owner of the motion safety gate.
         self._persist_mission_runtime(payload)
 
-    def _point_event_callback(
-        self,
-        message: String,
-    ) -> None:
-        """Store structured point evidence without changing mission control."""
+    # CURRENT BRANCH FILE:
 
-        self._mark_ros_message()
 
-        payload = _json_object(message.data)
-        if payload is None:
-            return
+# src/rover_backend/rover_backend/ros_bridge.py
+#
+# REPLACE THE ENTIRE CURRENT _point_event_callback() FUNCTION WITH THIS.
+#
+# Final report accuracy comes ONLY from Mission Manager's nested accuracy
+# object, which itself is now a copy of RPP terminal_result.
+#
+# NO live /rpp/accuracy fallback.
+# NO capture_* fallback.
+# NO abs() or radial reconstruction for final point evidence.
 
-        payload["received_at"] = utc_now_iso()
-        event_name = str(payload.get("event") or "").strip().upper()
-        point_index_raw = payload.get("point_index")
-        point_index = (
-            _safe_int(point_index_raw, -1)
-            if point_index_raw is not None
-            else -1
+
+def _point_event_callback(
+    self,
+    message: String,
+) -> None:
+    """Store RPP-terminal point evidence without recalculating accuracy."""
+
+    self._mark_ros_message()
+
+    payload = _json_object(message.data)
+    if payload is None:
+        return
+
+    payload["received_at"] = utc_now_iso()
+
+    event_name = str(payload.get("event") or "").strip().upper()
+
+    point_index_raw = payload.get("point_index")
+
+    point_index = _safe_int(point_index_raw, -1) if point_index_raw is not None else -1
+
+    point_number = point_index + 1 if point_index >= 0 else 0
+
+    # ----------------------------------------------------------
+    # RPP TERMINAL ACCURACY ONLY
+    # ----------------------------------------------------------
+    manager_accuracy = payload.get("accuracy")
+
+    accuracy_snapshot: dict[str, Any] | None = None
+
+    if isinstance(manager_accuracy, dict):
+        candidate = copy.deepcopy(manager_accuracy)
+
+        source = str(candidate.get("measurement_source") or "").strip().upper()
+
+        if source == "RPP_TERMINAL_RESULT":
+            # Copy only. No position calculations.
+            accuracy_snapshot = candidate
+
+            # Backend receive time is metadata only.
+            accuracy_snapshot.setdefault(
+                "captured_at",
+                payload["received_at"],
+            )
+
+    if accuracy_snapshot is not None:
+        payload["accuracy"] = copy.deepcopy(accuracy_snapshot)
+
+        payload["overall_accuracy_mm"] = accuracy_snapshot.get("overall_accuracy_mm")
+
+        overall_mm = _finite_float(accuracy_snapshot.get("overall_accuracy_mm"))
+
+        payload["accuracy_remarks"] = (
+            f"{overall_mm:.1f} mm" if overall_mm is not None else "Unavailable"
         )
-        point_number = point_index + 1 if point_index >= 0 else 0
 
-        # Mission Manager's immutable nested snapshot is authoritative.  Flat
-        # capture fields and live RPP accuracy remain compatibility fallbacks.
-        manager_accuracy = payload.get("accuracy")
-        accuracy_snapshot: dict[str, Any] | None = None
+    else:
+        payload["accuracy"] = None
+        payload["overall_accuracy_mm"] = None
+        payload["accuracy_remarks"] = "Unavailable"
 
-        if isinstance(manager_accuracy, dict):
-            accuracy_snapshot = copy.deepcopy(manager_accuracy)
-            radial_mm = _finite_float(
-                accuracy_snapshot.get("radial_error_mm")
-            )
-            xtrack_mm = _finite_float(
-                accuracy_snapshot.get("cross_track_error_mm")
-            )
-            along_mm = _finite_float(
-                accuracy_snapshot.get("along_track_error_mm")
-            )
-            tolerance_mm = _finite_float(
-                accuracy_snapshot.get("tolerance_mm"),
-                30.0,
-            )
-            accuracy_outcome = str(
-                accuracy_snapshot.get("outcome") or "UNSPECIFIED"
-            ).strip().upper()
+    # ----------------------------------------------------------
+    # Existing spray evidence handling.
+    # ----------------------------------------------------------
+    manager_spray = payload.get("spray")
 
-            accuracy_snapshot.update(
-                {
-                    "available": radial_mm is not None,
-                    "goal_number": point_number,
-                    "cross_track_error_mm": xtrack_mm,
-                    "cross_track_abs_mm": (
-                        abs(xtrack_mm) if xtrack_mm is not None else None
-                    ),
-                    "front_back_error_mm": along_mm,
-                    "front_back_abs_mm": (
-                        abs(along_mm) if along_mm is not None else None
-                    ),
-                    "radial_error_mm": radial_mm,
-                    "closest_radial_error_mm": radial_mm,
-                    "overall_accuracy_mm": radial_mm,
-                    "accuracy_target_mm": tolerance_mm,
-                    "accuracy_status": accuracy_outcome,
-                    "accuracy_pass": accuracy_outcome in {
-                        "ACHIEVED",
-                        "PASSED",
-                        "ACCURACY_PASS",
-                    },
-                    "captured_at": payload["received_at"],
-                }
-            )
+    if isinstance(manager_spray, dict):
+        spray = copy.deepcopy(manager_spray)
 
-        else:
-            capture_radial_mm = _finite_float(
-                payload.get("capture_radial_error_mm")
-            )
-            capture_xtrack_mm = _finite_float(
-                payload.get("capture_cross_track_error_mm")
-            )
-            capture_along_mm = _finite_float(
-                payload.get("capture_along_track_error_mm")
-            )
+        spray_attempted = bool(spray.get("attempted", False))
 
-            if bool(
-                payload.get("capture_accuracy_available", False)
-                and capture_radial_mm is not None
-            ):
-                accuracy_snapshot = {
-                    "available": True,
-                    "goal_number": point_number,
-                    "cross_track_error_mm": capture_xtrack_mm,
-                    "cross_track_abs_mm": (
-                        abs(capture_xtrack_mm)
-                        if capture_xtrack_mm is not None
-                        else None
-                    ),
-                    "front_back_error_mm": capture_along_mm,
-                    "front_back_abs_mm": (
-                        abs(capture_along_mm)
-                        if capture_along_mm is not None
-                        else None
-                    ),
-                    "radial_error_mm": capture_radial_mm,
-                    "closest_radial_error_mm": capture_radial_mm,
-                    "overall_accuracy_mm": capture_radial_mm,
-                    "accuracy_target_mm": 30.0,
-                    "accuracy_status": (
-                        "ACCURACY_PASS"
-                        if capture_radial_mm <= 30.0
-                        else "FAILED"
-                    ),
-                    "accuracy_pass": capture_radial_mm <= 30.0,
-                    "captured_at": payload["received_at"],
-                }
-            else:
-                live_accuracy = rover_state.section("accuracy")
-                live_goal = _safe_int(live_accuracy.get("goal_number"), 0)
-                live_matches = point_number > 0 and (
-                    live_goal == 0 or live_goal == point_number
-                )
-                if (
-                    event_name
-                    in {
-                        "ACCURACY_FAILED",
-                        "FAILED",
-                        "COMPLETED",
-                        "SKIPPED",
-                        "MARKED",
-                    }
-                    and bool(live_accuracy.get("available", False))
-                    and live_matches
-                ):
-                    accuracy_snapshot = copy.deepcopy(live_accuracy)
-                    accuracy_snapshot["captured_at"] = payload["received_at"]
-                    accuracy_snapshot["overall_accuracy_mm"] = (
-                        live_accuracy.get("closest_radial_error_mm")
-                        if live_accuracy.get("closest_radial_error_mm") is not None
-                        else live_accuracy.get("radial_error_mm")
-                    )
+        spray_outcome = str(spray.get("outcome") or "UNKNOWN").strip().upper()
 
-        if accuracy_snapshot is not None:
-            payload["accuracy"] = accuracy_snapshot
-            payload["overall_accuracy_mm"] = accuracy_snapshot.get(
-                "overall_accuracy_mm"
-            )
-            overall_mm = _finite_float(
-                accuracy_snapshot.get("overall_accuracy_mm")
-            )
-            payload["accuracy_remarks"] = (
-                f"{overall_mm:.1f} mm"
-                if overall_mm is not None
-                else "Unavailable"
-            )
+        spray_reason = spray.get("reason")
 
-        manager_spray = payload.get("spray")
-        if isinstance(manager_spray, dict):
-            spray = copy.deepcopy(manager_spray)
-            spray_attempted = bool(spray.get("attempted", False))
-            spray_outcome = str(
-                spray.get("outcome") or "UNKNOWN"
-            ).strip().upper()
-            spray_reason = spray.get("reason")
-            spray_elapsed_sec = _finite_float(
-                spray.get("elapsed_sec")
+        spray_elapsed_sec = _finite_float(spray.get("elapsed_sec"))
+
+    else:
+        spray_attempted = bool(
+            payload.get(
+                "spray_attempted",
+                False,
             )
-        else:
-            spray_attempted = bool(
-                payload.get("spray_attempted", False)
-            )
-            spray_outcome = str(
-                payload.get("spray_outcome") or "UNKNOWN"
-            ).strip().upper()
-            spray_reason = payload.get("spray_failure_reason")
-            spray_elapsed_sec = _finite_float(
-                payload.get("spray_elapsed_sec")
-            )
-            spray = {
-                "attempted": spray_attempted,
-                "outcome": spray_outcome,
-                "reason": spray_reason,
-                "elapsed_sec": spray_elapsed_sec,
+        )
+
+        spray_outcome = str(payload.get("spray_outcome") or "UNKNOWN").strip().upper()
+
+        spray_reason = payload.get("spray_failure_reason")
+
+        spray_elapsed_sec = _finite_float(payload.get("spray_elapsed_sec"))
+
+        spray = {
+            "attempted": spray_attempted,
+            "outcome": spray_outcome,
+            "reason": spray_reason,
+            "elapsed_sec": spray_elapsed_sec,
+        }
+
+    spray_confirmed = (
+        True
+        if spray_outcome == "SUCCESS"
+        else (
+            False
+            if spray_outcome
+            in {
+                "FAILED",
+                "TIMEOUT",
             }
-
-        spray_confirmed = (
-            True
-            if spray_outcome == "SUCCESS"
-            else False
-            if spray_outcome in {"FAILED", "TIMEOUT"}
             else None
         )
+    )
 
-        mission = rover_state.section("mission")
-        point_results = dict(mission.get("point_results") or {})
-        point_id = str(payload.get("point_id") or "").strip()
+    mission = rover_state.section("mission")
 
-        if point_id:
-            existing = point_results.get(point_id)
-            existing = existing if isinstance(existing, dict) else {}
-            event_history = list(existing.get("event_history") or [])
-            event_history.append(
-                {
-                    "event": event_name,
-                    "state": payload.get("state"),
-                    "reason": payload.get("reason"),
-                    "timestamp_unix_ns": payload.get("timestamp_unix_ns"),
-                    "received_at": payload["received_at"],
-                    "accuracy": copy.deepcopy(accuracy_snapshot),
-                    "spray": copy.deepcopy(spray),
-                }
-            )
+    point_results = dict(mission.get("point_results") or {})
 
-            manager_result = payload.get("point_result")
-            result = (
-                copy.deepcopy(manager_result)
-                if isinstance(manager_result, dict)
-                else {}
-            )
-            result.update(
-                {
-                    "point_id": point_id,
-                    "point_index": point_index,
-                    "event": event_name,
-                    "mission_run_id": payload.get("mission_run_id"),
-                    "point_outcome": str(
-                        result.get("point_outcome") or event_name
-                    ).strip().upper(),
-                    "spray": copy.deepcopy(spray),
-                    "spray_attempted": spray_attempted,
-                    "spray_outcome": spray_outcome,
-                    "spray_confirmed": spray_confirmed,
-                    "spray_failure_reason": spray_reason,
-                    "spray_elapsed_sec": spray_elapsed_sec,
-                    "spray_monitor_only": True,
-                    "overall_accuracy_mm": (
-                        accuracy_snapshot.get("overall_accuracy_mm")
-                        if accuracy_snapshot is not None
-                        else None
-                    ),
-                    "accuracy_remarks": payload.get(
-                        "accuracy_remarks",
-                        "Unavailable",
-                    ),
-                    "accuracy": copy.deepcopy(accuracy_snapshot),
-                    "event_history": event_history,
-                    "received_at": payload["received_at"],
-                }
-            )
+    point_id = str(payload.get("point_id") or "").strip()
 
-            accuracy_outcome = str(
-                (accuracy_snapshot or {}).get("outcome") or ""
-            ).strip().upper()
-            if accuracy_outcome == "FAILED" or event_name == "ACCURACY_FAILED":
-                result["accuracy_failure"] = copy.deepcopy(accuracy_snapshot)
-            elif existing.get("accuracy_failure") is not None:
-                result["accuracy_failure"] = copy.deepcopy(
-                    existing["accuracy_failure"]
-                )
+    if point_id:
+        existing = point_results.get(point_id)
 
-            point_results[point_id] = result
+        existing = existing if isinstance(existing, dict) else {}
 
-        rover_state.update(
-            "mission",
-            last_point_event=payload,
-            point_results=point_results,
+        event_history = list(existing.get("event_history") or [])
+
+        event_history.append(
+            {
+                "event": event_name,
+                "state": payload.get("state"),
+                "reason": payload.get("reason"),
+                "timestamp_unix_ns": payload.get("timestamp_unix_ns"),
+                "received_at": payload["received_at"],
+                "accuracy": copy.deepcopy(accuracy_snapshot),
+                "spray": copy.deepcopy(spray),
+            }
         )
 
-        # Reporting is monitor-only, but each point transition is durably
-        # checkpointed so a backend restart cannot erase completed, skipped,
-        # or failed rows from the frontend report.
-        try:
-            mission_report_store.checkpoint_live_report()
-        except MissionReportError as error:
-            reason = f"Mission report checkpoint failed: {error}"
-            rover_state.update(
-                "report",
-                status="CHECKPOINT_FAILED",
-                error=reason,
-            )
-            self.get_logger().error(reason)
+        manager_result = payload.get("point_result")
 
-        if event_name == "MISSION_TERMINATED":
-            self._schedule_terminal_mission_cleanup(payload)
+        result = (
+            copy.deepcopy(manager_result)
+            if isinstance(
+                manager_result,
+                dict,
+            )
+            else {}
+        )
+
+        result.update(
+            {
+                "point_id": point_id,
+                "point_index": point_index,
+                "event": event_name,
+                "mission_run_id": payload.get("mission_run_id"),
+                "point_outcome": str(result.get("point_outcome") or event_name)
+                .strip()
+                .upper(),
+                "spray": copy.deepcopy(spray),
+                "spray_attempted": spray_attempted,
+                "spray_outcome": spray_outcome,
+                "spray_confirmed": spray_confirmed,
+                "spray_failure_reason": spray_reason,
+                "spray_elapsed_sec": spray_elapsed_sec,
+                "spray_monitor_only": True,
+                "overall_accuracy_mm": (
+                    accuracy_snapshot.get("overall_accuracy_mm")
+                    if accuracy_snapshot is not None
+                    else None
+                ),
+                "accuracy_remarks": payload.get(
+                    "accuracy_remarks",
+                    "Unavailable",
+                ),
+                # Exact RPP terminal evidence only.
+                "accuracy": copy.deepcopy(accuracy_snapshot),
+                "event_history": event_history,
+                "received_at": payload["received_at"],
+            }
+        )
+
+        rpp_outcome = (
+            str((accuracy_snapshot or {}).get("rpp_outcome") or "").strip().upper()
+        )
+
+        if rpp_outcome == "MISSED" or event_name == "ACCURACY_FAILED":
+            result["accuracy_failure"] = copy.deepcopy(accuracy_snapshot)
+
+        elif existing.get("accuracy_failure") is not None:
+            result["accuracy_failure"] = copy.deepcopy(existing["accuracy_failure"])
+
+        point_results[point_id] = result
+
+    rover_state.update(
+        "mission",
+        last_point_event=payload,
+        point_results=point_results,
+    )
+
+    # Existing durable checkpoint behavior.
+    try:
+        mission_report_store.checkpoint_live_report()
+
+    except MissionReportError as error:
+        reason = "Mission report checkpoint failed: " f"{error}"
+
+        rover_state.update(
+            "report",
+            status="CHECKPOINT_FAILED",
+            error=reason,
+        )
+
+        self.get_logger().error(reason)
+
+    if event_name == "MISSION_TERMINATED":
+        self._schedule_terminal_mission_cleanup(payload)
 
     def _schedule_terminal_mission_cleanup(
         self,
@@ -2075,9 +1942,7 @@ class RoverBackendRosNode(Node):
     ) -> None:
         """Archive a terminal mission, then clear ROS and active files."""
 
-        if not bool(
-            terminal_event.get("disarm_confirmed", False)
-        ):
+        if not bool(terminal_event.get("disarm_confirmed", False)):
             reason = str(
                 terminal_event.get("message")
                 or (
@@ -2091,9 +1956,7 @@ class RoverBackendRosNode(Node):
 
         with mission_report_store.lifecycle_transaction():
             try:
-                report = mission_report_store.write_terminal_report(
-                    terminal_event
-                )
+                report = mission_report_store.write_terminal_report(terminal_event)
             except StaleMissionTerminalEvent as error:
                 self.get_logger().warn(str(error))
                 return
@@ -2230,9 +2093,7 @@ class RoverBackendRosNode(Node):
             try:
                 settings.mission_runtime_file.unlink(missing_ok=True)
             except OSError:
-                LOGGER.exception(
-                    "Unable to remove stale mission runtime state"
-                )
+                LOGGER.exception("Unable to remove stale mission runtime state")
             return
 
         runtime_payload = {
@@ -2507,8 +2368,7 @@ class RoverBackendRosNode(Node):
             "WAITING_FOR_NEXT",
         }:
             raise RuntimeError(
-                "Cannot change execution mode while mission is "
-                f"{manager_state}"
+                "Cannot change execution mode while mission is " f"{manager_state}"
             )
 
         self._publish_execution_mode(mode)
@@ -2661,7 +2521,9 @@ class RosBridgeRuntime:
             try:
                 node.emergency_stop()
             except Exception:
-                LOGGER.exception("Unable to request mission_manager emergency stop during backend shutdown")
+                LOGGER.exception(
+                    "Unable to request mission_manager emergency stop during backend shutdown"
+                )
 
         if executor is not None:
             try:

@@ -42,13 +42,9 @@ class MissionReportStore:
 
     SCHEMA_VERSION = 2
     REPORT_SOURCE = "ROVER_BACKEND"
-    MEASUREMENT_SOURCE = "MISSION_MANAGER_LOCAL_SEGMENT"
-    POINT_STATUSES = frozenset(
-        {"PENDING", "COMPLETED", "SKIPPED", "FAILED"}
-    )
-    TERMINAL_POINT_STATUSES = frozenset(
-        {"COMPLETED", "SKIPPED", "FAILED"}
-    )
+    MEASUREMENT_SOURCE = "RPP_TERMINAL_RESULT"
+    POINT_STATUSES = frozenset({"PENDING", "COMPLETED", "SKIPPED", "FAILED"})
+    TERMINAL_POINT_STATUSES = frozenset({"COMPLETED", "SKIPPED", "FAILED"})
     _POINT_ID_PATTERN = re.compile(r"^P(\d+)$", re.IGNORECASE)
 
     def __init__(self, report_file: Path) -> None:
@@ -156,9 +152,7 @@ class MissionReportStore:
             index = cls._safe_int(raw_index, -1)
             if index >= 0:
                 return index
-        return cls._index_from_point_id(
-            result.get("point_id") or fallback_point_id
-        )
+        return cls._index_from_point_id(result.get("point_id") or fallback_point_id)
 
     @classmethod
     def _canonical_status(cls, *values: Any) -> str:
@@ -214,11 +208,15 @@ class MissionReportStore:
         targets = targets_value if isinstance(targets_value, list) else []
         value = targets[index] if index < len(targets) else {}
         target = value if isinstance(value, dict) else {}
-        mode = str(
-            target.get("coordinate_mode")
-            or metadata.get("coordinate_mode")
-            or "UNKNOWN"
-        ).strip().upper()
+        mode = (
+            str(
+                target.get("coordinate_mode")
+                or metadata.get("coordinate_mode")
+                or "UNKNOWN"
+            )
+            .strip()
+            .upper()
+        )
         if mode == "GPS":
             return {
                 "coordinate_mode": "GPS",
@@ -233,147 +231,217 @@ class MissionReportStore:
             }
         return {"coordinate_mode": mode}
 
-    @classmethod
-    def _canonical_point(
-        cls,
-        *,
-        index: int,
-        raw_status: Any,
-        result: dict[str, Any],
-        active_index: int | None,
-        target: dict[str, Any],
-    ) -> dict[str, Any]:
-        accuracy_value = result.get("accuracy")
-        failure_value = result.get("accuracy_failure")
-        accuracy = accuracy_value if isinstance(accuracy_value, dict) else {}
-        failure = failure_value if isinstance(failure_value, dict) else {}
-        sources = (accuracy, failure, result)
 
-        result_status = cls._canonical_status(
-            result.get("point_outcome"),
-            result.get("event"),
-            accuracy.get("outcome"),
-        )
-        status_status = cls._canonical_status(raw_status)
-        status = (
-            status_status
-            if status_status in cls.TERMINAL_POINT_STATUSES
-            else result_status
-            if result_status in cls.TERMINAL_POINT_STATUSES
-            else "PENDING"
-        )
+# CURRENT BRANCH FILE:
+# src/rover_backend/rover_backend/mission_report.py
+#
+# 1) CHANGE:
+#
+#     MEASUREMENT_SOURCE = "MISSION_MANAGER_LOCAL_SEGMENT"
+#
+# TO:
+#
+#     MEASUREMENT_SOURCE = "RPP_TERMINAL_RESULT"
+#
+#
+# 2) REPLACE THE ENTIRE CURRENT _canonical_point() FUNCTION WITH THIS.
 
-        cross_track_mm = cls._first_finite(
-            sources,
-            (
-                "cross_track_error_mm",
-                "capture_cross_track_error_mm",
-                "xtrack_mm",
+
+@classmethod
+def _canonical_point(
+    cls,
+    *,
+    index: int,
+    raw_status: Any,
+    result: dict[str, Any],
+    active_index: int | None,
+    target: dict[str, Any],
+) -> dict[str, Any]:
+
+    # ----------------------------------------------------------
+    # STATUS
+    # Final public point state remains Mission Manager/backend:
+    # PENDING / COMPLETED / SKIPPED / FAILED.
+    # ----------------------------------------------------------
+    accuracy_value = result.get("accuracy")
+
+    accuracy = (
+        accuracy_value
+        if isinstance(
+            accuracy_value,
+            dict,
+        )
+        else {}
+    )
+
+    result_status = cls._canonical_status(
+        result.get("point_outcome"),
+        result.get("event"),
+    )
+
+    status_status = cls._canonical_status(raw_status)
+
+    status = (
+        status_status
+        if status_status in cls.TERMINAL_POINT_STATUSES
+        else (
+            result_status if result_status in cls.TERMINAL_POINT_STATUSES else "PENDING"
+        )
+    )
+
+    # ----------------------------------------------------------
+    # ACCURACY
+    # Read ONLY exact values stored from RPP terminal_result.
+    # No fallbacks and no calculations.
+    # ----------------------------------------------------------
+    measurement_source = str(accuracy.get("measurement_source") or "").strip().upper()
+
+    source_is_rpp = measurement_source == cls.MEASUREMENT_SOURCE
+
+    cross_track_mm = (
+        cls._finite_float(accuracy.get("cross_track_error_mm"))
+        if source_is_rpp
+        else None
+    )
+
+    along_track_mm = (
+        cls._finite_float(accuracy.get("along_track_error_mm"))
+        if source_is_rpp
+        else None
+    )
+
+    overall_accuracy_mm = (
+        cls._finite_float(accuracy.get("overall_accuracy_mm"))
+        if source_is_rpp
+        else None
+    )
+
+    tolerance_mm = (
+        cls._finite_float(accuracy.get("tolerance_mm")) if source_is_rpp else None
+    )
+
+    accuracy_available = bool(
+        source_is_rpp
+        and accuracy.get(
+            "available",
+            False,
+        )
+        and cross_track_mm is not None
+        and along_track_mm is not None
+        and overall_accuracy_mm is not None
+    )
+
+    within_tolerance_value = accuracy.get("within_tolerance") if source_is_rpp else None
+
+    within_tolerance = (
+        bool(within_tolerance_value) if within_tolerance_value is not None else None
+    )
+
+    # ----------------------------------------------------------
+    # SPRAY
+    # Existing spray evidence is preserved.
+    # ----------------------------------------------------------
+    spray_value = result.get("spray")
+
+    spray = (
+        spray_value
+        if isinstance(
+            spray_value,
+            dict,
+        )
+        else {}
+    )
+
+    spray_attempted = bool(
+        spray.get(
+            "attempted",
+            result.get(
+                "spray_attempted",
+                False,
             ),
         )
-        along_track_mm = cls._first_finite(
-            sources,
-            (
-                "along_track_error_mm",
-                "front_back_error_mm",
-                "capture_along_track_error_mm",
-                "along_error_mm",
-            ),
-        )
-        total_accuracy_mm = cls._first_finite(
-            sources,
-            (
-                "total_accuracy_mm",
-                "radial_error_mm",
-                "closest_radial_error_mm",
-                "overall_accuracy_mm",
-                "combined_error_mm",
-                "capture_radial_error_mm",
-            ),
-        )
-        tolerance_mm = cls._first_finite(
-            sources,
-            ("tolerance_mm", "accuracy_target_mm"),
-        )
-        within_tolerance = (
-            total_accuracy_mm <= tolerance_mm
-            if total_accuracy_mm is not None and tolerance_mm is not None
-            else None
-        )
+    )
 
-        spray_value = result.get("spray")
-        spray = spray_value if isinstance(spray_value, dict) else {}
-        spray_attempted = bool(
-            spray.get("attempted", result.get("spray_attempted", False))
-        )
-        spray_outcome = str(
-            spray.get("outcome") or result.get("spray_outcome") or ""
-        ).strip().upper()
-        if not spray_attempted:
-            spray_outcome = "NOT_ATTEMPTED"
-        elif not spray_outcome or spray_outcome == "UNSPECIFIED":
-            spray_outcome = "UNKNOWN"
+    spray_outcome = (
+        str(spray.get("outcome") or result.get("spray_outcome") or "").strip().upper()
+    )
 
-        spray_confirmed_value = result.get("spray_confirmed")
-        if spray_confirmed_value is None:
-            spray_confirmed = (
-                True
-                if spray_outcome == "SUCCESS"
-                else False
-                if spray_outcome in {"FAILED", "TIMEOUT"}
+    if not spray_attempted:
+        spray_outcome = "NOT_ATTEMPTED"
+
+    elif not spray_outcome or spray_outcome == "UNSPECIFIED":
+        spray_outcome = "UNKNOWN"
+
+    spray_confirmed_value = result.get("spray_confirmed")
+
+    if spray_confirmed_value is None:
+        spray_confirmed = (
+            True
+            if spray_outcome == "SUCCESS"
+            else (
+                False
+                if spray_outcome
+                in {
+                    "FAILED",
+                    "TIMEOUT",
+                }
                 else None
             )
-        else:
-            spray_confirmed = bool(spray_confirmed_value)
+        )
 
-        return {
-            "point_id": f"P{index + 1:04d}",
-            "point_index": index,
-            "sequence": index + 1,
-            "target": copy.deepcopy(target),
-            "status": status,
-            "is_active": bool(status == "PENDING" and active_index == index),
-            "accuracy": {
-                "measurement_source": cls.MEASUREMENT_SOURCE,
-                "available": any(
-                    value is not None
-                    for value in (
-                        cross_track_mm,
-                        along_track_mm,
-                        total_accuracy_mm,
-                    )
-                ),
-                "cross_track_error_mm": cross_track_mm,
-                "along_track_error_mm": along_track_mm,
-                "total_accuracy_mm": total_accuracy_mm,
-                "tolerance_mm": tolerance_mm,
-                "within_tolerance": within_tolerance,
-                "captured_at": cls._first_value(
-                    (accuracy, failure, result),
-                    ("captured_at", "received_at", "updated_at"),
-                ),
-            },
-            "spray": {
-                "attempted": spray_attempted,
-                "outcome": spray_outcome,
-                "confirmed": spray_confirmed,
-                "reason": spray.get("reason")
-                or result.get("spray_failure_reason"),
-                "elapsed_sec": cls._finite_float(
-                    spray.get("elapsed_sec")
-                    if spray.get("elapsed_sec") is not None
-                    else result.get("spray_elapsed_sec")
-                ),
-            },
-            "reason": cls._first_value(
-                (result, accuracy, failure),
-                ("reason", "failure_reason"),
+    else:
+        spray_confirmed = bool(spray_confirmed_value)
+
+    return {
+        "point_id": f"P{index + 1:04d}",
+        "point_index": index,
+        "sequence": index + 1,
+        "target": copy.deepcopy(target),
+        "status": status,
+        "is_active": bool(status == "PENDING" and active_index == index),
+        "accuracy": {
+            "measurement_source": cls.MEASUREMENT_SOURCE,
+            "available": accuracy_available,
+            "cross_track_error_mm": (cross_track_mm if accuracy_available else None),
+            "along_track_error_mm": (along_track_mm if accuracy_available else None),
+            # Canonical UI field.
+            "overall_accuracy_mm": (
+                overall_accuracy_mm if accuracy_available else None
             ),
-            "updated_at": cls._first_value(
-                (result,),
-                ("received_at", "completed_at", "updated_at"),
+            # Compatibility alias.
+            # This is copied, not recalculated.
+            "total_accuracy_mm": (overall_accuracy_mm if accuracy_available else None),
+            "tolerance_mm": (tolerance_mm if accuracy_available else None),
+            # Copy RPP's decision.
+            # Backend does NOT compare values.
+            "within_tolerance": within_tolerance,
+            "rpp_outcome": (accuracy.get("rpp_outcome") if source_is_rpp else None),
+            "captured_at": (
+                accuracy.get("captured_at")
+                or result.get("received_at")
+                or result.get("updated_at")
             ),
-        }
+        },
+        "spray": {
+            "attempted": spray_attempted,
+            "outcome": spray_outcome,
+            "confirmed": spray_confirmed,
+            "reason": spray.get("reason") or result.get("spray_failure_reason"),
+            "elapsed_sec": cls._finite_float(
+                spray.get("elapsed_sec")
+                if spray.get("elapsed_sec") is not None
+                else result.get("spray_elapsed_sec")
+            ),
+        },
+        "reason": (
+            result.get("reason") or accuracy.get("reason") or accuracy.get("rpp_reason")
+        ),
+        "updated_at": (
+            result.get("received_at")
+            or result.get("completed_at")
+            or result.get("updated_at")
+        ),
+    }
 
     @classmethod
     def _result_map(
@@ -434,9 +502,7 @@ class MissionReportStore:
             )
             for status in cls.POINT_STATUSES
         }
-        resolved = (
-            counts["COMPLETED"] + counts["SKIPPED"] + counts["FAILED"]
-        )
+        resolved = counts["COMPLETED"] + counts["SKIPPED"] + counts["FAILED"]
         total = len(points)
         report["summary"] = {
             "total_points": total,
@@ -445,9 +511,7 @@ class MissionReportStore:
             "skipped_points": counts["SKIPPED"],
             "failed_points": counts["FAILED"],
             "resolved_points": resolved,
-            "progress_percent": (
-                round(100.0 * resolved / total, 2) if total else 0.0
-            ),
+            "progress_percent": (round(100.0 * resolved / total, 2) if total else 0.0),
         }
 
     @classmethod
@@ -460,16 +524,12 @@ class MissionReportStore:
         terminal_event: dict[str, Any] | None = None,
         cleanup: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        terminal_event = (
-            terminal_event if isinstance(terminal_event, dict) else {}
-        )
+        terminal_event = terminal_event if isinstance(terminal_event, dict) else {}
         manager_summary_value = terminal_event.get("mission_summary")
         if not isinstance(manager_summary_value, dict):
             manager_summary_value = terminal_event.get("summary")
         manager_summary = (
-            manager_summary_value
-            if isinstance(manager_summary_value, dict)
-            else {}
+            manager_summary_value if isinstance(manager_summary_value, dict) else {}
         )
 
         point_status_value = manager_summary.get("point_status")
@@ -478,9 +538,7 @@ class MissionReportStore:
         if not isinstance(point_status_value, list):
             point_status_value = mission.get("point_status")
         point_status = (
-            list(point_status_value)
-            if isinstance(point_status_value, list)
-            else []
+            list(point_status_value) if isinstance(point_status_value, list) else []
         )
 
         results = cls._result_map(mission, terminal_event)
@@ -498,28 +556,20 @@ class MissionReportStore:
 
         active_index_raw = mission.get("active_point_index")
         active_index = (
-            cls._safe_int(active_index_raw, -1)
-            if active_index_raw is not None
-            else -1
+            cls._safe_int(active_index_raw, -1) if active_index_raw is not None else -1
         )
         if active_index < 0:
             parsed_active_index = cls._index_from_point_id(
                 mission.get("active_point_id")
             )
             active_index = (
-                parsed_active_index
-                if parsed_active_index is not None
-                else -1
+                parsed_active_index if parsed_active_index is not None else -1
             )
 
         points = [
             cls._canonical_point(
                 index=index,
-                raw_status=(
-                    point_status[index]
-                    if index < len(point_status)
-                    else None
-                ),
+                raw_status=(point_status[index] if index < len(point_status) else None),
                 result=results.get(index, {}),
                 active_index=active_index,
                 target=cls._canonical_target(metadata, index),
@@ -529,9 +579,7 @@ class MissionReportStore:
 
         generated_at = utc_now_iso()
         mission_id = str(
-            mission.get("mission_id")
-            or metadata.get("mission_id")
-            or ""
+            mission.get("mission_id") or metadata.get("mission_id") or ""
         ).strip()
         mission_run_id = str(
             manager_summary.get("mission_run_id")
@@ -539,43 +587,37 @@ class MissionReportStore:
             or mission.get("mission_run_id")
             or ""
         ).strip()
-        report_state = str(
-            manager_summary.get("state")
-            or mission.get("state")
-            or "EMPTY"
-        ).strip().upper()
+        report_state = (
+            str(manager_summary.get("state") or mission.get("state") or "EMPTY")
+            .strip()
+            .upper()
+        )
 
         termination = None
         disarm_confirmed = None
         warnings: list[Any] = []
         if lifecycle == "TERMINAL":
-            termination = str(
-                terminal_event.get("termination")
-                or (
-                    "COMPLETED"
-                    if bool(terminal_event.get("completed", False))
-                    else "STOPPED"
+            termination = (
+                str(
+                    terminal_event.get("termination")
+                    or (
+                        "COMPLETED"
+                        if bool(terminal_event.get("completed", False))
+                        else "STOPPED"
+                    )
                 )
-            ).strip().upper()
-            disarm_confirmed = bool(
-                terminal_event.get("disarm_confirmed", False)
+                .strip()
+                .upper()
             )
+            disarm_confirmed = bool(terminal_event.get("disarm_confirmed", False))
             warnings_value = terminal_event.get("warnings")
-            warnings = (
-                list(warnings_value)
-                if isinstance(warnings_value, list)
-                else []
-            )
+            warnings = list(warnings_value) if isinstance(warnings_value, list) else []
 
         cleanup_payload = (
             copy.deepcopy(cleanup)
             if isinstance(cleanup, dict)
             else {
-                "status": (
-                    "ACTIVE"
-                    if lifecycle == "LIVE"
-                    else "REPORT_WRITTEN"
-                ),
+                "status": ("ACTIVE" if lifecycle == "LIVE" else "REPORT_WRITTEN"),
                 "complete": False,
                 "trajectory_cleared": False,
                 "active_artifacts_deleted": False,
@@ -596,8 +638,7 @@ class MissionReportStore:
             "disarm_confirmed": disarm_confirmed,
             "warnings": warnings,
             "mission": {
-                "filename": metadata.get("active_filename")
-                or mission.get("filename"),
+                "filename": metadata.get("active_filename") or mission.get("filename"),
                 "original_filename": metadata.get("original_filename"),
                 "coordinate_mode": str(
                     metadata.get("coordinate_mode")
@@ -652,10 +693,7 @@ class MissionReportStore:
                 continue
             old_status = str(old_point.get("status") or "").upper()
             new_status = str(new_point.get("status") or "").upper()
-            if (
-                old_status in cls.TERMINAL_POINT_STATUSES
-                and new_status == "PENDING"
-            ):
+            if old_status in cls.TERMINAL_POINT_STATUSES and new_status == "PENDING":
                 preserved = copy.deepcopy(old_point)
                 preserved["is_active"] = False
                 new_points_value[index] = preserved
@@ -673,8 +711,7 @@ class MissionReportStore:
         """Remove private legacy evidence if a schema-v1 report is found."""
 
         if (
-            cls._safe_int(report.get("schema_version"), 0)
-            == cls.SCHEMA_VERSION
+            cls._safe_int(report.get("schema_version"), 0) == cls.SCHEMA_VERSION
             and report.get("source") == cls.REPORT_SOURCE
             and isinstance(report.get("points"), list)
         ):
@@ -686,9 +723,7 @@ class MissionReportStore:
         summary = summary_value if isinstance(summary_value, dict) else {}
         legacy_results_value = report.get("point_results")
         legacy_results = (
-            legacy_results_value
-            if isinstance(legacy_results_value, list)
-            else []
+            legacy_results_value if isinstance(legacy_results_value, list) else []
         )
         mission = {
             "mission_id": report.get("mission_id"),
@@ -708,8 +743,7 @@ class MissionReportStore:
         terminal_event = {
             "event": "MISSION_TERMINATED",
             "mission_run_id": report.get("mission_run_id"),
-            "completed": str(report.get("termination") or "").upper()
-            == "COMPLETED",
+            "completed": str(report.get("termination") or "").upper() == "COMPLETED",
             "termination": report.get("termination"),
             "disarm_confirmed": report.get("disarm_confirmed", True),
             "warnings": report.get("warnings", []),
@@ -774,10 +808,7 @@ class MissionReportStore:
             )
             with self._condition:
                 checkpoint = self._read_canonical_unlocked()
-            if (
-                isinstance(checkpoint, dict)
-                and checkpoint.get("lifecycle") == "LIVE"
-            ):
+            if isinstance(checkpoint, dict) and checkpoint.get("lifecycle") == "LIVE":
                 current = self._merge_checkpoint(current, checkpoint)
             return current
 
@@ -800,9 +831,7 @@ class MissionReportStore:
                 persisted = self._read_canonical_unlocked()
 
             if isinstance(persisted, dict):
-                persisted_id = str(
-                    persisted.get("mission_id") or ""
-                ).strip()
+                persisted_id = str(persisted.get("mission_id") or "").strip()
                 if persisted.get("lifecycle") == "TERMINAL" and (
                     not mission_id or persisted_id == mission_id
                 ):
@@ -815,10 +844,7 @@ class MissionReportStore:
                     metadata=metadata,
                     lifecycle="LIVE",
                 )
-                if (
-                    isinstance(persisted, dict)
-                    and persisted.get("lifecycle") == "LIVE"
-                ):
+                if isinstance(persisted, dict) and persisted.get("lifecycle") == "LIVE":
                     current = self._merge_checkpoint(current, persisted)
                 return current
 
@@ -840,10 +866,7 @@ class MissionReportStore:
             )
             with self._condition:
                 persisted = self._read_canonical_unlocked()
-                if (
-                    isinstance(persisted, dict)
-                    and persisted.get("lifecycle") == "LIVE"
-                ):
+                if isinstance(persisted, dict) and persisted.get("lifecycle") == "LIVE":
                     current = self._merge_checkpoint(current, persisted)
                 try:
                     self._atomic_write_json(self.report_file, current)
@@ -866,11 +889,7 @@ class MissionReportStore:
                 "terminal_available": False,
                 "status": str(
                     current.get("status")
-                    or (
-                        "TERMINAL_CLEANUP_FAILED"
-                        if error
-                        else "UNAVAILABLE"
-                    )
+                    or ("TERMINAL_CLEANUP_FAILED" if error else "UNAVAILABLE")
                 ).upper(),
                 "mission_id": current.get("mission_id"),
                 "termination": current.get("termination"),
@@ -886,8 +905,7 @@ class MissionReportStore:
         cleanup = cleanup_value if isinstance(cleanup_value, dict) else {}
         is_terminal = report.get("lifecycle") == "TERMINAL"
         status = str(
-            cleanup.get("status")
-            or ("READY" if is_terminal else "LIVE")
+            cleanup.get("status") or ("READY" if is_terminal else "LIVE")
         ).upper()
         error = cleanup.get("error")
         current = rover_state.section("report")
@@ -898,9 +916,7 @@ class MissionReportStore:
             and current.get("mission_id") == report.get("mission_id")
             and current.get("error")
         ):
-            status = str(
-                current.get("status") or "REPORT_UPDATE_FAILED"
-            ).upper()
+            status = str(current.get("status") or "REPORT_UPDATE_FAILED").upper()
             error = current.get("error")
 
         return {
@@ -912,9 +928,7 @@ class MissionReportStore:
             "cleanup_complete": bool(cleanup.get("complete", False)),
             "error": error,
             "report_url": "/api/mission/report",
-            "download_url": (
-                "/api/mission/report/download" if is_terminal else None
-            ),
+            "download_url": ("/api/mission/report/download" if is_terminal else None),
             "generated_at": report.get("generated_at"),
             "updated_at": utc_now_iso(),
         }
@@ -963,9 +977,7 @@ class MissionReportStore:
                 report_url="/api/mission/report",
                 download_url=None,
                 generated_at=(
-                    report.get("generated_at")
-                    if isinstance(report, dict)
-                    else None
+                    report.get("generated_at") if isinstance(report, dict) else None
                 ),
             )
             with self._condition:
@@ -982,21 +994,14 @@ class MissionReportStore:
             str(terminal_event.get("event") or "").strip().upper()
             != "MISSION_TERMINATED"
         ):
-            raise MissionReportError(
-                "Terminal report requires MISSION_TERMINATED."
-            )
+            raise MissionReportError("Terminal report requires MISSION_TERMINATED.")
         if not bool(terminal_event.get("disarm_confirmed", False)):
             raise MissionReportError(
                 "Mission Manager did not confirm PX4 disarm; active mission artifacts were retained."
             )
 
-        event_timestamp = self._safe_int(
-            terminal_event.get("timestamp_unix_ns"), 0
-        )
-        if (
-            event_timestamp > 0
-            and event_timestamp < self._latest_upload_unix_ns
-        ):
+        event_timestamp = self._safe_int(terminal_event.get("timestamp_unix_ns"), 0)
+        if event_timestamp > 0 and event_timestamp < self._latest_upload_unix_ns:
             raise StaleMissionTerminalEvent(
                 "Ignored a terminal event older than the active upload."
             )
@@ -1011,9 +1016,7 @@ class MissionReportStore:
         summary_value = terminal_event.get("mission_summary")
         if not isinstance(summary_value, dict):
             summary_value = terminal_event.get("summary")
-        manager_summary = (
-            summary_value if isinstance(summary_value, dict) else {}
-        )
+        manager_summary = summary_value if isinstance(summary_value, dict) else {}
         event_run_id = str(
             manager_summary.get("mission_run_id")
             or terminal_event.get("mission_run_id")
@@ -1096,8 +1099,7 @@ class MissionReportStore:
                 self._condition.notify_all()
         except OSError as write_error:
             reason = (
-                "Unable to update terminal report cleanup status: "
-                f"{write_error}"
+                "Unable to update terminal report cleanup status: " f"{write_error}"
             )
             rover_state.update(
                 "report",
@@ -1152,11 +1154,7 @@ class MissionReportStore:
         with self._condition:
             while True:
                 report = self._read_canonical_unlocked()
-                cleanup = (
-                    report.get("cleanup")
-                    if isinstance(report, dict)
-                    else None
-                )
+                cleanup = report.get("cleanup") if isinstance(report, dict) else None
                 if (
                     isinstance(report, dict)
                     and report.get("mission_id") == mission_id
@@ -1170,9 +1168,8 @@ class MissionReportStore:
                     return report
 
                 report_state = rover_state.section("report")
-                if (
-                    report_state.get("mission_id") == mission_id
-                    and report_state.get("error")
+                if report_state.get("mission_id") == mission_id and report_state.get(
+                    "error"
                 ):
                     return {
                         "mission_id": mission_id,

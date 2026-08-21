@@ -44,12 +44,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from std_msgs.msg import Bool, Float32, Int32MultiArray, String, UInt8MultiArray
 from std_srvs.srv import Trigger
 
-from mission_manager.marking_arrival_policy import (
-    FAIL_NOW,
-    KEEP_APPROACHING,
-    after_fail_mode_action,
-    phase_a_decision,
-)
+from mission_manager.marking_arrival_policy import after_fail_mode_action
 
 
 class MissionManager(Node):
@@ -1644,12 +1639,6 @@ class MissionManager(Node):
             # SKIP removes spray permission immediately, even if requested
             # while the current point transaction is active.
             self._publish_marking_active(False)
-            (
-                self._marking_xtrack_m,
-                self._marking_along_error_m,
-                self._marking_combined_error_m,
-                self._marking_radial_error_m,
-            ) = self._marking_error_components(marking_number)
             accuracy = self._capture_accuracy_snapshot(
                 marking_number=marking_number,
                 path_index=path_index,
@@ -2012,56 +2001,164 @@ class MissionManager(Node):
         value = float(value)
         return value if math.isfinite(value) else None
 
-    def _capture_accuracy_snapshot(
-        self,
-        *,
-        marking_number: int,
-        path_index: int,
-        outcome: str,
-        reason: Optional[str],
-    ) -> dict[str, Any]:
-        """Capture one immutable accuracy decision for a CSV point."""
-        if 0 <= marking_number < len(self._point_accuracy_snapshots):
-            existing = self._point_accuracy_snapshots[marking_number]
-            if existing is not None:
-                return copy.deepcopy(existing)
 
-        radial_m = self._finite_number(self._marking_radial_error_m)
-        xtrack_m = self._finite_number(self._marking_xtrack_m)
-        along_m = self._finite_number(self._marking_along_error_m)
-        combined_m = self._finite_number(self._marking_combined_error_m)
+# CURRENT BRANCH FILE:
+# src/mission_manager/mission_manager/mission_manager_node.py
+#
+# REPLACE THE ENTIRE CURRENT _capture_accuracy_snapshot() FUNCTION WITH THIS.
+
+
+def _capture_accuracy_snapshot(
+    self,
+    *,
+    marking_number: int,
+    path_index: int,
+    outcome: str,
+    reason: Optional[str],
+) -> dict[str, Any]:
+    """Capture immutable point accuracy from RPP terminal_result ONLY.
+
+    This function performs NO marking geometry calculation.
+
+    - No hypot().
+    - No local target-distance calculation.
+    - No Mission Manager xtrack calculation.
+    - No Mission Manager along-track calculation.
+    - No tolerance decision.
+
+    RPP already calculated and decided the terminal result.
+    """
+
+    if 0 <= marking_number < len(self._point_accuracy_snapshots):
+        existing = self._point_accuracy_snapshots[marking_number]
+        if existing is not None:
+            return copy.deepcopy(existing)
+
+    point_decision = str(outcome or "").strip().upper()
+
+    # Operator SKIP intentionally has no terminal accuracy in the report.
+    # This guarantees:
+    #   Skipped -> Along — | Cross — | Overall —
+    allow_rpp_terminal = point_decision != "NOT_EVALUATED"
+
+    rpp = (
+        self._rpp_terminal_result
+        if allow_rpp_terminal and isinstance(self._rpp_terminal_result, dict)
+        else None
+    )
+
+    expected_marking_number = marking_number + 1
+    rpp_valid = False
+    rpp_outcome: Optional[str] = None
+
+    if rpp is not None:
+        try:
+            rpp_outcome = str(rpp.get("outcome") or "").strip().upper()
+            rpp_valid = (
+                int(rpp.get("marking_number") or 0) == expected_marking_number
+                and bool(rpp.get("is_marking", False))
+                and rpp_outcome in {"CAPTURED", "MISSED"}
+                and str(rpp.get("measurement_source") or rpp.get("source") or "")
+                .strip()
+                .upper()
+                == "RPP_TERMINAL_RESULT"
+            )
+        except (TypeError, ValueError):
+            rpp_valid = False
+
+    def copied_finite(key: str) -> Optional[float]:
+        if not rpp_valid or rpp is None:
+            return None
+
+        value = rpp.get(key)
+
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+
+        return number if math.isfinite(number) else None
+
+    if rpp_valid and rpp is not None:
+        cross_mm = copied_finite("cross_track_error_mm")
+        along_mm = copied_finite("along_track_error_mm")
+        overall_mm = copied_finite("overall_accuracy_mm")
+        tolerance_mm = copied_finite("tolerance_mm")
+
+        radial_m = copied_finite("radial_error_m")
+        cross_m = copied_finite("cross_track_error_m")
+        along_m = copied_finite("along_track_error_m")
+        tolerance_m = copied_finite("tolerance_m")
+        speed_mps = copied_finite("speed_mps")
+
+        available = (
+            cross_mm is not None and along_mm is not None and overall_mm is not None
+        )
+
         snapshot: dict[str, Any] = {
-            "outcome": str(outcome).upper(),
+            "measurement_source": "RPP_TERMINAL_RESULT",
+            "available": available,
+            # Mission Manager point-state context only.
+            "outcome": point_decision,
             "reason": reason,
+            # Exact RPP terminal state.
+            "rpp_outcome": rpp_outcome,
+            "rpp_reason": rpp.get("reason"),
             "point_id": f"P{marking_number+1:04d}",
             "point_index": marking_number,
             "path_index": path_index,
-            "timestamp_unix_ns": time.time_ns(),
-            "tolerance_m": self.marking_tolerance_m,
-            "tolerance_mm": self.marking_tolerance_m * 1000.0,
-            "radial_error_m": radial_m,
-            "radial_error_mm": radial_m * 1000.0 if radial_m is not None else None,
-            "cross_track_error_m": xtrack_m,
-            "cross_track_error_mm": (
-                xtrack_m * 1000.0 if xtrack_m is not None else None
-            ),
+            # Exact timestamp produced by RPP.
+            "timestamp_unix_ns": rpp.get("timestamp_unix_ns"),
+            # COPY ONLY.
+            "cross_track_error_m": cross_m,
+            "cross_track_error_mm": cross_mm,
             "along_track_error_m": along_m,
-            "along_track_error_mm": along_m * 1000.0 if along_m is not None else None,
-            "combined_error_m": combined_m,
-            "combined_error_mm": (
-                combined_m * 1000.0 if combined_m is not None else None
+            "along_track_error_mm": along_mm,
+            "radial_error_m": radial_m,
+            "radial_error_mm": overall_mm,
+            "overall_accuracy_mm": overall_mm,
+            "total_accuracy_mm": overall_mm,
+            "tolerance_m": tolerance_m,
+            "tolerance_mm": tolerance_mm,
+            "within_tolerance": (
+                bool(rpp.get("within_tolerance"))
+                if rpp.get("within_tolerance") is not None
+                else None
             ),
-            "speed_mps": self._finite_number(self._speed_mps),
-            "stationary": (
-                math.isfinite(self._speed_mps)
-                and self._speed_mps <= self.stationary_speed_tolerance_mps
-            ),
-            "verification_elapsed_sec": self._marking_hold_elapsed_sec,
-            "verification_required_sec": self.marking_hold_sec,
+            "speed_mps": speed_mps,
         }
-        if 0 <= marking_number < len(self._point_accuracy_snapshots):
-            self._point_accuracy_snapshots[marking_number] = copy.deepcopy(snapshot)
-        return copy.deepcopy(snapshot)
+
+    else:
+        # No RPP terminal result means NO report accuracy.
+        snapshot = {
+            "measurement_source": "RPP_TERMINAL_RESULT",
+            "available": False,
+            "outcome": point_decision,
+            "reason": reason,
+            "rpp_outcome": None,
+            "rpp_reason": None,
+            "point_id": f"P{marking_number+1:04d}",
+            "point_index": marking_number,
+            "path_index": path_index,
+            "timestamp_unix_ns": None,
+            "cross_track_error_m": None,
+            "cross_track_error_mm": None,
+            "along_track_error_m": None,
+            "along_track_error_mm": None,
+            "radial_error_m": None,
+            "radial_error_mm": None,
+            "overall_accuracy_mm": None,
+            "total_accuracy_mm": None,
+            "tolerance_m": None,
+            "tolerance_mm": None,
+            "within_tolerance": None,
+            "speed_mps": None,
+        }
+
+    if 0 <= marking_number < len(self._point_accuracy_snapshots):
+        self._point_accuracy_snapshots[marking_number] = copy.deepcopy(snapshot)
+
+    return copy.deepcopy(snapshot)
 
     def _spray_outcome_snapshot(
         self,
@@ -2158,92 +2255,105 @@ class MissionManager(Node):
         msg.data = bool(complete)
         self.mission_complete_pub.publish(msg)
 
-    def _emit_point_event(
-        self,
-        event: str,
-        marking_number: int,
-        path_index: int,
-        *,
-        reason: Optional[str] = None,
-        accuracy: Optional[dict[str, Any]] = None,
-        spray: Optional[dict[str, Any]] = None,
-        point_result: Optional[dict[str, Any]] = None,
-    ) -> None:
-        accuracy_payload = (
-            copy.deepcopy(accuracy)
-            if accuracy is not None
-            else {
-                "outcome": "UNSPECIFIED",
-                "reason": reason,
-                "tolerance_m": self.marking_tolerance_m,
-                "tolerance_mm": self.marking_tolerance_m * 1000.0,
-                "radial_error_m": self._finite_number(self._marking_radial_error_m),
-                "radial_error_mm": (
-                    self._marking_radial_error_m * 1000.0
-                    if math.isfinite(self._marking_radial_error_m)
-                    else None
-                ),
-                "cross_track_error_m": self._finite_number(self._marking_xtrack_m),
-                "cross_track_error_mm": (
-                    self._marking_xtrack_m * 1000.0
-                    if math.isfinite(self._marking_xtrack_m)
-                    else None
-                ),
-                "along_track_error_m": self._finite_number(self._marking_along_error_m),
-                "along_track_error_mm": (
-                    self._marking_along_error_m * 1000.0
-                    if math.isfinite(self._marking_along_error_m)
-                    else None
-                ),
-                "combined_error_m": self._finite_number(self._marking_combined_error_m),
-                "combined_error_mm": (
-                    self._marking_combined_error_m * 1000.0
-                    if math.isfinite(self._marking_combined_error_m)
-                    else None
-                ),
-                "speed_mps": self._finite_number(self._speed_mps),
-            }
-        )
-        spray_payload = (
-            copy.deepcopy(spray)
-            if spray is not None
-            else {
-                "attempted": self._spray_request_started is not None,
-                "outcome": "UNSPECIFIED",
-                "reason": None,
-                "required": self.spray_required,
-                "elapsed_sec": (
-                    max(0.0, time.monotonic() - self._spray_request_started)
-                    if self._spray_request_started is not None
-                    else 0.0
-                ),
-            }
-        )
-        payload = {
-            "event": event,
-            "mission_run_id": self._mission_run_id or None,
+    # CURRENT BRANCH FILE:
+
+
+# src/mission_manager/mission_manager/mission_manager_node.py
+#
+# REPLACE THE ENTIRE CURRENT _emit_point_event() FUNCTION WITH THIS.
+#
+# Important: fallback accuracy is now "unavailable".
+# It never reconstructs accuracy from Mission Manager live geometry.
+
+
+def _emit_point_event(
+    self,
+    event: str,
+    marking_number: int,
+    path_index: int,
+    *,
+    reason: Optional[str] = None,
+    accuracy: Optional[dict[str, Any]] = None,
+    spray: Optional[dict[str, Any]] = None,
+    point_result: Optional[dict[str, Any]] = None,
+) -> None:
+
+    accuracy_payload = (
+        copy.deepcopy(accuracy)
+        if isinstance(accuracy, dict)
+        else {
+            "measurement_source": "RPP_TERMINAL_RESULT",
+            "available": False,
+            "outcome": "UNAVAILABLE",
+            "reason": reason,
+            "rpp_outcome": None,
+            "rpp_reason": None,
             "point_id": f"P{marking_number+1:04d}",
             "point_index": marking_number,
             "path_index": path_index,
-            "state": self._state,
-            "timestamp_unix_ns": time.time_ns(),
-            "radial_error_m": accuracy_payload.get("radial_error_m"),
-            "radial_error_mm": accuracy_payload.get("radial_error_mm"),
-            "reason": reason,
-            "xtrack_m": accuracy_payload.get("cross_track_error_m"),
-            "xtrack_mm": accuracy_payload.get("cross_track_error_mm"),
-            "along_error_m": accuracy_payload.get("along_track_error_m"),
-            "along_error_mm": accuracy_payload.get("along_track_error_mm"),
-            "combined_error_m": accuracy_payload.get("combined_error_m"),
-            "combined_error_mm": accuracy_payload.get("combined_error_mm"),
-            "accuracy": accuracy_payload,
-            "spray": spray_payload,
-            "spray_outcome": spray_payload.get("outcome"),
-            "point_result": copy.deepcopy(point_result),
+            "timestamp_unix_ns": None,
+            "cross_track_error_m": None,
+            "cross_track_error_mm": None,
+            "along_track_error_m": None,
+            "along_track_error_mm": None,
+            "radial_error_m": None,
+            "radial_error_mm": None,
+            "overall_accuracy_mm": None,
+            "total_accuracy_mm": None,
+            "tolerance_m": None,
+            "tolerance_mm": None,
+            "within_tolerance": None,
+            "speed_mps": None,
         }
-        msg = String()
-        msg.data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-        self.point_event_pub.publish(msg)
+    )
+
+    spray_payload = (
+        copy.deepcopy(spray)
+        if spray is not None
+        else {
+            "attempted": self._spray_request_started is not None,
+            "outcome": "UNSPECIFIED",
+            "reason": None,
+            "required": self.spray_required,
+            "elapsed_sec": (
+                max(0.0, time.monotonic() - self._spray_request_started)
+                if self._spray_request_started is not None
+                else 0.0
+            ),
+        }
+    )
+
+    payload = {
+        "event": event,
+        "mission_run_id": self._mission_run_id or None,
+        "point_id": f"P{marking_number+1:04d}",
+        "point_index": marking_number,
+        "path_index": path_index,
+        "state": self._state,
+        "timestamp_unix_ns": time.time_ns(),
+        # Compatibility flat fields are COPY-ONLY aliases.
+        "radial_error_m": accuracy_payload.get("radial_error_m"),
+        "radial_error_mm": accuracy_payload.get("radial_error_mm"),
+        "reason": reason,
+        "xtrack_m": accuracy_payload.get("cross_track_error_m"),
+        "xtrack_mm": accuracy_payload.get("cross_track_error_mm"),
+        "along_error_m": accuracy_payload.get("along_track_error_m"),
+        "along_error_mm": accuracy_payload.get("along_track_error_mm"),
+        "overall_accuracy_mm": accuracy_payload.get("overall_accuracy_mm"),
+        "accuracy": accuracy_payload,
+        "spray": spray_payload,
+        "spray_outcome": spray_payload.get("outcome"),
+        "point_result": copy.deepcopy(point_result),
+    }
+
+    msg = String()
+    msg.data = json.dumps(
+        payload,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    self.point_event_pub.publish(msg)
 
     def _fail_marking_point(
         self, marking_number: int, path_index: int, reason: str
@@ -2483,81 +2593,116 @@ class MissionManager(Node):
         self._complete_mission()
         return True
 
-    def _resolve_accuracy_failure(
-        self,
-        *,
-        marking_number: int,
-        failure_reason: str,
-    ) -> None:
-        """Record FAILED with no spray, then AUTO-continue or MANUAL NEXT."""
+    # CURRENT BRANCH FILE:
 
-        point_id = f"P{marking_number+1:04d}"
-        accuracy = self._capture_accuracy_snapshot(
-            marking_number=marking_number,
-            path_index=self._current_path_index,
-            outcome="FAILED",
-            reason=failure_reason,
+
+# src/mission_manager/mission_manager/mission_manager_node.py
+#
+# REPLACE THE ENTIRE CURRENT _resolve_accuracy_failure() FUNCTION WITH THIS.
+#
+# This preserves the current AUTO/MANUAL transition behavior but the stored
+# failure accuracy is RPP-only and spray is explicitly forbidden.
+
+
+def _resolve_accuracy_failure(
+    self,
+    *,
+    marking_number: int,
+    failure_reason: str,
+) -> None:
+    """Record RPP MISSED as FAILED with no spray."""
+
+    point_id = f"P{marking_number+1:04d}"
+
+    accuracy = self._capture_accuracy_snapshot(
+        marking_number=marking_number,
+        path_index=self._current_path_index,
+        outcome="FAILED",
+        reason=failure_reason,
+    )
+
+    spray = self._spray_outcome_snapshot(
+        attempted=False,
+        outcome="NOT_ATTEMPTED_RPP_MISSED",
+        reason=failure_reason,
+    )
+
+    # Absolute guarantee: RPP MISSED never authorizes spray.
+    self._publish_marking_active(False)
+    self._spray_request_started = None
+
+    self._point_status[marking_number] = "FAILED"
+
+    point_result = self._store_point_result(
+        marking_number=marking_number,
+        path_index=self._current_path_index,
+        point_outcome="FAILED",
+        accuracy=accuracy,
+        spray=spray,
+    )
+
+    overall_mm = accuracy.get("overall_accuracy_mm")
+    overall_text = (
+        f"{overall_mm:.1f}mm"
+        if isinstance(overall_mm, (int, float)) and math.isfinite(float(overall_mm))
+        else "unavailable"
+    )
+
+    self._last_message = (
+        f"{point_id} FAILED from RPP MISSED "
+        f"(overall={overall_text}); {failure_reason}"
+    )
+
+    self._emit_point_event(
+        "ACCURACY_FAILED",
+        marking_number,
+        self._current_path_index,
+        reason=failure_reason,
+        accuracy=accuracy,
+        spray=spray,
+        point_result=point_result,
+    )
+
+    self._publish_marking_active(False)
+
+    self._current_path_index = self._next_semantic_index(self._current_path_index + 1)
+
+    self._reset_arrival_state()
+    self._publish_runtime_path()
+
+    if self._finish_if_done():
+        return
+
+    action = after_fail_mode_action(self._execution_mode)
+
+    if action == "WAITING_FOR_NEXT":
+        self._state = "WAITING_FOR_NEXT"
+        self._pause_reason = None
+        self._resume_available = False
+
+        self._set_safety(
+            emergency_stop=False,
+            mission_enable=False,
         )
-        spray = self._spray_outcome_snapshot(
-            attempted=False,
-            outcome="NOT_ATTEMPTED_ACCURACY_FAILED",
-            reason=failure_reason,
-        )
-        self._point_status[marking_number] = "FAILED"
-        point_result = self._store_point_result(
-            marking_number=marking_number,
-            path_index=self._current_path_index,
-            point_outcome="FAILED",
-            accuracy=accuracy,
-            spray=spray,
-        )
-        radial_mm = accuracy.get("radial_error_mm")
-        radial_text = (
-            f"{radial_mm:.1f}mm" if radial_mm is not None else "unavailable"
-        )
+
         self._last_message = (
-            f"{point_id} FAILED accuracy ({radial_text}); "
-            f"{failure_reason}"
+            f"{point_id} FAILED from RPP MISSED "
+            f"(overall={overall_text}); waiting for NEXT"
         )
-        self._emit_point_event(
-            "ACCURACY_FAILED",
-            marking_number,
-            self._current_path_index,
-            reason=failure_reason,
-            accuracy=accuracy,
-            spray=spray,
-            point_result=point_result,
-        )
-        self._publish_marking_active(False)
-        self._current_path_index = self._next_semantic_index(
-            self._current_path_index + 1
-        )
-        self._reset_arrival_state()
-        self._publish_runtime_path()
 
-        if self._finish_if_done():
-            return
+    else:
+        self._state = "RUNNING"
+        self._pause_reason = None
+        self._resume_available = False
 
-        action = after_fail_mode_action(self._execution_mode)
-        if action == "WAITING_FOR_NEXT":
-            self._state = "WAITING_FOR_NEXT"
-            self._pause_reason = None
-            self._resume_available = False
-            self._set_safety(emergency_stop=False, mission_enable=False)
-            self._last_message = (
-                f"{point_id} FAILED accuracy ({radial_text}); "
-                "waiting for NEXT"
-            )
-        else:
-            self._state = "RUNNING"
-            self._pause_reason = None
-            self._resume_available = False
-            self._last_message = (
-                f"{point_id} FAILED accuracy ({radial_text}); "
-                "continuing automatically"
-            )
-            self._publish_goal()
-        self._publish_status(force=True)
+        self._last_message = (
+            f"{point_id} FAILED from RPP MISSED "
+            f"(overall={overall_text}); continuing automatically"
+        )
+
+        self._publish_goal()
+
+    self._publish_status(force=True)
 
     def _complete_mission(self) -> None:
         """Report normal completion, then schedule automatic STOP cleanup."""
@@ -2729,67 +2874,96 @@ class MissionManager(Node):
             if self._point_status[marking_number] == "PENDING":
                 self._point_status[marking_number] = "ACTIVE"
 
-            (
-                self._marking_xtrack_m,
-                self._marking_along_error_m,
-                self._marking_combined_error_m,
-                self._marking_radial_error_m,
-            ) = self._marking_error_components(marking_number)
+            # CURRENT BRANCH FILE:
+            # src/mission_manager/mission_manager/mission_manager_node.py
+            #
+            # In _control_loop(), after:
+            #
+            #     self._active_marking_number = marking_number
+            #     if self._point_status[marking_number] == "PENDING":
+            #         self._point_status[marking_number] = "ACTIVE"
+            #
+            # REPLACE EVERYTHING from the current:
+            #
+            #     (
+            #         self._marking_xtrack_m,
+            #         ...
+            #     ) = self._marking_error_components(marking_number)
+            #
+            # THROUGH THE END OF CURRENT "PHASE B" -- immediately before:
+            #
+            #     # PHASE C: spray transaction.
+            #
+            # WITH THIS BLOCK.
+            #
+            # KEEP THE EXISTING PHASE C code after this block, with the two small edits
+            # shown at the bottom of this file.
 
-            inside_30mm = (
-                math.isfinite(self._marking_radial_error_m)
-                and self._marking_radial_error_m <= self.marking_tolerance_m
-            )
-            stationary = self._speed_mps <= self.stationary_speed_tolerance_mps
-            self._marking_error_valid = inside_30mm
-
-            # ------------------------------------------------------
-            # MARKING SEQUENCE
-            # ------------------------------------------------------
-            # Pass: <=30 mm AND stationary starts ONE 3 s hold, then spray.
-            # Miss: RPP MISSED or past the goal plane while outside 30 mm
-            #       fails immediately. No 3 s hold. AUTO -> next point.
-            #       MANUAL waits for NEXT.
+            # ======================================================
+            # MARKING DECISION: RPP TERMINAL RESULT ONLY
+            # ======================================================
             now = time.monotonic()
             point_id = f"P{marking_number+1:04d}"
             spray_key = (self._mission_run_id, point_id)
-            past_goal_plane = (
-                math.isfinite(self._marking_along_error_m)
-                and self._marking_along_error_m >= self.GOAL_PLANE_OVERSHOOT_TRIGGER_M
-            )
-            rpp_terminal_outcome = (
-                str(self._rpp_terminal_result.get("outcome", "")).upper()
+
+            rpp = (
+                self._rpp_terminal_result
                 if isinstance(self._rpp_terminal_result, dict)
-                else ""
+                else None
             )
 
-            # PHASE A: wait for a real 30 mm capture, or fail a miss now.
+            rpp_terminal_outcome = (
+                str(rpp.get("outcome") or "").strip().upper() if rpp is not None else ""
+            )
+
+            # These compatibility status fields are no longer calculated by
+            # Mission Manager. They remain empty until/reset between points.
+            self._marking_error_valid = rpp_terminal_outcome == "CAPTURED"
+
+            # ------------------------------------------------------
+            # PHASE A
+            # Wait for RPP's one authoritative terminal decision.
+            # ------------------------------------------------------
             if self._marking_hold_started is None:
                 self._publish_marking_active(False)
-                decision = phase_a_decision(
-                    inside_30mm=inside_30mm,
-                    stationary=stationary,
-                    rpp_outcome=rpp_terminal_outcome,
-                    past_goal_plane=past_goal_plane,
-                )
-                if decision == KEEP_APPROACHING:
+
+                if rpp_terminal_outcome == "":
                     self._arrival_settle_started = None
                     self._arrival_settle_elapsed_sec = 0.0
                     self._marking_hold_elapsed_sec = 0.0
+
+                    self._last_message = (
+                        f"{point_id} active; waiting for RPP CAPTURED/MISSED"
+                    )
                     return
-                if decision == FAIL_NOW:
-                    failed_reasons: list[str] = []
-                    if not inside_30mm:
-                        failed_reasons.append("RADIAL_OUTSIDE_30MM")
-                    if rpp_terminal_outcome == "MISSED":
-                        failed_reasons.append("RPP_MISSED")
-                    elif rpp_terminal_outcome == "CAPTURED":
-                        failed_reasons.append("RPP_CAPTURED_OUTSIDE_30MM")
-                    if past_goal_plane:
-                        failed_reasons.append("GOAL_PLANE_OVERSHOOT")
+
+                if rpp_terminal_outcome == "MISSED":
                     self._resolve_accuracy_failure(
                         marking_number=marking_number,
-                        failure_reason="+".join(failed_reasons) or "MARK_MISSED",
+                        failure_reason=str((rpp or {}).get("reason") or "RPP_MISSED"),
+                    )
+                    return
+
+                if rpp_terminal_outcome != "CAPTURED":
+                    self._last_message = (
+                        f"{point_id} waiting; invalid RPP terminal outcome "
+                        f"{rpp_terminal_outcome!r}"
+                    )
+                    return
+
+                # CAPTURED is already RPP's stationary final-stop decision.
+                # Mission Manager does NOT calculate/check 30 mm again.
+                accuracy = self._capture_accuracy_snapshot(
+                    marking_number=marking_number,
+                    path_index=self._current_path_index,
+                    outcome="ACHIEVED",
+                    reason=None,
+                )
+
+                if accuracy.get("available") is not True:
+                    self._publish_marking_active(False)
+                    self._enter_error(
+                        f"{point_id} RPP CAPTURED without complete terminal accuracy"
                     )
                     return
 
@@ -2797,63 +2971,70 @@ class MissionManager(Node):
                 self._arrival_settle_started = now
                 self._arrival_settle_elapsed_sec = 0.0
                 self._marking_hold_elapsed_sec = 0.0
+
                 self._last_message = (
-                    f"{point_id} reached <= "
-                    f"{self.marking_tolerance_m*1000.0:.0f}mm "
-                    "and is stationary; starting "
-                    f"{self.marking_hold_sec:.1f}s verification; "
+                    f"{point_id} RPP CAPTURED; starting "
+                    f"{self.marking_hold_sec:.1f}s pre-mark hold; "
                     "spray remains OFF"
                 )
+
                 self._publish_status(force=True)
                 return
 
-            # PHASE B: fixed verification window.
+            # ------------------------------------------------------
+            # PHASE B
+            # Fixed pre-mark hold AFTER RPP CAPTURED.
+            #
+            # No radial re-check.
+            # No cross-track re-check.
+            # No along-track re-check.
+            # No second tolerance decision.
+            # ------------------------------------------------------
             if self._spray_request_started is None:
                 self._marking_hold_elapsed_sec = max(
-                    0.0, now - self._marking_hold_started
+                    0.0,
+                    now - self._marking_hold_started,
                 )
+
                 self._arrival_settle_elapsed_sec = self._marking_hold_elapsed_sec
+
                 self._publish_marking_active(False)
 
-                if self._marking_hold_elapsed_sec < self.marking_hold_sec:
-                    remaining = max(
-                        0.0,
-                        self.marking_hold_sec - self._marking_hold_elapsed_sec,
-                    )
-                    self._last_message = (
-                        f"{point_id} verification hold; "
-                        f"{remaining:.2f}s remaining; "
-                        f"radial={self._marking_radial_error_m*1000.0:.1f}mm; "
-                        f"speed={self._speed_mps:.3f}m/s"
-                    )
-                    return
-
-                # The 3-second timer has expired. NOW perform the authoritative
-                # point-achieved decision.
-                if not (inside_30mm and stationary):
-                    failed_reasons: list[str] = []
-                    if not inside_30mm:
-                        failed_reasons.append("RADIAL_OUTSIDE_30MM")
-                    if not stationary:
-                        failed_reasons.append("ROVER_NOT_STATIONARY")
-                    self._resolve_accuracy_failure(
-                        marking_number=marking_number,
-                        failure_reason="+".join(failed_reasons),
-                    )
-                    return
-
-                # Verified after the full 3 seconds. Only NOW is physical
-                # marking requested.
                 accuracy = self._capture_accuracy_snapshot(
                     marking_number=marking_number,
                     path_index=self._current_path_index,
                     outcome="ACHIEVED",
                     reason=None,
                 )
+
+                if accuracy.get("available") is not True:
+                    self._publish_marking_active(False)
+                    self._enter_error(
+                        f"{point_id} lost RPP terminal accuracy before spray"
+                    )
+                    return
+
+                if self._marking_hold_elapsed_sec < self.marking_hold_sec:
+                    remaining = max(
+                        0.0,
+                        self.marking_hold_sec - self._marking_hold_elapsed_sec,
+                    )
+
+                    overall_mm = accuracy.get("overall_accuracy_mm")
+
+                    self._last_message = (
+                        f"{point_id} RPP CAPTURED hold; "
+                        f"{remaining:.2f}s remaining; "
+                        f"overall={overall_mm}mm"
+                    )
+                    return
+
+                # Hold complete. RPP CAPTURED authorizes spray.
                 pending_spray = self._spray_outcome_snapshot(
                     attempted=self.spray_required,
-                    outcome="PENDING" if self.spray_required else "DISABLED",
+                    outcome=("PENDING" if self.spray_required else "DISABLED"),
                 )
+
                 self._emit_point_event(
                     "ACCURACY_ACHIEVED",
                     marking_number,
@@ -2861,23 +3042,53 @@ class MissionManager(Node):
                     accuracy=accuracy,
                     spray=pending_spray,
                 )
-                self._spray_request_started = now
-                self._publish_marking_active(True)
-                self._last_message = (
-                    f"{point_id} VERIFIED after "
-                    f"{self.marking_hold_sec:.1f}s: "
-                    f"radial={self._marking_radial_error_m*1000.0:.1f}mm; "
-                    "spray/mark triggered"
-                )
-                self._publish_status(force=True)
 
-                # If spray is disabled for this installation, positional
-                # verification alone completes the point.
-                if not self.spray_required:
-                    self._publish_marking_active(False)
-                else:
+                self._spray_request_started = now
+
+                if self.spray_required:
+                    self._publish_marking_active(True)
+
+                    overall_mm = accuracy.get("overall_accuracy_mm")
+
+                    self._last_message = (
+                        f"{point_id} RPP CAPTURED after "
+                        f"{self.marking_hold_sec:.1f}s: "
+                        f"overall={overall_mm}mm; "
+                        "spray/mark triggered"
+                    )
+
+                    self._publish_status(force=True)
                     return
 
+                # Spray disabled: fall through to existing PHASE C completion.
+                self._publish_marking_active(False)
+
+            # ==============================================================
+            # TWO SMALL CURRENT PHASE-C EDITS
+            # ==============================================================
+
+            # CURRENT:
+            #
+            # accuracy = copy.deepcopy(self._point_accuracy_snapshots[marking_number])
+            # if accuracy is None:
+            #     accuracy = self._capture_accuracy_snapshot(...)
+            #
+            # REPLACE WITH:
+
+            accuracy = self._capture_accuracy_snapshot(
+                marking_number=marking_number,
+                path_index=self._current_path_index,
+                outcome="ACHIEVED",
+                reason=None,
+            )
+
+            # CURRENT:
+            #
+            # final_mm = accuracy.get("radial_error_mm")
+            #
+            # REPLACE WITH:
+            #
+            # final_mm = accuracy.get("overall_accuracy_mm")
             # PHASE C: spray transaction. Current spray_controller needs
             # marking_active to remain TRUE through its stable/pre-spray and
             # press/release transaction, so keep it asserted until a result.
@@ -2917,16 +3128,13 @@ class MissionManager(Node):
             # spray disabled). Spray failure never aborts the whole mission.
             self._publish_marking_active(False)
 
-            accuracy = copy.deepcopy(self._point_accuracy_snapshots[marking_number])
-            if accuracy is None:
-                # Defensive fallback; the normal path captures this exactly at
-                # the end of the fixed verification window.
-                accuracy = self._capture_accuracy_snapshot(
-                    marking_number=marking_number,
-                    path_index=self._current_path_index,
-                    outcome="ACHIEVED",
-                    reason=None,
-                )
+            accuracy = self._capture_accuracy_snapshot(
+                marking_number=marking_number,
+                path_index=self._current_path_index,
+                outcome="ACHIEVED",
+                reason=None,
+            )
+
             if not self.spray_required:
                 spray = self._spray_outcome_snapshot(
                     attempted=False,
@@ -2953,7 +3161,7 @@ class MissionManager(Node):
                     ),
                 )
 
-            final_mm = accuracy.get("radial_error_mm")
+            final_mm = accuracy.get("overall_accuracy_mm")
             final_text = f"{final_mm:.1f}mm" if final_mm is not None else "unavailable"
             self._point_status[marking_number] = "COMPLETED"
             self._last_completed_marking_number = marking_number

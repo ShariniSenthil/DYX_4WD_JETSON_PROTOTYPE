@@ -2671,8 +2671,7 @@ class RPPController(Node):
             self.c_line_bearing = None
             self.c_line_reanchored_after_pivot = False
             self.get_logger().warn(
-                f"P1 RESOLVED ({event}) / "
-                "P1->P2 INTERPOLATED GUIDANCE RELEASED"
+                f"P1 RESOLVED ({event}) / " "P1->P2 INTERPOLATED GUIDANCE RELEASED"
             )
 
     def reset_motion_state(self):
@@ -4069,56 +4068,111 @@ class RPPController(Node):
         """Compatibility helper; preserve the configured acceleration slew."""
         return self.command_speed_slew_limit(requested_speed)
 
-    def publish_terminal_result(
-        self,
-        outcome,
-        *,
-        reason,
-        target_distance,
-        signed_cross_track,
-        along_remaining,
-    ):
-        """Publish one terminal result for the active semantic goal.
 
-        This is a handshake only. Mission Manager remains authoritative for
-        the fixed 3-second verification and final ACHIEVED/FAILED decision.
-        """
-        outcome = str(outcome).strip().upper()
-        if outcome not in {"CAPTURED", "MISSED"}:
-            return
-        if self._terminal_result_sent is not None:
-            return
-        if self.segment_goal_x is None or self.segment_goal_y is None:
-            return
+# CURRENT BRANCH FILE:
+# src/rpp_controller/rpp_controller/rpp_controller_node.py
+#
+# REPLACE THE ENTIRE CURRENT publish_terminal_result() FUNCTION WITH THIS.
+#
+# Current branch signature is preserved exactly.
 
-        payload = {
-            "outcome": outcome,
-            "reason": str(reason or ""),
-            "goal_x": float(self.segment_goal_x),
-            "goal_y": float(self.segment_goal_y),
-            "marking_number": int(self.segment_goal_number or 0),
-            "is_marking": bool((self.segment_goal_number or 0) > 0),
-            "radial_error_m": float(target_distance),
-            "cross_track_error_m": float(signed_cross_track),
-            "along_track_remaining_m": float(along_remaining),
-            "speed_mps": (
-                float(self.current_speed_mps)
-                if math.isfinite(self.current_speed_mps)
-                else None
-            ),
-            "stop_commanded": True,
-            "timestamp_unix_ns": self.get_clock().now().nanoseconds,
-        }
-        msg = String()
-        msg.data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-        self.terminal_result_pub.publish(msg)
-        self._terminal_result_sent = outcome
-        self.get_logger().warn(
-            "RPP TERMINAL RESULT -> MISSION MANAGER | "
-            f"outcome={outcome} | reason={reason} | "
-            f"radial={target_distance * 1000.0:.1f}mm | "
-            f"along={along_remaining * 1000.0:+.1f}mm"
-        )
+
+def publish_terminal_result(
+    self,
+    outcome,
+    *,
+    reason,
+    target_distance,
+    signed_cross_track,
+    along_remaining,
+):
+    """Publish the authoritative terminal result for the active semantic goal.
+
+    RPP is the ONLY owner of final marking accuracy.
+
+    Downstream nodes may store/display these values but must never reconstruct
+    the final marking accuracy from odometry, GPS, target coordinates or live
+    telemetry.
+    """
+    outcome = str(outcome).strip().upper()
+
+    if outcome not in {"CAPTURED", "MISSED"}:
+        return
+
+    if self._terminal_result_sent is not None:
+        return
+
+    if self.segment_goal_x is None or self.segment_goal_y is None:
+        return
+
+    # --------------------------------------------------------------
+    # FINAL ACCURACY IS CALCULATED ONCE -- HERE IN RPP.
+    # --------------------------------------------------------------
+    radial_m = float(target_distance)
+    cross_track_m = float(signed_cross_track)
+    along_track_m = float(along_remaining)
+    tolerance_m = float(self.waypoint_tolerance)
+
+    radial_mm = radial_m * 1000.0
+    cross_track_mm = cross_track_m * 1000.0
+    along_track_mm = along_track_m * 1000.0
+    tolerance_mm = tolerance_m * 1000.0
+
+    payload = {
+        "source": "RPP_TERMINAL_RESULT",
+        "measurement_source": "RPP_TERMINAL_RESULT",
+        "available": True,
+        "outcome": outcome,
+        "reason": str(reason or ""),
+        "goal_x": float(self.segment_goal_x),
+        "goal_y": float(self.segment_goal_y),
+        "marking_number": int(self.segment_goal_number or 0),
+        "is_marking": bool((self.segment_goal_number or 0) > 0),
+        # Raw SI values kept for diagnostics/compatibility.
+        "radial_error_m": radial_m,
+        "cross_track_error_m": cross_track_m,
+        "along_track_remaining_m": along_track_m,
+        "along_track_error_m": along_track_m,
+        "tolerance_m": tolerance_m,
+        # ----------------------------------------------------------
+        # CANONICAL FINAL MISSION-REPORT VALUES.
+        # No downstream node should recalculate these.
+        # ----------------------------------------------------------
+        "cross_track_error_mm": cross_track_mm,
+        "along_track_error_mm": along_track_mm,
+        "along_track_remaining_mm": along_track_mm,
+        "radial_error_mm": radial_mm,
+        "overall_accuracy_mm": radial_mm,
+        "total_accuracy_mm": radial_mm,
+        "tolerance_mm": tolerance_mm,
+        # RPP outcome is already the authoritative decision.
+        "within_tolerance": outcome == "CAPTURED",
+        "speed_mps": (
+            float(self.current_speed_mps)
+            if math.isfinite(self.current_speed_mps)
+            else None
+        ),
+        "stop_commanded": True,
+        "timestamp_unix_ns": self.get_clock().now().nanoseconds,
+    }
+
+    msg = String()
+    msg.data = json.dumps(
+        payload,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    self.terminal_result_pub.publish(msg)
+    self._terminal_result_sent = outcome
+
+    self.get_logger().warn(
+        "RPP TERMINAL RESULT -> MISSION MANAGER | "
+        f"outcome={outcome} | reason={reason} | "
+        f"overall={radial_mm:.1f}mm | "
+        f"cross={cross_track_mm:+.1f}mm | "
+        f"along={along_track_mm:+.1f}mm"
+    )
 
     def latch_exact_marking_stop(
         self,
