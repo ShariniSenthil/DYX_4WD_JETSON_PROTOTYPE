@@ -19,6 +19,7 @@ from tf_transformations import euler_from_quaternion
 
 from rpp_controller.point_event_policy import (
     first_marking_approach_is_active,
+    latched_stop_terminal_outcome,
     should_release_first_marking,
 )
 
@@ -4159,26 +4160,39 @@ class RPPController(Node):
 
         return self.marking_stop_latched
 
-    def evaluate_latched_marking_stop(self, target_distance):
-        """Keep zero latched after a genuine <=30 mm semantic capture."""
+    def evaluate_latched_marking_stop(
+        self,
+        target_distance,
+        signed_cross_track,
+        along_remaining,
+    ):
+        """Keep zero latched and emit one outcome after the rover settles."""
         self.publish_stop()
 
-        if self.marking_stop_latched_at is None:
+        if self._terminal_result_sent is not None:
             return
 
-        elapsed = (
-            self.get_clock().now() - self.marking_stop_latched_at
-        ).nanoseconds / 1e9
-
-        if (
-            elapsed >= self.marking_stop_settle_timeout_sec
-            and self.current_speed_mps <= self.stationary_speed_tolerance
-            and target_distance > self.waypoint_tolerance
-        ):
-            self.get_logger().warn(
-                "CAPTURE LATCH PRESERVED AFTER SETTLING DRIFT | "
-                f"current_distance={target_distance * 1000.0:.1f}mm | "
-                f"speed={self.current_speed_mps:.3f}m/s"
+        outcome = latched_stop_terminal_outcome(
+            target_distance=target_distance,
+            current_speed=self.current_speed_mps,
+            waypoint_tolerance=self.waypoint_tolerance,
+            stationary_speed_tolerance=self.stationary_speed_tolerance,
+        )
+        if outcome == "CAPTURED":
+            self.publish_terminal_result(
+                "CAPTURED",
+                reason="RADIUS_30MM_STATIONARY",
+                target_distance=target_distance,
+                signed_cross_track=signed_cross_track,
+                along_remaining=along_remaining,
+            )
+        elif outcome == "MISSED":
+            self.publish_terminal_result(
+                "MISSED",
+                reason="SETTLED_OUTSIDE_30MM_AFTER_ENTRY",
+                target_distance=target_distance,
+                signed_cross_track=signed_cross_track,
+                along_remaining=along_remaining,
             )
 
     def control_loop(self):
@@ -4387,7 +4401,11 @@ class RPPController(Node):
         )
 
         if goal_requires_precision_stop and self.marking_stop_latched:
-            self.evaluate_latched_marking_stop(goal_distance)
+            self.evaluate_latched_marking_stop(
+                goal_distance,
+                goal_signed_cross_track,
+                goal_along_remaining,
+            )
             self.log_control(
                 mode_prefix
                 + "EXACT WP_RADIUS 30MM / ZERO LATCH / WAIT MISSION MANAGER",
@@ -4407,7 +4425,11 @@ class RPPController(Node):
             goal_signed_cross_track,
             goal_along_remaining,
         ):
-            self.evaluate_latched_marking_stop(goal_distance)
+            self.evaluate_latched_marking_stop(
+                goal_distance,
+                goal_signed_cross_track,
+                goal_along_remaining,
+            )
             self.log_control(
                 mode_prefix
                 + "EXACT WP_RADIUS 30MM / ZERO LATCH / WAIT MISSION MANAGER",
