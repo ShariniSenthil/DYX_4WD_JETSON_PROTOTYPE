@@ -2692,6 +2692,7 @@ class RPPController(Node):
 
         self.marking_stop_latched = False
         self.marking_stop_latched_at = None
+        self._terminal_result_sent = None
         self.terminal_gate_inside_since = None
         self.terminal_gate_ready = False
         self.reset_terminal_precision_state()
@@ -4079,7 +4080,7 @@ class RPPController(Node):
         outcome = str(outcome).strip().upper()
         if outcome not in {"CAPTURED", "MISSED"}:
             return
-        if self._terminal_result_sent == outcome:
+        if self._terminal_result_sent is not None:
             return
         if self.segment_goal_x is None or self.segment_goal_y is None:
             return
@@ -4120,31 +4121,36 @@ class RPPController(Node):
         along_remaining,
     ):
         """Latch zero after entering the exact 30 mm semantic-goal circle."""
-        if self.marking_stop_latched:
-            return True
-
         if target_distance <= self.waypoint_tolerance:
-            self.marking_stop_latched = True
-            self.marking_stop_latched_at = self.get_clock().now()
-            self.marking_stop_trigger_radius = self.waypoint_tolerance
-            self.closest_marking_distance = min(
-                self.closest_marking_distance,
-                target_distance,
+            if not self.marking_stop_latched:
+                self.marking_stop_latched = True
+                self.marking_stop_latched_at = self.get_clock().now()
+                self.marking_stop_trigger_radius = self.waypoint_tolerance
+                self.closest_marking_distance = min(
+                    self.closest_marking_distance,
+                    target_distance,
+                )
+                self.reset_speed_profiles()
+                self.get_logger().warn(
+                    "EXACT WP_RADIUS ENTERED / ZERO LATCHED | "
+                    f"radial={target_distance * 1000.0:.1f}mm | "
+                    f"xtrack={signed_cross_track * 1000.0:+.1f}mm | "
+                    f"along={along_remaining * 1000.0:+.1f}mm"
+                )
+            speed = (
+                float(self.current_speed_mps)
+                if math.isfinite(self.current_speed_mps)
+                else math.inf
             )
-            self.reset_speed_profiles()
-            self.get_logger().warn(
-                "EXACT WP_RADIUS ENTERED / ZERO LATCHED | "
-                f"radial={target_distance * 1000.0:.1f}mm | "
-                f"xtrack={signed_cross_track * 1000.0:+.1f}mm | "
-                f"along={along_remaining * 1000.0:+.1f}mm"
-            )
-            self.publish_terminal_result(
-                "CAPTURED",
-                reason="RADIUS_30MM_ENTRY",
-                target_distance=target_distance,
-                signed_cross_track=signed_cross_track,
-                along_remaining=along_remaining,
-            )
+            if speed <= self.stationary_speed_tolerance:
+                self.publish_terminal_result(
+                    "CAPTURED",
+                    reason="RADIUS_30MM_STATIONARY",
+                    target_distance=target_distance,
+                    signed_cross_track=signed_cross_track,
+                    along_remaining=along_remaining,
+                )
+            return True
 
         return self.marking_stop_latched
 

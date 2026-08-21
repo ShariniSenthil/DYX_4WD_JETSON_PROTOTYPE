@@ -44,6 +44,13 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from std_msgs.msg import Bool, Float32, Int32MultiArray, String, UInt8MultiArray
 from std_srvs.srv import Trigger
 
+from mission_manager.marking_arrival_policy import (
+    FAIL_NOW,
+    KEEP_APPROACHING,
+    after_fail_mode_action,
+    phase_a_decision,
+)
+
 
 class MissionManager(Node):
     """Mission/safety/marking state machine. Motion control is RPP's job."""
@@ -766,11 +773,12 @@ class MissionManager(Node):
             self._publish_status(force=True)
 
     def _rpp_terminal_result_callback(self, message: String) -> None:
-        """Receive RPP CAPTURED/MISSED stop results for the active goal.
+        """Receive RPP CAPTURED/MISSED for the active goal.
 
-        This result is only a terminal trigger. The Mission Manager still
-        waits for a stationary chassis and then runs its fixed 3-second
-        verification before deciding ACHIEVED versus FAILED.
+        CAPTURED does not start the 3 s hold. Mission Manager starts that
+        hold only when it measures <=30 mm and stationary.
+        MISSED, while stationary and outside 30 mm, fails the point now
+        with no 3 s hold.
         """
         try:
             payload = json.loads(message.data)
@@ -2475,6 +2483,82 @@ class MissionManager(Node):
         self._complete_mission()
         return True
 
+    def _resolve_accuracy_failure(
+        self,
+        *,
+        marking_number: int,
+        failure_reason: str,
+    ) -> None:
+        """Record FAILED with no spray, then AUTO-continue or MANUAL NEXT."""
+
+        point_id = f"P{marking_number+1:04d}"
+        accuracy = self._capture_accuracy_snapshot(
+            marking_number=marking_number,
+            path_index=self._current_path_index,
+            outcome="FAILED",
+            reason=failure_reason,
+        )
+        spray = self._spray_outcome_snapshot(
+            attempted=False,
+            outcome="NOT_ATTEMPTED_ACCURACY_FAILED",
+            reason=failure_reason,
+        )
+        self._point_status[marking_number] = "FAILED"
+        point_result = self._store_point_result(
+            marking_number=marking_number,
+            path_index=self._current_path_index,
+            point_outcome="FAILED",
+            accuracy=accuracy,
+            spray=spray,
+        )
+        radial_mm = accuracy.get("radial_error_mm")
+        radial_text = (
+            f"{radial_mm:.1f}mm" if radial_mm is not None else "unavailable"
+        )
+        self._last_message = (
+            f"{point_id} FAILED accuracy ({radial_text}); "
+            f"{failure_reason}"
+        )
+        self._emit_point_event(
+            "ACCURACY_FAILED",
+            marking_number,
+            self._current_path_index,
+            reason=failure_reason,
+            accuracy=accuracy,
+            spray=spray,
+            point_result=point_result,
+        )
+        self._publish_marking_active(False)
+        self._current_path_index = self._next_semantic_index(
+            self._current_path_index + 1
+        )
+        self._reset_arrival_state()
+        self._publish_runtime_path()
+
+        if self._finish_if_done():
+            return
+
+        action = after_fail_mode_action(self._execution_mode)
+        if action == "WAITING_FOR_NEXT":
+            self._state = "WAITING_FOR_NEXT"
+            self._pause_reason = None
+            self._resume_available = False
+            self._set_safety(emergency_stop=False, mission_enable=False)
+            self._last_message = (
+                f"{point_id} FAILED accuracy ({radial_text}); "
+                "waiting for NEXT"
+            )
+        else:
+            self._state = "RUNNING"
+            self._pause_reason = None
+            self._resume_available = False
+            self._last_message = (
+                f"{point_id} FAILED accuracy ({radial_text}); "
+                "continuing automatically"
+            )
+            self._publish_goal()
+        self._publish_status(force=True)
+
     def _complete_mission(self) -> None:
         """Report normal completion, then schedule automatic STOP cleanup."""
         if self._auto_stop_pending:
@@ -2660,20 +2744,12 @@ class MissionManager(Node):
             self._marking_error_valid = inside_30mm
 
             # ------------------------------------------------------
-            # EXACT USER-CONTRACT MARKING SEQUENCE
+            # MARKING SEQUENCE
             # ------------------------------------------------------
-            # 1) First exact arrival (<=30 mm + stationary), or a stationary
-            #    crossing >=20 mm beyond the incoming goal plane, starts ONE
-            #    fixed 3-second window. The plane trigger lets a precision miss
-            #    resolve FAILED instead of waiting forever.
-            # 2) Spray remains OFF during those 3 seconds.
-            # 3) At the end, re-check only the 30 mm position contract and
-            #    stationary state. Runtime RTK/PX4 monitors remain independent
-            #    motion-safety gates, not accuracy-result gates.
-            # 4) If still valid -> trigger spray, wait for its SUCCESS/FAILED
-            #    result (failure is monitor-only), then move to next point.
-            # 5) If invalid at the 3-second check -> record FAILED with spray
-            #    OFF; AUTO advances, MANUAL advances and waits for NEXT.
+            # Pass: <=30 mm AND stationary starts ONE 3 s hold, then spray.
+            # Miss: RPP MISSED or past the goal plane while outside 30 mm
+            #       fails immediately. No 3 s hold. AUTO -> next point.
+            #       MANUAL waits for NEXT.
             now = time.monotonic()
             point_id = f"P{marking_number+1:04d}"
             spray_key = (self._mission_run_id, point_id)
@@ -2686,39 +2762,47 @@ class MissionManager(Node):
                 if isinstance(self._rpp_terminal_result, dict)
                 else ""
             )
-            rpp_terminal_trigger = rpp_terminal_outcome in {"CAPTURED", "MISSED"}
 
-            # PHASE A: waiting to first reach the exact point.
+            # PHASE A: wait for a real 30 mm capture, or fail a miss now.
             if self._marking_hold_started is None:
                 self._publish_marking_active(False)
-
-                if not (
-                    stationary
-                    and (inside_30mm or past_goal_plane or rpp_terminal_trigger)
-                ):
+                decision = phase_a_decision(
+                    inside_30mm=inside_30mm,
+                    stationary=stationary,
+                    rpp_outcome=rpp_terminal_outcome,
+                    past_goal_plane=past_goal_plane,
+                )
+                if decision == KEEP_APPROACHING:
                     self._arrival_settle_started = None
                     self._arrival_settle_elapsed_sec = 0.0
                     self._marking_hold_elapsed_sec = 0.0
+                    return
+                if decision == FAIL_NOW:
+                    failed_reasons: list[str] = []
+                    if not inside_30mm:
+                        failed_reasons.append("RADIAL_OUTSIDE_30MM")
+                    if rpp_terminal_outcome == "MISSED":
+                        failed_reasons.append("RPP_MISSED")
+                    elif rpp_terminal_outcome == "CAPTURED":
+                        failed_reasons.append("RPP_CAPTURED_OUTSIDE_30MM")
+                    if past_goal_plane:
+                        failed_reasons.append("GOAL_PLANE_OVERSHOOT")
+                    self._resolve_accuracy_failure(
+                        marking_number=marking_number,
+                        failure_reason="+".join(failed_reasons) or "MARK_MISSED",
+                    )
                     return
 
                 self._marking_hold_started = now
                 self._arrival_settle_started = now
                 self._arrival_settle_elapsed_sec = 0.0
                 self._marking_hold_elapsed_sec = 0.0
-                if inside_30mm:
-                    trigger = f"reached <= {self.marking_tolerance_m*1000.0:.0f}mm"
-                elif rpp_terminal_outcome == "CAPTURED":
-                    trigger = "RPP reported 30mm CAPTURED and rover is stationary"
-                elif rpp_terminal_outcome == "MISSED":
-                    trigger = "RPP reported terminal MISSED and rover is stationary"
-                else:
-                    trigger = (
-                        "crossed incoming goal plane by "
-                        f"{self._marking_along_error_m*1000.0:.1f}mm"
-                    )
                 self._last_message = (
-                    f"{point_id} {trigger} and is stationary; starting "
-                    f"{self.marking_hold_sec:.1f}s verification; spray remains OFF"
+                    f"{point_id} reached <= "
+                    f"{self.marking_tolerance_m*1000.0:.0f}mm "
+                    "and is stationary; starting "
+                    f"{self.marking_hold_sec:.1f}s verification; "
+                    "spray remains OFF"
                 )
                 self._publish_status(force=True)
                 return
@@ -2752,81 +2836,10 @@ class MissionManager(Node):
                         failed_reasons.append("RADIAL_OUTSIDE_30MM")
                     if not stationary:
                         failed_reasons.append("ROVER_NOT_STATIONARY")
-                    failure_reason = "+".join(failed_reasons)
-                    accuracy = self._capture_accuracy_snapshot(
+                    self._resolve_accuracy_failure(
                         marking_number=marking_number,
-                        path_index=self._current_path_index,
-                        outcome="FAILED",
-                        reason=failure_reason,
+                        failure_reason="+".join(failed_reasons),
                     )
-                    spray = self._spray_outcome_snapshot(
-                        attempted=False,
-                        outcome="NOT_ATTEMPTED_ACCURACY_FAILED",
-                        reason=failure_reason,
-                    )
-                    self._point_status[marking_number] = "FAILED"
-                    point_result = self._store_point_result(
-                        marking_number=marking_number,
-                        path_index=self._current_path_index,
-                        point_outcome="FAILED",
-                        accuracy=accuracy,
-                        spray=spray,
-                    )
-                    radial_mm = accuracy.get("radial_error_mm")
-                    radial_text = (
-                        f"{radial_mm:.1f}mm" if radial_mm is not None else "unavailable"
-                    )
-                    self._last_message = (
-                        f"{point_id} NOT achieved at the end of "
-                        f"{self.marking_hold_sec:.1f}s verification: "
-                        f"radial={radial_text}, speed={self._speed_mps:.3f}m/s"
-                    )
-                    # Publish the immutable measured result before disabling
-                    # motion; safety transitions must never erase this record.
-                    self._emit_point_event(
-                        "ACCURACY_FAILED",
-                        marking_number,
-                        self._current_path_index,
-                        reason=failure_reason,
-                        accuracy=accuracy,
-                        spray=spray,
-                        point_result=point_result,
-                    )
-                    self._publish_marking_active(False)
-
-                    # Accuracy failure is a resolved terminal point. Advance
-                    # only after its immutable report has been published.
-                    self._current_path_index = self._next_semantic_index(
-                        self._current_path_index + 1
-                    )
-                    self._reset_arrival_state()
-                    self._publish_runtime_path()
-
-                    if self._finish_if_done():
-                        return
-
-                    if self._execution_mode == "MANUAL":
-                        self._state = "WAITING_FOR_NEXT"
-                        self._pause_reason = None
-                        self._resume_available = False
-                        self._set_safety(
-                            emergency_stop=False,
-                            mission_enable=False,
-                        )
-                        self._last_message = (
-                            f"{point_id} FAILED accuracy ({radial_text}); "
-                            "waiting for NEXT"
-                        )
-                    else:
-                        self._state = "RUNNING"
-                        self._pause_reason = None
-                        self._resume_available = False
-                        self._last_message = (
-                            f"{point_id} FAILED accuracy ({radial_text}); "
-                            "continuing automatically"
-                        )
-                        self._publish_goal()
-                    self._publish_status(force=True)
                     return
 
                 # Verified after the full 3 seconds. Only NOW is physical
