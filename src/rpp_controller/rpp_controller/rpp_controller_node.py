@@ -17,6 +17,11 @@ from rclpy.qos import (
 from std_msgs.msg import Bool, Float64, String
 from tf_transformations import euler_from_quaternion
 
+from rpp_controller.point_event_policy import (
+    first_marking_approach_is_active,
+    should_release_first_marking,
+)
+
 
 class RPPController(Node):
     """Precision waypoint marking controller.
@@ -2628,7 +2633,7 @@ class RPPController(Node):
         self.marking_active = active
 
     def point_event_callback(self, msg):
-        """Release P1 guidance only after the verified completion event."""
+        """Release P1 guidance after Mission Manager resolves P1."""
         try:
             payload = json.loads(msg.data)
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -2656,17 +2661,16 @@ class RPPController(Node):
             )
 
         if (
-            event == "COMPLETED"
-            and point_index == 0
+            should_release_first_marking(event, point_index)
             and not self.first_marking_completed
         ):
-            self.first_marking_hold_seen = True
+            self.first_marking_hold_seen = event == "COMPLETED"
             self.first_marking_completed = True
             self.c_line_locked = False
             self.c_line_bearing = None
             self.c_line_reanchored_after_pivot = False
             self.get_logger().warn(
-                "P1 VERIFIED MARKING COMPLETION EVENT / "
+                f"P1 RESOLVED ({event}) / "
                 "P1->P2 INTERPOLATED GUIDANCE RELEASED"
             )
 
@@ -2874,11 +2878,12 @@ class RPPController(Node):
         return True
 
     def first_marking_approach_active(self):
-        return (
-            not self.first_marking_completed
-            and self.c_line_locked
-            and self.c_line_bearing is not None
-            and bool(self.marking_waypoints)
+        return first_marking_approach_is_active(
+            first_marking_resolved=self.first_marking_completed,
+            segment_goal_number=self.segment_goal_number,
+            c_line_locked=self.c_line_locked,
+            c_line_bearing_available=self.c_line_bearing is not None,
+            has_marking_waypoints=bool(self.marking_waypoints),
         )
 
     def adaptive_terminal_line_guidance(
