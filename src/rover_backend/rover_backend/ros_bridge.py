@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+import struct
 import tempfile
 import threading
 import time
@@ -34,6 +35,7 @@ import rclpy
 
 from geometry_msgs.msg import PoseStamped
 from mavros_msgs.msg import GPSRAW
+from mavros_msgs.msg import Mavlink
 from mavros_msgs.msg import State
 from nav_msgs.msg import Odometry
 from nav_msgs.msg import Path as NavPath
@@ -353,6 +355,13 @@ class RoverBackendRosNode(Node):
             GPSRAW,
             "/mavros/gpsstatus/gps1/raw",
             self._gps_status_callback,
+            sensor_qos,
+        )
+
+        self.create_subscription(
+            Mavlink,
+            "/uas1/mavlink_source",
+            self._mavlink_estimator_status_callback,
             sensor_qos,
         )
 
@@ -708,6 +717,150 @@ class RoverBackendRosNode(Node):
                 "vehicle",
                 heading_deg=(float(yaw_centidegrees) / 100.0) % 360.0,
             )
+
+    def _mavlink_estimator_status_callback(
+        self,
+        message: Mavlink,
+    ) -> None:
+        """Decode PX4 MAVLink ESTIMATOR_STATUS (#230) accuracy telemetry."""
+
+        if int(message.msgid) != 230:
+            return
+
+        # The raw MAVROS transport can expose frames that failed CRC or
+        # signature validation. Never turn those bytes into telemetry.
+        if int(message.framing_status) != int(Mavlink.FRAMING_OK):
+            return
+
+        self._mark_ros_message()
+
+        try:
+            words = [int(value) for value in message.payload64]
+            payload = struct.pack(
+                "<" + ("Q" * len(words)),
+                *words,
+            )
+
+            payload_length = int(message.len)
+
+            if payload_length < 0 or payload_length > len(payload):
+                raise ValueError(
+                    "ESTIMATOR_STATUS payload length exceeds MAVROS payload64"
+                )
+
+            # MAVLink 2 may trim trailing zero bytes. Padding restores the
+            # fixed 42-byte wire layout before unpacking the final flags field.
+            payload = payload[:payload_length].ljust(
+                42,
+                b"\x00",
+            )
+
+            (
+                _time_usec,
+                vel_ratio,
+                pos_horiz_ratio,
+                pos_vert_ratio,
+                mag_ratio,
+                hagl_ratio,
+                tas_ratio,
+                pos_horiz_accuracy,
+                pos_vert_accuracy,
+                flags,
+            ) = struct.unpack(
+                "<Q8fH",
+                payload[:42],
+            )
+        except (
+            struct.error,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ):
+            LOGGER.exception(
+                "Failed to decode MAVLink ESTIMATOR_STATUS"
+            )
+            return
+
+        horizontal_accuracy_m = _finite_float(
+            pos_horiz_accuracy
+        )
+        vertical_accuracy_m = _finite_float(
+            pos_vert_accuracy
+        )
+
+        if (
+            horizontal_accuracy_m is not None
+            and horizontal_accuracy_m <= 0.0
+        ):
+            horizontal_accuracy_m = None
+
+        if (
+            vertical_accuracy_m is not None
+            and vertical_accuracy_m <= 0.0
+        ):
+            vertical_accuracy_m = None
+
+        horizontal_accuracy_mm = (
+            horizontal_accuracy_m * 1000.0
+            if horizontal_accuracy_m is not None
+            else None
+        )
+        vertical_accuracy_mm = (
+            vertical_accuracy_m * 1000.0
+            if vertical_accuracy_m is not None
+            else None
+        )
+        estimator_flags = int(flags)
+        absolute_horizontal_valid = bool(estimator_flags & 16)
+        absolute_vertical_valid = bool(estimator_flags & 32)
+        gps_glitch = bool(estimator_flags & 1024)
+        accel_error = bool(estimator_flags & 2048)
+        available = (
+            horizontal_accuracy_m is not None
+            and vertical_accuracy_m is not None
+        )
+        healthy = (
+            absolute_horizontal_valid
+            and absolute_vertical_valid
+            and not gps_glitch
+            and not accel_error
+        )
+
+        # Keep the flat legacy API and nested GPS compatibility fields live.
+        # Raw receiver h_acc/v_acc remain separate GPS_RAW_INT measurements.
+        rover_state.update(
+            "gps",
+            px4_hrms_source="MAVLINK_ESTIMATOR_STATUS_230",
+            px4_hrms_m=horizontal_accuracy_m,
+            px4_hrms_mm=horizontal_accuracy_mm,
+            px4_vrms_m=vertical_accuracy_m,
+            px4_vrms_mm=vertical_accuracy_mm,
+            px4_estimator_available=available,
+            px4_estimator_flags=estimator_flags,
+            px4_estimator_healthy=healthy,
+        )
+
+        rover_state.update(
+            "estimator",
+            available=available,
+            source="MAVLINK_ESTIMATOR_STATUS_230",
+            horizontal_accuracy_m=horizontal_accuracy_m,
+            horizontal_accuracy_mm=horizontal_accuracy_mm,
+            vertical_accuracy_m=vertical_accuracy_m,
+            vertical_accuracy_mm=vertical_accuracy_mm,
+            vel_ratio=_finite_float(vel_ratio),
+            pos_horiz_ratio=_finite_float(pos_horiz_ratio),
+            pos_vert_ratio=_finite_float(pos_vert_ratio),
+            mag_ratio=_finite_float(mag_ratio),
+            hagl_ratio=_finite_float(hagl_ratio),
+            tas_ratio=_finite_float(tas_ratio),
+            flags=estimator_flags,
+            absolute_horizontal_valid=absolute_horizontal_valid,
+            absolute_vertical_valid=absolute_vertical_valid,
+            gps_glitch=gps_glitch,
+            accel_error=accel_error,
+            healthy=healthy,
+        )
 
     def _heading_callback(
         self,
