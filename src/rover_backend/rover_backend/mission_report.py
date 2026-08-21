@@ -231,217 +231,201 @@ class MissionReportStore:
             }
         return {"coordinate_mode": mode}
 
+    @classmethod
+    def _canonical_point(
+        cls,
+        *,
+        index: int,
+        raw_status: Any,
+        result: dict[str, Any],
+        active_index: int | None,
+        target: dict[str, Any],
+    ) -> dict[str, Any]:
 
-# CURRENT BRANCH FILE:
-# src/rover_backend/rover_backend/mission_report.py
-#
-# 1) CHANGE:
-#
-#     MEASUREMENT_SOURCE = "MISSION_MANAGER_LOCAL_SEGMENT"
-#
-# TO:
-#
-#     MEASUREMENT_SOURCE = "RPP_TERMINAL_RESULT"
-#
-#
-# 2) REPLACE THE ENTIRE CURRENT _canonical_point() FUNCTION WITH THIS.
+        # ----------------------------------------------------------
+        # STATUS
+        # Final public point state remains Mission Manager/backend:
+        # PENDING / COMPLETED / SKIPPED / FAILED.
+        # ----------------------------------------------------------
+        accuracy_value = result.get("accuracy")
 
-
-@classmethod
-def _canonical_point(
-    cls,
-    *,
-    index: int,
-    raw_status: Any,
-    result: dict[str, Any],
-    active_index: int | None,
-    target: dict[str, Any],
-) -> dict[str, Any]:
-
-    # ----------------------------------------------------------
-    # STATUS
-    # Final public point state remains Mission Manager/backend:
-    # PENDING / COMPLETED / SKIPPED / FAILED.
-    # ----------------------------------------------------------
-    accuracy_value = result.get("accuracy")
-
-    accuracy = (
-        accuracy_value
-        if isinstance(
-            accuracy_value,
-            dict,
+        accuracy = (
+            accuracy_value
+            if isinstance(
+                accuracy_value,
+                dict,
+            )
+            else {}
         )
-        else {}
-    )
 
-    result_status = cls._canonical_status(
-        result.get("point_outcome"),
-        result.get("event"),
-    )
-
-    status_status = cls._canonical_status(raw_status)
-
-    status = (
-        status_status
-        if status_status in cls.TERMINAL_POINT_STATUSES
-        else (
-            result_status if result_status in cls.TERMINAL_POINT_STATUSES else "PENDING"
+        result_status = cls._canonical_status(
+            result.get("point_outcome"),
+            result.get("event"),
         )
-    )
 
-    # ----------------------------------------------------------
-    # ACCURACY
-    # Read ONLY exact values stored from RPP terminal_result.
-    # No fallbacks and no calculations.
-    # ----------------------------------------------------------
-    measurement_source = str(accuracy.get("measurement_source") or "").strip().upper()
+        status_status = cls._canonical_status(raw_status)
 
-    source_is_rpp = measurement_source == cls.MEASUREMENT_SOURCE
-
-    cross_track_mm = (
-        cls._finite_float(accuracy.get("cross_track_error_mm"))
-        if source_is_rpp
-        else None
-    )
-
-    along_track_mm = (
-        cls._finite_float(accuracy.get("along_track_error_mm"))
-        if source_is_rpp
-        else None
-    )
-
-    overall_accuracy_mm = (
-        cls._finite_float(accuracy.get("overall_accuracy_mm"))
-        if source_is_rpp
-        else None
-    )
-
-    tolerance_mm = (
-        cls._finite_float(accuracy.get("tolerance_mm")) if source_is_rpp else None
-    )
-
-    accuracy_available = bool(
-        source_is_rpp
-        and accuracy.get(
-            "available",
-            False,
-        )
-        and cross_track_mm is not None
-        and along_track_mm is not None
-        and overall_accuracy_mm is not None
-    )
-
-    within_tolerance_value = accuracy.get("within_tolerance") if source_is_rpp else None
-
-    within_tolerance = (
-        bool(within_tolerance_value) if within_tolerance_value is not None else None
-    )
-
-    # ----------------------------------------------------------
-    # SPRAY
-    # Existing spray evidence is preserved.
-    # ----------------------------------------------------------
-    spray_value = result.get("spray")
-
-    spray = (
-        spray_value
-        if isinstance(
-            spray_value,
-            dict,
-        )
-        else {}
-    )
-
-    spray_attempted = bool(
-        spray.get(
-            "attempted",
-            result.get(
-                "spray_attempted",
-                False,
-            ),
-        )
-    )
-
-    spray_outcome = (
-        str(spray.get("outcome") or result.get("spray_outcome") or "").strip().upper()
-    )
-
-    if not spray_attempted:
-        spray_outcome = "NOT_ATTEMPTED"
-
-    elif not spray_outcome or spray_outcome == "UNSPECIFIED":
-        spray_outcome = "UNKNOWN"
-
-    spray_confirmed_value = result.get("spray_confirmed")
-
-    if spray_confirmed_value is None:
-        spray_confirmed = (
-            True
-            if spray_outcome == "SUCCESS"
+        status = (
+            status_status
+            if status_status in cls.TERMINAL_POINT_STATUSES
             else (
-                False
-                if spray_outcome
-                in {
-                    "FAILED",
-                    "TIMEOUT",
-                }
-                else None
+                result_status if result_status in cls.TERMINAL_POINT_STATUSES else "PENDING"
             )
         )
 
-    else:
-        spray_confirmed = bool(spray_confirmed_value)
+        # ----------------------------------------------------------
+        # ACCURACY
+        # Read ONLY exact values stored from RPP terminal_result.
+        # No fallbacks and no calculations.
+        # ----------------------------------------------------------
+        measurement_source = str(accuracy.get("measurement_source") or "").strip().upper()
 
-    return {
-        "point_id": f"P{index + 1:04d}",
-        "point_index": index,
-        "sequence": index + 1,
-        "target": copy.deepcopy(target),
-        "status": status,
-        "is_active": bool(status == "PENDING" and active_index == index),
-        "accuracy": {
-            "measurement_source": cls.MEASUREMENT_SOURCE,
-            "available": accuracy_available,
-            "cross_track_error_mm": (cross_track_mm if accuracy_available else None),
-            "along_track_error_mm": (along_track_mm if accuracy_available else None),
-            # Canonical UI field.
-            "overall_accuracy_mm": (
-                overall_accuracy_mm if accuracy_available else None
+        source_is_rpp = measurement_source == cls.MEASUREMENT_SOURCE
+
+        cross_track_mm = (
+            cls._finite_float(accuracy.get("cross_track_error_mm"))
+            if source_is_rpp
+            else None
+        )
+
+        along_track_mm = (
+            cls._finite_float(accuracy.get("along_track_error_mm"))
+            if source_is_rpp
+            else None
+        )
+
+        overall_accuracy_mm = (
+            cls._finite_float(accuracy.get("overall_accuracy_mm"))
+            if source_is_rpp
+            else None
+        )
+
+        tolerance_mm = (
+            cls._finite_float(accuracy.get("tolerance_mm")) if source_is_rpp else None
+        )
+
+        accuracy_available = bool(
+            source_is_rpp
+            and accuracy.get(
+                "available",
+                False,
+            )
+            and cross_track_mm is not None
+            and along_track_mm is not None
+            and overall_accuracy_mm is not None
+        )
+
+        within_tolerance_value = accuracy.get("within_tolerance") if source_is_rpp else None
+
+        within_tolerance = (
+            bool(within_tolerance_value) if within_tolerance_value is not None else None
+        )
+
+        # ----------------------------------------------------------
+        # SPRAY
+        # Existing spray evidence is preserved.
+        # ----------------------------------------------------------
+        spray_value = result.get("spray")
+
+        spray = (
+            spray_value
+            if isinstance(
+                spray_value,
+                dict,
+            )
+            else {}
+        )
+
+        spray_attempted = bool(
+            spray.get(
+                "attempted",
+                result.get(
+                    "spray_attempted",
+                    False,
+                ),
+            )
+        )
+
+        spray_outcome = (
+            str(spray.get("outcome") or result.get("spray_outcome") or "").strip().upper()
+        )
+
+        if not spray_attempted:
+            spray_outcome = "NOT_ATTEMPTED"
+
+        elif not spray_outcome or spray_outcome == "UNSPECIFIED":
+            spray_outcome = "UNKNOWN"
+
+        spray_confirmed_value = result.get("spray_confirmed")
+
+        if spray_confirmed_value is None:
+            spray_confirmed = (
+                True
+                if spray_outcome == "SUCCESS"
+                else (
+                    False
+                    if spray_outcome
+                    in {
+                        "FAILED",
+                        "TIMEOUT",
+                    }
+                    else None
+                )
+            )
+
+        else:
+            spray_confirmed = bool(spray_confirmed_value)
+
+        return {
+            "point_id": f"P{index + 1:04d}",
+            "point_index": index,
+            "sequence": index + 1,
+            "target": copy.deepcopy(target),
+            "status": status,
+            "is_active": bool(status == "PENDING" and active_index == index),
+            "accuracy": {
+                "measurement_source": cls.MEASUREMENT_SOURCE,
+                "available": accuracy_available,
+                "cross_track_error_mm": (cross_track_mm if accuracy_available else None),
+                "along_track_error_mm": (along_track_mm if accuracy_available else None),
+                # Canonical UI field.
+                "overall_accuracy_mm": (
+                    overall_accuracy_mm if accuracy_available else None
+                ),
+                # Compatibility alias.
+                # This is copied, not recalculated.
+                "total_accuracy_mm": (overall_accuracy_mm if accuracy_available else None),
+                "tolerance_mm": (tolerance_mm if accuracy_available else None),
+                # Copy RPP's decision.
+                # Backend does NOT compare values.
+                "within_tolerance": within_tolerance,
+                "rpp_outcome": (accuracy.get("rpp_outcome") if source_is_rpp else None),
+                "captured_at": (
+                    accuracy.get("captured_at")
+                    or result.get("received_at")
+                    or result.get("updated_at")
+                ),
+            },
+            "spray": {
+                "attempted": spray_attempted,
+                "outcome": spray_outcome,
+                "confirmed": spray_confirmed,
+                "reason": spray.get("reason") or result.get("spray_failure_reason"),
+                "elapsed_sec": cls._finite_float(
+                    spray.get("elapsed_sec")
+                    if spray.get("elapsed_sec") is not None
+                    else result.get("spray_elapsed_sec")
+                ),
+            },
+            "reason": (
+                result.get("reason") or accuracy.get("reason") or accuracy.get("rpp_reason")
             ),
-            # Compatibility alias.
-            # This is copied, not recalculated.
-            "total_accuracy_mm": (overall_accuracy_mm if accuracy_available else None),
-            "tolerance_mm": (tolerance_mm if accuracy_available else None),
-            # Copy RPP's decision.
-            # Backend does NOT compare values.
-            "within_tolerance": within_tolerance,
-            "rpp_outcome": (accuracy.get("rpp_outcome") if source_is_rpp else None),
-            "captured_at": (
-                accuracy.get("captured_at")
-                or result.get("received_at")
+            "updated_at": (
+                result.get("received_at")
+                or result.get("completed_at")
                 or result.get("updated_at")
             ),
-        },
-        "spray": {
-            "attempted": spray_attempted,
-            "outcome": spray_outcome,
-            "confirmed": spray_confirmed,
-            "reason": spray.get("reason") or result.get("spray_failure_reason"),
-            "elapsed_sec": cls._finite_float(
-                spray.get("elapsed_sec")
-                if spray.get("elapsed_sec") is not None
-                else result.get("spray_elapsed_sec")
-            ),
-        },
-        "reason": (
-            result.get("reason") or accuracy.get("reason") or accuracy.get("rpp_reason")
-        ),
-        "updated_at": (
-            result.get("received_at")
-            or result.get("completed_at")
-            or result.get("updated_at")
-        ),
-    }
+        }
 
     @classmethod
     def _result_map(

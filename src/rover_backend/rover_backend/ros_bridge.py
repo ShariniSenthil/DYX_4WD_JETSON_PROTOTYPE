@@ -1681,12 +1681,9 @@ class RoverBackendRosNode(Node):
         # mission_manager is the sole owner of the motion safety gate.
         self._persist_mission_runtime(payload)
 
-    # CURRENT BRANCH FILE:
 
 
-# src/rover_backend/rover_backend/ros_bridge.py
 #
-# REPLACE THE ENTIRE CURRENT _point_event_callback() FUNCTION WITH THIS.
 #
 # Final report accuracy comes ONLY from Mission Manager's nested accuracy
 # object, which itself is now a copy of RPP terminal_result.
@@ -1696,220 +1693,220 @@ class RoverBackendRosNode(Node):
 # NO abs() or radial reconstruction for final point evidence.
 
 
-def _point_event_callback(
-    self,
-    message: String,
-) -> None:
-    """Store RPP-terminal point evidence without recalculating accuracy."""
+    def _point_event_callback(
+        self,
+        message: String,
+    ) -> None:
+        """Store RPP-terminal point evidence without recalculating accuracy."""
 
-    self._mark_ros_message()
+        self._mark_ros_message()
 
-    payload = _json_object(message.data)
-    if payload is None:
-        return
+        payload = _json_object(message.data)
+        if payload is None:
+            return
 
-    payload["received_at"] = utc_now_iso()
+        payload["received_at"] = utc_now_iso()
 
-    event_name = str(payload.get("event") or "").strip().upper()
+        event_name = str(payload.get("event") or "").strip().upper()
 
-    point_index_raw = payload.get("point_index")
+        point_index_raw = payload.get("point_index")
 
-    point_index = _safe_int(point_index_raw, -1) if point_index_raw is not None else -1
+        point_index = _safe_int(point_index_raw, -1) if point_index_raw is not None else -1
 
-    point_number = point_index + 1 if point_index >= 0 else 0
+        point_number = point_index + 1 if point_index >= 0 else 0
 
-    # ----------------------------------------------------------
-    # RPP TERMINAL ACCURACY ONLY
-    # ----------------------------------------------------------
-    manager_accuracy = payload.get("accuracy")
+        # ----------------------------------------------------------
+        # RPP TERMINAL ACCURACY ONLY
+        # ----------------------------------------------------------
+        manager_accuracy = payload.get("accuracy")
 
-    accuracy_snapshot: dict[str, Any] | None = None
+        accuracy_snapshot: dict[str, Any] | None = None
 
-    if isinstance(manager_accuracy, dict):
-        candidate = copy.deepcopy(manager_accuracy)
+        if isinstance(manager_accuracy, dict):
+            candidate = copy.deepcopy(manager_accuracy)
 
-        source = str(candidate.get("measurement_source") or "").strip().upper()
+            source = str(candidate.get("measurement_source") or "").strip().upper()
 
-        if source == "RPP_TERMINAL_RESULT":
-            # Copy only. No position calculations.
-            accuracy_snapshot = candidate
+            if source == "RPP_TERMINAL_RESULT":
+                # Copy only. No position calculations.
+                accuracy_snapshot = candidate
 
-            # Backend receive time is metadata only.
-            accuracy_snapshot.setdefault(
-                "captured_at",
-                payload["received_at"],
+                # Backend receive time is metadata only.
+                accuracy_snapshot.setdefault(
+                    "captured_at",
+                    payload["received_at"],
+                )
+
+        if accuracy_snapshot is not None:
+            payload["accuracy"] = copy.deepcopy(accuracy_snapshot)
+
+            payload["overall_accuracy_mm"] = accuracy_snapshot.get("overall_accuracy_mm")
+
+            overall_mm = _finite_float(accuracy_snapshot.get("overall_accuracy_mm"))
+
+            payload["accuracy_remarks"] = (
+                f"{overall_mm:.1f} mm" if overall_mm is not None else "Unavailable"
             )
 
-    if accuracy_snapshot is not None:
-        payload["accuracy"] = copy.deepcopy(accuracy_snapshot)
+        else:
+            payload["accuracy"] = None
+            payload["overall_accuracy_mm"] = None
+            payload["accuracy_remarks"] = "Unavailable"
 
-        payload["overall_accuracy_mm"] = accuracy_snapshot.get("overall_accuracy_mm")
+        # ----------------------------------------------------------
+        # Existing spray evidence handling.
+        # ----------------------------------------------------------
+        manager_spray = payload.get("spray")
 
-        overall_mm = _finite_float(accuracy_snapshot.get("overall_accuracy_mm"))
+        if isinstance(manager_spray, dict):
+            spray = copy.deepcopy(manager_spray)
 
-        payload["accuracy_remarks"] = (
-            f"{overall_mm:.1f} mm" if overall_mm is not None else "Unavailable"
-        )
+            spray_attempted = bool(spray.get("attempted", False))
 
-    else:
-        payload["accuracy"] = None
-        payload["overall_accuracy_mm"] = None
-        payload["accuracy_remarks"] = "Unavailable"
+            spray_outcome = str(spray.get("outcome") or "UNKNOWN").strip().upper()
 
-    # ----------------------------------------------------------
-    # Existing spray evidence handling.
-    # ----------------------------------------------------------
-    manager_spray = payload.get("spray")
+            spray_reason = spray.get("reason")
 
-    if isinstance(manager_spray, dict):
-        spray = copy.deepcopy(manager_spray)
+            spray_elapsed_sec = _finite_float(spray.get("elapsed_sec"))
 
-        spray_attempted = bool(spray.get("attempted", False))
+        else:
+            spray_attempted = bool(
+                payload.get(
+                    "spray_attempted",
+                    False,
+                )
+            )
 
-        spray_outcome = str(spray.get("outcome") or "UNKNOWN").strip().upper()
+            spray_outcome = str(payload.get("spray_outcome") or "UNKNOWN").strip().upper()
 
-        spray_reason = spray.get("reason")
+            spray_reason = payload.get("spray_failure_reason")
 
-        spray_elapsed_sec = _finite_float(spray.get("elapsed_sec"))
+            spray_elapsed_sec = _finite_float(payload.get("spray_elapsed_sec"))
 
-    else:
-        spray_attempted = bool(
-            payload.get(
-                "spray_attempted",
-                False,
+            spray = {
+                "attempted": spray_attempted,
+                "outcome": spray_outcome,
+                "reason": spray_reason,
+                "elapsed_sec": spray_elapsed_sec,
+            }
+
+        spray_confirmed = (
+            True
+            if spray_outcome == "SUCCESS"
+            else (
+                False
+                if spray_outcome
+                in {
+                    "FAILED",
+                    "TIMEOUT",
+                }
+                else None
             )
         )
 
-        spray_outcome = str(payload.get("spray_outcome") or "UNKNOWN").strip().upper()
+        mission = rover_state.section("mission")
 
-        spray_reason = payload.get("spray_failure_reason")
+        point_results = dict(mission.get("point_results") or {})
 
-        spray_elapsed_sec = _finite_float(payload.get("spray_elapsed_sec"))
+        point_id = str(payload.get("point_id") or "").strip()
 
-        spray = {
-            "attempted": spray_attempted,
-            "outcome": spray_outcome,
-            "reason": spray_reason,
-            "elapsed_sec": spray_elapsed_sec,
-        }
+        if point_id:
+            existing = point_results.get(point_id)
 
-    spray_confirmed = (
-        True
-        if spray_outcome == "SUCCESS"
-        else (
-            False
-            if spray_outcome
-            in {
-                "FAILED",
-                "TIMEOUT",
-            }
-            else None
-        )
-    )
+            existing = existing if isinstance(existing, dict) else {}
 
-    mission = rover_state.section("mission")
+            event_history = list(existing.get("event_history") or [])
 
-    point_results = dict(mission.get("point_results") or {})
-
-    point_id = str(payload.get("point_id") or "").strip()
-
-    if point_id:
-        existing = point_results.get(point_id)
-
-        existing = existing if isinstance(existing, dict) else {}
-
-        event_history = list(existing.get("event_history") or [])
-
-        event_history.append(
-            {
-                "event": event_name,
-                "state": payload.get("state"),
-                "reason": payload.get("reason"),
-                "timestamp_unix_ns": payload.get("timestamp_unix_ns"),
-                "received_at": payload["received_at"],
-                "accuracy": copy.deepcopy(accuracy_snapshot),
-                "spray": copy.deepcopy(spray),
-            }
-        )
-
-        manager_result = payload.get("point_result")
-
-        result = (
-            copy.deepcopy(manager_result)
-            if isinstance(
-                manager_result,
-                dict,
+            event_history.append(
+                {
+                    "event": event_name,
+                    "state": payload.get("state"),
+                    "reason": payload.get("reason"),
+                    "timestamp_unix_ns": payload.get("timestamp_unix_ns"),
+                    "received_at": payload["received_at"],
+                    "accuracy": copy.deepcopy(accuracy_snapshot),
+                    "spray": copy.deepcopy(spray),
+                }
             )
-            else {}
-        )
 
-        result.update(
-            {
-                "point_id": point_id,
-                "point_index": point_index,
-                "event": event_name,
-                "mission_run_id": payload.get("mission_run_id"),
-                "point_outcome": str(result.get("point_outcome") or event_name)
-                .strip()
-                .upper(),
-                "spray": copy.deepcopy(spray),
-                "spray_attempted": spray_attempted,
-                "spray_outcome": spray_outcome,
-                "spray_confirmed": spray_confirmed,
-                "spray_failure_reason": spray_reason,
-                "spray_elapsed_sec": spray_elapsed_sec,
-                "spray_monitor_only": True,
-                "overall_accuracy_mm": (
-                    accuracy_snapshot.get("overall_accuracy_mm")
-                    if accuracy_snapshot is not None
-                    else None
-                ),
-                "accuracy_remarks": payload.get(
-                    "accuracy_remarks",
-                    "Unavailable",
-                ),
-                # Exact RPP terminal evidence only.
-                "accuracy": copy.deepcopy(accuracy_snapshot),
-                "event_history": event_history,
-                "received_at": payload["received_at"],
-            }
-        )
+            manager_result = payload.get("point_result")
 
-        rpp_outcome = (
-            str((accuracy_snapshot or {}).get("rpp_outcome") or "").strip().upper()
-        )
+            result = (
+                copy.deepcopy(manager_result)
+                if isinstance(
+                    manager_result,
+                    dict,
+                )
+                else {}
+            )
 
-        if rpp_outcome == "MISSED" or event_name == "ACCURACY_FAILED":
-            result["accuracy_failure"] = copy.deepcopy(accuracy_snapshot)
+            result.update(
+                {
+                    "point_id": point_id,
+                    "point_index": point_index,
+                    "event": event_name,
+                    "mission_run_id": payload.get("mission_run_id"),
+                    "point_outcome": str(result.get("point_outcome") or event_name)
+                    .strip()
+                    .upper(),
+                    "spray": copy.deepcopy(spray),
+                    "spray_attempted": spray_attempted,
+                    "spray_outcome": spray_outcome,
+                    "spray_confirmed": spray_confirmed,
+                    "spray_failure_reason": spray_reason,
+                    "spray_elapsed_sec": spray_elapsed_sec,
+                    "spray_monitor_only": True,
+                    "overall_accuracy_mm": (
+                        accuracy_snapshot.get("overall_accuracy_mm")
+                        if accuracy_snapshot is not None
+                        else None
+                    ),
+                    "accuracy_remarks": payload.get(
+                        "accuracy_remarks",
+                        "Unavailable",
+                    ),
+                    # Exact RPP terminal evidence only.
+                    "accuracy": copy.deepcopy(accuracy_snapshot),
+                    "event_history": event_history,
+                    "received_at": payload["received_at"],
+                }
+            )
 
-        elif existing.get("accuracy_failure") is not None:
-            result["accuracy_failure"] = copy.deepcopy(existing["accuracy_failure"])
+            rpp_outcome = (
+                str((accuracy_snapshot or {}).get("rpp_outcome") or "").strip().upper()
+            )
 
-        point_results[point_id] = result
+            if rpp_outcome == "MISSED" or event_name == "ACCURACY_FAILED":
+                result["accuracy_failure"] = copy.deepcopy(accuracy_snapshot)
 
-    rover_state.update(
-        "mission",
-        last_point_event=payload,
-        point_results=point_results,
-    )
+            elif existing.get("accuracy_failure") is not None:
+                result["accuracy_failure"] = copy.deepcopy(existing["accuracy_failure"])
 
-    # Existing durable checkpoint behavior.
-    try:
-        mission_report_store.checkpoint_live_report()
-
-    except MissionReportError as error:
-        reason = "Mission report checkpoint failed: " f"{error}"
+            point_results[point_id] = result
 
         rover_state.update(
-            "report",
-            status="CHECKPOINT_FAILED",
-            error=reason,
+            "mission",
+            last_point_event=payload,
+            point_results=point_results,
         )
 
-        self.get_logger().error(reason)
+        # Existing durable checkpoint behavior.
+        try:
+            mission_report_store.checkpoint_live_report()
 
-    if event_name == "MISSION_TERMINATED":
-        self._schedule_terminal_mission_cleanup(payload)
+        except MissionReportError as error:
+            reason = "Mission report checkpoint failed: " f"{error}"
+
+            rover_state.update(
+                "report",
+                status="CHECKPOINT_FAILED",
+                error=reason,
+            )
+
+            self.get_logger().error(reason)
+
+        if event_name == "MISSION_TERMINATED":
+            self._schedule_terminal_mission_cleanup(payload)
 
     def _schedule_terminal_mission_cleanup(
         self,
