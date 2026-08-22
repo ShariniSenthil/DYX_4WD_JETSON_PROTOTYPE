@@ -65,6 +65,12 @@ class MissionManager(Node):
     OFFBOARD_BEFORE_ARM_SETTLE_SEC = 0.50
     GOAL_PLANE_OVERSHOOT_TRIGGER_M = 0.020
 
+    # Non-blocking AUTO-continue hold: after a point reaches COMPLETED (or
+    # FAILED with AUTO continue), hold the rover stopped for this long before
+    # the next semantic goal is published. Monotonic deadline, not a sleep;
+    # cleared by _reset_point_timers() on every stop/abort/reset path.
+    AUTO_CONTINUE_DELAY_SEC = 1.0
+
     POINT_PASS_THROUGH = 0
     POINT_DUMMY_ALIGNMENT = 1
     POINT_MARKING = 2
@@ -381,6 +387,11 @@ class MissionManager(Node):
         # Final mission completion is reported first, then on the next control
         # tick the exact same STOP cleanup is executed automatically.
         self._auto_stop_pending = False
+
+        # Monotonic deadline for the non-blocking AUTO-continue hold. While
+        # set, _control_loop() refuses to publish the next goal so the rover
+        # stays stopped. Always cleared via _reset_point_timers().
+        self._auto_continue_until: Optional[float] = None
 
         self._marking_xtrack_m = math.inf
         self._marking_along_error_m = math.inf
@@ -1908,6 +1919,7 @@ class MissionManager(Node):
         self._marking_hold_started = None
         self._marking_hold_elapsed_sec = 0.0
         self._spray_request_started = None
+        self._auto_continue_until = None
 
     def _reset_arrival_state(self) -> None:
         """Reset working state after an actual point/mission transition."""
@@ -2686,12 +2698,15 @@ class MissionManager(Node):
             self._pause_reason = None
             self._resume_available = False
 
-            self._last_message = (
-                f"{point_id} FAILED from RPP MISSED "
-                f"(overall={overall_text}); continuing automatically"
+            self._auto_continue_until = (
+                time.monotonic() + self.AUTO_CONTINUE_DELAY_SEC
             )
 
-            self._publish_goal()
+            self._last_message = (
+                f"{point_id} FAILED from RPP MISSED "
+                f"(overall={overall_text}); continuing automatically in "
+                f"{self.AUTO_CONTINUE_DELAY_SEC:.1f}s"
+            )
 
         self._publish_status(force=True)
 
@@ -2781,6 +2796,16 @@ class MissionManager(Node):
                 "WAITING_FOR_NEXT",
             }:
                 return
+
+            # AUTO-continue hold gate. The path index has already advanced to
+            # the next semantic goal, so this must run BEFORE _publish_goal()
+            # (and therefore before _advance_over_terminal_markings()) to keep
+            # the rover stopped. Stays silent at 20 Hz.
+            if self._auto_continue_until is not None:
+                if time.monotonic() < self._auto_continue_until:
+                    return
+
+                self._auto_continue_until = None
 
             self._publish_goal()
 
@@ -3194,10 +3219,14 @@ class MissionManager(Node):
                 self._state = "RUNNING"
                 self._pause_reason = None
                 self._resume_available = False
-                self._last_message = (
-                    f"{point_id} COMPLETED at {final_text}; " "continuing automatically"
+                self._auto_continue_until = (
+                    time.monotonic() + self.AUTO_CONTINUE_DELAY_SEC
                 )
-                self._publish_goal()
+                self._last_message = (
+                    f"{point_id} COMPLETED at {final_text}; "
+                    f"continuing automatically in "
+                    f"{self.AUTO_CONTINUE_DELAY_SEC:.1f}s"
+                )
 
             self._publish_status(force=True)
 
