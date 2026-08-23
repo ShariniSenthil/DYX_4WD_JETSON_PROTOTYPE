@@ -30,6 +30,15 @@ from rpp_controller.path_geometry import (
     make_path_signature,
     validate_goal_metadata,
 )
+from rpp_controller.guidance import (
+    GuidanceConfig,
+    compute_precision_guidance,
+)
+from rpp_controller.speed_regulator import (
+    LongitudinalRegulator,
+    LongitudinalRegulatorConfig,
+    SpeedRegulatorInput,
+)
 
 
 class RPPController(Node):
@@ -437,6 +446,41 @@ class RPPController(Node):
         self.declare_parameter("geometry_max_backward_jump_m", 0.10)
         self.declare_parameter("geometry_max_forward_jump_m", 1.00)
 
+        # Phase-2 command math remains independently default-OFF.  Both
+        # consumers require the synchronized Phase-1 geometry contract.
+        self.declare_parameter("precision_guidance_enabled", False)
+        self.declare_parameter("precision_speed_control_enabled", False)
+        self.declare_parameter("precision_lookahead_min_m", 0.20)
+        self.declare_parameter("precision_lookahead_max_m", 1.00)
+        self.declare_parameter("precision_lookahead_time_s", 0.55)
+        self.declare_parameter("precision_xtrack_lookahead_gain", 0.0)
+        self.declare_parameter("precision_moving_bearing_cone_deg", 30.0)
+
+        self.declare_parameter("precision_hardware_speed_ceiling_mps", 1.00)
+        self.declare_parameter("precision_acceleration_mps2", 0.75)
+        self.declare_parameter("precision_deceleration_mps2", 0.75)
+        self.declare_parameter("precision_launch_speed_mps", 0.10)
+        self.declare_parameter("precision_control_dt_max_sec", 0.10)
+        self.declare_parameter("precision_heading_accel_full_error_deg", 2.0)
+        self.declare_parameter("precision_heading_recovery_start_deg", 4.0)
+        self.declare_parameter("precision_heading_recovery_full_deg", 15.0)
+        self.declare_parameter("precision_xtrack_accel_full_m", 0.010)
+        self.declare_parameter("precision_xtrack_recovery_start_m", 0.020)
+        self.declare_parameter("precision_xtrack_recovery_full_m", 0.100)
+        self.declare_parameter("precision_recovery_min_speed_mps", 0.15)
+        self.declare_parameter("precision_corner_angle_threshold_deg", 45.0)
+        self.declare_parameter("precision_corner_target_speed_mps", 0.12)
+        self.declare_parameter("precision_corner_accel_block_buffer_m", 0.10)
+        # Phase 2 must never create an early terminal zero.  The existing
+        # radial 30 mm latch remains the sole normal zero owner until Phase 5.
+        self.declare_parameter("precision_terminal_target_speed_mps", 0.15)
+        self.declare_parameter("precision_minimum_moving_speed_mps", 0.04)
+        self.declare_parameter("precision_braking_latency_sec", 0.10)
+        self.declare_parameter("precision_braking_margin_m", 0.05)
+        self.declare_parameter("precision_curvature_enabled", False)
+        self.declare_parameter("precision_lateral_acceleration_max_mps2", 0.30)
+        self.declare_parameter("precision_curvature_epsilon_inv_m", 1.0e-6)
+
         self.local_frame = str(self.get_parameter("local_frame").value).strip()
         self.cruise_speed = float(self.get_parameter("cruise_speed_mps").value)
         self.acceleration_enabled = bool(
@@ -826,9 +870,6 @@ class RPPController(Node):
         self.geometry_diagnostics_enabled = bool(
             self.get_parameter("geometry_diagnostics_enabled").value
         )
-        self.geometry_processing_enabled = (
-            self.geometry_tracking_enabled or self.geometry_diagnostics_enabled
-        )
         self.geometry_corner_threshold = math.radians(
             float(self.get_parameter("geometry_corner_threshold_deg").value)
         )
@@ -849,6 +890,121 @@ class RPPController(Node):
         )
         self.geometry_max_forward_jump = float(
             self.get_parameter("geometry_max_forward_jump_m").value
+        )
+
+        self.precision_guidance_enabled = bool(
+            self.get_parameter("precision_guidance_enabled").value
+        )
+        self.precision_speed_control_enabled = bool(
+            self.get_parameter("precision_speed_control_enabled").value
+        )
+        self.geometry_processing_enabled = (
+            self.geometry_tracking_enabled
+            or self.geometry_diagnostics_enabled
+            or self.precision_guidance_enabled
+            or self.precision_speed_control_enabled
+        )
+        self.precision_guidance_config = GuidanceConfig(
+            lookahead_min_m=float(
+                self.get_parameter("precision_lookahead_min_m").value
+            ),
+            lookahead_max_m=float(
+                self.get_parameter("precision_lookahead_max_m").value
+            ),
+            lookahead_time_s=float(
+                self.get_parameter("precision_lookahead_time_s").value
+            ),
+            xtrack_lookahead_gain=float(
+                self.get_parameter("precision_xtrack_lookahead_gain").value
+            ),
+            moving_bearing_cone_rad=math.radians(
+                float(
+                    self.get_parameter("precision_moving_bearing_cone_deg").value
+                )
+            ),
+        )
+        self.precision_minimum_moving_speed = float(
+            self.get_parameter("precision_minimum_moving_speed_mps").value
+        )
+        self.precision_speed_config = LongitudinalRegulatorConfig(
+            hardware_speed_ceiling_mps=float(
+                self.get_parameter("precision_hardware_speed_ceiling_mps").value
+            ),
+            acceleration_mps2=float(
+                self.get_parameter("precision_acceleration_mps2").value
+            ),
+            deceleration_mps2=float(
+                self.get_parameter("precision_deceleration_mps2").value
+            ),
+            launch_speed_mps=float(
+                self.get_parameter("precision_launch_speed_mps").value
+            ),
+            control_dt_max_sec=float(
+                self.get_parameter("precision_control_dt_max_sec").value
+            ),
+            heading_accel_full_error_rad=math.radians(
+                float(
+                    self.get_parameter(
+                        "precision_heading_accel_full_error_deg"
+                    ).value
+                )
+            ),
+            heading_recovery_start_rad=math.radians(
+                float(
+                    self.get_parameter("precision_heading_recovery_start_deg").value
+                )
+            ),
+            heading_recovery_full_rad=math.radians(
+                float(
+                    self.get_parameter("precision_heading_recovery_full_deg").value
+                )
+            ),
+            cross_track_accel_full_m=float(
+                self.get_parameter("precision_xtrack_accel_full_m").value
+            ),
+            cross_track_recovery_start_m=float(
+                self.get_parameter("precision_xtrack_recovery_start_m").value
+            ),
+            cross_track_recovery_full_m=float(
+                self.get_parameter("precision_xtrack_recovery_full_m").value
+            ),
+            recovery_min_speed_mps=float(
+                self.get_parameter("precision_recovery_min_speed_mps").value
+            ),
+            corner_angle_threshold_rad=math.radians(
+                float(
+                    self.get_parameter("precision_corner_angle_threshold_deg").value
+                )
+            ),
+            corner_target_speed_mps=float(
+                self.get_parameter("precision_corner_target_speed_mps").value
+            ),
+            corner_accel_block_buffer_m=float(
+                self.get_parameter("precision_corner_accel_block_buffer_m").value
+            ),
+            terminal_target_speed_mps=float(
+                self.get_parameter("precision_terminal_target_speed_mps").value
+            ),
+            braking_latency_sec=float(
+                self.get_parameter("precision_braking_latency_sec").value
+            ),
+            braking_margin_m=float(
+                self.get_parameter("precision_braking_margin_m").value
+            ),
+            curvature_enabled=bool(
+                self.get_parameter("precision_curvature_enabled").value
+            ),
+            lateral_acceleration_max_mps2=float(
+                self.get_parameter(
+                    "precision_lateral_acceleration_max_mps2"
+                ).value
+            ),
+            curvature_epsilon_inv_m=float(
+                self.get_parameter("precision_curvature_epsilon_inv_m").value
+            ),
+        )
+        self.precision_speed_regulator = LongitudinalRegulator(
+            self.precision_speed_config
         )
 
         # --------------------------------------------------------------
@@ -1068,6 +1224,16 @@ class RPPController(Node):
             "/rpp/geometry_debug",
             command_qos,
         )
+        self.guidance_debug_pub = self.create_publisher(
+            String,
+            "/rpp/guidance_debug",
+            command_qos,
+        )
+        self.speed_debug_pub = self.create_publisher(
+            String,
+            "/rpp/speed_debug",
+            command_qos,
+        )
 
         # Explicit terminal-result handshake to Mission Manager.
         # Motion ownership stays in RPP; Mission Manager still performs the
@@ -1134,9 +1300,27 @@ class RPPController(Node):
         self.geometry_active_span = None
         self.geometry_last_goal_raw_index = None
         self.geometry_last_projection = None
+        self.geometry_last_projection_cycle_token = None
         self.geometry_last_odom_point = None
         self.geometry_last_reset_reason = GeometryResetReason.INITIAL_INSTALL.value
         self.geometry_reset_count = 0
+
+        # New command math owns one projection/guidance/speed solution per
+        # controller cycle.  Tokens make stale Phase-1 projection state
+        # impossible to reuse after an early-return or failed projection.
+        self.precision_cycle_token = 0
+        self.geometry_last_projection_cycle_token = None
+        self.precision_cycle_dt_sec = 1.0 / self.CONTROL_HZ
+        self.precision_last_cycle_time = None
+        self.precision_guidance_cycle_token = None
+        self.precision_guidance_result = None
+        self.precision_speed_cycle_token = None
+        self.precision_speed_result = None
+        self.precision_speed_request = None
+        self.precision_last_published_translational_speed_mps = 0.0
+        self.precision_regulator_reset_reason = "INITIALIZE"
+        self.precision_regulator_reset_count = 0
+        self.precision_speed_regulator.reset()
 
         self.mission_enabled = False
         self.emergency_stop = True
@@ -1370,6 +1554,50 @@ class RPPController(Node):
     def validate_parameters(self):
         if not self.local_frame:
             raise ValueError("local_frame must not be empty")
+
+        if (
+            self.precision_guidance_enabled
+            or self.precision_speed_control_enabled
+        ) and not self.geometry_tracking_enabled:
+            raise ValueError(
+                "precision_guidance_enabled and precision_speed_control_enabled "
+                "require geometry_tracking_enabled=true"
+            )
+        if not (
+            0.0
+            < self.precision_speed_config.terminal_target_speed_mps
+            <= self.precision_speed_config.hardware_speed_ceiling_mps
+        ):
+            raise ValueError(
+                "precision_terminal_target_speed_mps must be positive and not "
+                "exceed precision_hardware_speed_ceiling_mps; Phase 2 must not "
+                "create an early terminal zero"
+            )
+        if not (
+            math.isfinite(self.precision_minimum_moving_speed)
+            and 0.0 < self.precision_minimum_moving_speed
+            <= self.precision_speed_config.terminal_target_speed_mps
+        ):
+            raise ValueError(
+                "precision_minimum_moving_speed_mps must be finite, positive, "
+                "and no greater than precision_terminal_target_speed_mps"
+            )
+        if (
+            self.precision_speed_config.hardware_speed_ceiling_mps
+            > self.MAXIMUM_MOVING_SPEED_MPS
+        ):
+            raise ValueError(
+                "precision_hardware_speed_ceiling_mps must not exceed the "
+                "verified moving hardware ceiling"
+            )
+        if (
+            self.precision_guidance_config.moving_bearing_cone_rad
+            > self.MAX_MOVING_HEADING_ERROR_RAD
+        ):
+            raise ValueError(
+                "precision_moving_bearing_cone_deg must not exceed the "
+                "verified 30 degree moving-command cone"
+            )
 
         if not (0.0 < self.geometry_corner_threshold <= math.pi):
             raise ValueError("geometry_corner_threshold_deg must be in (0, 180]")
@@ -2130,7 +2358,9 @@ class RPPController(Node):
         self.geometry_active_span = None
         self.geometry_last_goal_raw_index = None
         self.geometry_last_projection = None
+        self.geometry_last_projection_cycle_token = None
         self.geometry_last_odom_point = None
+        self._reset_precision_regulator("GEOMETRY_INVALIDATED", progress_s=0.0)
         self._record_geometry_reset(reason)
         self.get_logger().warn(
             f"PRECISION GEOMETRY AUTHORITY INVALIDATED | reason={reason}"
@@ -2295,12 +2525,14 @@ class RPPController(Node):
         self.geometry_active_span = None
         self.geometry_last_goal_raw_index = None
         self.geometry_last_projection = None
+        self.geometry_last_projection_cycle_token = None
         self.geometry_last_odom_point = None
         if previous_signature is not None and previous_signature != signature:
             self.geometry_progress_tracker.reset(GeometryResetReason.PATH_REPLACED)
             self._record_geometry_reset(GeometryResetReason.PATH_REPLACED)
         else:
             self._record_geometry_reset(GeometryResetReason.INITIAL_INSTALL)
+        self._reset_precision_regulator("PATH_INSTALLED", progress_s=0.0)
         self._try_bind_geometry_goal(log_error=False)
         self.get_logger().warn(
             "PRECISION PATH GEOMETRY INSTALLED | "
@@ -2350,6 +2582,11 @@ class RPPController(Node):
             )
             self._record_geometry_reset(GeometryResetReason.ACTIVE_GOAL_ADVANCED)
             self.geometry_last_projection = None
+            self.geometry_last_projection_cycle_token = None
+            self._reset_precision_regulator(
+                "ACTIVE_GOAL_ADVANCED",
+                progress_s=binding.active_span.start_s,
+            )
         self.geometry_last_goal_raw_index = binding.raw_path_index
         return True
 
@@ -2400,6 +2637,8 @@ class RPPController(Node):
             )
             self._record_geometry_reset(GeometryResetReason.LOCALIZATION_JUMP)
             self.geometry_last_projection = None
+            self.geometry_last_projection_cycle_token = None
+            self._reset_precision_regulator("LOCALIZATION_JUMP", progress_s=0.0)
             self.get_logger().warn(
                 "PRECISION GEOMETRY PROGRESS RESET | reason=LOCALIZATION_JUMP"
             )
@@ -2634,6 +2873,14 @@ class RPPController(Node):
             "ros_time_ns": self.get_clock().now().nanoseconds,
             "geometry_tracking_enabled": self.geometry_tracking_enabled,
             "geometry_diagnostics_enabled": self.geometry_diagnostics_enabled,
+            "precision_guidance_enabled": self.precision_guidance_enabled,
+            "precision_speed_control_enabled": self.precision_speed_control_enabled,
+            "cycle_token": self.precision_cycle_token,
+            "projection_cycle_token": (
+                self.geometry_last_projection_cycle_token
+                if projection is not None
+                else None
+            ),
             "path_signature": self.geometry_installed_signature,
             "raw_path_index": nearest_raw_index,
             "nearest_raw_index": nearest_raw_index,
@@ -2761,6 +3008,7 @@ class RPPController(Node):
             return None
 
         self.geometry_last_projection = projection
+        self.geometry_last_projection_cycle_token = self.precision_cycle_token
         path_bearing = None
         if projection.segment_index is not None:
             path_bearing = self.path_geometry.segments[
@@ -3192,6 +3440,15 @@ class RPPController(Node):
         self.xtrack_priority_inside_since = None
         self.reset_xtrack_damping_state()
         self.reset_speed_profiles()
+        goal_progress_s = (
+            self.geometry_active_span.start_s
+            if self.geometry_active_span is not None
+            else 0.0
+        )
+        self._reset_precision_regulator(
+            "SEGMENT_GOAL_CHANGED",
+            progress_s=goal_progress_s,
+        )
 
         self.marking_missed = False
         self.capture_monitor_armed = False
@@ -3250,6 +3507,7 @@ class RPPController(Node):
         self.mission_enabled = enabled
 
         if enabled and not previous:
+            self._reset_precision_regulator("MISSION_ENABLED", progress_s=0.0)
             self.terminal_gate_inside_since = None
             self.terminal_gate_ready = False
             if not self.first_marking_completed:
@@ -3313,6 +3571,7 @@ class RPPController(Node):
             self.reset_acceleration_profile()
             self.command_slew_speed = 0.0
             self.command_slew_last_time = None
+            self._reset_precision_regulator("POINT_COMPLETED", progress_s=0.0)
             self.get_logger().warn(
                 "MARKING COMPLETED / NEXT-LEG ACCELERATION ARMED | "
                 f"point_index={point_index} | "
@@ -3348,6 +3607,7 @@ class RPPController(Node):
         self.xtrack_priority_inside_since = None
         self.reset_xtrack_damping_state()
         self.reset_speed_profiles()
+        self._reset_precision_regulator("MOTION_STATE_RESET", progress_s=0.0)
 
         self.marking_missed = False
         self.capture_monitor_armed = False
@@ -3953,6 +4213,335 @@ class RPPController(Node):
             )
         return self.command_slew_speed
 
+    def _begin_precision_cycle(self):
+        """Create the bounded timing/token authority for one control tick."""
+
+        self.precision_cycle_token += 1
+        now = self.get_clock().now()
+        if self.precision_last_cycle_time is None:
+            dt_sec = 1.0 / self.CONTROL_HZ
+        else:
+            dt_sec = (now - self.precision_last_cycle_time).nanoseconds / 1e9
+            if not math.isfinite(dt_sec):
+                dt_sec = 0.0
+            dt_sec = max(
+                0.0,
+                min(dt_sec, self.precision_speed_config.control_dt_max_sec),
+            )
+        self.precision_last_cycle_time = now
+        self.precision_cycle_dt_sec = dt_sec
+
+        self.geometry_last_projection = None
+        self.geometry_last_projection_cycle_token = None
+        self.precision_guidance_cycle_token = None
+        self.precision_guidance_result = None
+        self.precision_speed_cycle_token = None
+        self.precision_speed_result = None
+        self.precision_speed_request = None
+
+    def _current_cycle_projection(self):
+        if (
+            self.geometry_last_projection_cycle_token
+            != self.precision_cycle_token
+        ):
+            return None
+        return self.geometry_last_projection
+
+    def _publish_guidance_debug(self, result, *, status):
+        if not (
+            self.precision_guidance_enabled
+            or self.precision_speed_control_enabled
+        ):
+            return
+        payload = {
+            "schema_version": 1,
+            "status": status,
+            "ros_time_ns": self.get_clock().now().nanoseconds,
+            "cycle_token": self.precision_cycle_token,
+            "projection_cycle_token": self.geometry_last_projection_cycle_token,
+            "precision_guidance_enabled": self.precision_guidance_enabled,
+            "precision_speed_control_enabled": self.precision_speed_control_enabled,
+            "path_signature": self.geometry_installed_signature,
+            "active_goal_identity": (
+                self.geometry_goal_binding.active_goal_identity
+                if self.geometry_goal_binding is not None
+                else None
+            ),
+            "rover_x": self.current_x,
+            "rover_y": self.current_y,
+            "rover_yaw_rad": self.current_yaw,
+            "lookahead_distance_m": (
+                result.lookahead_distance_m if result is not None else None
+            ),
+            "lookahead_target_s": (
+                result.lookahead_target_s if result is not None else None
+            ),
+            "lookahead_segment_index": (
+                result.lookahead_segment_index if result is not None else None
+            ),
+            "lookahead_x": result.lookahead_point.x if result is not None else None,
+            "lookahead_y": result.lookahead_point.y if result is not None else None,
+            "path_heading_rad": (
+                result.local_path_heading_rad if result is not None else None
+            ),
+            "lookahead_bearing_rad": (
+                result.lookahead_bearing_rad if result is not None else None
+            ),
+            "heading_error_rad": (
+                result.heading_error_rad if result is not None else None
+            ),
+            "cross_track_m": (
+                result.signed_cross_track_m if result is not None else None
+            ),
+            "desired_command_bearing_rad": (
+                result.desired_movement_bearing_rad if result is not None else None
+            ),
+            "limited_command_bearing_rad": (
+                result.limited_command_bearing_rad if result is not None else None
+            ),
+            "bearing_clamp_fired": (
+                result.bearing_clamp_fired if result is not None else None
+            ),
+        }
+        message = String()
+        message.data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        self.guidance_debug_pub.publish(message)
+
+    def _compute_precision_guidance_for_cycle(self):
+        """Return guidance only from this tick's successful projection."""
+
+        if self.precision_guidance_cycle_token == self.precision_cycle_token:
+            return self.precision_guidance_result
+        projection = self._current_cycle_projection()
+        if not (
+            projection is not None
+            and self.path_geometry is not None
+            and self.geometry_active_span is not None
+            and self.current_x is not None
+            and self.current_y is not None
+            and self.current_yaw is not None
+        ):
+            self._publish_guidance_debug(None, status="CURRENT_PROJECTION_UNAVAILABLE")
+            return None
+        measured_speed = (
+            self.current_speed_mps
+            if math.isfinite(self.current_speed_mps)
+            else 0.0
+        )
+        effective_speed = max(
+            0.0,
+            measured_speed,
+            self.precision_last_published_translational_speed_mps,
+        )
+        try:
+            result = compute_precision_guidance(
+                self.precision_guidance_config,
+                geometry=self.path_geometry,
+                projection=projection,
+                active_span=self.geometry_active_span,
+                rover_position=(self.current_x, self.current_y),
+                rover_yaw_rad=self.current_yaw,
+                speed_mps=effective_speed,
+            )
+        except (TypeError, ValueError):
+            self._publish_guidance_debug(None, status="GUIDANCE_REJECTED")
+            return None
+        self.precision_guidance_cycle_token = self.precision_cycle_token
+        self.precision_guidance_result = result
+        self._publish_guidance_debug(result, status="READY")
+        return result
+
+    def _scoped_precision_corner_preview(self, projection):
+        """Return only corners at or before the active semantic stop."""
+
+        if self.path_geometry is None or self.geometry_active_span is None:
+            return None, None
+        corner = self.path_geometry.next_corner(projection.progress_s)
+        if corner is None or corner.s > self.geometry_active_span.stop_s + 1.0e-9:
+            return None, None
+        return max(0.0, corner.s - projection.progress_s), corner.turn_angle_rad
+
+    def _resolve_precision_speed_for_cycle(self):
+        """Resolve exactly one longitudinal command for this control tick."""
+
+        if self.precision_speed_cycle_token == self.precision_cycle_token:
+            return self.precision_speed_result
+        projection = self._current_cycle_projection()
+        guidance = self._compute_precision_guidance_for_cycle()
+        if projection is None or guidance is None:
+            return None
+        corner_distance, corner_angle = self._scoped_precision_corner_preview(
+            projection
+        )
+        measured_speed = (
+            self.current_speed_mps
+            if math.isfinite(self.current_speed_mps)
+            else 0.0
+        )
+        request = SpeedRegulatorInput(
+            mission_speed_ceiling_mps=self.cruise_speed,
+            measured_speed_mps=measured_speed,
+            last_commanded_speed_mps=(
+                self.precision_last_published_translational_speed_mps
+            ),
+            dt_sec=self.precision_cycle_dt_sec,
+            along_track_progress_m=projection.progress_s,
+            heading_error_rad=guidance.heading_error_rad,
+            cross_track_error_m=guidance.signed_cross_track_m,
+            distance_to_corner_m=corner_distance,
+            corner_angle_rad=corner_angle,
+            distance_to_terminal_m=projection.remaining_to_active_stop_m,
+            curvature_inv_m=None,
+            hard_zero=False,
+        )
+        try:
+            result = self.precision_speed_regulator.resolve(request)
+        except (RuntimeError, TypeError, ValueError):
+            return None
+        self.precision_speed_cycle_token = self.precision_cycle_token
+        self.precision_speed_request = request
+        self.precision_speed_result = result
+        return result
+
+    def _reset_precision_regulator(self, reason, *, progress_s=None):
+        if not hasattr(self, "precision_speed_regulator"):
+            return
+        if progress_s is None:
+            projection = self._current_cycle_projection()
+            progress_s = projection.progress_s if projection is not None else 0.0
+        if not math.isfinite(progress_s) or progress_s < 0.0:
+            progress_s = 0.0
+        self.precision_speed_regulator.reset(
+            along_track_progress_m=progress_s,
+            initial_speed_mps=0.0,
+        )
+        self.precision_last_published_translational_speed_mps = 0.0
+        self.precision_speed_cycle_token = None
+        self.precision_speed_result = None
+        self.precision_speed_request = None
+        self.precision_regulator_reset_reason = str(reason)
+        self.precision_regulator_reset_count += 1
+
+    def _record_published_translational_speed(self, speed_mps):
+        if math.isfinite(speed_mps) and speed_mps >= 0.0:
+            self.precision_last_published_translational_speed_mps = speed_mps
+
+    def _publish_speed_debug(self, result, *, published_speed, floor_applied):
+        request = self.precision_speed_request
+        caps = result.caps
+        winning_owner = (
+            "minimum_moving_floor"
+            if floor_applied
+            else result.winning_cap_owner.value
+        )
+        payload = {
+            "schema_version": 1,
+            "status": "READY",
+            "ros_time_ns": self.get_clock().now().nanoseconds,
+            "cycle_token": self.precision_cycle_token,
+            "projection_cycle_token": self.geometry_last_projection_cycle_token,
+            "precision_speed_control_enabled": self.precision_speed_control_enabled,
+            "requested_speed_mps": result.requested_speed_mps,
+            "published_speed_mps": published_speed,
+            "winning_cap_owner": winning_owner,
+            "resolver_winning_cap_owner": result.winning_cap_owner.value,
+            "minimum_moving_floor_applied": floor_applied,
+            "minimum_moving_speed_mps": self.precision_minimum_moving_speed,
+            "caps": {
+                "mission_mps": caps.mission_mps,
+                "hardware_mps": caps.hardware_mps,
+                "acceleration_mps": caps.acceleration_mps,
+                "heading_mps": caps.heading_mps,
+                "cross_track_mps": caps.cross_track_mps,
+                "corner_mps": caps.corner_mps,
+                "terminal_mps": caps.terminal_mps,
+                "curvature_mps": caps.curvature_mps,
+            },
+            "bounded_dt_sec": result.bounded_dt_sec,
+            "effective_speed_mps": result.effective_speed_mps,
+            "acceleration_gate_scale": result.acceleration_gate_scale,
+            "acceleration_progress_m": result.acceleration_progress_m,
+            "corner_required_braking_distance_m": (
+                result.corner_required_braking_distance_m
+            ),
+            "terminal_required_braking_distance_m": (
+                result.terminal_required_braking_distance_m
+            ),
+            "distance_to_corner_m": (
+                request.distance_to_corner_m if request is not None else None
+            ),
+            "corner_angle_rad": (
+                request.corner_angle_rad if request is not None else None
+            ),
+            "distance_to_terminal_m": (
+                request.distance_to_terminal_m if request is not None else None
+            ),
+            "last_published_translational_speed_mps": (
+                request.last_commanded_speed_mps if request is not None else None
+            ),
+            "measured_speed_mps": (
+                request.measured_speed_mps if request is not None else None
+            ),
+            "regulator_reset_reason": self.precision_regulator_reset_reason,
+            "regulator_reset_count": self.precision_regulator_reset_count,
+        }
+        message = String()
+        message.data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        self.speed_debug_pub.publish(message)
+
+    def publish_precision_velocity_ned(self, command_bearing, result):
+        """Publish one already-resolved translational command.
+
+        This path deliberately bypasses all legacy acceleration, deceleration,
+        hard-cap, and slew profiles.  The pure resolver owns longitudinal math;
+        this adapter retains only finite/vector/hardware safety clamps.  Native
+        pivot carrier commands never call this method.
+        """
+
+        if result is None or not math.isfinite(command_bearing):
+            self.get_logger().error("INVALID PRECISION COMMAND / IMMEDIATE ZERO")
+            self.publish_stop()
+            return 0.0, 0.0, 0.0
+        resolved_speed = float(result.requested_speed_mps)
+        if not math.isfinite(resolved_speed) or resolved_speed < 0.0:
+            self.get_logger().error("NON-FINITE PRECISION SPEED / IMMEDIATE ZERO")
+            self.publish_stop()
+            return 0.0, 0.0, 0.0
+
+        # A non-latched Phase-2 cycle must remain translational.  Phase 5 owns
+        # the future zero/certificate state machine; today the unchanged 30 mm
+        # radial latch reaches publish_stop() before this method is selected.
+        output_speed = max(resolved_speed, self.precision_minimum_moving_speed)
+        floor_applied = output_speed > resolved_speed + 1.0e-12
+        output_speed = min(
+            output_speed,
+            self.cruise_speed,
+            self.precision_speed_config.hardware_speed_ceiling_mps,
+            self.MAXIMUM_MOVING_SPEED_MPS,
+        )
+        north = output_speed * math.sin(command_bearing)
+        east = output_speed * math.cos(command_bearing)
+        if not all(math.isfinite(value) for value in (north, east, output_speed)):
+            self.get_logger().error("NON-FINITE PRECISION VECTOR / IMMEDIATE ZERO")
+            self.publish_stop()
+            return 0.0, 0.0, 0.0
+
+        msg = Vector3Stamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "map_ned"
+        msg.vector.x = float(north)
+        msg.vector.y = float(east)
+        msg.vector.z = 0.0
+        self.velocity_pub.publish(msg)
+        self._record_published_translational_speed(output_speed)
+        self.publish_motion_profile_monitor(output_speed)
+        self._publish_speed_debug(
+            result,
+            published_speed=output_speed,
+            floor_applied=floor_applied,
+        )
+        return north, east, output_speed
+
     def publish_velocity_ned(
         self,
         north,
@@ -4047,6 +4636,7 @@ class RPPController(Node):
         return north, east, output_speed
 
     def publish_stop(self):
+        self._reset_precision_regulator("LITERAL_STOP")
         self.publish_velocity_ned(0.0, 0.0)
 
     @staticmethod
@@ -4906,6 +5496,7 @@ class RPPController(Node):
             )
 
     def control_loop(self):
+        self._begin_precision_cycle()
         if self.emergency_stop:
             self.publish_stop()
             self.log_waiting("emergency stop active")
@@ -4951,6 +5542,9 @@ class RPPController(Node):
             if self.current_speed_mps <= self.stationary_speed_tolerance:
                 self.post_extension_stationary_hold = False
                 self.reset_speed_profiles()
+                self._reset_precision_regulator(
+                    "EXTENSION_STATIONARY_RECAPTURE"
+                )
                 self.get_logger().warn(
                     "EXTENSION STATIONARY CONFIRMED / NEXT SEGMENT RELEASED | "
                     f"speed={self.current_speed_mps:.3f}m/s"
@@ -5094,6 +5688,14 @@ class RPPController(Node):
             delta_east,
         )
         path_heading_error = self.normalize_angle(path_bearing - self.current_yaw)
+
+        precision_guidance = None
+        if self.precision_guidance_enabled or self.precision_speed_control_enabled:
+            precision_guidance = self._compute_precision_guidance_for_cycle()
+            if precision_guidance is None:
+                self.publish_stop()
+                self.log_waiting("precision guidance lacks current-cycle projection")
+                return
 
         self.publish_mm_monitor(
             path_bearing,
@@ -5255,6 +5857,11 @@ class RPPController(Node):
                 target_y,
                 self.segment_alignment_correction_limit,
             )
+            if self.precision_guidance_enabled:
+                alignment_guidance_bearing = (
+                    precision_guidance.limited_command_bearing_rad
+                )
+                alignment_cross_track = precision_guidance.signed_cross_track_m
 
             if abs(alignment_cross_track) >= self.segment_alignment_max_cross_track:
                 self.alignment_safety_hold = True
@@ -5340,6 +5947,7 @@ class RPPController(Node):
                 self.segment_pivot_keeper_started_at = None
                 self.alignment_inside_since = None
                 self.reset_terminal_native_pivot()
+                self._reset_precision_regulator("PIVOT_COMPLETE_RECAPTURE_ARMED")
 
                 if first_approach:
                     self.reanchor_c_to_p1_after_pivot()
@@ -5399,6 +6007,7 @@ class RPPController(Node):
                 self.xtrack_priority_active = True
                 self.xtrack_priority_inside_since = None
                 self.reset_xtrack_damping_state()
+                self._reset_precision_regulator("PIVOT_RECAPTURE_FALLBACK")
 
                 self.get_logger().error(
                     "FAST CAPTURE XTRACK GUARD / FALLBACK TO 1.00MPS | "
@@ -5435,6 +6044,9 @@ class RPPController(Node):
                         self.xtrack_priority_active = False
                         self.xtrack_priority_inside_since = None
                         self.reset_xtrack_damping_state()
+                        self._reset_precision_regulator(
+                            "PIVOT_RECAPTURE_COMPLETE"
+                        )
 
                         self.get_logger().warn(
                             "FAST POST-PIVOT LINE CAPTURE RELEASED | "
@@ -5450,20 +6062,38 @@ class RPPController(Node):
                     self.alignment_inside_since = None
 
                 if self.segment_alignment_active:
+                    if self.precision_guidance_enabled:
+                        alignment_guidance_bearing = (
+                            precision_guidance.limited_command_bearing_rad
+                        )
                     (
                         command_bearing,
                         command_heading_error,
                     ) = self.limit_moving_guidance_bearing(alignment_guidance_bearing)
 
                     speed = self.segment_alignment_recovery_speed
-                    north = speed * math.sin(command_bearing)
-                    east = speed * math.cos(command_bearing)
-                    north, east, speed = self.publish_velocity_ned(
-                        north,
-                        east,
-                        apply_acceleration=True,
-                        apply_deceleration=False,
-                    )
+                    if self.precision_speed_control_enabled:
+                        speed_result = self._resolve_precision_speed_for_cycle()
+                        if speed_result is None:
+                            self.publish_stop()
+                            self.get_logger().error(
+                                "PRECISION SPEED REJECTED / POST-PIVOT SAFE HOLD"
+                            )
+                            return
+                        north, east, speed = self.publish_precision_velocity_ned(
+                            command_bearing,
+                            speed_result,
+                        )
+                    else:
+                        north = speed * math.sin(command_bearing)
+                        east = speed * math.cos(command_bearing)
+                        north, east, speed = self.publish_velocity_ned(
+                            north,
+                            east,
+                            apply_acceleration=True,
+                            apply_deceleration=False,
+                        )
+                        self._record_published_translational_speed(speed)
 
                     self.log_control(
                         mode_prefix
@@ -5547,20 +6177,38 @@ class RPPController(Node):
         )
 
         if not terminal_active and xtrack_speed_cap_active:
+            if self.precision_guidance_enabled:
+                xtrack_guidance_bearing = (
+                    precision_guidance.limited_command_bearing_rad
+                )
             (
                 xtrack_guidance_bearing,
                 command_heading_error,
             ) = self.limit_moving_guidance_bearing(xtrack_guidance_bearing)
             speed = self.xtrack_priority_speed
-            north = speed * math.sin(xtrack_guidance_bearing)
-            east = speed * math.cos(xtrack_guidance_bearing)
-            north, east, speed = self.publish_velocity_ned(
-                north,
-                east,
-                apply_acceleration=True,
-                apply_deceleration=False,
-                hard_speed_cap_mps=self.xtrack_priority_speed,
-            )
+            if self.precision_speed_control_enabled:
+                speed_result = self._resolve_precision_speed_for_cycle()
+                if speed_result is None:
+                    self.publish_stop()
+                    self.get_logger().error(
+                        "PRECISION SPEED REJECTED / RECOVERY SAFE HOLD"
+                    )
+                    return
+                north, east, speed = self.publish_precision_velocity_ned(
+                    xtrack_guidance_bearing,
+                    speed_result,
+                )
+            else:
+                north = speed * math.sin(xtrack_guidance_bearing)
+                east = speed * math.cos(xtrack_guidance_bearing)
+                north, east, speed = self.publish_velocity_ned(
+                    north,
+                    east,
+                    apply_acceleration=True,
+                    apply_deceleration=False,
+                    hard_speed_cap_mps=self.xtrack_priority_speed,
+                )
+                self._record_published_translational_speed(speed)
             self.log_control(
                 mode_prefix
                 + "GLOBAL DAMPED XTRACK RECOVERY / "
@@ -5671,6 +6319,8 @@ class RPPController(Node):
                 xtrack_guidance_bearing,
                 along_remaining,
             )
+            if self.precision_guidance_enabled:
+                guidance_bearing = precision_guidance.limited_command_bearing_rad
             heading_error = self.normalize_angle(guidance_bearing - self.current_yaw)
 
             profile_target = self.terminal_speed_for_along_remaining(along_remaining)
@@ -5679,18 +6329,38 @@ class RPPController(Node):
             )
 
             speed = self.cruise_speed
-            north = speed * math.sin(guidance_bearing)
-            east = speed * math.cos(guidance_bearing)
-            north, east, speed = self.publish_velocity_ned(
-                north,
-                east,
-                apply_acceleration=True,
-                apply_deceleration=True,
-                goal_distance=along_remaining,
-                hard_speed_cap_mps=terminal_speed_cap,
-            )
+            if self.precision_speed_control_enabled:
+                speed_result = self._resolve_precision_speed_for_cycle()
+                if speed_result is None:
+                    self.publish_stop()
+                    self.get_logger().error(
+                        "PRECISION SPEED REJECTED / TERMINAL SAFE HOLD"
+                    )
+                    return
+                north, east, speed = self.publish_precision_velocity_ned(
+                    guidance_bearing,
+                    speed_result,
+                )
+            else:
+                north = speed * math.sin(guidance_bearing)
+                east = speed * math.cos(guidance_bearing)
+                north, east, speed = self.publish_velocity_ned(
+                    north,
+                    east,
+                    apply_acceleration=True,
+                    apply_deceleration=True,
+                    goal_distance=along_remaining,
+                    hard_speed_cap_mps=terminal_speed_cap,
+                )
+                self._record_published_translational_speed(speed)
 
-            if xtrack_speed_cap_active:
+            if self.precision_speed_control_enabled:
+                speed_owner = (
+                    "PRECISION_RESOLVER:"
+                    f"{speed_result.winning_cap_owner.value}"
+                )
+                profile_target = speed_result.requested_speed_mps
+            elif xtrack_speed_cap_active:
                 speed_owner = (
                     "MIN(DISTANCE_PROFILE,"
                     f"XTRACK_CAP={self.xtrack_priority_speed:.3f})"
@@ -5730,6 +6400,9 @@ class RPPController(Node):
             target_y,
             self.path_correction_limit,
         )
+        if self.precision_guidance_enabled:
+            guidance_bearing = precision_guidance.limited_command_bearing_rad
+            signed_cross_track = precision_guidance.signed_cross_track_m
         heading_error = self.normalize_angle(guidance_bearing - self.current_yaw)
 
         speed = self.cruise_speed
@@ -5747,15 +6420,34 @@ class RPPController(Node):
                 f"xtrack={signed_cross_track:.3f}m"
             )
 
-        north = speed * math.sin(guidance_bearing)
-        east = speed * math.cos(guidance_bearing)
+        if self.precision_guidance_enabled or self.precision_speed_control_enabled:
+            status += (
+                " | PHASE2 "
+                f"guidance={'ON' if self.precision_guidance_enabled else 'OFF'}"
+                f" speed={'ON' if self.precision_speed_control_enabled else 'OFF'}"
+            )
+
         # Normal/pass-through movement uses only the gentle start ramp.
         # Terminal deceleration is activated exclusively after the final-line
         # precision gate is latched inside the terminal corridor.
-        north, east, speed = self.publish_velocity_ned(
-            north,
-            east,
-        )
+        if self.precision_speed_control_enabled:
+            speed_result = self._resolve_precision_speed_for_cycle()
+            if speed_result is None:
+                self.publish_stop()
+                self.get_logger().error("PRECISION SPEED REJECTED / SAFE HOLD")
+                return
+            north, east, speed = self.publish_precision_velocity_ned(
+                guidance_bearing,
+                speed_result,
+            )
+        else:
+            north = speed * math.sin(guidance_bearing)
+            east = speed * math.cos(guidance_bearing)
+            north, east, speed = self.publish_velocity_ned(
+                north,
+                east,
+            )
+            self._record_published_translational_speed(speed)
         self.log_control(
             status,
             target_distance,

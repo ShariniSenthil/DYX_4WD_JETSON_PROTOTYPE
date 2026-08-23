@@ -393,6 +393,40 @@ def generate_launch_description() -> LaunchDescription:
                         "geometry_localization_jump_reset_m": 0.50,
                         "geometry_max_backward_jump_m": 0.10,
                         "geometry_max_forward_jump_m": 1.00,
+                        # Phase-2 projection guidance and unified longitudinal
+                        # regulation. Both are independently default-OFF and
+                        # require geometry_tracking_enabled=true when enabled.
+                        "precision_guidance_enabled": False,
+                        "precision_speed_control_enabled": False,
+                        "precision_lookahead_min_m": 0.20,
+                        "precision_lookahead_max_m": 1.00,
+                        "precision_lookahead_time_s": 0.55,
+                        "precision_xtrack_lookahead_gain": 0.0,
+                        "precision_moving_bearing_cone_deg": 30.0,
+                        "precision_hardware_speed_ceiling_mps": 1.00,
+                        "precision_acceleration_mps2": 0.75,
+                        "precision_deceleration_mps2": 0.75,
+                        "precision_launch_speed_mps": 0.10,
+                        "precision_control_dt_max_sec": 0.10,
+                        "precision_heading_accel_full_error_deg": 2.0,
+                        "precision_heading_recovery_start_deg": 4.0,
+                        "precision_heading_recovery_full_deg": 15.0,
+                        "precision_xtrack_accel_full_m": 0.010,
+                        "precision_xtrack_recovery_start_m": 0.020,
+                        "precision_xtrack_recovery_full_m": 0.100,
+                        "precision_recovery_min_speed_mps": 0.15,
+                        "precision_corner_angle_threshold_deg": 45.0,
+                        "precision_corner_target_speed_mps": 0.12,
+                        "precision_corner_accel_block_buffer_m": 0.10,
+                        # Positive by design: Phase 2 never owns terminal zero.
+                        # The existing 30 mm radial latch remains authoritative.
+                        "precision_terminal_target_speed_mps": 0.15,
+                        "precision_minimum_moving_speed_mps": 0.04,
+                        "precision_braking_latency_sec": 0.10,
+                        "precision_braking_margin_m": 0.05,
+                        "precision_curvature_enabled": False,
+                        "precision_lateral_acceleration_max_mps2": 0.30,
+                        "precision_curvature_epsilon_inv_m": 1.0e-6,
                         # 75 mm lets a 20 Hz rover moving at 1 m/s advance
                         # reliably through 50 mm interpolation samples without
                         # treating them as arrival/stop tolerances.
