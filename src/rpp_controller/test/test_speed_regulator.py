@@ -81,6 +81,66 @@ def test_winning_cap_is_deterministic_when_caps_tie():
     assert result.winning_cap_owner is SpeedCapOwner.MISSION
 
 
+def test_tracking_inputs_default_to_no_cap_and_acceleration_allowed():
+    result = primed_regulator(speed=1.0).resolve(request())
+
+    assert result.caps.tracking_mps is None
+    assert result.caps.acceleration_mps == pytest.approx(1.0)
+
+
+def test_tracking_cap_has_explicit_owner_and_immediate_precedence():
+    result = primed_regulator(speed=1.0).resolve(
+        request(tracking_speed_cap_mps=0.35)
+    )
+
+    assert result.caps.tracking_mps == pytest.approx(0.35)
+    assert result.requested_speed_mps == pytest.approx(0.35)
+    assert result.winning_cap_owner is SpeedCapOwner.TRACKING
+
+
+def test_tracking_tie_precedence_is_stable_after_acceleration():
+    result = primed_regulator(speed=0.20).resolve(
+        request(
+            last_commanded_speed_mps=0.20,
+            cross_track_error_m=0.20,
+            tracking_speed_cap_mps=0.20,
+        )
+    )
+
+    assert result.requested_speed_mps == pytest.approx(0.20)
+    assert result.winning_cap_owner is SpeedCapOwner.ACCELERATION
+
+
+def test_tracking_acceleration_permission_blocks_upward_speed_change():
+    regulator = primed_regulator(speed=0.40)
+    result = regulator.resolve(
+        request(
+            last_commanded_speed_mps=0.40,
+            along_track_progress_m=20.0,
+            tracking_acceleration_allowed=False,
+        )
+    )
+
+    assert result.caps.acceleration_mps == pytest.approx(0.40)
+    assert result.requested_speed_mps == pytest.approx(0.40)
+    assert result.winning_cap_owner is SpeedCapOwner.ACCELERATION
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -0.01])
+def test_tracking_cap_rejects_nonfinite_or_negative_values(value):
+    with pytest.raises(ValueError):
+        primed_regulator(speed=1.0).resolve(
+            request(tracking_speed_cap_mps=value)
+        )
+
+
+def test_tracking_acceleration_permission_requires_boolean():
+    with pytest.raises(ValueError):
+        primed_regulator(speed=1.0).resolve(
+            request(tracking_acceleration_allowed=1)
+        )
+
+
 def test_acceleration_uses_geometric_progress_and_time_slew():
     regulator = LongitudinalRegulator(make_config())
     regulator.reset(along_track_progress_m=5.0)

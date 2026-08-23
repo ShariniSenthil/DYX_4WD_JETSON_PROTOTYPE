@@ -35,6 +35,7 @@ class SpeedCapOwner(str, Enum):
     ACCELERATION = "acceleration"
     HEADING = "heading_alignment"
     CROSS_TRACK = "cross_track_recovery"
+    TRACKING = "tracking_stability"
     CORNER = "corner_preview"
     TERMINAL = "terminal_braking"
     CURVATURE = "curvature"
@@ -178,6 +179,8 @@ class SpeedRegulatorInput:
     corner_angle_rad: Optional[float] = None
     distance_to_terminal_m: Optional[float] = None
     curvature_inv_m: Optional[float] = None
+    tracking_acceleration_allowed: bool = True
+    tracking_speed_cap_mps: Optional[float] = None
     hard_zero: bool = False
 
 
@@ -190,6 +193,7 @@ class SpeedCaps:
     acceleration_mps: float
     heading_mps: float
     cross_track_mps: float
+    tracking_mps: Optional[float]
     corner_mps: Optional[float]
     terminal_mps: Optional[float]
     curvature_mps: Optional[float]
@@ -205,6 +209,7 @@ class SpeedCaps:
             (SpeedCapOwner.CROSS_TRACK, self.cross_track_mps),
         ]
         optional = (
+            (SpeedCapOwner.TRACKING, self.tracking_mps),
             (SpeedCapOwner.CORNER, self.corner_mps),
             (SpeedCapOwner.TERMINAL, self.terminal_mps),
             (SpeedCapOwner.CURVATURE, self.curvature_mps),
@@ -379,6 +384,11 @@ class LongitudinalRegulator:
         curvature = self._optional_finite(
             "curvature_inv_m", request.curvature_inv_m
         )
+        if not isinstance(request.tracking_acceleration_allowed, bool):
+            raise ValueError("tracking_acceleration_allowed must be boolean")
+        tracking_cap = self._optional_nonnegative(
+            "tracking_speed_cap_mps", request.tracking_speed_cap_mps
+        )
 
         config = self.config
         bounded_dt = min(max(0.0, dt_sec), config.control_dt_max_sec)
@@ -472,6 +482,11 @@ class LongitudinalRegulator:
             time_acceleration_cap,
             distance_acceleration_cap,
         )
+        if not request.tracking_acceleration_allowed:
+            # Stability authority can block a speed increase without owning
+            # launch/zero semantics.  The adapter's separately configured
+            # minimum-moving floor may still create controlled initial creep.
+            acceleration_cap = min(acceleration_cap, last_commanded)
 
         heading_cap = _decreasing_cap(
             heading_error,
@@ -505,6 +520,11 @@ class LongitudinalRegulator:
             acceleration_mps=acceleration_cap,
             heading_mps=heading_cap,
             cross_track_mps=cross_track_cap,
+            tracking_mps=(
+                min(base_ceiling, tracking_cap)
+                if tracking_cap is not None
+                else None
+            ),
             corner_mps=corner_cap,
             terminal_mps=terminal_cap,
             curvature_mps=curvature_cap,

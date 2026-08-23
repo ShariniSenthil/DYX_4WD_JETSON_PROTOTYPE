@@ -427,6 +427,22 @@ def generate_launch_description() -> LaunchDescription:
                         "precision_curvature_enabled": False,
                         "precision_lateral_acceleration_max_mps2": 0.30,
                         "precision_curvature_epsilon_inv_m": 1.0e-6,
+                        # Phase-4 recovery hysteresis and controller-frame run
+                        # metrics. Default-OFF; requires geometry + Phase-2
+                        # guidance and speed authority when enabled.
+                        "precision_tracking_control_enabled": False,
+                        "precision_tracking_recovery_enter_xtrack_m": 0.050,
+                        "precision_tracking_recovery_exit_xtrack_m": 0.020,
+                        "precision_tracking_recovery_enter_heading_deg": 15.0,
+                        "precision_tracking_recovery_exit_heading_deg": 5.0,
+                        "precision_tracking_stable_dwell_sec": 0.30,
+                        "precision_tracking_recovery_speed_scale": 0.35,
+                        "precision_tracking_recapture_speed_scale": 0.50,
+                        "precision_tracking_metrics_capacity": 2048,
+                        "precision_tracking_histogram_bin_width_m": 0.001,
+                        "precision_tracking_histogram_max_m": 1.0,
+                        "precision_tracking_monotonic_tolerance_m": 0.001,
+                        "precision_tracking_cruise_threshold_mps": 0.80,
                         # Phase-3 measured pivot/recenter FSM. Default-OFF
                         # preserves the production native keeper and adapter.
                         "precision_pivot_enabled": False,
