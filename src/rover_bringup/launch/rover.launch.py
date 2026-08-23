@@ -427,6 +427,29 @@ def generate_launch_description() -> LaunchDescription:
                         "precision_curvature_enabled": False,
                         "precision_lateral_acceleration_max_mps2": 0.30,
                         "precision_curvature_epsilon_inv_m": 1.0e-6,
+                        # Phase-3 measured pivot/recenter FSM. Default-OFF
+                        # preserves the production native keeper and adapter.
+                        "precision_pivot_enabled": False,
+                        "precision_pivot_anchor_tolerance_m": 0.030,
+                        "precision_pivot_recenter_threshold_m": 0.030,
+                        "precision_pivot_stop_speed_tolerance_mps": 0.010,
+                        "precision_pivot_stop_yaw_rate_tolerance_radps": 0.050,
+                        "precision_pivot_telemetry_timeout_sec": 0.25,
+                        "precision_pivot_stop_settle_sec": 0.20,
+                        "precision_pivot_heading_tolerance_deg": 2.0,
+                        "precision_pivot_release_settle_sec": 0.20,
+                        "precision_pivot_brake_timeout_sec": 8.0,
+                        "precision_pivot_timeout_sec": 9.0,
+                        "precision_pivot_recenter_speed_mps": 0.12,
+                        "precision_pivot_recenter_timeout_sec": 5.0,
+                        "precision_pivot_max_recenter_attempts": 2,
+                        "precision_pivot_realign_timeout_sec": 9.0,
+                        "precision_pivot_recapture_timeout_sec": 8.0,
+                        "post_pivot_capture_speed_mps": 0.20,
+                        "precision_pivot_recapture_xtrack_m": 0.020,
+                        "precision_pivot_recapture_heading_deg": 2.0,
+                        "precision_pivot_recapture_settle_sec": 0.20,
+                        "precision_pivot_recenter_forward_cone_deg": 30.0,
                         # 75 mm lets a 20 Hz rover moving at 1 m/s advance
                         # reliably through 50 mm interpolation samples without
                         # treating them as arrival/stop tolerances.

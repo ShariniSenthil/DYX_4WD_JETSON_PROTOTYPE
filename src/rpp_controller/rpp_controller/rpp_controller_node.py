@@ -39,6 +39,13 @@ from rpp_controller.speed_regulator import (
     LongitudinalRegulatorConfig,
     SpeedRegulatorInput,
 )
+from rpp_controller.motion_state_machine import (
+    MotionDirective,
+    MotionState,
+    PivotMotionConfig,
+    PivotMotionInput,
+    VerifiedPivotStateMachine,
+)
 
 
 class RPPController(Node):
@@ -481,6 +488,33 @@ class RPPController(Node):
         self.declare_parameter("precision_lateral_acceleration_max_mps2", 0.30)
         self.declare_parameter("precision_curvature_epsilon_inv_m", 1.0e-6)
 
+        # Phase-3 measured pivot/recenter controller.  It is independent and
+        # default-OFF: the production Phase-A/B keeper below remains byte-for-
+        # byte authoritative until this flag is explicitly enabled.
+        self.declare_parameter("precision_pivot_enabled", False)
+        self.declare_parameter("precision_pivot_anchor_tolerance_m", 0.030)
+        self.declare_parameter("precision_pivot_recenter_threshold_m", 0.030)
+        self.declare_parameter("precision_pivot_stop_speed_tolerance_mps", 0.010)
+        self.declare_parameter(
+            "precision_pivot_stop_yaw_rate_tolerance_radps", 0.050
+        )
+        self.declare_parameter("precision_pivot_telemetry_timeout_sec", 0.25)
+        self.declare_parameter("precision_pivot_stop_settle_sec", 0.20)
+        self.declare_parameter("precision_pivot_heading_tolerance_deg", 2.0)
+        self.declare_parameter("precision_pivot_release_settle_sec", 0.20)
+        self.declare_parameter("precision_pivot_brake_timeout_sec", 8.0)
+        self.declare_parameter("precision_pivot_timeout_sec", 9.0)
+        self.declare_parameter("precision_pivot_recenter_speed_mps", 0.12)
+        self.declare_parameter("precision_pivot_recenter_timeout_sec", 5.0)
+        self.declare_parameter("precision_pivot_max_recenter_attempts", 2)
+        self.declare_parameter("precision_pivot_realign_timeout_sec", 9.0)
+        self.declare_parameter("precision_pivot_recapture_timeout_sec", 8.0)
+        self.declare_parameter("post_pivot_capture_speed_mps", 0.20)
+        self.declare_parameter("precision_pivot_recapture_xtrack_m", 0.020)
+        self.declare_parameter("precision_pivot_recapture_heading_deg", 2.0)
+        self.declare_parameter("precision_pivot_recapture_settle_sec", 0.20)
+        self.declare_parameter("precision_pivot_recenter_forward_cone_deg", 30.0)
+
         self.local_frame = str(self.get_parameter("local_frame").value).strip()
         self.cruise_speed = float(self.get_parameter("cruise_speed_mps").value)
         self.acceleration_enabled = bool(
@@ -898,11 +932,18 @@ class RPPController(Node):
         self.precision_speed_control_enabled = bool(
             self.get_parameter("precision_speed_control_enabled").value
         )
+        # Loaded fully below after Phase-2 configs are constructed.  Read the
+        # gate here so geometry subscription/install authority includes the
+        # Phase-3 consumer from the first retained DDS sample.
+        precision_pivot_requested = bool(
+            self.get_parameter("precision_pivot_enabled").value
+        )
         self.geometry_processing_enabled = (
             self.geometry_tracking_enabled
             or self.geometry_diagnostics_enabled
             or self.precision_guidance_enabled
             or self.precision_speed_control_enabled
+            or precision_pivot_requested
         )
         self.precision_guidance_config = GuidanceConfig(
             lookahead_min_m=float(
@@ -1005,6 +1046,92 @@ class RPPController(Node):
         )
         self.precision_speed_regulator = LongitudinalRegulator(
             self.precision_speed_config
+        )
+
+        self.precision_pivot_enabled = bool(
+            self.get_parameter("precision_pivot_enabled").value
+        )
+        self.precision_pivot_telemetry_timeout_sec = float(
+            self.get_parameter("precision_pivot_telemetry_timeout_sec").value
+        )
+        self.precision_pivot_recenter_speed = float(
+            self.get_parameter("precision_pivot_recenter_speed_mps").value
+        )
+        self.post_pivot_capture_speed = float(
+            self.get_parameter("post_pivot_capture_speed_mps").value
+        )
+        self.precision_pivot_recapture_xtrack = float(
+            self.get_parameter("precision_pivot_recapture_xtrack_m").value
+        )
+        self.precision_pivot_recapture_heading = math.radians(
+            float(
+                self.get_parameter("precision_pivot_recapture_heading_deg").value
+            )
+        )
+        self.precision_pivot_recapture_settle_sec = float(
+            self.get_parameter("precision_pivot_recapture_settle_sec").value
+        )
+        self.precision_pivot_recenter_forward_cone = math.radians(
+            float(
+                self.get_parameter(
+                    "precision_pivot_recenter_forward_cone_deg"
+                ).value
+            )
+        )
+        self.precision_pivot_config = PivotMotionConfig(
+            pivot_anchor_tolerance_m=float(
+                self.get_parameter("precision_pivot_anchor_tolerance_m").value
+            ),
+            pivot_recenter_threshold_m=float(
+                self.get_parameter("precision_pivot_recenter_threshold_m").value
+            ),
+            stop_speed_tolerance_mps=float(
+                self.get_parameter(
+                    "precision_pivot_stop_speed_tolerance_mps"
+                ).value
+            ),
+            stop_yaw_rate_tolerance_radps=float(
+                self.get_parameter(
+                    "precision_pivot_stop_yaw_rate_tolerance_radps"
+                ).value
+            ),
+            release_heading_tolerance_rad=math.radians(
+                float(
+                    self.get_parameter(
+                        "precision_pivot_heading_tolerance_deg"
+                    ).value
+                )
+            ),
+            stop_settle_sec=float(
+                self.get_parameter("precision_pivot_stop_settle_sec").value
+            ),
+            pivot_release_settle_sec=float(
+                self.get_parameter("precision_pivot_release_settle_sec").value
+            ),
+            control_dt_max_sec=float(
+                self.get_parameter("precision_control_dt_max_sec").value
+            ),
+            brake_timeout_sec=float(
+                self.get_parameter("precision_pivot_brake_timeout_sec").value
+            ),
+            pivot_timeout_sec=float(
+                self.get_parameter("precision_pivot_timeout_sec").value
+            ),
+            recenter_timeout_sec=float(
+                self.get_parameter("precision_pivot_recenter_timeout_sec").value
+            ),
+            realign_timeout_sec=float(
+                self.get_parameter("precision_pivot_realign_timeout_sec").value
+            ),
+            recapture_timeout_sec=float(
+                self.get_parameter("precision_pivot_recapture_timeout_sec").value
+            ),
+            max_recenter_attempts=int(
+                self.get_parameter("precision_pivot_max_recenter_attempts").value
+            ),
+        )
+        self.precision_pivot_fsm = VerifiedPivotStateMachine(
+            self.precision_pivot_config
         )
 
         # --------------------------------------------------------------
@@ -1234,6 +1361,11 @@ class RPPController(Node):
             "/rpp/speed_debug",
             command_qos,
         )
+        self.pivot_debug_pub = self.create_publisher(
+            String,
+            "/rpp/pivot_debug",
+            command_qos,
+        )
 
         # Explicit terminal-result handshake to Mission Manager.
         # Motion ownership stays in RPP; Mission Manager still performs the
@@ -1248,6 +1380,7 @@ class RPPController(Node):
         self.current_y = None
         self.current_yaw = None
         self.current_speed_mps = math.inf
+        self.current_yaw_rate_radps = math.inf
         self.last_odom_time = None
 
         self.target_x = None
@@ -1321,6 +1454,20 @@ class RPPController(Node):
         self.precision_regulator_reset_reason = "INITIALIZE"
         self.precision_regulator_reset_count = 0
         self.precision_speed_regulator.reset()
+
+        # Phase-3 adapter state.  Mission geometry remains authoritative; this
+        # is a latched maneuver anchor/identity sidecar only.
+        self.precision_pivot_anchor_x = None
+        self.precision_pivot_anchor_y = None
+        self.precision_pivot_anchor_identity = None
+        self.precision_pivot_target_bearing = None
+        self.precision_pivot_last_result = None
+        self.precision_pivot_last_reset_reason = "INITIALIZE"
+        self.precision_pivot_reset_count = 0
+        self.precision_pivot_last_time_sec = 0.0
+        self.precision_pivot_recapture_inside_since = None
+        self.precision_pivot_reanchor_complete = False
+        self.precision_pivot_release_certified = False
 
         self.mission_enabled = False
         self.emergency_stop = True
@@ -1558,10 +1705,84 @@ class RPPController(Node):
         if (
             self.precision_guidance_enabled
             or self.precision_speed_control_enabled
+            or self.precision_pivot_enabled
         ) and not self.geometry_tracking_enabled:
             raise ValueError(
-                "precision_guidance_enabled and precision_speed_control_enabled "
+                "precision guidance, speed control, and pivot require "
+                "geometry_tracking_enabled=true when enabled; Phase-2 features "
                 "require geometry_tracking_enabled=true"
+            )
+        if not (
+            math.isfinite(self.precision_pivot_telemetry_timeout_sec)
+            and 0.0 < self.precision_pivot_telemetry_timeout_sec
+            <= self.odom_timeout_sec
+        ):
+            raise ValueError(
+                "precision_pivot_telemetry_timeout_sec must be finite, positive, "
+                "and no greater than odom_timeout_sec"
+            )
+        if not (
+            math.isfinite(self.precision_pivot_recenter_speed)
+            and self.minimum_speed
+            <= self.precision_pivot_recenter_speed
+            <= self.cruise_speed
+        ):
+            raise ValueError(
+                "precision_pivot_recenter_speed_mps must be between minimum "
+                "and cruise speed"
+            )
+        if not (
+            math.isfinite(self.post_pivot_capture_speed)
+            and self.minimum_speed
+            <= self.post_pivot_capture_speed
+            <= self.cruise_speed
+        ):
+            raise ValueError(
+                "post_pivot_capture_speed_mps must be between minimum and cruise speed"
+            )
+        if not (
+            math.isfinite(self.precision_pivot_recapture_xtrack)
+            and 0.0 < self.precision_pivot_recapture_xtrack
+            <= self.segment_alignment_cross_track_tolerance
+        ):
+            raise ValueError(
+                "precision_pivot_recapture_xtrack_m must be positive and no "
+                "greater than segment alignment tolerance"
+            )
+        if not (
+            math.isfinite(self.precision_pivot_recapture_heading)
+            and 0.0 < self.precision_pivot_recapture_heading < math.radians(45.0)
+        ):
+            raise ValueError(
+                "precision_pivot_recapture_heading_deg must be finite and in (0,45)"
+            )
+        if not (
+            math.isfinite(self.precision_pivot_recapture_settle_sec)
+            and self.precision_pivot_recapture_settle_sec > 0.0
+        ):
+            raise ValueError(
+                "precision_pivot_recapture_settle_sec must be finite and > 0"
+            )
+        if not (
+            math.isfinite(self.precision_pivot_recenter_forward_cone)
+            and 0.0 < self.precision_pivot_recenter_forward_cone
+            <= self.MAX_MOVING_HEADING_ERROR_RAD
+        ):
+            raise ValueError(
+                "precision_pivot_recenter_forward_cone_deg must be within the "
+                "verified moving-command cone"
+            )
+        if not (1.0 <= self.precision_pivot_config.pivot_timeout_sec <= 30.0):
+            raise ValueError("precision_pivot_timeout_sec must be in [1,30]")
+        if not math.isclose(
+            self.precision_pivot_config.pivot_recenter_threshold_m,
+            self.precision_pivot_config.pivot_anchor_tolerance_m,
+            rel_tol=0.0,
+            abs_tol=1.0e-9,
+        ):
+            raise ValueError(
+                "precision_pivot_recenter_threshold_m must equal "
+                "precision_pivot_anchor_tolerance_m"
             )
         if not (
             0.0
@@ -2361,6 +2582,7 @@ class RPPController(Node):
         self.geometry_last_projection_cycle_token = None
         self.geometry_last_odom_point = None
         self._reset_precision_regulator("GEOMETRY_INVALIDATED", progress_s=0.0)
+        self._reset_precision_pivot("GEOMETRY_INVALIDATED", clear_anchor=True)
         self._record_geometry_reset(reason)
         self.get_logger().warn(
             f"PRECISION GEOMETRY AUTHORITY INVALIDATED | reason={reason}"
@@ -2533,6 +2755,7 @@ class RPPController(Node):
         else:
             self._record_geometry_reset(GeometryResetReason.INITIAL_INSTALL)
         self._reset_precision_regulator("PATH_INSTALLED", progress_s=0.0)
+        self._reset_precision_pivot("PATH_INSTALLED", clear_anchor=True)
         self._try_bind_geometry_goal(log_error=False)
         self.get_logger().warn(
             "PRECISION PATH GEOMETRY INSTALLED | "
@@ -2595,6 +2818,7 @@ class RPPController(Node):
         y = float(msg.pose.pose.position.y)
         q = msg.pose.pose.orientation
         linear = msg.twist.twist.linear
+        angular = msg.twist.twist.angular
         quaternion = (
             float(q.x),
             float(q.y),
@@ -2603,6 +2827,7 @@ class RPPController(Node):
         )
         speed_x = float(linear.x)
         speed_y = float(linear.y)
+        yaw_rate = float(angular.z)
         if not all(
             math.isfinite(value)
             for value in (
@@ -2639,6 +2864,10 @@ class RPPController(Node):
             self.geometry_last_projection = None
             self.geometry_last_projection_cycle_token = None
             self._reset_precision_regulator("LOCALIZATION_JUMP", progress_s=0.0)
+            self._reset_precision_pivot(
+                "LOCALIZATION_JUMP",
+                clear_anchor=True,
+            )
             self.get_logger().warn(
                 "PRECISION GEOMETRY PROGRESS RESET | reason=LOCALIZATION_JUMP"
             )
@@ -2655,6 +2884,10 @@ class RPPController(Node):
             speed_x,
             speed_y,
         )
+        # MAVROS odometry twist and pose share one callback/freshness stamp.
+        # Whether angular.z is the physical chassis yaw rate at pivot dynamics
+        # remains a field-validation item and is exposed in pivot diagnostics.
+        self.current_yaw_rate_radps = yaw_rate if math.isfinite(yaw_rate) else math.inf
         self.last_odom_time = self.get_clock().now()
 
     def nav_path_callback(self, msg):
@@ -3449,6 +3682,19 @@ class RPPController(Node):
             "SEGMENT_GOAL_CHANGED",
             progress_s=goal_progress_s,
         )
+        self._reset_precision_pivot("SEGMENT_GOAL_CHANGED", clear_anchor=True)
+        if self.segment_start_x is not None and self.segment_start_y is not None:
+            anchor_identity = (
+                "C_TO_P1_START"
+                if fresh_p1
+                else f"SEMANTIC_SEGMENT_START_TO_{new_number or 'EXT'}"
+            )
+            self._latch_precision_pivot_anchor(
+                self.segment_start_x,
+                self.segment_start_y,
+                anchor_identity,
+                target_bearing=self.target_path_bearing,
+            )
 
         self.marking_missed = False
         self.capture_monitor_armed = False
@@ -3508,6 +3754,7 @@ class RPPController(Node):
 
         if enabled and not previous:
             self._reset_precision_regulator("MISSION_ENABLED", progress_s=0.0)
+            self._reset_precision_pivot("MISSION_ENABLED", clear_anchor=True)
             self.terminal_gate_inside_since = None
             self.terminal_gate_ready = False
             if not self.first_marking_completed:
@@ -3515,6 +3762,27 @@ class RPPController(Node):
                 self.c_line_bearing = None
                 self.c_line_reanchored_after_pivot = False
                 self.lock_c_to_p1_line("mission enabled")
+            anchor_x = (
+                self.current_x
+                if not self.first_marking_completed
+                else self.segment_start_x
+            )
+            anchor_y = (
+                self.current_y
+                if not self.first_marking_completed
+                else self.segment_start_y
+            )
+            if anchor_x is not None and anchor_y is not None:
+                self._latch_precision_pivot_anchor(
+                    anchor_x,
+                    anchor_y,
+                    (
+                        "MISSION_ENABLE_C"
+                        if not self.first_marking_completed
+                        else "MISSION_ENABLE_SEGMENT_START"
+                    ),
+                    target_bearing=self.target_path_bearing,
+                )
         elif not enabled:
             self.reset_motion_state()
             if not self.first_marking_completed:
@@ -3529,6 +3797,7 @@ class RPPController(Node):
             )
         self.emergency_stop = active
         if active:
+            self._reset_precision_pivot("EMERGENCY_STOP", clear_anchor=True)
             self.publish_stop()
 
     def marking_active_callback(self, msg):
@@ -3547,6 +3816,7 @@ class RPPController(Node):
 
         if active:
             self.reset_terminal_native_pivot()
+            self._reset_precision_pivot("MARKING_HOLD", clear_anchor=True)
 
         self.marking_active = active
 
@@ -3572,6 +3842,7 @@ class RPPController(Node):
             self.command_slew_speed = 0.0
             self.command_slew_last_time = None
             self._reset_precision_regulator("POINT_COMPLETED", progress_s=0.0)
+            self._reset_precision_pivot("POINT_COMPLETED", clear_anchor=True)
             self.get_logger().warn(
                 "MARKING COMPLETED / NEXT-LEG ACCELERATION ARMED | "
                 f"point_index={point_index} | "
@@ -3608,6 +3879,7 @@ class RPPController(Node):
         self.reset_xtrack_damping_state()
         self.reset_speed_profiles()
         self._reset_precision_regulator("MOTION_STATE_RESET", progress_s=0.0)
+        self._reset_precision_pivot("MOTION_STATE_RESET", clear_anchor=True)
 
         self.marking_missed = False
         self.capture_monitor_armed = False
@@ -3621,6 +3893,398 @@ class RPPController(Node):
         self.reset_terminal_precision_state()
         self.c_line_reanchored_after_pivot = False
         self.reset_terminal_native_pivot()
+
+    def _precision_now_sec(self):
+        return max(0.0, self.get_clock().now().nanoseconds / 1.0e9)
+
+    def _reset_precision_pivot(self, reason, *, clear_anchor):
+        """Cancel Phase-3 authority at every mission/geometry safety boundary."""
+        now_sec = self._precision_now_sec()
+        self.precision_pivot_fsm.reset(monotonic_time_sec=now_sec)
+        self.precision_pivot_last_time_sec = now_sec
+        self.precision_pivot_last_result = None
+        self.precision_pivot_last_reset_reason = str(reason)
+        self.precision_pivot_reset_count += 1
+        self.precision_pivot_recapture_inside_since = None
+        self.precision_pivot_reanchor_complete = False
+        self.precision_pivot_release_certified = False
+        if clear_anchor:
+            self.precision_pivot_anchor_x = None
+            self.precision_pivot_anchor_y = None
+            self.precision_pivot_anchor_identity = None
+            self.precision_pivot_target_bearing = None
+        if self.precision_pivot_enabled:
+            self.reset_terminal_native_pivot()
+
+    def _latch_precision_pivot_anchor(
+        self,
+        x,
+        y,
+        identity,
+        *,
+        target_bearing=None,
+    ):
+        values = (x, y)
+        if not all(
+            value is not None and math.isfinite(float(value)) for value in values
+        ):
+            return False
+        self.precision_pivot_anchor_x = float(x)
+        self.precision_pivot_anchor_y = float(y)
+        self.precision_pivot_anchor_identity = str(identity)
+        self.precision_pivot_target_bearing = (
+            float(target_bearing)
+            if target_bearing is not None and math.isfinite(float(target_bearing))
+            else None
+        )
+        self.precision_pivot_reanchor_complete = False
+        self.precision_pivot_release_certified = False
+        return True
+
+    def _ensure_precision_pivot_anchor(self, path_bearing, first_approach):
+        if (
+            self.precision_pivot_anchor_x is not None
+            and self.precision_pivot_anchor_y is not None
+        ):
+            self.precision_pivot_target_bearing = path_bearing
+            return True
+        if first_approach and self.c_line_start_x is not None:
+            return self._latch_precision_pivot_anchor(
+                self.c_line_start_x,
+                self.c_line_start_y,
+                "C_TO_P1_LATCHED_C",
+                target_bearing=path_bearing,
+            )
+        if self.segment_start_x is not None and self.segment_start_y is not None:
+            return self._latch_precision_pivot_anchor(
+                self.segment_start_x,
+                self.segment_start_y,
+                "SEMANTIC_SEGMENT_START",
+                target_bearing=path_bearing,
+            )
+        # Exceptional mid-leg re-entry has no trustworthy prior semantic
+        # anchor.  Capturing current pose is explicit and visible in bags.
+        return self._latch_precision_pivot_anchor(
+            self.current_x,
+            self.current_y,
+            "MID_LEG_REENTRY_CURRENT_POSE",
+            target_bearing=path_bearing,
+        )
+
+    def precision_pivot_carrier_command(self, true_bearing, reason):
+        """Return the unchanged dynamic +/-60deg PX4 native-pivot carrier.
+
+        Unlike terminal_native_pivot_command(), this precision-only generator
+        never releases at the legacy 4deg threshold.  The measured FSM is the
+        sole release authority.
+        """
+        true_bearing = self.normalize_angle(true_bearing)
+        true_error = self.normalize_angle(true_bearing - self.current_yaw)
+        if not self.terminal_native_pivot_active:
+            self.terminal_native_pivot_active = True
+            self.terminal_native_pivot_true_bearing = true_bearing
+            self.terminal_native_pivot_reason = str(reason)
+        else:
+            true_bearing = self.terminal_native_pivot_true_bearing
+            true_error = self.normalize_angle(true_bearing - self.current_yaw)
+        turn_sign = 1.0 if true_error >= 0.0 else -1.0
+        carrier_error = turn_sign * self.terminal_native_pivot_request_error
+        request_bearing = self.normalize_angle(self.current_yaw + carrier_error)
+        return request_bearing, true_error
+
+    def _publish_precision_anchor_approach(self):
+        """Move toward the latched anchor with a low, forward-cone command."""
+        if not all(
+            value is not None and math.isfinite(float(value))
+            for value in (
+                self.current_x,
+                self.current_y,
+                self.current_yaw,
+                self.precision_pivot_anchor_x,
+                self.precision_pivot_anchor_y,
+            )
+        ):
+            self.publish_stop()
+            return 0.0, 0.0, 0.0
+        delta_east = self.precision_pivot_anchor_x - self.current_x
+        delta_north = self.precision_pivot_anchor_y - self.current_y
+        distance = math.hypot(delta_east, delta_north)
+        if distance <= self.precision_pivot_config.pivot_anchor_tolerance_m:
+            self.publish_stop()
+            return 0.0, 0.0, 0.0
+        desired = math.atan2(delta_north, delta_east)
+        error = self.normalize_angle(desired - self.current_yaw)
+        error = max(
+            -self.precision_pivot_recenter_forward_cone,
+            min(self.precision_pivot_recenter_forward_cone, error),
+        )
+        command_bearing = self.normalize_angle(self.current_yaw + error)
+        speed = self.precision_pivot_recenter_speed
+        north = speed * math.sin(command_bearing)
+        east = speed * math.cos(command_bearing)
+        return self.publish_velocity_ned(
+            north,
+            east,
+            apply_acceleration=False,
+            apply_deceleration=False,
+            hard_speed_cap_mps=speed,
+        )
+
+    def _publish_pivot_debug(self, result, *, anchor_error, heading_error):
+        """Best-effort diagnostics; serialization/DDS cannot escape a tick."""
+        try:
+            payload = {
+                "enabled": bool(self.precision_pivot_enabled),
+                "state": result.state.value if result is not None else None,
+                "previous_state": (
+                    result.previous_state.value if result is not None else None
+                ),
+                "directive": result.directive.value if result is not None else None,
+                "transition_reason": (
+                    result.transition_reason if result is not None else ""
+                ),
+                "anchor_x": self.precision_pivot_anchor_x,
+                "anchor_y": self.precision_pivot_anchor_y,
+                "anchor_identity": self.precision_pivot_anchor_identity,
+                "anchor_radial_error_m": anchor_error,
+                "heading_error_deg": math.degrees(heading_error),
+                "measured_speed_mps": self.current_speed_mps,
+                "measured_yaw_rate_radps": self.current_yaw_rate_radps,
+                "odom_twist_yaw_rate_field_validation_required": True,
+                "telemetry_fresh": (
+                    result.stop_certificate.telemetry_fresh
+                    if result is not None
+                    else False
+                ),
+                "stop_certificate_valid": (
+                    result.stop_certificate.valid if result is not None else False
+                ),
+                "release_certificate_valid": (
+                    result.release_certificate.valid if result is not None else False
+                ),
+                "release_certified_before_recapture": bool(
+                    self.precision_pivot_release_certified
+                ),
+                "max_pivot_drift_m": (
+                    result.max_pivot_drift_m if result is not None else 0.0
+                ),
+                "recenter_attempts": (
+                    result.recenter_attempts if result is not None else 0
+                ),
+                "reset_reason": self.precision_pivot_last_reset_reason,
+                "reset_count": self.precision_pivot_reset_count,
+            }
+            message = String()
+            message.data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            self.pivot_debug_pub.publish(message)
+        except Exception as error:  # diagnostics are never control authority
+            self.get_logger().error(f"PIVOT DEBUG PUBLISH FAILED | {error}")
+
+    def _run_precision_pivot_alignment(
+        self,
+        *,
+        path_bearing,
+        alignment_guidance_bearing,
+        alignment_cross_track,
+        target_x,
+        target_y,
+        first_approach,
+    ):
+        """Run one Phase-3 measured pivot cycle and publish its directive."""
+        if not self._ensure_precision_pivot_anchor(path_bearing, first_approach):
+            self.publish_stop()
+            return True
+
+        if (
+            self.precision_pivot_fsm.state is MotionState.RECAPTURE
+            and first_approach
+            and self.precision_pivot_reanchor_complete
+            and self.c_line_bearing is not None
+        ):
+            path_bearing = self.c_line_bearing
+            alignment_guidance_bearing, alignment_cross_track = self.line_guidance(
+                path_bearing,
+                target_x,
+                target_y,
+                self.segment_alignment_correction_limit,
+            )
+
+        now_sec = self._precision_now_sec()
+        if now_sec < self.precision_pivot_last_time_sec:
+            self._reset_precision_pivot("ROS_TIME_REGRESSION", clear_anchor=False)
+            now_sec = self._precision_now_sec()
+        self.precision_pivot_last_time_sec = now_sec
+        anchor_error = math.hypot(
+            self.current_x - self.precision_pivot_anchor_x,
+            self.current_y - self.precision_pivot_anchor_y,
+        )
+        heading_error = self.normalize_angle(path_bearing - self.current_yaw)
+        telemetry_fresh = self.is_fresh(
+            self.last_odom_time,
+            self.precision_pivot_telemetry_timeout_sec,
+        ) and math.isfinite(self.current_yaw_rate_radps)
+
+        # Invalid/stale measured motion evidence is a hard adapter stop.  Do
+        # not even ask the pure FSM for a motion directive because no carrier,
+        # anchor approach, realign, or recapture command may be mapped without
+        # current measured yaw-rate evidence.
+        if not telemetry_fresh:
+            self._publish_pivot_debug(
+                None,
+                anchor_error=anchor_error,
+                heading_error=heading_error,
+            )
+            self.publish_stop()
+            return True
+
+        recapture_complete = False
+        if self.precision_pivot_fsm.state is MotionState.RECAPTURE:
+            geometry_ok = (
+                abs(alignment_cross_track)
+                <= self.precision_pivot_recapture_xtrack
+                and abs(heading_error) <= self.precision_pivot_recapture_heading
+                and telemetry_fresh
+                and self.precision_pivot_release_certified
+            )
+            if geometry_ok:
+                if self.precision_pivot_recapture_inside_since is None:
+                    self.precision_pivot_recapture_inside_since = now_sec
+                recapture_complete = (
+                    now_sec - self.precision_pivot_recapture_inside_since
+                    >= self.precision_pivot_recapture_settle_sec
+                )
+            else:
+                self.precision_pivot_recapture_inside_since = None
+
+        try:
+            result = self.precision_pivot_fsm.step(
+                PivotMotionInput(
+                    monotonic_time_sec=now_sec,
+                    dt_sec=self.precision_cycle_dt_sec,
+                    anchor_radial_error_m=anchor_error,
+                    measured_linear_speed_mps=self.current_speed_mps,
+                    measured_yaw_rate_radps=self.current_yaw_rate_radps,
+                    heading_error_rad=heading_error,
+                    telemetry_fresh=telemetry_fresh,
+                    pivot_requested=True,
+                    brake_to_anchor_requested=True,
+                    recapture_complete=recapture_complete,
+                )
+            )
+        except (TypeError, ValueError) as error:
+            self.alignment_safety_hold = True
+            self.publish_stop()
+            self.get_logger().error(f"PRECISION PIVOT INPUT REJECTED / HOLD | {error}")
+            return True
+
+        self.precision_pivot_last_result = result
+        if (
+            result.state is MotionState.RECAPTURE
+            and result.release_certificate.valid
+        ):
+            self.precision_pivot_release_certified = True
+        self._publish_pivot_debug(
+            result,
+            anchor_error=anchor_error,
+            heading_error=heading_error,
+        )
+
+        if result.failed or result.directive is MotionDirective.HOLD_FAIL:
+            self.alignment_safety_hold = True
+            self.publish_stop()
+            return True
+
+        if result.directive in {
+            MotionDirective.CORNER_APPROACH,
+            MotionDirective.BRAKE_TO_ANCHOR,
+            MotionDirective.RECENTER,
+        }:
+            self._publish_precision_anchor_approach()
+            return True
+
+        if result.directive in {MotionDirective.HOLD_ZERO}:
+            self.publish_stop()
+            return True
+
+        if result.directive in {MotionDirective.PIVOT, MotionDirective.REALIGN}:
+            # REALIGN holds zero once heading enters tolerance so measured
+            # speed/yaw-rate evidence can accumulate without carrier chatter.
+            if (
+                result.directive is MotionDirective.REALIGN
+                and abs(heading_error)
+                <= self.precision_pivot_config.release_heading_tolerance_rad
+            ):
+                self.publish_stop()
+                return True
+            carrier_bearing, true_error = self.precision_pivot_carrier_command(
+                path_bearing,
+                "PRECISION-PIVOT-FSM",
+            )
+            speed = self.segment_alignment_speed
+            north = speed * math.sin(carrier_bearing)
+            east = speed * math.cos(carrier_bearing)
+            self.publish_velocity_ned(
+                north,
+                east,
+                apply_acceleration=False,
+                apply_deceleration=False,
+            )
+            return True
+
+        if result.directive is MotionDirective.RECAPTURE:
+            # Position and measured release have been certified before this
+            # re-anchor/translation point.  P1 is never re-anchored earlier.
+            if first_approach and not self.precision_pivot_reanchor_complete:
+                if not self.precision_pivot_release_certified:
+                    self.publish_stop()
+                    return True
+                self.reanchor_c_to_p1_after_pivot()
+                self.precision_pivot_reanchor_complete = True
+                self.reset_terminal_native_pivot()
+                self.publish_stop()
+                return True
+            if first_approach and self.c_line_bearing is not None:
+                path_bearing = self.c_line_bearing
+                alignment_guidance_bearing, alignment_cross_track = self.line_guidance(
+                    path_bearing,
+                    target_x,
+                    target_y,
+                    self.segment_alignment_correction_limit,
+                )
+            command_bearing, _ = self.limit_moving_guidance_bearing(
+                alignment_guidance_bearing
+            )
+            speed = self.post_pivot_capture_speed
+            north = speed * math.sin(command_bearing)
+            east = speed * math.cos(command_bearing)
+            self.publish_velocity_ned(
+                north,
+                east,
+                apply_acceleration=False,
+                apply_deceleration=False,
+                hard_speed_cap_mps=speed,
+            )
+            return True
+
+        if (
+            result.state is MotionState.TRACK
+            and result.previous_state is MotionState.RECAPTURE
+        ):
+            self.segment_alignment_active = False
+            self.segment_alignment_pivot_complete = False
+            self.segment_pivot_keeper_started_at = None
+            self.reset_terminal_native_pivot()
+            self.reset_speed_profiles()
+            self.command_slew_speed = 0.0
+            self.command_slew_last_time = None
+            self._reset_precision_regulator("PRECISION_PIVOT_RECAPTURE_COMPLETE")
+            # A literal-zero boundary ensures neither legacy nor Phase-2
+            # longitudinal state inherits the carrier/capture magnitude.
+            self.publish_stop()
+            return True
+
+        self.publish_stop()
+        return True
 
     def reset_terminal_native_pivot(self):
         self.terminal_native_pivot_active = False
@@ -5842,6 +6506,17 @@ class RPPController(Node):
             self.segment_pivot_keeper_started_at = None
             self.alignment_inside_since = None
             self.reset_terminal_native_pivot()
+            if self.precision_pivot_enabled:
+                self._reset_precision_pivot(
+                    "MID_LEG_ALIGNMENT_REENTRY",
+                    clear_anchor=True,
+                )
+                self._latch_precision_pivot_anchor(
+                    self.current_x,
+                    self.current_y,
+                    "MID_LEG_REENTRY_CURRENT_POSE",
+                    target_bearing=path_bearing,
+                )
             self.get_logger().warn(
                 "SEGMENT ALIGNMENT RE-ENTERED | "
                 f"path_error={math.degrees(path_heading_error):+.1f}deg"
@@ -5871,6 +6546,17 @@ class RPPController(Node):
                     f"xtrack={alignment_cross_track:.3f}m | "
                     f"limit={self.segment_alignment_max_cross_track:.3f}m | "
                     f"path_error={math.degrees(path_heading_error):+.1f}deg"
+                )
+                return
+
+            if self.precision_pivot_enabled:
+                self._run_precision_pivot_alignment(
+                    path_bearing=path_bearing,
+                    alignment_guidance_bearing=alignment_guidance_bearing,
+                    alignment_cross_track=alignment_cross_track,
+                    target_x=target_x,
+                    target_y=target_y,
+                    first_approach=first_approach,
                 )
                 return
 
