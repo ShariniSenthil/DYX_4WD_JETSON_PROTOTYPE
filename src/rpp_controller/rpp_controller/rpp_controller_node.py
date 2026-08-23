@@ -53,6 +53,14 @@ from rpp_controller.tracking_control import (
     TrackingMetricsAccumulator,
     TrackingStabilityController,
 )
+from rpp_controller.terminal_certificate import (
+    ControllerPose,
+    TerminalConfig,
+    TerminalDirective,
+    TerminalInput,
+    TerminalState,
+    TerminalStopStateMachine,
+)
 
 
 class RPPController(Node):
@@ -522,6 +530,25 @@ class RPPController(Node):
             "precision_tracking_cruise_threshold_mps", 0.80
         )
 
+        # Phase-5 measured terminal certificate.  Separately default-OFF: the
+        # legacy 30 mm latch remains untouched unless the complete precision
+        # geometry/guidance/speed/tracking stack is deliberately enabled.
+        self.declare_parameter("precision_terminal_enabled", False)
+        self.declare_parameter("precision_terminal_radial_tolerance_m", 0.010)
+        self.declare_parameter("precision_terminal_capture_tolerance_m", 0.010)
+        self.declare_parameter("precision_terminal_settle_tolerance_m", 0.010)
+        self.declare_parameter("precision_terminal_stop_speed_tolerance_mps", 0.010)
+        self.declare_parameter(
+            "precision_terminal_stop_yaw_rate_tolerance_radps", 0.050
+        )
+        self.declare_parameter("precision_terminal_settle_dwell_sec", 0.30)
+        self.declare_parameter("precision_terminal_telemetry_timeout_sec", 0.25)
+        self.declare_parameter("precision_terminal_approach_distance_m", 0.75)
+        self.declare_parameter("precision_terminal_brake_distance_m", 0.30)
+        self.declare_parameter("precision_terminal_timeout_sec", 15.0)
+        self.declare_parameter("precision_terminal_settle_timeout_sec", 5.0)
+        self.declare_parameter("precision_terminal_min_actuatable_speed_mps", 0.04)
+
         # Phase-3 measured pivot/recenter controller.  It is independent and
         # default-OFF: the production Phase-A/B keeper below remains byte-for-
         # byte authoritative until this flag is explicitly enabled.
@@ -969,6 +996,9 @@ class RPPController(Node):
         self.precision_tracking_control_enabled = bool(
             self.get_parameter("precision_tracking_control_enabled").value
         )
+        self.precision_terminal_enabled = bool(
+            self.get_parameter("precision_terminal_enabled").value
+        )
         # Loaded fully below after Phase-2 configs are constructed.  Read the
         # gate here so geometry subscription/install authority includes the
         # Phase-3 consumer from the first retained DDS sample.
@@ -981,6 +1011,7 @@ class RPPController(Node):
             or self.precision_guidance_enabled
             or self.precision_speed_control_enabled
             or self.precision_tracking_control_enabled
+            or self.precision_terminal_enabled
             or precision_pivot_requested
         )
         self.precision_guidance_config = GuidanceConfig(
@@ -1151,6 +1182,55 @@ class RPPController(Node):
         )
         self.precision_tracking_metrics = TrackingMetricsAccumulator(
             self.precision_tracking_config
+        )
+
+        self.precision_terminal_telemetry_timeout_sec = float(
+            self.get_parameter("precision_terminal_telemetry_timeout_sec").value
+        )
+        self.precision_terminal_config = TerminalConfig(
+            terminal_radial_tolerance_m=float(
+                self.get_parameter("precision_terminal_radial_tolerance_m").value
+            ),
+            capture_entry_tolerance_m=float(
+                self.get_parameter("precision_terminal_capture_tolerance_m").value
+            ),
+            settle_radial_tolerance_m=float(
+                self.get_parameter("precision_terminal_settle_tolerance_m").value
+            ),
+            stop_speed_tolerance_mps=float(
+                self.get_parameter(
+                    "precision_terminal_stop_speed_tolerance_mps"
+                ).value
+            ),
+            stop_yaw_rate_tolerance_radps=float(
+                self.get_parameter(
+                    "precision_terminal_stop_yaw_rate_tolerance_radps"
+                ).value
+            ),
+            settle_dwell_sec=float(
+                self.get_parameter("precision_terminal_settle_dwell_sec").value
+            ),
+            approach_distance_m=float(
+                self.get_parameter("precision_terminal_approach_distance_m").value
+            ),
+            brake_distance_m=float(
+                self.get_parameter("precision_terminal_brake_distance_m").value
+            ),
+            terminal_timeout_sec=float(
+                self.get_parameter("precision_terminal_timeout_sec").value
+            ),
+            settle_timeout_sec=float(
+                self.get_parameter("precision_terminal_settle_timeout_sec").value
+            ),
+            control_dt_max_sec=self.precision_speed_config.control_dt_max_sec,
+            minimum_actuatable_speed_mps=float(
+                self.get_parameter(
+                    "precision_terminal_min_actuatable_speed_mps"
+                ).value
+            ),
+        )
+        self.precision_terminal_fsm = TerminalStopStateMachine(
+            self.precision_terminal_config
         )
 
         self.precision_pivot_enabled = bool(
@@ -1476,6 +1556,11 @@ class RPPController(Node):
             "/rpp/pivot_debug",
             command_qos,
         )
+        self.terminal_certificate_pub = self.create_publisher(
+            String,
+            "/rpp/terminal_certificate",
+            command_qos,
+        )
 
         # Explicit terminal-result handshake to Mission Manager.
         # Motion ownership stays in RPP; Mission Manager still performs the
@@ -1560,6 +1645,7 @@ class RPPController(Node):
         self.precision_speed_cycle_token = None
         self.precision_speed_result = None
         self.precision_speed_request = None
+        self.precision_terminal_speed_override_mps = None
         self.precision_tracking_cycle_token = None
         self.precision_tracking_output = None
         self.precision_tracking_input = None
@@ -1621,6 +1707,19 @@ class RPPController(Node):
         self.marking_stop_latched_at = None
         self.marking_stop_trigger_radius = None
         self._terminal_result_sent = None
+
+        # Phase-5 adapter state. The pure FSM is stepped at most once per
+        # control-cycle token. Identity components are copied from the raw,
+        # synchronized semantic-goal metadata and never inferred from pose.
+        self.precision_terminal_cycle_token = None
+        self.precision_terminal_last_result = None
+        self.precision_terminal_request_armed = False
+        self.precision_terminal_identity = None
+        self.precision_terminal_identity_components = None
+        self.precision_terminal_last_sample = None
+        self.precision_terminal_last_reset_reason = "INITIALIZE"
+        self.precision_terminal_reset_count = 0
+        self.precision_terminal_historical_certificate = None
 
         # First marking state. C is captured when the mission is enabled.
         self.first_marking_completed = False
@@ -1840,6 +1939,45 @@ class RPPController(Node):
             raise ValueError(
                 "precision_tracking_control_enabled requires geometry_tracking, "
                 "precision_guidance, and precision_speed_control"
+            )
+        if self.precision_terminal_enabled and not (
+            self.geometry_tracking_enabled
+            and self.precision_guidance_enabled
+            and self.precision_speed_control_enabled
+            and self.precision_tracking_control_enabled
+            and self.precision_pivot_enabled
+        ):
+            raise ValueError(
+                "precision_terminal_enabled requires geometry_tracking, "
+                "precision_guidance, precision_speed_control, and "
+                "precision_tracking_control, and precision_pivot"
+            )
+        if not (
+            math.isfinite(self.precision_terminal_telemetry_timeout_sec)
+            and 0.0 < self.precision_terminal_telemetry_timeout_sec
+            <= self.odom_timeout_sec
+        ):
+            raise ValueError(
+                "precision_terminal_telemetry_timeout_sec must be finite, "
+                "positive, and no greater than odom_timeout_sec"
+            )
+        if self.precision_terminal_enabled and not math.isclose(
+            self.precision_terminal_config.minimum_actuatable_speed_mps,
+            self.precision_minimum_moving_speed,
+            rel_tol=0.0,
+            abs_tol=1.0e-9,
+        ):
+            raise ValueError(
+                "precision_terminal_min_actuatable_speed_mps must equal "
+                "precision_minimum_moving_speed_mps"
+            )
+        if (
+            self.precision_terminal_enabled
+            and self.precision_terminal_config.minimum_actuatable_speed_mps
+            > self.precision_speed_config.hardware_speed_ceiling_mps
+        ):
+            raise ValueError(
+                "precision terminal minimum actuatable speed exceeds hardware ceiling"
             )
         if not (
             math.isfinite(self.precision_pivot_telemetry_timeout_sec)
@@ -2717,6 +2855,7 @@ class RPPController(Node):
             path_identity=None,
         )
         self._reset_precision_pivot("GEOMETRY_INVALIDATED", clear_anchor=True)
+        self._reset_precision_terminal("GEOMETRY_INVALIDATED")
         self._record_geometry_reset(reason)
         self.get_logger().warn(
             f"PRECISION GEOMETRY AUTHORITY INVALIDATED | reason={reason}"
@@ -2789,6 +2928,17 @@ class RPPController(Node):
             self.geometry_active_span = None
             self.get_logger().error("IGNORED NON-OBJECT SEGMENT GOAL METADATA")
             return
+        previous_metadata = self.geometry_pending_goal_metadata
+        previous_instance = (
+            previous_metadata.get("mission_run_id"),
+            previous_metadata.get("goal_instance_id"),
+        ) if isinstance(previous_metadata, dict) else (None, None)
+        new_instance = (
+            payload.get("mission_run_id"),
+            payload.get("goal_instance_id"),
+        )
+        if previous_instance != new_instance and any(new_instance):
+            self._reset_precision_terminal("SEGMENT_GOAL_IDENTITY_CHANGED")
         self.geometry_pending_goal_metadata = payload
         self.geometry_goal_binding = None
         self.geometry_active_span = None
@@ -2895,6 +3045,7 @@ class RPPController(Node):
             path_identity=signature,
         )
         self._reset_precision_pivot("PATH_INSTALLED", clear_anchor=True)
+        self._reset_precision_terminal("PATH_INSTALLED")
         self._try_bind_geometry_goal(log_error=False)
         self.get_logger().warn(
             "PRECISION PATH GEOMETRY INSTALLED | "
@@ -3015,6 +3166,7 @@ class RPPController(Node):
                 "LOCALIZATION_JUMP",
                 clear_anchor=True,
             )
+            self._reset_precision_terminal("LOCALIZATION_JUMP")
             self.get_logger().warn(
                 "PRECISION GEOMETRY PROGRESS RESET | reason=LOCALIZATION_JUMP"
             )
@@ -3830,6 +3982,7 @@ class RPPController(Node):
             progress_s=goal_progress_s,
         )
         self._reset_precision_pivot("SEGMENT_GOAL_CHANGED", clear_anchor=True)
+        self._reset_precision_terminal("SEGMENT_GOAL_CHANGED")
         if self.segment_start_x is not None and self.segment_start_y is not None:
             anchor_identity = (
                 "C_TO_P1_START"
@@ -3911,6 +4064,7 @@ class RPPController(Node):
                 path_identity=self.geometry_installed_signature,
             )
             self._reset_precision_pivot("MISSION_ENABLED", clear_anchor=True)
+            self._reset_precision_terminal("MISSION_ENABLED")
             self.terminal_gate_inside_since = None
             self.terminal_gate_ready = False
             if not self.first_marking_completed:
@@ -3947,13 +4101,16 @@ class RPPController(Node):
 
     def emergency_stop_callback(self, msg):
         active = bool(msg.data)
-        if active != self.emergency_stop:
+        previous = self.emergency_stop
+        if active != previous:
             self.get_logger().warn(
                 "EMERGENCY STOP ACTIVE" if active else "EMERGENCY STOP RELEASED"
             )
         self.emergency_stop = active
         if active:
             self._reset_precision_pivot("EMERGENCY_STOP", clear_anchor=True)
+            if not previous:
+                self._reset_precision_terminal("EMERGENCY_STOP")
             self.publish_stop()
 
     def marking_active_callback(self, msg):
@@ -3999,6 +4156,7 @@ class RPPController(Node):
             self.command_slew_last_time = None
             self._reset_precision_regulator("POINT_COMPLETED", progress_s=0.0)
             self._reset_precision_pivot("POINT_COMPLETED", clear_anchor=True)
+            self._reset_precision_terminal("POINT_COMPLETED")
             self.get_logger().warn(
                 "MARKING COMPLETED / NEXT-LEG ACCELERATION ARMED | "
                 f"point_index={point_index} | "
@@ -4036,6 +4194,7 @@ class RPPController(Node):
         self.reset_speed_profiles()
         self._reset_precision_regulator("MOTION_STATE_RESET", progress_s=0.0)
         self._reset_precision_pivot("MOTION_STATE_RESET", clear_anchor=True)
+        self._reset_precision_terminal("MOTION_STATE_RESET")
 
         self.marking_missed = False
         self.capture_monitor_armed = False
@@ -5063,6 +5222,7 @@ class RPPController(Node):
         self.precision_speed_cycle_token = None
         self.precision_speed_result = None
         self.precision_speed_request = None
+        self.precision_terminal_speed_override_mps = None
 
     def _current_cycle_projection(self):
         if (
@@ -5470,6 +5630,9 @@ class RPPController(Node):
             distance_to_corner_m=corner_distance,
             corner_angle_rad=corner_angle,
             distance_to_terminal_m=projection.remaining_to_active_stop_m,
+            terminal_target_speed_override_mps=(
+                self.precision_terminal_speed_override_mps
+            ),
             curvature_inv_m=None,
             tracking_acceleration_allowed=(
                 tracking.acceleration_allowed if tracking is not None else True
@@ -5568,6 +5731,17 @@ class RPPController(Node):
             ),
             "distance_to_terminal_m": (
                 request.distance_to_terminal_m if request is not None else None
+            ),
+            "terminal_target_speed_override_mps": (
+                request.terminal_target_speed_override_mps
+                if request is not None
+                else None
+            ),
+            "effective_terminal_target_speed_mps": (
+                request.terminal_target_speed_override_mps
+                if request is not None
+                and request.terminal_target_speed_override_mps is not None
+                else self.precision_speed_config.terminal_target_speed_mps
             ),
             "last_published_translational_speed_mps": (
                 request.last_commanded_speed_mps if request is not None else None
@@ -6425,6 +6599,351 @@ class RPPController(Node):
 # Current branch signature is preserved exactly.
 
 
+    def _reset_precision_terminal(self, reason):
+        """Reset Phase-5 authority only at an explicit semantic boundary."""
+
+        if not hasattr(self, "precision_terminal_fsm"):
+            return
+        now_sec = self._precision_now_sec()
+        try:
+            self.precision_terminal_fsm.reset(
+                monotonic_time_sec=now_sec,
+                semantic_boundary_reason=str(reason),
+            )
+        except ValueError:
+            # A ROS-time regression is itself an explicit control boundary.
+            self.precision_terminal_fsm = TerminalStopStateMachine(
+                self.precision_terminal_config
+            )
+        self.precision_terminal_cycle_token = None
+        self.precision_terminal_last_result = None
+        self.precision_terminal_request_armed = False
+        self.precision_terminal_identity = None
+        self.precision_terminal_identity_components = None
+        self.precision_terminal_last_sample = None
+        self.precision_terminal_speed_override_mps = None
+        self.precision_terminal_historical_certificate = None
+        self.precision_terminal_last_reset_reason = str(reason)
+        self.precision_terminal_reset_count += 1
+
+    def _current_precision_terminal_identity(self):
+        """Return a synchronized, run-scoped semantic terminal identity."""
+
+        binding = self.geometry_goal_binding
+        metadata = self.geometry_pending_goal_metadata
+        if not (
+            self.geometry_contract_synchronized
+            and binding is not None
+            and isinstance(metadata, dict)
+            and self.geometry_installed_signature is not None
+            and metadata.get("path_signature") == self.geometry_installed_signature
+            and metadata.get("raw_path_index") == binding.raw_path_index
+            and metadata.get("active_goal_identity")
+            == binding.active_goal_identity
+        ):
+            return None, None
+        mission_run_id = metadata.get("mission_run_id")
+        goal_instance_id = metadata.get("goal_instance_id")
+        if not (
+            isinstance(mission_run_id, str)
+            and mission_run_id.strip()
+            and isinstance(goal_instance_id, str)
+            and goal_instance_id.strip()
+        ):
+            return None, None
+        components = {
+            "mission_run_id": mission_run_id.strip(),
+            "path_signature": self.geometry_installed_signature,
+            "raw_path_index": int(binding.raw_path_index),
+            "active_goal_identity": str(binding.active_goal_identity),
+            "goal_instance_id": goal_instance_id.strip(),
+        }
+        identity = (
+            f"RUN:{components['mission_run_id']}|"
+            f"PATH:{components['path_signature']}|"
+            f"RAW:{components['raw_path_index']}|"
+            f"GOAL:{components['active_goal_identity']}|"
+            f"INSTANCE:{components['goal_instance_id']}"
+        )
+        return identity, components
+
+    def _step_precision_terminal_for_cycle(
+        self,
+        *,
+        goal_distance,
+        goal_along_remaining,
+        path_heading_error,
+    ):
+        """Step the terminal FSM exactly once using current-cycle geometry."""
+
+        if self.precision_terminal_cycle_token == self.precision_cycle_token:
+            return self.precision_terminal_last_result
+        projection = self._current_cycle_projection()
+        guidance = self.precision_guidance_result
+        identity, components = self._current_precision_terminal_identity()
+        if projection is None or guidance is None or identity is None:
+            return None
+
+        now_sec = self._precision_now_sec()
+        telemetry_fresh = self.is_fresh(
+            self.last_odom_time,
+            self.precision_terminal_telemetry_timeout_sec,
+        )
+        along_error = max(
+            0.0,
+            float(self.geometry_active_span.stop_s - projection.projected_s),
+        )
+        sample = TerminalInput(
+            monotonic_time_sec=now_sec,
+            dt_sec=self.precision_cycle_dt_sec,
+            terminal_requested=True,
+            terminal_identity=identity,
+            distance_to_terminal_m=along_error,
+            radial_error_m=float(goal_distance),
+            cross_track_error_m=float(guidance.signed_cross_track_m),
+            along_track_error_m=along_error,
+            measured_linear_speed_mps=float(self.current_speed_mps),
+            measured_yaw_rate_radps=float(self.current_yaw_rate_radps),
+            telemetry_fresh=telemetry_fresh,
+            braking_required=(
+                along_error <= self.precision_terminal_config.brake_distance_m
+            ),
+            heading_error_deg=math.degrees(path_heading_error),
+            current_pose=ControllerPose(
+                x_m=float(self.current_x),
+                y_m=float(self.current_y),
+                yaw_rad=float(self.current_yaw),
+            ),
+        )
+        try:
+            result = self.precision_terminal_fsm.step(sample)
+        except (TypeError, ValueError):
+            return None
+        self.precision_terminal_cycle_token = self.precision_cycle_token
+        self.precision_terminal_last_result = result
+        self.precision_terminal_last_sample = sample
+        self.precision_terminal_request_armed = True
+        self.precision_terminal_identity = identity
+        self.precision_terminal_identity_components = components
+        if result.certificate is not None:
+            self.precision_terminal_historical_certificate = result.certificate
+        if result.directive in {
+            TerminalDirective.APPROACH,
+            TerminalDirective.BRAKE,
+        }:
+            self.precision_terminal_speed_override_mps = (
+                self.precision_terminal_config.minimum_actuatable_speed_mps
+            )
+        self._publish_precision_terminal_heartbeat()
+        return result
+
+    def _step_precision_terminal_stale_cycle(self):
+        """Revoke live validity on stale telemetry without clearing zero latch."""
+
+        prior = self.precision_terminal_last_sample
+        if not self.precision_terminal_request_armed or prior is None:
+            return None
+        if self.precision_terminal_cycle_token == self.precision_cycle_token:
+            return self.precision_terminal_last_result
+        sample = TerminalInput(
+            monotonic_time_sec=self._precision_now_sec(),
+            dt_sec=self.precision_cycle_dt_sec,
+            terminal_requested=True,
+            terminal_identity=self.precision_terminal_identity,
+            distance_to_terminal_m=prior.distance_to_terminal_m,
+            radial_error_m=prior.radial_error_m,
+            cross_track_error_m=prior.cross_track_error_m,
+            along_track_error_m=prior.along_track_error_m,
+            measured_linear_speed_mps=prior.measured_linear_speed_mps,
+            measured_yaw_rate_radps=prior.measured_yaw_rate_radps,
+            telemetry_fresh=False,
+            braking_required=True,
+            heading_error_deg=prior.heading_error_deg,
+            current_pose=prior.current_pose,
+        )
+        try:
+            result = self.precision_terminal_fsm.step(sample)
+        except (TypeError, ValueError):
+            return None
+        self.precision_terminal_cycle_token = self.precision_cycle_token
+        self.precision_terminal_last_result = result
+        self.precision_terminal_last_sample = sample
+        if result.certificate is not None:
+            self.precision_terminal_historical_certificate = result.certificate
+        self._publish_precision_terminal_heartbeat()
+        return result
+
+    def _step_precision_terminal_hold_cycle(self):
+        """Refresh a latched/certified stop while Mission Manager verifies it."""
+
+        prior = self.precision_terminal_last_sample
+        if not self.precision_terminal_request_armed or prior is None:
+            return None
+        if self.precision_terminal_cycle_token == self.precision_cycle_token:
+            return self.precision_terminal_last_result
+        telemetry_fresh = self.is_fresh(
+            self.last_odom_time,
+            self.precision_terminal_telemetry_timeout_sec,
+        )
+        pose_valid = all(
+            value is not None and math.isfinite(float(value))
+            for value in (self.current_x, self.current_y, self.current_yaw)
+        )
+        goal_valid = all(
+            value is not None and math.isfinite(float(value))
+            for value in (self.segment_goal_x, self.segment_goal_y)
+        )
+        radial_error = (
+            math.hypot(
+                self.segment_goal_x - self.current_x,
+                self.segment_goal_y - self.current_y,
+            )
+            if pose_valid and goal_valid
+            else prior.radial_error_m
+        )
+        sample = TerminalInput(
+            monotonic_time_sec=self._precision_now_sec(),
+            dt_sec=self.precision_cycle_dt_sec,
+            terminal_requested=True,
+            terminal_identity=self.precision_terminal_identity,
+            distance_to_terminal_m=prior.distance_to_terminal_m,
+            radial_error_m=radial_error,
+            cross_track_error_m=prior.cross_track_error_m,
+            along_track_error_m=prior.along_track_error_m,
+            measured_linear_speed_mps=float(self.current_speed_mps),
+            measured_yaw_rate_radps=float(self.current_yaw_rate_radps),
+            telemetry_fresh=telemetry_fresh,
+            braking_required=True,
+            heading_error_deg=prior.heading_error_deg,
+            current_pose=(
+                ControllerPose(
+                    x_m=float(self.current_x),
+                    y_m=float(self.current_y),
+                    yaw_rad=float(self.current_yaw),
+                )
+                if pose_valid
+                else prior.current_pose
+            ),
+        )
+        try:
+            result = self.precision_terminal_fsm.step(sample)
+        except (TypeError, ValueError):
+            return None
+        self.precision_terminal_cycle_token = self.precision_cycle_token
+        self.precision_terminal_last_result = result
+        self.precision_terminal_last_sample = sample
+        if result.certificate is not None:
+            self.precision_terminal_historical_certificate = result.certificate
+        self._publish_precision_terminal_heartbeat()
+        self._publish_precision_terminal_result_if_ready(result)
+        return result
+
+    def _publish_precision_terminal_heartbeat(self):
+        """Publish non-authoritative live FSM evidence; failures are isolated."""
+
+        if not self.precision_terminal_request_armed:
+            return
+        result = self.precision_terminal_last_result
+        sample = self.precision_terminal_last_sample
+        components = self.precision_terminal_identity_components or {}
+        if result is None or sample is None:
+            return
+        certificate = result.certificate
+        try:
+            payload = {
+                "schema_version": 2,
+                "source": "RPP_PRECISION_TERMINAL_HEARTBEAT",
+                "ros_time_ns": self.get_clock().now().nanoseconds,
+                "precision_terminal_enabled": self.precision_terminal_enabled,
+                "state": result.state.value,
+                "directive": result.directive.value,
+                "zero_latched": result.zero_latched,
+                "motion_evidence_valid": result.motion_evidence_valid,
+                "currently_valid": result.currently_valid,
+                "transition_reason": result.transition_reason,
+                "terminal_identity": result.terminal_identity,
+                "terminal_identity_components": components,
+                "mission_run_id": components.get("mission_run_id"),
+                "goal_instance_id": components.get("goal_instance_id"),
+                "path_signature": components.get("path_signature"),
+                "raw_path_index": components.get("raw_path_index"),
+                "active_goal_identity": components.get("active_goal_identity"),
+                "radial_error_mm": sample.radial_error_m * 1000.0,
+                "cross_error_mm": sample.cross_track_error_m * 1000.0,
+                "along_error_mm": sample.along_track_error_m * 1000.0,
+                "heading_error_deg": sample.heading_error_deg,
+                "measured_speed_mps": sample.measured_linear_speed_mps,
+                "measured_yaw_rate_radps": sample.measured_yaw_rate_radps,
+                "telemetry_fresh": sample.telemetry_fresh,
+                "settle_held_sec": result.settle_held_sec,
+                "max_radial_during_settle_mm": (
+                    certificate.max_radial_during_settle_mm
+                    if certificate is not None
+                    else None
+                ),
+                "certificate": (
+                    certificate.to_dict() if certificate is not None else None
+                ),
+                "precision_certificate_version": (
+                    certificate.version if certificate is not None else None
+                ),
+                "precision_pass": bool(
+                    certificate is not None and certificate.precision_pass
+                ),
+                "truth_frame": "controller_estimator_frame_only",
+                "localization_accuracy_certified": False,
+                "physical_accuracy_certified": False,
+                "reset_reason": self.precision_terminal_last_reset_reason,
+                "reset_count": self.precision_terminal_reset_count,
+            }
+            message = String()
+            message.data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            self.terminal_certificate_pub.publish(message)
+        except Exception as error:  # diagnostics never alter stop authority
+            try:
+                self.get_logger().error(
+                    f"TERMINAL CERTIFICATE HEARTBEAT PUBLISH FAILED | {error}"
+                )
+            except Exception:
+                pass
+
+    def _publish_precision_terminal_result_if_ready(self, result):
+        """Bridge FSM completion to the unchanged legacy result topic once."""
+
+        if result is None or self._terminal_result_sent is not None:
+            return
+        sample = self.precision_terminal_last_sample
+        if sample is None:
+            return
+        certificate = result.certificate
+        if (
+            result.state is TerminalState.CERTIFIED
+            and result.currently_valid
+            and certificate is not None
+            and certificate.version == 2
+        ):
+            self.publish_terminal_result(
+                "CAPTURED",
+                reason="PRECISION_TERMINAL_CERTIFIED_V2",
+                target_distance=sample.radial_error_m,
+                signed_cross_track=sample.cross_track_error_m,
+                along_remaining=sample.along_track_error_m,
+                precision_certificate=certificate,
+            )
+        elif (
+            result.state is TerminalState.HOLD_FAIL
+            and self.precision_terminal_historical_certificate is None
+        ):
+            self.publish_terminal_result(
+                "MISSED",
+                reason=result.transition_reason or "PRECISION_TERMINAL_FAILED",
+                target_distance=sample.radial_error_m,
+                signed_cross_track=sample.cross_track_error_m,
+                along_remaining=sample.along_track_error_m,
+                precision_certificate=None,
+            )
+
+
     def publish_terminal_result(
         self,
         outcome,
@@ -6433,6 +6952,7 @@ class RPPController(Node):
         target_distance,
         signed_cross_track,
         along_remaining,
+        precision_certificate=None,
     ):
         """Publish the authoritative terminal result for the active semantic goal.
 
@@ -6503,6 +7023,100 @@ class RPPController(Node):
             "stop_commanded": True,
             "timestamp_unix_ns": self.get_clock().now().nanoseconds,
         }
+
+        if self.precision_terminal_enabled:
+            components = self.precision_terminal_identity_components or {}
+            certificate_payload = (
+                precision_certificate.to_dict()
+                if precision_certificate is not None
+                else None
+            )
+            payload.update(
+                {
+                    "controller_outcome": outcome,
+                    "precision_certificate_version": (
+                        precision_certificate.version
+                        if precision_certificate is not None
+                        else 2
+                    ),
+                    "terminal_identity": self.precision_terminal_identity,
+                    "terminal_identity_components": components,
+                    "mission_run_id": components.get("mission_run_id"),
+                    "goal_instance_id": components.get("goal_instance_id"),
+                    "path_signature": components.get("path_signature"),
+                    "raw_path_index": components.get("raw_path_index"),
+                    "active_goal_identity": components.get(
+                        "active_goal_identity"
+                    ),
+                    "precision_pass": bool(
+                        precision_certificate is not None
+                        and precision_certificate.precision_pass
+                    ),
+                    "cross_error_mm": cross_track_mm,
+                    "along_error_mm": along_track_mm,
+                    "stop_spec_mm": (
+                        self.precision_terminal_config.terminal_radial_tolerance_m
+                        * 1000.0
+                    ),
+                    "precision_stop_spec_mm": (
+                        self.precision_terminal_config.terminal_radial_tolerance_m
+                        * 1000.0
+                    ),
+                    "measured_yaw_rate_radps": (
+                        float(self.current_yaw_rate_radps)
+                        if math.isfinite(self.current_yaw_rate_radps)
+                        else None
+                    ),
+                    "speed_at_release_mps": (
+                        precision_certificate.measured_speed_mps
+                        if precision_certificate is not None
+                        else (
+                            float(self.current_speed_mps)
+                            if math.isfinite(self.current_speed_mps)
+                            else None
+                        )
+                    ),
+                    "yaw_rate_at_release_radps": (
+                        precision_certificate.measured_yaw_rate_radps
+                        if precision_certificate is not None
+                        else (
+                            float(self.current_yaw_rate_radps)
+                            if math.isfinite(self.current_yaw_rate_radps)
+                            else None
+                        )
+                    ),
+                    "telemetry_fresh": self.is_fresh(
+                        self.last_odom_time,
+                        self.precision_terminal_telemetry_timeout_sec,
+                    ),
+                    "settle_sec": (
+                        precision_certificate.settle_sec
+                        if precision_certificate is not None
+                        else 0.0
+                    ),
+                    "max_radial_during_settle_mm": (
+                        precision_certificate.max_radial_during_settle_mm
+                        if precision_certificate is not None
+                        else None
+                    ),
+                    "first_capture_pose": (
+                        precision_certificate.first_capture_pose.to_dict()
+                        if precision_certificate is not None
+                        and precision_certificate.first_capture_pose is not None
+                        else None
+                    ),
+                    "final_settled_pose": (
+                        precision_certificate.final_settled_pose.to_dict()
+                        if precision_certificate is not None
+                        and precision_certificate.final_settled_pose is not None
+                        else None
+                    ),
+                    "truth_frame": "controller_estimator_frame_only",
+                    "localization_accuracy_certified": False,
+                    "physical_accuracy_certified": False,
+                    "precision_certificate": certificate_payload,
+                }
+            )
 
         msg = String()
         msg.data = json.dumps(
@@ -6609,6 +7223,8 @@ class RPPController(Node):
             return
         if self.marking_active:
             self.publish_stop()
+            if self.precision_terminal_enabled:
+                self._step_precision_terminal_hold_cycle()
             self.log_waiting("continuous marking hold")
             return
         if not self.marking_metadata_received:
@@ -6628,6 +7244,9 @@ class RPPController(Node):
             self.odom_timeout_sec,
         ):
             self.publish_stop()
+            if self.precision_terminal_enabled:
+                stale_result = self._step_precision_terminal_stale_cycle()
+                self._publish_precision_terminal_result_if_ready(stale_result)
             self.log_waiting("odometry timeout")
             return
         if self.marking_missed:
@@ -6820,7 +7439,55 @@ class RPPController(Node):
             + math.cos(path_bearing) * goal_delta_north
         )
 
-        if goal_requires_precision_stop and self.marking_stop_latched:
+        # Phase-5 terminal authority is evaluated after current projection,
+        # guidance and exact semantic-goal errors, but before the legacy 30 mm
+        # latch.  Once armed it remains active for this goal even if estimator
+        # noise briefly moves the radial distance outside the approach region.
+        if (
+            self.precision_terminal_enabled
+            and goal_requires_precision_stop
+            and (
+                self.precision_terminal_request_armed
+                or goal_distance
+                <= self.precision_terminal_config.approach_distance_m
+            )
+        ):
+            terminal_result = self._step_precision_terminal_for_cycle(
+                goal_distance=goal_distance,
+                goal_along_remaining=goal_along_remaining,
+                path_heading_error=path_heading_error,
+            )
+            if terminal_result is None:
+                self.publish_stop()
+                self.log_waiting(
+                    "precision terminal lacks synchronized current goal binding"
+                )
+                return
+            if terminal_result.directive in {
+                TerminalDirective.HOLD_ZERO,
+                TerminalDirective.HOLD_FAIL,
+            }:
+                self.publish_stop()
+                self._publish_precision_terminal_result_if_ready(terminal_result)
+                self.log_control(
+                    mode_prefix
+                    + "PRECISION TERMINAL "
+                    + terminal_result.state.value.upper()
+                    + " / ZERO OWNED",
+                    goal_distance,
+                    goal_distance,
+                    path_heading_error,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
+                return
+
+        if (
+            not self.precision_terminal_enabled
+            and goal_requires_precision_stop
+            and self.marking_stop_latched
+        ):
             self.evaluate_latched_marking_stop(
                 goal_distance,
                 goal_signed_cross_track,
@@ -6840,10 +7507,14 @@ class RPPController(Node):
 
         # Exact radial distance is checked independently for every semantic
         # stop goal: marking point or extension/dummy.
-        if goal_requires_precision_stop and self.latch_exact_marking_stop(
-            goal_distance,
-            goal_signed_cross_track,
-            goal_along_remaining,
+        if (
+            not self.precision_terminal_enabled
+            and goal_requires_precision_stop
+            and self.latch_exact_marking_stop(
+                goal_distance,
+                goal_signed_cross_track,
+                goal_along_remaining,
+            )
         ):
             self.evaluate_latched_marking_stop(
                 goal_distance,

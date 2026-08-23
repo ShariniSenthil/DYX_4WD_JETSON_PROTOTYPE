@@ -236,6 +236,10 @@ def generate_launch_description() -> LaunchDescription:
                         # Additive Phase-1 path identity contract. Default-OFF
                         # preserves legacy Pose-only goal publication.
                         "precision_path_contract_enabled": False,
+                        # Phase-6 verifier remains dormant until Phase-5 RPP
+                        # certificate authority is deliberately enabled.
+                        "precision_terminal_enabled": False,
+                        "precision_terminal_heartbeat_timeout_sec": 0.50,
                         "maximum_marking_points": 10000,
                     }
                 ],
@@ -443,6 +447,21 @@ def generate_launch_description() -> LaunchDescription:
                         "precision_tracking_histogram_max_m": 1.0,
                         "precision_tracking_monotonic_tolerance_m": 0.001,
                         "precision_tracking_cruise_threshold_mps": 0.80,
+                        # Phase-5 measured <=10 mm controller-frame stop.
+                        # Default-OFF preserves the production 30 mm latch.
+                        "precision_terminal_enabled": False,
+                        "precision_terminal_radial_tolerance_m": 0.010,
+                        "precision_terminal_capture_tolerance_m": 0.010,
+                        "precision_terminal_settle_tolerance_m": 0.010,
+                        "precision_terminal_stop_speed_tolerance_mps": 0.010,
+                        "precision_terminal_stop_yaw_rate_tolerance_radps": 0.050,
+                        "precision_terminal_settle_dwell_sec": 0.30,
+                        "precision_terminal_telemetry_timeout_sec": 0.25,
+                        "precision_terminal_approach_distance_m": 0.75,
+                        "precision_terminal_brake_distance_m": 0.30,
+                        "precision_terminal_timeout_sec": 15.0,
+                        "precision_terminal_settle_timeout_sec": 5.0,
+                        "precision_terminal_min_actuatable_speed_mps": 0.04,
                         # Phase-3 measured pivot/recenter FSM. Default-OFF
                         # preserves the production native keeper and adapter.
                         "precision_pivot_enabled": False,

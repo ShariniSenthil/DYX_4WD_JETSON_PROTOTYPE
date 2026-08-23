@@ -376,6 +376,59 @@ class MissionReportStore:
         else:
             spray_confirmed = bool(spray_confirmed_value)
 
+        canonical_accuracy: dict[str, Any] = {
+            "measurement_source": cls.MEASUREMENT_SOURCE,
+            "available": accuracy_available,
+            "cross_track_error_mm": (cross_track_mm if accuracy_available else None),
+            "along_track_error_mm": (along_track_mm if accuracy_available else None),
+            # Canonical UI field.
+            "overall_accuracy_mm": (
+                overall_accuracy_mm if accuracy_available else None
+            ),
+            # Compatibility alias. This is copied, not recalculated.
+            "total_accuracy_mm": (overall_accuracy_mm if accuracy_available else None),
+            "tolerance_mm": (tolerance_mm if accuracy_available else None),
+            # Copy RPP's decision. Backend does NOT compare values.
+            "within_tolerance": within_tolerance,
+            "rpp_outcome": (accuracy.get("rpp_outcome") if source_is_rpp else None),
+            "captured_at": (
+                accuracy.get("captured_at")
+                or result.get("received_at")
+                or result.get("updated_at")
+            ),
+        }
+        if source_is_rpp:
+            for key in (
+                "precision_certificate_version",
+                "precision_pass",
+                "terminal_identity",
+                "mission_run_id",
+                "path_signature",
+                "raw_path_index",
+                "active_goal_identity",
+                "goal_instance_id",
+                "radial_error_mm",
+                "cross_error_mm",
+                "along_error_mm",
+                "heading_error_deg",
+                "measured_speed_mps",
+                "measured_yaw_rate_radps",
+                "stop_spec_mm",
+                "telemetry_fresh",
+                "settle_sec",
+                "first_capture_pose",
+                "final_settled_pose",
+                "max_radial_during_settle_mm",
+                "truth_frame",
+                "localization_accuracy_certified",
+                "physical_accuracy_certified",
+                "precision_certificate",
+                "precision_terminal_evidence",
+                "terminal_result",
+            ):
+                if key in accuracy:
+                    canonical_accuracy[key] = copy.deepcopy(accuracy[key])
+
         return {
             "point_id": f"P{index + 1:04d}",
             "point_index": index,
@@ -383,29 +436,7 @@ class MissionReportStore:
             "target": copy.deepcopy(target),
             "status": status,
             "is_active": bool(status == "PENDING" and active_index == index),
-            "accuracy": {
-                "measurement_source": cls.MEASUREMENT_SOURCE,
-                "available": accuracy_available,
-                "cross_track_error_mm": (cross_track_mm if accuracy_available else None),
-                "along_track_error_mm": (along_track_mm if accuracy_available else None),
-                # Canonical UI field.
-                "overall_accuracy_mm": (
-                    overall_accuracy_mm if accuracy_available else None
-                ),
-                # Compatibility alias.
-                # This is copied, not recalculated.
-                "total_accuracy_mm": (overall_accuracy_mm if accuracy_available else None),
-                "tolerance_mm": (tolerance_mm if accuracy_available else None),
-                # Copy RPP's decision.
-                # Backend does NOT compare values.
-                "within_tolerance": within_tolerance,
-                "rpp_outcome": (accuracy.get("rpp_outcome") if source_is_rpp else None),
-                "captured_at": (
-                    accuracy.get("captured_at")
-                    or result.get("received_at")
-                    or result.get("updated_at")
-                ),
-            },
+            "accuracy": canonical_accuracy,
             "spray": {
                 "attempted": spray_attempted,
                 "outcome": spray_outcome,

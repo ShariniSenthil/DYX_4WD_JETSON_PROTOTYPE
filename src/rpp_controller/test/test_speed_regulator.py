@@ -59,6 +59,49 @@ def primed_regulator(config=None, *, speed=1.0, progress=0.0):
     return regulator
 
 
+def test_terminal_target_override_defaults_to_configured_phase2_behavior():
+    config = make_config(terminal_target_speed_mps=0.15)
+    baseline = primed_regulator(config, speed=1.0).resolve(
+        request(distance_to_terminal_m=0.05)
+    )
+    explicit_none = primed_regulator(config, speed=1.0).resolve(
+        request(
+            distance_to_terminal_m=0.05,
+            terminal_target_speed_override_mps=None,
+        )
+    )
+
+    assert baseline.caps.terminal_mps == pytest.approx(0.15)
+    assert explicit_none.caps.terminal_mps == pytest.approx(
+        baseline.caps.terminal_mps
+    )
+
+
+def test_precision_terminal_override_uses_minimum_actuatable_target():
+    config = make_config(terminal_target_speed_mps=0.15)
+    result = primed_regulator(config, speed=1.0).resolve(
+        request(
+            distance_to_terminal_m=0.05,
+            terminal_target_speed_override_mps=0.04,
+        )
+    )
+
+    assert result.caps.terminal_mps == pytest.approx(0.04)
+    assert result.requested_speed_mps == pytest.approx(0.04)
+    assert result.winning_cap_owner is SpeedCapOwner.TERMINAL
+
+
+@pytest.mark.parametrize("override", [-0.01, math.nan, math.inf, 1.01])
+def test_terminal_target_override_rejects_invalid_values(override):
+    with pytest.raises(ValueError):
+        primed_regulator(speed=1.0).resolve(
+            request(
+                distance_to_terminal_m=0.10,
+                terminal_target_speed_override_mps=override,
+            )
+        )
+
+
 def test_mission_and_hardware_ceilings_are_separate_caps():
     mission_owned = primed_regulator(speed=1.0).resolve(
         request(mission_speed_ceiling_mps=0.70)

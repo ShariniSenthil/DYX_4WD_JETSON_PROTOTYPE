@@ -178,6 +178,9 @@ class SpeedRegulatorInput:
     distance_to_corner_m: Optional[float] = None
     corner_angle_rad: Optional[float] = None
     distance_to_terminal_m: Optional[float] = None
+    # Per-request override used by the separately gated precision terminal
+    # adapter.  None preserves the configured Phase-2 target exactly.
+    terminal_target_speed_override_mps: Optional[float] = None
     curvature_inv_m: Optional[float] = None
     tracking_acceleration_allowed: bool = True
     tracking_speed_cap_mps: Optional[float] = None
@@ -349,6 +352,7 @@ class LongitudinalRegulator:
     def resolve(self, request: SpeedRegulatorInput) -> SpeedRegulatorResult:
         """Resolve one finite non-negative speed command."""
 
+        config = self.config
         mission_ceiling = _finite_nonnegative(
             "mission_speed_ceiling_mps", request.mission_speed_ceiling_mps
         )
@@ -381,6 +385,16 @@ class LongitudinalRegulator:
         distance_to_terminal = self._optional_nonnegative(
             "distance_to_terminal_m", request.distance_to_terminal_m
         )
+        terminal_target_speed = self._optional_nonnegative(
+            "terminal_target_speed_override_mps",
+            request.terminal_target_speed_override_mps,
+        )
+        if terminal_target_speed is None:
+            terminal_target_speed = config.terminal_target_speed_mps
+        if terminal_target_speed > config.hardware_speed_ceiling_mps:
+            raise ValueError(
+                "terminal_target_speed_override_mps exceeds hardware speed ceiling"
+            )
         curvature = self._optional_finite(
             "curvature_inv_m", request.curvature_inv_m
         )
@@ -390,7 +404,6 @@ class LongitudinalRegulator:
             "tracking_speed_cap_mps", request.tracking_speed_cap_mps
         )
 
-        config = self.config
         bounded_dt = min(max(0.0, dt_sec), config.control_dt_max_sec)
         base_ceiling = min(mission_ceiling, config.hardware_speed_ceiling_mps)
         effective_speed = max(measured_speed, last_commanded)
@@ -445,7 +458,7 @@ class LongitudinalRegulator:
         if distance_to_terminal is not None:
             terminal_required = braking_distance(
                 effective_speed,
-                config.terminal_target_speed_mps,
+                terminal_target_speed,
                 config.deceleration_mps2,
                 config.braking_latency_sec,
                 config.braking_margin_m,
@@ -454,7 +467,7 @@ class LongitudinalRegulator:
                 base_ceiling,
                 allowable_speed_for_distance(
                     distance_to_terminal,
-                    config.terminal_target_speed_mps,
+                    terminal_target_speed,
                     config.deceleration_mps2,
                     config.braking_latency_sec,
                     config.braking_margin_m,

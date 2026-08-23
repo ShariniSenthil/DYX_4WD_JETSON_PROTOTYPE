@@ -49,7 +49,13 @@ from mission_manager.path_contract import (
     PendingPreparedPath,
     build_segment_goal_metadata,
     is_valid_path_signature,
+    make_goal_instance_id,
     resolve_path_signature,
+)
+from mission_manager.precision_terminal_policy import (
+    PrecisionTerminalDecision,
+    PrecisionTerminalExpectation,
+    validate_precision_terminal_heartbeat,
 )
 
 
@@ -105,6 +111,8 @@ class MissionManager(Node):
         self.declare_parameter("spray_confirmation_timeout_sec", 5.0)
         self.declare_parameter("spray_status_timeout_sec", 2.0)
         self.declare_parameter("precision_path_contract_enabled", False)
+        self.declare_parameter("precision_terminal_enabled", False)
+        self.declare_parameter("precision_terminal_heartbeat_timeout_sec", 0.50)
 
         self.local_frame = str(self.get_parameter("local_frame").value).strip()
         self.marking_tolerance_m = float(
@@ -141,6 +149,23 @@ class MissionManager(Node):
         if not isinstance(precision_path_contract_value, bool):
             raise ValueError("precision_path_contract_enabled must be a bool")
         self.precision_path_contract_enabled = precision_path_contract_value
+        precision_terminal_value = self.get_parameter(
+            "precision_terminal_enabled"
+        ).value
+        if not isinstance(precision_terminal_value, bool):
+            raise ValueError("precision_terminal_enabled must be a bool")
+        self.precision_terminal_enabled = precision_terminal_value
+        self.precision_terminal_heartbeat_timeout_sec = float(
+            self.get_parameter("precision_terminal_heartbeat_timeout_sec").value
+        )
+        if (
+            self.precision_terminal_enabled
+            and not self.precision_path_contract_enabled
+        ):
+            raise ValueError(
+                "precision_terminal_enabled requires "
+                "precision_path_contract_enabled"
+            )
         self._validate_parameters()
 
         # ----------------------------------------------------------
@@ -274,6 +299,13 @@ class MissionManager(Node):
             String,
             "/rpp/terminal_result",
             self._rpp_terminal_result_callback,
+            command_qos,
+            callback_group=self._io_group,
+        )
+        self.create_subscription(
+            String,
+            "/rpp/terminal_certificate",
+            self._rpp_terminal_certificate_callback,
             command_qos,
             callback_group=self._io_group,
         )
@@ -424,6 +456,8 @@ class MissionManager(Node):
         # never bypasses Mission Manager's own final position/speed re-check.
         self._rpp_terminal_result: Optional[dict[str, Any]] = None
         self._rpp_terminal_result_last_rx_monotonic: Optional[float] = None
+        self._rpp_terminal_certificate: Optional[dict[str, Any]] = None
+        self._rpp_terminal_certificate_last_rx_monotonic: Optional[float] = None
 
         self._spray_controller_ready = False
         self._spray_controller_state: Optional[str] = None
@@ -502,6 +536,9 @@ class MissionManager(Node):
             "odom_timeout_sec": self.odom_timeout_sec,
             "spray_confirmation_timeout_sec": self.spray_confirmation_timeout_sec,
             "spray_status_timeout_sec": self.spray_status_timeout_sec,
+            "precision_terminal_heartbeat_timeout_sec": (
+                self.precision_terminal_heartbeat_timeout_sec
+            ),
         }
         for name, value in values.items():
             if not math.isfinite(value) or value <= 0.0:
@@ -891,6 +928,213 @@ class MissionManager(Node):
                 return
             self._rpp_terminal_result = copy.deepcopy(payload)
             self._rpp_terminal_result_last_rx_monotonic = time.monotonic()
+
+    def _rpp_terminal_certificate_callback(self, message: String) -> None:
+        """Retain a locally timestamped precision heartbeat for strict policy checks."""
+        try:
+            payload = json.loads(message.data)
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+        with self._lock:
+            self._rpp_terminal_certificate = copy.deepcopy(payload)
+            self._rpp_terminal_certificate_last_rx_monotonic = time.monotonic()
+
+    def _current_precision_terminal_expectation(
+        self,
+    ) -> Optional[PrecisionTerminalExpectation]:
+        """Return the exact current run/path/goal identity without geometry work."""
+        if (
+            not self.precision_terminal_enabled
+            or not self._mission_run_id
+            or self._path_signature is None
+            or not (0 <= self._current_path_index < len(self._navigation_path))
+        ):
+            return None
+        try:
+            goal_sequence = self._semantic_path_indices.index(
+                self._current_path_index
+            )
+            point_type = self._path_types[self._current_path_index]
+            marking_index = self._marking_indices[self._current_path_index]
+            metadata = build_segment_goal_metadata(
+                path_signature=self._path_signature,
+                goal_sequence=goal_sequence,
+                raw_path_index=self._current_path_index,
+                point_type=point_type,
+                marking_index=marking_index,
+                marking_point_type=self.POINT_MARKING,
+            )
+            goal_instance_id = make_goal_instance_id(
+                mission_run_id=self._mission_run_id,
+                path_signature=self._path_signature,
+                raw_path_index=self._current_path_index,
+                goal_sequence=goal_sequence,
+            )
+        except (ValueError, IndexError):
+            return None
+        return PrecisionTerminalExpectation(
+            mission_run_id=self._mission_run_id,
+            path_signature=self._path_signature,
+            raw_path_index=self._current_path_index,
+            active_goal_identity=str(metadata["active_goal_identity"]),
+            goal_instance_id=goal_instance_id,
+        )
+
+    def _precision_terminal_decision(
+        self, now_monotonic_sec: float
+    ) -> PrecisionTerminalDecision:
+        """Validate the latest heartbeat against the current semantic goal."""
+        expectation = self._current_precision_terminal_expectation()
+        if expectation is None:
+            return PrecisionTerminalDecision(False, "expectation_unavailable")
+        return validate_precision_terminal_heartbeat(
+            self._rpp_terminal_certificate,
+            received_monotonic_sec=(
+                self._rpp_terminal_certificate_last_rx_monotonic
+            ),
+            now_monotonic_sec=now_monotonic_sec,
+            timeout_sec=self.precision_terminal_heartbeat_timeout_sec,
+            expectation=expectation,
+        )
+
+    def _precision_rpp_terminal_result_valid(self) -> bool:
+        """Require the legacy result payload to bind to the same precision goal."""
+        expectation = self._current_precision_terminal_expectation()
+        result = self._rpp_terminal_result
+        if expectation is None or not isinstance(result, dict):
+            return False
+        expected = {
+            "mission_run_id": expectation.mission_run_id,
+            "path_signature": expectation.path_signature,
+            "raw_path_index": expectation.raw_path_index,
+            "active_goal_identity": expectation.active_goal_identity,
+            "goal_instance_id": expectation.goal_instance_id,
+            "terminal_identity": expectation.terminal_identity,
+        }
+        return all(result.get(key) == value for key, value in expected.items())
+
+    def _reset_precision_marking_hold(self) -> None:
+        """Reset only Mission Manager's verification dwell, never RPP zero."""
+        self._marking_hold_started = None
+        self._marking_hold_elapsed_sec = 0.0
+        self._arrival_settle_started = None
+        self._arrival_settle_elapsed_sec = 0.0
+
+    def _precision_marking_pre_spray(
+        self,
+        *,
+        marking_number: int,
+        point_id: str,
+        now_monotonic_sec: float,
+    ) -> bool:
+        """Gate marking hold on a continuously valid current certificate.
+
+        Return true only when the existing spray transaction may proceed.
+        """
+        if self._spray_request_started is not None:
+            return True
+
+        decision = self._precision_terminal_decision(now_monotonic_sec)
+        rpp = (
+            self._rpp_terminal_result
+            if isinstance(self._rpp_terminal_result, dict)
+            else None
+        )
+        outcome = (
+            str(rpp.get("outcome") or "").strip().upper()
+            if rpp is not None
+            else ""
+        )
+
+        if outcome == "MISSED" and self._precision_rpp_terminal_result_valid():
+            self._resolve_accuracy_failure(
+                marking_number=marking_number,
+                failure_reason=str((rpp or {}).get("reason") or "RPP_MISSED"),
+            )
+            return False
+
+        result_valid = (
+            outcome == "CAPTURED"
+            and self._precision_rpp_terminal_result_valid()
+        )
+        if not decision.valid or not result_valid:
+            self._reset_precision_marking_hold()
+            self._publish_marking_active(False)
+            reason = (
+                decision.reason
+                if not decision.valid
+                else "terminal_result_invalid"
+            )
+            self._last_message = (
+                f"{point_id} precision hold blocked/reset: {reason}"
+            )
+            return False
+
+        if self._marking_hold_started is None:
+            self._marking_hold_started = now_monotonic_sec
+            self._arrival_settle_started = now_monotonic_sec
+            self._last_message = (
+                f"{point_id} precision certificate valid; starting "
+                f"{self.marking_hold_sec:.1f}s pre-mark hold; spray remains OFF"
+            )
+            self._publish_marking_active(False)
+            self._publish_status(force=True)
+            return False
+
+        self._marking_hold_elapsed_sec = max(
+            0.0, now_monotonic_sec - self._marking_hold_started
+        )
+        self._arrival_settle_elapsed_sec = self._marking_hold_elapsed_sec
+        self._publish_marking_active(False)
+        if self._marking_hold_elapsed_sec < self.marking_hold_sec:
+            remaining = max(
+                0.0, self.marking_hold_sec - self._marking_hold_elapsed_sec
+            )
+            self._last_message = (
+                f"{point_id} precision certificate hold; "
+                f"{remaining:.2f}s remaining"
+            )
+            return False
+
+        accuracy = self._capture_accuracy_snapshot(
+            marking_number=marking_number,
+            path_index=self._current_path_index,
+            outcome="ACHIEVED",
+            reason=None,
+        )
+        if accuracy.get("available") is not True or accuracy.get(
+            "precision_pass"
+        ) is not True:
+            self._reset_precision_marking_hold()
+            self._last_message = (
+                f"{point_id} precision evidence incomplete at hold completion"
+            )
+            return False
+
+        pending_spray = self._spray_outcome_snapshot(
+            attempted=self.spray_required,
+            outcome=("PENDING" if self.spray_required else "DISABLED"),
+        )
+        self._emit_point_event(
+            "ACCURACY_ACHIEVED",
+            marking_number,
+            self._current_path_index,
+            accuracy=accuracy,
+            spray=pending_spray,
+        )
+        self._spray_request_started = now_monotonic_sec
+        if self.spray_required:
+            self._publish_marking_active(True)
+            self._last_message = (
+                f"{point_id} precision certificate held for "
+                f"{self.marking_hold_sec:.1f}s; spray/mark triggered"
+            )
+            self._publish_status(force=True)
+            return False
+        self._publish_marking_active(False)
+        return True
 
     # ==============================================================
     # Spray controller handshake
@@ -2003,6 +2247,8 @@ class MissionManager(Node):
         self._marking_radial_error_m = math.inf
         self._rpp_terminal_result = None
         self._rpp_terminal_result_last_rx_monotonic = None
+        self._rpp_terminal_certificate = None
+        self._rpp_terminal_certificate_last_rx_monotonic = None
 
     def _reset_execution_progress(self) -> None:
         self._current_path_index = self._next_semantic_index(0)
@@ -2144,6 +2390,10 @@ class MissionManager(Node):
                     .strip()
                     .upper()
                     == "RPP_TERMINAL_RESULT"
+                    and (
+                        not self.precision_terminal_enabled
+                        or self._precision_rpp_terminal_result_valid()
+                    )
                 )
             except (TypeError, ValueError):
                 rpp_valid = False
@@ -2209,6 +2459,62 @@ class MissionManager(Node):
                 ),
                 "speed_mps": speed_mps,
             }
+
+            if self.precision_terminal_enabled:
+                decision = self._precision_terminal_decision(time.monotonic())
+                heartbeat = self._rpp_terminal_certificate
+                if decision.valid and isinstance(heartbeat, dict):
+                    certificate = copy.deepcopy(decision.certificate)
+                    snapshot.update(
+                        {
+                            "precision_certificate_version": heartbeat.get(
+                                "precision_certificate_version"
+                            ),
+                            "precision_pass": heartbeat.get("precision_pass"),
+                            "terminal_identity": heartbeat.get("terminal_identity"),
+                            "mission_run_id": heartbeat.get("mission_run_id"),
+                            "path_signature": heartbeat.get("path_signature"),
+                            "raw_path_index": heartbeat.get("raw_path_index"),
+                            "active_goal_identity": heartbeat.get(
+                                "active_goal_identity"
+                            ),
+                            "goal_instance_id": heartbeat.get("goal_instance_id"),
+                            "radial_error_mm": certificate.get("radial_error_mm"),
+                            "cross_error_mm": certificate.get("cross_error_mm"),
+                            "along_error_mm": certificate.get("along_error_mm"),
+                            "heading_error_deg": certificate.get(
+                                "heading_error_deg"
+                            ),
+                            "measured_speed_mps": certificate.get(
+                                "measured_speed_mps"
+                            ),
+                            "measured_yaw_rate_radps": certificate.get(
+                                "measured_yaw_rate_radps"
+                            ),
+                            "stop_spec_mm": certificate.get("stop_spec_mm"),
+                            "telemetry_fresh": heartbeat.get("telemetry_fresh"),
+                            "settle_sec": certificate.get("settle_sec"),
+                            "first_capture_pose": certificate.get(
+                                "first_capture_pose"
+                            ),
+                            "final_settled_pose": certificate.get(
+                                "final_settled_pose"
+                            ),
+                            "max_radial_during_settle_mm": certificate.get(
+                                "max_radial_during_settle_mm"
+                            ),
+                            "truth_frame": heartbeat.get("truth_frame"),
+                            "localization_accuracy_certified": heartbeat.get(
+                                "localization_accuracy_certified"
+                            ),
+                            "physical_accuracy_certified": heartbeat.get(
+                                "physical_accuracy_certified"
+                            ),
+                            "precision_certificate": certificate,
+                            "precision_terminal_evidence": copy.deepcopy(heartbeat),
+                            "terminal_result": copy.deepcopy(rpp),
+                        }
+                    )
 
         else:
             # No RPP terminal result means NO report accuracy.
@@ -2316,6 +2622,16 @@ class MissionManager(Node):
                 )
                 point_type = self._path_types[self._current_path_index]
                 marking_index = self._marking_indices[self._current_path_index]
+                goal_instance_id = None
+                mission_run_id = None
+                if self.precision_terminal_enabled and self._mission_run_id:
+                    mission_run_id = self._mission_run_id
+                    goal_instance_id = make_goal_instance_id(
+                        mission_run_id=mission_run_id,
+                        path_signature=self._path_signature,
+                        raw_path_index=self._current_path_index,
+                        goal_sequence=goal_sequence,
+                    )
                 payload = build_segment_goal_metadata(
                     path_signature=self._path_signature,
                     goal_sequence=goal_sequence,
@@ -2323,6 +2639,8 @@ class MissionManager(Node):
                     point_type=point_type,
                     marking_index=marking_index,
                     marking_point_type=self.POINT_MARKING,
+                    mission_run_id=mission_run_id,
+                    goal_instance_id=goal_instance_id,
                 )
                 metadata_message = String()
                 metadata_message.data = json.dumps(
@@ -2971,6 +3289,28 @@ class MissionManager(Node):
             # heading or speed logic here. RPP owns how it reaches the dummy.
             if point_type == self.POINT_DUMMY_ALIGNMENT:
                 self._publish_marking_active(False)
+                if self.precision_terminal_enabled:
+                    now = time.monotonic()
+                    decision = self._precision_terminal_decision(now)
+                    if not decision.valid:
+                        self._last_message = (
+                            "Dummy/extension waiting for current precision "
+                            f"certificate: {decision.reason}"
+                        )
+                        return
+                    self._reset_arrival_state()
+                    self._current_path_index = self._next_semantic_index(
+                        self._current_path_index + 1
+                    )
+                    self._last_message = (
+                        "Dummy/extension precision stop certified; "
+                        "next semantic goal selected"
+                    )
+                    self._publish_runtime_path()
+                    self._publish_goal()
+                    self._publish_status(force=True)
+                    return
+
                 self._reset_arrival_state()
                 inside_extension_radius = distance <= self.dummy_arrival_tolerance_m
                 extension_stationary = (
@@ -3038,6 +3378,14 @@ class MissionManager(Node):
             now = time.monotonic()
             point_id = f"P{marking_number+1:04d}"
             spray_key = (self._mission_run_id, point_id)
+
+            if self.precision_terminal_enabled:
+                if not self._precision_marking_pre_spray(
+                    marking_number=marking_number,
+                    point_id=point_id,
+                    now_monotonic_sec=now,
+                ):
+                    return
 
             rpp = (
                 self._rpp_terminal_result

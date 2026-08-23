@@ -4,6 +4,7 @@ from mission_manager.path_contract import (
     PendingPreparedPath,
     build_segment_goal_metadata,
     is_valid_path_signature,
+    make_goal_instance_id,
     make_path_signature,
     resolve_path_signature,
 )
@@ -52,6 +53,54 @@ def test_marking_goal_uses_authoritative_point_id():
         "point_id": "P0008",
         "active_goal_identity": "P0008",
     }
+
+
+def test_precision_goal_metadata_is_additive_and_run_scoped():
+    instance = make_goal_instance_id(
+        mission_run_id="run-7",
+        path_signature=SIGNATURE,
+        raw_path_index=42,
+        goal_sequence=3,
+    )
+    payload = build_segment_goal_metadata(
+        path_signature=SIGNATURE,
+        goal_sequence=3,
+        raw_path_index=42,
+        point_type=2,
+        marking_index=7,
+        marking_point_type=2,
+        mission_run_id="run-7",
+        goal_instance_id=instance,
+    )
+
+    assert payload["schema_version"] == 1
+    assert payload["mission_run_id"] == "run-7"
+    assert payload["goal_instance_id"] == instance
+    assert instance == make_goal_instance_id(
+        mission_run_id="run-7",
+        path_signature=SIGNATURE,
+        raw_path_index=42,
+        goal_sequence=3,
+    )
+    assert instance != make_goal_instance_id(
+        mission_run_id="run-8",
+        path_signature=SIGNATURE,
+        raw_path_index=42,
+        goal_sequence=3,
+    )
+
+
+def test_precision_goal_metadata_requires_both_nonempty_identity_fields():
+    with pytest.raises(ValueError, match="goal_instance_id"):
+        build_segment_goal_metadata(
+            path_signature=SIGNATURE,
+            goal_sequence=0,
+            raw_path_index=1,
+            point_type=2,
+            marking_index=0,
+            marking_point_type=2,
+            mission_run_id="run-1",
+        )
 
 
 def test_dummy_goal_identity_is_path_scoped_without_point_id():

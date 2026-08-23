@@ -144,6 +144,8 @@ def build_segment_goal_metadata(
     point_type: int,
     marking_index: int,
     marking_point_type: int,
+    mission_run_id: str | None = None,
+    goal_instance_id: str | None = None,
 ) -> dict[str, Any]:
     """Build the additive, versioned semantic-goal identity payload.
 
@@ -171,7 +173,7 @@ def build_segment_goal_metadata(
             f"PATH:{path_signature}:RAW:{raw_path_index}:TYPE:{point_type}"
         )
 
-    return {
+    payload = {
         "schema_version": SEGMENT_GOAL_METADATA_VERSION,
         "path_signature": path_signature,
         "goal_sequence": int(goal_sequence),
@@ -181,3 +183,34 @@ def build_segment_goal_metadata(
         "point_id": point_id,
         "active_goal_identity": active_goal_identity,
     }
+    if mission_run_id is None and goal_instance_id is None:
+        return payload
+    if not isinstance(mission_run_id, str) or not mission_run_id.strip():
+        raise ValueError("mission_run_id must be a non-empty string")
+    if not isinstance(goal_instance_id, str) or not goal_instance_id.strip():
+        raise ValueError("goal_instance_id must be a non-empty string")
+    payload["mission_run_id"] = mission_run_id.strip()
+    payload["goal_instance_id"] = goal_instance_id.strip()
+    return payload
+
+
+def make_goal_instance_id(
+    *,
+    mission_run_id: str,
+    path_signature: str,
+    raw_path_index: int,
+    goal_sequence: int,
+) -> str:
+    """Return a stable deterministic identity for one run-scoped goal."""
+
+    if not isinstance(mission_run_id, str) or not mission_run_id.strip():
+        raise ValueError("mission_run_id must be a non-empty string")
+    if not is_valid_path_signature(path_signature):
+        raise ValueError("path_signature must be a lowercase SHA-256 digest")
+    if raw_path_index < 0 or goal_sequence < 0:
+        raise ValueError("raw_path_index and goal_sequence must be >= 0")
+    material = (
+        f"{mission_run_id.strip()}|{path_signature}|"
+        f"{int(raw_path_index)}|{int(goal_sequence)}"
+    ).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
