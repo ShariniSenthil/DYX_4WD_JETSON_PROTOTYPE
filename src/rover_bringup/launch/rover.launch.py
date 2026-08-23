@@ -233,6 +233,9 @@ def generate_launch_description() -> LaunchDescription:
                         "waypoint_match_tolerance_m": 0.002,
                         "odom_timeout_sec": 0.50,
                         "maximum_navigation_points": 200000,
+                        # Additive Phase-1 path identity contract. Default-OFF
+                        # preserves legacy Pose-only goal publication.
+                        "precision_path_contract_enabled": False,
                         "maximum_marking_points": 10000,
                     }
                 ],
@@ -374,6 +377,22 @@ def generate_launch_description() -> LaunchDescription:
                         "terminal_line_correction_limit_deg": 18.0,
                         "line_tracking_lookahead_m": 0.55,
                         "nav_path_lookahead_m": 0.55,
+                        # Phase-1 derived geometry sidecar. Default-OFF keeps
+                        # the production 50mm cursor command path unchanged;
+                        # enable only for explicit field A/B runs after the
+                        # synchronized path/goal contract is visible in bags.
+                        "geometry_tracking_enabled": False,
+                        # Shadow projection/diagnostics without changing the
+                        # production cursor solution. Also default-OFF so old
+                        # bags do not require the additive path signature.
+                        "geometry_diagnostics_enabled": False,
+                        "geometry_corner_threshold_deg": 45.0,
+                        "geometry_projection_back_window_segments": 2,
+                        "geometry_projection_forward_window_segments": 4,
+                        "geometry_projection_reacquire_distance_m": 0.30,
+                        "geometry_localization_jump_reset_m": 0.50,
+                        "geometry_max_backward_jump_m": 0.10,
+                        "geometry_max_forward_jump_m": 1.00,
                         # 75 mm lets a 20 Hz rover moving at 1 m/s advance
                         # reliably through 50 mm interpolation samples without
                         # treating them as arrival/stop tolerances.

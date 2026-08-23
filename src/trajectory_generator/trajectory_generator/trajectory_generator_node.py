@@ -350,6 +350,12 @@ class TrajectoryGenerator(Node):
             retained_qos,
         )
 
+        self.path_signature_pub = self.create_publisher(
+            String,
+            "/trajectory_generator/path_signature",
+            retained_qos,
+        )
+
         self.ready_pub = self.create_publisher(
             Bool,
             "/trajectory_generator/ready",
@@ -463,6 +469,8 @@ class TrajectoryGenerator(Node):
         self.prepared_path_types: list[int] = []
 
         self.prepared_marking_indices: list[int] = []
+
+        self.prepared_path_signature: str | None = None
 
         self.last_error: str | None = None
         self.last_wait_log_time = self.get_clock().now()
@@ -1682,6 +1690,14 @@ class TrajectoryGenerator(Node):
 
         self.marking_indices_pub.publish(index_message)
 
+    def _publish_path_signature(
+        self,
+        signature: str | None,
+    ) -> None:
+        message = String()
+        message.data = signature or ""
+        self.path_signature_pub.publish(message)
+
     def _publish_empty_outputs(
         self,
     ) -> None:
@@ -1701,6 +1717,8 @@ class TrajectoryGenerator(Node):
             marking_indices=[],
         )
 
+        self._publish_path_signature(None)
+
     def _publish_status(
         self,
         *,
@@ -1714,6 +1732,7 @@ class TrajectoryGenerator(Node):
             "ready": self.ready,
             "mission_id": (self.mission_id),
             "mission_checksum": (self.mission_checksum),
+            "path_signature": self.prepared_path_signature,
             "coordinate_mode": (self.raw_coordinate_mode),
             "extension_mode": (self.extension_mode),
             "dummy_point_distance_m": (self.dummy_point_distance_m),
@@ -1801,6 +1820,7 @@ class TrajectoryGenerator(Node):
         self.prepared_navigation_points = []
         self.prepared_path_types = []
         self.prepared_marking_indices = []
+        self.prepared_path_signature = None
 
         self._publish_ready(False)
 
@@ -1962,6 +1982,8 @@ class TrajectoryGenerator(Node):
 
                 self.prepared_marking_indices = marking_indices
 
+                self.prepared_path_signature = signature
+
                 self.mission_waypoints_pub.publish(mission_path)
 
                 self.nav_path_pub.publish(navigation_path)
@@ -1970,6 +1992,10 @@ class TrajectoryGenerator(Node):
                     point_types=point_types,
                     marking_indices=(marking_indices),
                 )
+
+                # Commit marker: subscribers install the separately retained
+                # path components only after this matching signature arrives.
+                self._publish_path_signature(signature)
 
                 self.prepare_requested = False
                 self.preparing = False

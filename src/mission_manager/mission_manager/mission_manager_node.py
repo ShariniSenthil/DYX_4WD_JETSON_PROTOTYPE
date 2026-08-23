@@ -45,6 +45,12 @@ from std_msgs.msg import Bool, Float32, Int32MultiArray, String, UInt8MultiArray
 from std_srvs.srv import Trigger
 
 from mission_manager.marking_arrival_policy import after_fail_mode_action
+from mission_manager.path_contract import (
+    PendingPreparedPath,
+    build_segment_goal_metadata,
+    is_valid_path_signature,
+    resolve_path_signature,
+)
 
 
 class MissionManager(Node):
@@ -98,6 +104,7 @@ class MissionManager(Node):
         self.declare_parameter("spray_required", True)
         self.declare_parameter("spray_confirmation_timeout_sec", 5.0)
         self.declare_parameter("spray_status_timeout_sec", 2.0)
+        self.declare_parameter("precision_path_contract_enabled", False)
 
         self.local_frame = str(self.get_parameter("local_frame").value).strip()
         self.marking_tolerance_m = float(
@@ -128,6 +135,12 @@ class MissionManager(Node):
         self.spray_status_timeout_sec = float(
             self.get_parameter("spray_status_timeout_sec").value
         )
+        precision_path_contract_value = self.get_parameter(
+            "precision_path_contract_enabled"
+        ).value
+        if not isinstance(precision_path_contract_value, bool):
+            raise ValueError("precision_path_contract_enabled must be a bool")
+        self.precision_path_contract_enabled = precision_path_contract_value
         self._validate_parameters()
 
         # ----------------------------------------------------------
@@ -177,6 +190,12 @@ class MissionManager(Node):
             Int32MultiArray,
             "/trajectory_generator/marking_indices",
             self._marking_indices_callback,
+            retained_qos,
+        )
+        self.create_subscription(
+            String,
+            "/trajectory_generator/path_signature",
+            self._path_signature_callback,
             retained_qos,
         )
         self.create_subscription(
@@ -280,6 +299,9 @@ class MissionManager(Node):
         self.segment_goal_pub = self.create_publisher(
             PoseStamped, "/segment_goal", command_qos
         )
+        self.segment_goal_metadata_pub = self.create_publisher(
+            String, "/mission_manager/segment_goal_metadata", command_qos
+        )
 
         self.runtime_path_pub = self.create_publisher(
             Path, "/runtime_nav_path", retained_qos
@@ -333,11 +355,7 @@ class MissionManager(Node):
         # ----------------------------------------------------------
         # Prepared mission snapshot
         # ----------------------------------------------------------
-        self._pending_nav_path: Optional[list[tuple[float, float]]] = None
-        self._pending_mission_waypoints: Optional[list[tuple[float, float]]] = None
-        self._pending_path_types: Optional[list[int]] = None
-        self._pending_marking_indices: Optional[list[int]] = None
-        self._trajectory_ready = False
+        self._pending_prepared_path = PendingPreparedPath()
 
         self._navigation_path: list[tuple[float, float]] = []
         self._mission_waypoints: list[tuple[float, float]] = []
@@ -345,6 +363,8 @@ class MissionManager(Node):
         self._marking_indices: list[int] = []
         self._marking_path_index_by_number: list[int] = []
         self._semantic_path_indices: list[int] = []  # dummy + real marking only
+        self._path_signature: Optional[str] = None
+        self._precision_path_contract_fault_latched = False
         self._point_status: list[str] = []
         # Accuracy snapshots are captured exactly once for each uploaded CSV
         # point.  They are intentionally independent from the live working
@@ -546,9 +566,10 @@ class MissionManager(Node):
             return
         with self._lock:
             if not points:
-                self._handle_source_clear("/nav_path cleared")
+                self._pending_prepared_path.clear_source("navigation_path")
+                self._invalidate_installed_path("/nav_path cleared")
                 return
-            self._pending_nav_path = points
+            self._pending_prepared_path.navigation_path = points
             self._try_load_prepared_mission()
 
     def _mission_waypoints_callback(self, message: Path) -> None:
@@ -561,9 +582,10 @@ class MissionManager(Node):
             return
         with self._lock:
             if not points:
-                self._handle_source_clear("/mission_waypoints cleared")
+                self._pending_prepared_path.clear_source("mission_waypoints")
+                self._invalidate_installed_path("/mission_waypoints cleared")
                 return
-            self._pending_mission_waypoints = points
+            self._pending_prepared_path.mission_waypoints = points
             self._try_load_prepared_mission()
 
     def _path_types_callback(self, message: UInt8MultiArray) -> None:
@@ -573,9 +595,10 @@ class MissionManager(Node):
             return
         with self._lock:
             if not values:
-                self._handle_source_clear("Path types cleared")
+                self._pending_prepared_path.clear_source("point_types")
+                self._invalidate_installed_path("Path types cleared")
                 return
-            self._pending_path_types = values
+            self._pending_prepared_path.point_types = values
             self._try_load_prepared_mission()
 
     def _marking_indices_callback(self, message: Int32MultiArray) -> None:
@@ -585,59 +608,80 @@ class MissionManager(Node):
             return
         with self._lock:
             if not values:
-                self._handle_source_clear("Marking indices cleared")
+                self._pending_prepared_path.clear_source("marking_indices")
+                self._invalidate_installed_path("Marking indices cleared")
                 return
-            self._pending_marking_indices = values
+            self._pending_prepared_path.marking_indices = values
+            self._try_load_prepared_mission()
+
+    def _path_signature_callback(self, message: String) -> None:
+        signature = str(message.data).strip()
+        with self._lock:
+            if not signature:
+                self._pending_prepared_path.clear_source("path_signature")
+                self._invalidate_installed_signature("Path signature cleared")
+                return
+            if not is_valid_path_signature(signature):
+                self._pending_prepared_path.clear_source("path_signature")
+                self.get_logger().error(
+                    "Rejected path signature: expected lowercase SHA-256 hex"
+                )
+                self._invalidate_installed_signature("Path signature invalid")
+                return
+            self._pending_prepared_path.path_signature = signature
             self._try_load_prepared_mission()
 
     def _trajectory_ready_callback(self, message: Bool) -> None:
         with self._lock:
-            self._trajectory_ready = bool(message.data)
-            if not self._trajectory_ready:
-                self._pending_nav_path = None
-                self._pending_mission_waypoints = None
-                self._pending_path_types = None
-                self._pending_marking_indices = None
-                if self._state in {
-                    "RUNNING",
-                    "PAUSED",
-                    "WAITING_FOR_NEXT",
-                }:
-                    self._enter_error("Trajectory readiness lost during active mission")
+            if not bool(message.data):
+                self._pending_prepared_path.invalidate_readiness()
+                self._invalidate_installed_path("Trajectory readiness lost")
                 return
+            self._pending_prepared_path.ready = True
             self._try_load_prepared_mission()
 
-    def _handle_source_clear(self, reason: str) -> None:
-        self._trajectory_ready = False
-        self._pending_nav_path = None
-        self._pending_mission_waypoints = None
-        self._pending_path_types = None
-        self._pending_marking_indices = None
+    def _invalidate_installed_signature(self, reason: str) -> None:
+        """Invalidate only the additive contract in legacy mode.
+
+        Precision mode cannot continue without a synchronized signature, so
+        the same event invalidates the installed prepared path as well.
+        """
+        self._path_signature = None
+        if self.precision_path_contract_enabled:
+            self._invalidate_installed_path(reason)
+        else:
+            self._publish_status(force=True)
+
+    def _invalidate_installed_path(self, reason: str) -> None:
+        """Invalidate installed runtime without erasing pending DDS inputs."""
+        self._path_signature = None
         if self._state in {"RUNNING", "PAUSED", "WAITING_FOR_NEXT"}:
-            self._enter_error(f"Prepared trajectory cleared while active: {reason}")
+            if self.precision_path_contract_enabled:
+                self._precision_path_contract_fault_latched = True
+            self._enter_error(f"Prepared trajectory invalid while active: {reason}")
             return
         self._clear_loaded_runtime(reason)
 
     def _try_load_prepared_mission(self) -> None:
-        if not self._trajectory_ready:
+        if self._precision_path_contract_fault_latched:
+            return
+        pending_path = self._pending_prepared_path
+        if not pending_path.ready:
             return
         pending = (
-            self._pending_nav_path,
-            self._pending_mission_waypoints,
-            self._pending_path_types,
-            self._pending_marking_indices,
+            pending_path.navigation_path,
+            pending_path.mission_waypoints,
+            pending_path.point_types,
+            pending_path.marking_indices,
         )
         if any(value is None for value in pending):
             return
 
-        navigation_path = list(self._pending_nav_path or [])
-        mission_waypoints = list(self._pending_mission_waypoints or [])
-        path_types = list(self._pending_path_types or [])
-        marking_indices = list(self._pending_marking_indices or [])
+        navigation_path = list(pending_path.navigation_path or [])
+        mission_waypoints = list(pending_path.mission_waypoints or [])
+        path_types = list(pending_path.point_types or [])
+        marking_indices = list(pending_path.marking_indices or [])
 
-        if self._state in {"RUNNING", "PAUSED", "WAITING_FOR_NEXT"}:
-            self.get_logger().error("Rejected replacement mission while active")
-            return
         if not navigation_path or not mission_waypoints:
             self._enter_error("Prepared mission contains no points")
             return
@@ -647,6 +691,38 @@ class MissionManager(Node):
                 f"path={len(navigation_path)} types={len(path_types)} "
                 f"indices={len(marking_indices)} markings={len(mission_waypoints)}"
             )
+            return
+
+        signature_decision = resolve_path_signature(
+            navigation_path,
+            mission_waypoints,
+            path_types,
+            marking_indices,
+            pending_path.path_signature,
+            signature_required=self.precision_path_contract_enabled,
+        )
+        if not signature_decision.can_install:
+            self.get_logger().warn(
+                "Prepared snapshot is waiting for a synchronized path signature: "
+                f"{signature_decision.reason}"
+            )
+            if self.precision_path_contract_enabled and self._navigation_path:
+                self._invalidate_installed_path(
+                    "Prepared path signature synchronization was lost"
+                )
+            return
+
+        if self._state in {"RUNNING", "PAUSED", "WAITING_FOR_NEXT"}:
+            if (
+                self.precision_path_contract_enabled
+                and signature_decision.synchronized_signature
+                != self._path_signature
+            ):
+                self._invalidate_installed_path(
+                    "Prepared trajectory changed during active mission"
+                )
+            else:
+                self.get_logger().error("Rejected replacement mission while active")
             return
 
         marking_path_index_by_number = [-1] * len(mission_waypoints)
@@ -698,6 +774,7 @@ class MissionManager(Node):
         self._marking_indices = marking_indices
         self._marking_path_index_by_number = marking_path_index_by_number
         self._semantic_path_indices = semantic_indices
+        self._path_signature = signature_decision.synchronized_signature
         self._point_status = ["PENDING"] * len(mission_waypoints)
         self._point_accuracy_snapshots = [None] * len(mission_waypoints)
         self._point_results = [None] * len(mission_waypoints)
@@ -1045,7 +1122,7 @@ class MissionManager(Node):
 
         PX4 still must accept OFFBOARD and ARM service commands.
         """
-        if not self._navigation_path or not self._trajectory_ready:
+        if not self._navigation_path or not self._pending_prepared_path.ready:
             return False, "No validated prepared mission is ready"
 
         if require_ready_state and self._state != "READY":
@@ -1239,11 +1316,8 @@ class MissionManager(Node):
         When completed=True, /mission_complete remains latched TRUE until the
         next prepared mission is loaded. For an operator STOP it is FALSE.
         """
-        self._trajectory_ready = False
-        self._pending_nav_path = None
-        self._pending_mission_waypoints = None
-        self._pending_path_types = None
-        self._pending_marking_indices = None
+        self._pending_prepared_path.clear_all()
+        self._precision_path_contract_fault_latched = False
 
         self._navigation_path = []
         self._mission_waypoints = []
@@ -1251,6 +1325,7 @@ class MissionManager(Node):
         self._marking_indices = []
         self._marking_path_index_by_number = []
         self._semantic_path_indices = []
+        self._path_signature = None
         self._point_status = []
         self._point_accuracy_snapshots = []
         self._point_results = []
@@ -1458,7 +1533,7 @@ class MissionManager(Node):
             with self._lock:
                 if (
                     self._navigation_path
-                    and self._trajectory_ready
+                    and self._pending_prepared_path.ready
                     and self._state != "ERROR"
                 ):
                     self._state = "READY"
@@ -1814,11 +1889,8 @@ class MissionManager(Node):
                 response.success = False
                 response.message = "Stop mission before Clear"
                 return response
-            self._trajectory_ready = False
-            self._pending_nav_path = None
-            self._pending_mission_waypoints = None
-            self._pending_path_types = None
-            self._pending_marking_indices = None
+            self._pending_prepared_path.clear_all()
+            self._precision_path_contract_fault_latched = False
             self._clear_loaded_runtime(
                 "Loaded trajectory cleared; mission.csv retained"
             )
@@ -1947,6 +2019,7 @@ class MissionManager(Node):
         self._marking_indices = []
         self._marking_path_index_by_number = []
         self._semantic_path_indices = []
+        self._path_signature = None
         self._point_status = []
         self._point_accuracy_snapshots = []
         self._point_results = []
@@ -2235,9 +2308,48 @@ class MissionManager(Node):
             return
         if self._path_types[self._current_path_index] == self.POINT_PASS_THROUGH:
             return
+        metadata_message: Optional[String] = None
+        if self._path_signature is not None:
+            try:
+                goal_sequence = self._semantic_path_indices.index(
+                    self._current_path_index
+                )
+                point_type = self._path_types[self._current_path_index]
+                marking_index = self._marking_indices[self._current_path_index]
+                payload = build_segment_goal_metadata(
+                    path_signature=self._path_signature,
+                    goal_sequence=goal_sequence,
+                    raw_path_index=self._current_path_index,
+                    point_type=point_type,
+                    marking_index=marking_index,
+                    marking_point_type=self.POINT_MARKING,
+                )
+                metadata_message = String()
+                metadata_message.data = json.dumps(
+                    payload,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            except (ValueError, IndexError) as error:
+                if self.precision_path_contract_enabled:
+                    self._enter_error(
+                        f"Cannot publish semantic goal metadata: {error}"
+                    )
+                    return
+                self.get_logger().error(
+                    f"Skipped optional semantic goal metadata: {error}"
+                )
+        elif self.precision_path_contract_enabled:
+            self._enter_error(
+                "Cannot publish semantic goal without synchronized path signature"
+            )
+            return
+
         msg = self._pose_for_index(self._current_path_index)
         self.active_waypoint_pub.publish(msg)
         self.segment_goal_pub.publish(msg)
+        if metadata_message is not None:
+            self.segment_goal_metadata_pub.publish(metadata_message)
 
     def _publish_runtime_path(self) -> None:
         msg = Path()
@@ -2479,8 +2591,15 @@ class MissionManager(Node):
             "execution_mode": self._execution_mode,
             "pause_reason": self._pause_reason,
             "resume_available": self._resume_available,
-            "trajectory_ready": self._trajectory_ready,
+            "trajectory_ready": self._pending_prepared_path.ready,
+            "precision_path_contract_enabled": (
+                self.precision_path_contract_enabled
+            ),
+            "precision_path_contract_fault_latched": (
+                self._precision_path_contract_fault_latched
+            ),
             "path_ready": bool(self._navigation_path),
+            "path_signature": self._path_signature,
             "current_path_index": self._current_path_index,
             "navigation_point_count": len(self._navigation_path),
             "current_point_id": active_id,

@@ -14,13 +14,21 @@ from rclpy.qos import (
     QoSProfile,
     ReliabilityPolicy,
 )
-from std_msgs.msg import Bool, Float64, String
+from std_msgs.msg import Bool, Float64, Int32MultiArray, String, UInt8MultiArray
 from tf_transformations import euler_from_quaternion
 
 from rpp_controller.point_event_policy import (
     first_marking_approach_is_active,
     latched_stop_terminal_outcome,
     should_release_first_marking,
+)
+from rpp_controller.path_geometry import (
+    GeometryProgressTracker,
+    GeometryResetReason,
+    PathGeometryIndex,
+    POINT_TYPE_MARKING,
+    make_path_signature,
+    validate_goal_metadata,
 )
 
 
@@ -416,6 +424,19 @@ class RPPController(Node):
         self.declare_parameter("odom_timeout_sec", 0.50)
         self.declare_parameter("waypoint_timeout_sec", 1.00)
 
+        # Derived path geometry is additive and default-OFF.  The retained raw
+        # path and legacy cursor remain authoritative until deliberately gated
+        # on after Phase-1 field review.
+        self.declare_parameter("geometry_tracking_enabled", False)
+        self.declare_parameter("geometry_diagnostics_enabled", False)
+        self.declare_parameter("geometry_corner_threshold_deg", 45.0)
+        self.declare_parameter("geometry_projection_back_window_segments", 2)
+        self.declare_parameter("geometry_projection_forward_window_segments", 4)
+        self.declare_parameter("geometry_projection_reacquire_distance_m", 0.30)
+        self.declare_parameter("geometry_localization_jump_reset_m", 0.50)
+        self.declare_parameter("geometry_max_backward_jump_m", 0.10)
+        self.declare_parameter("geometry_max_forward_jump_m", 1.00)
+
         self.local_frame = str(self.get_parameter("local_frame").value).strip()
         self.cruise_speed = float(self.get_parameter("cruise_speed_mps").value)
         self.acceleration_enabled = bool(
@@ -799,6 +820,36 @@ class RPPController(Node):
         self.waypoint_timeout_sec = float(
             self.get_parameter("waypoint_timeout_sec").value
         )
+        self.geometry_tracking_enabled = bool(
+            self.get_parameter("geometry_tracking_enabled").value
+        )
+        self.geometry_diagnostics_enabled = bool(
+            self.get_parameter("geometry_diagnostics_enabled").value
+        )
+        self.geometry_processing_enabled = (
+            self.geometry_tracking_enabled or self.geometry_diagnostics_enabled
+        )
+        self.geometry_corner_threshold = math.radians(
+            float(self.get_parameter("geometry_corner_threshold_deg").value)
+        )
+        self.geometry_back_window_segments = int(
+            self.get_parameter("geometry_projection_back_window_segments").value
+        )
+        self.geometry_forward_window_segments = int(
+            self.get_parameter("geometry_projection_forward_window_segments").value
+        )
+        self.geometry_reacquire_distance = float(
+            self.get_parameter("geometry_projection_reacquire_distance_m").value
+        )
+        self.geometry_localization_jump_reset = float(
+            self.get_parameter("geometry_localization_jump_reset_m").value
+        )
+        self.geometry_max_backward_jump = float(
+            self.get_parameter("geometry_max_backward_jump_m").value
+        )
+        self.geometry_max_forward_jump = float(
+            self.get_parameter("geometry_max_forward_jump_m").value
+        )
 
         # --------------------------------------------------------------
         # RPP ACCELERATION + MARKING-ONLY DECELERATION CONTRACT
@@ -864,6 +915,36 @@ class RPPController(Node):
             "/mission_waypoints",
             self.marking_waypoints_callback,
             retained_qos,
+        )
+        self.create_subscription(
+            UInt8MultiArray,
+            "/trajectory_generator/path_types",
+            self.path_types_callback,
+            retained_qos,
+        )
+        self.create_subscription(
+            Int32MultiArray,
+            "/trajectory_generator/marking_indices",
+            self.marking_indices_callback,
+            retained_qos,
+        )
+        self.create_subscription(
+            String,
+            "/trajectory_generator/path_signature",
+            self.path_signature_callback,
+            retained_qos,
+        )
+        self.create_subscription(
+            Bool,
+            "/trajectory_generator/ready",
+            self.trajectory_ready_callback,
+            retained_qos,
+        )
+        self.create_subscription(
+            String,
+            "/mission_manager/segment_goal_metadata",
+            self.segment_goal_metadata_callback,
+            command_qos,
         )
         self.create_subscription(
             Bool,
@@ -982,6 +1063,11 @@ class RPPController(Node):
             "/rpp/accuracy",
             retained_qos,
         )
+        self.geometry_debug_pub = self.create_publisher(
+            String,
+            "/rpp/geometry_debug",
+            command_qos,
+        )
 
         # Explicit terminal-result handshake to Mission Manager.
         # Motion ownership stays in RPP; Mission Manager still performs the
@@ -1028,6 +1114,29 @@ class RPPController(Node):
 
         self.marking_waypoints = []
         self.marking_metadata_received = False
+
+        # Separately retained path components are installed atomically only
+        # after their canonical signature matches.  These fields never mutate
+        # the authoritative arrays above.
+        self.geometry_pending_nav_points = None
+        self.geometry_pending_marking_waypoints = None
+        self.geometry_pending_path_types = None
+        self.geometry_pending_marking_indices = None
+        self.geometry_pending_path_signature = None
+        self.geometry_trajectory_ready = False
+        self.geometry_contract_synchronized = False
+        self.path_geometry = None
+        self.geometry_progress_tracker = None
+        self.geometry_installed_signature = None
+        self.geometry_previous_installed_signature = None
+        self.geometry_pending_goal_metadata = None
+        self.geometry_goal_binding = None
+        self.geometry_active_span = None
+        self.geometry_last_goal_raw_index = None
+        self.geometry_last_projection = None
+        self.geometry_last_odom_point = None
+        self.geometry_last_reset_reason = GeometryResetReason.INITIAL_INSTALL.value
+        self.geometry_reset_count = 0
 
         self.mission_enabled = False
         self.emergency_stop = True
@@ -1261,6 +1370,39 @@ class RPPController(Node):
     def validate_parameters(self):
         if not self.local_frame:
             raise ValueError("local_frame must not be empty")
+
+        if not (0.0 < self.geometry_corner_threshold <= math.pi):
+            raise ValueError("geometry_corner_threshold_deg must be in (0, 180]")
+        for name, value in (
+            (
+                "geometry_projection_back_window_segments",
+                self.geometry_back_window_segments,
+            ),
+            (
+                "geometry_projection_forward_window_segments",
+                self.geometry_forward_window_segments,
+            ),
+        ):
+            if not (0 <= value <= 1000):
+                raise ValueError(f"{name} must be an integer in [0, 1000]")
+        for name, value in (
+            (
+                "geometry_projection_reacquire_distance_m",
+                self.geometry_reacquire_distance,
+            ),
+            (
+                "geometry_localization_jump_reset_m",
+                self.geometry_localization_jump_reset,
+            ),
+        ):
+            if not math.isfinite(value) or not (0.0 < value <= 1000.0):
+                raise ValueError(f"{name} must be finite and in (0, 1000]")
+        for name, value in (
+            ("geometry_max_backward_jump_m", self.geometry_max_backward_jump),
+            ("geometry_max_forward_jump_m", self.geometry_max_forward_jump),
+        ):
+            if not math.isfinite(value) or not (0.0 <= value <= 1000.0):
+                raise ValueError(f"{name} must be finite and in [0, 1000]")
 
         positive_values = {
             "cruise_speed_mps": self.cruise_speed,
@@ -1967,6 +2109,250 @@ class RPPController(Node):
         _, _, yaw = euler_from_quaternion(quaternion)
         return yaw if math.isfinite(yaw) else None
 
+    def _record_geometry_reset(self, reason):
+        if isinstance(reason, GeometryResetReason):
+            reason = reason.value
+        self.geometry_last_reset_reason = str(reason)
+        self.geometry_reset_count += 1
+
+    def _invalidate_installed_geometry(self, reason):
+        """Revoke installed precision authority without discarding staged DDS data."""
+
+        if self.geometry_installed_signature is not None:
+            self.geometry_previous_installed_signature = (
+                self.geometry_installed_signature
+            )
+        self.geometry_contract_synchronized = False
+        self.path_geometry = None
+        self.geometry_progress_tracker = None
+        self.geometry_installed_signature = None
+        self.geometry_goal_binding = None
+        self.geometry_active_span = None
+        self.geometry_last_goal_raw_index = None
+        self.geometry_last_projection = None
+        self.geometry_last_odom_point = None
+        self._record_geometry_reset(reason)
+        self.get_logger().warn(
+            f"PRECISION GEOMETRY AUTHORITY INVALIDATED | reason={reason}"
+        )
+
+    def path_types_callback(self, msg):
+        if not self.geometry_processing_enabled:
+            return
+        values = [int(value) for value in msg.data]
+        if not values:
+            self.geometry_pending_path_types = None
+            self._invalidate_installed_geometry(
+                GeometryResetReason.SOURCE_CLEARED
+            )
+            return
+        self.geometry_pending_path_types = values
+        self._try_install_path_geometry()
+
+    def marking_indices_callback(self, msg):
+        if not self.geometry_processing_enabled:
+            return
+        values = [int(value) for value in msg.data]
+        if not values:
+            self.geometry_pending_marking_indices = None
+            self._invalidate_installed_geometry(
+                GeometryResetReason.SOURCE_CLEARED
+            )
+            return
+        self.geometry_pending_marking_indices = values
+        self._try_install_path_geometry()
+
+    def path_signature_callback(self, msg):
+        if not self.geometry_processing_enabled:
+            return
+        signature = str(msg.data).strip()
+        if not signature:
+            self.geometry_pending_path_signature = None
+            self._invalidate_installed_geometry(
+                GeometryResetReason.SOURCE_CLEARED
+            )
+            return
+        self.geometry_pending_path_signature = signature
+        self._try_install_path_geometry()
+
+    def trajectory_ready_callback(self, msg):
+        if not self.geometry_processing_enabled:
+            return
+        self.geometry_trajectory_ready = bool(msg.data)
+        if not self.geometry_trajectory_ready:
+            self._invalidate_installed_geometry(
+                GeometryResetReason.SOURCE_CLEARED
+            )
+            return
+        self._try_install_path_geometry()
+
+    def segment_goal_metadata_callback(self, msg):
+        if not self.geometry_processing_enabled:
+            return
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self.geometry_pending_goal_metadata = None
+            self.geometry_goal_binding = None
+            self.geometry_active_span = None
+            self.get_logger().error("IGNORED INVALID SEGMENT GOAL METADATA JSON")
+            return
+        if not isinstance(payload, dict):
+            self.geometry_pending_goal_metadata = None
+            self.geometry_goal_binding = None
+            self.geometry_active_span = None
+            self.get_logger().error("IGNORED NON-OBJECT SEGMENT GOAL METADATA")
+            return
+        self.geometry_pending_goal_metadata = payload
+        self.geometry_goal_binding = None
+        self.geometry_active_span = None
+        self._try_bind_geometry_goal(log_error=True)
+
+    def _try_install_path_geometry(self):
+        if not self.geometry_processing_enabled or not self.geometry_trajectory_ready:
+            return False
+        components = (
+            self.geometry_pending_nav_points,
+            self.geometry_pending_marking_waypoints,
+            self.geometry_pending_path_types,
+            self.geometry_pending_marking_indices,
+            self.geometry_pending_path_signature,
+        )
+        if any(value is None for value in components):
+            return False
+
+        navigation_points = list(self.geometry_pending_nav_points)
+        marking_points = list(self.geometry_pending_marking_waypoints)
+        point_types = list(self.geometry_pending_path_types)
+        marking_indices = list(self.geometry_pending_marking_indices)
+        signature = str(self.geometry_pending_path_signature)
+        if not navigation_points or not marking_points:
+            return False
+        if not (
+            len(navigation_points) == len(point_types) == len(marking_indices)
+        ):
+            return False
+
+        try:
+            calculated_signature = make_path_signature(
+                navigation_points,
+                marking_points,
+                point_types,
+                marking_indices,
+            )
+        except (OverflowError, TypeError, ValueError):
+            return False
+        if calculated_signature != signature:
+            return False
+
+        try:
+            geometry = PathGeometryIndex.build(
+                navigation_points,
+                point_types=point_types,
+                marking_indices=marking_indices,
+                corner_threshold_rad=self.geometry_corner_threshold,
+            )
+            marking_anchors = [
+                anchor
+                for anchor in geometry.semantic_anchors
+                if anchor.point_type == POINT_TYPE_MARKING
+            ]
+        except (TypeError, ValueError) as error:
+            self.get_logger().error(f"REJECTED PRECISION PATH GEOMETRY | {error}")
+            return False
+
+        if len(marking_anchors) != len(marking_points):
+            self.get_logger().error(
+                "REJECTED PRECISION PATH GEOMETRY | marking count mismatch"
+            )
+            return False
+        for anchor, marking in zip(marking_anchors, marking_points):
+            marking_error = math.hypot(
+                anchor.point.x - marking[0],
+                anchor.point.y - marking[1],
+            )
+            if marking_error > max(self.waypoint_match_tolerance, 0.002):
+                self.get_logger().error(
+                    "REJECTED PRECISION PATH GEOMETRY | marking coordinate mismatch"
+                )
+                return False
+
+        previous_signature = (
+            self.geometry_installed_signature
+            or self.geometry_previous_installed_signature
+        )
+        if previous_signature == signature and self.path_geometry is not None:
+            self.geometry_contract_synchronized = True
+            self._try_bind_geometry_goal(log_error=False)
+            return True
+
+        self.path_geometry = geometry
+        self.geometry_progress_tracker = GeometryProgressTracker(geometry)
+        self.geometry_installed_signature = signature
+        self.geometry_previous_installed_signature = signature
+        self.geometry_contract_synchronized = True
+        self.geometry_goal_binding = None
+        self.geometry_active_span = None
+        self.geometry_last_goal_raw_index = None
+        self.geometry_last_projection = None
+        self.geometry_last_odom_point = None
+        if previous_signature is not None and previous_signature != signature:
+            self.geometry_progress_tracker.reset(GeometryResetReason.PATH_REPLACED)
+            self._record_geometry_reset(GeometryResetReason.PATH_REPLACED)
+        else:
+            self._record_geometry_reset(GeometryResetReason.INITIAL_INSTALL)
+        self._try_bind_geometry_goal(log_error=False)
+        self.get_logger().warn(
+            "PRECISION PATH GEOMETRY INSTALLED | "
+            f"raw_points={len(geometry.raw_points)} | "
+            f"segments={len(geometry.segments)} | "
+            f"corners={len(geometry.corners)} | signature={signature[:12]}"
+        )
+        return True
+
+    def _try_bind_geometry_goal(self, *, log_error):
+        if not (
+            self.geometry_contract_synchronized
+            and self.path_geometry is not None
+            and self.geometry_progress_tracker is not None
+            and self.geometry_installed_signature is not None
+            and self.geometry_pending_goal_metadata is not None
+            and self.segment_goal_x is not None
+            and self.segment_goal_y is not None
+        ):
+            return False
+        try:
+            binding = validate_goal_metadata(
+                self.geometry_pending_goal_metadata,
+                expected_path_signature=self.geometry_installed_signature,
+                geometry=self.path_geometry,
+                goal_point=(self.segment_goal_x, self.segment_goal_y),
+                coordinate_tolerance_m=max(self.waypoint_match_tolerance, 0.002),
+            )
+        except (TypeError, ValueError) as error:
+            self.geometry_goal_binding = None
+            self.geometry_active_span = None
+            if log_error:
+                self.get_logger().error(
+                    f"REJECTED SEGMENT GOAL GEOMETRY BINDING | {error}"
+                )
+            return False
+
+        previous_raw_index = self.geometry_last_goal_raw_index
+        self.geometry_goal_binding = binding
+        self.geometry_active_span = binding.active_span
+        if previous_raw_index != binding.raw_path_index:
+            hint = binding.active_span.first_segment_index
+            self.geometry_progress_tracker.reset(
+                GeometryResetReason.ACTIVE_GOAL_ADVANCED,
+                progress_s=binding.active_span.start_s,
+                hint_segment_index=hint,
+            )
+            self._record_geometry_reset(GeometryResetReason.ACTIVE_GOAL_ADVANCED)
+            self.geometry_last_projection = None
+        self.geometry_last_goal_raw_index = binding.raw_path_index
+        return True
+
     def odom_callback(self, msg):
         x = float(msg.pose.pose.position.x)
         y = float(msg.pose.pose.position.y)
@@ -1998,6 +2384,30 @@ class RPPController(Node):
             return
         if not math.isfinite(yaw):
             return
+
+        if (
+            self.geometry_processing_enabled
+            and self.geometry_progress_tracker is not None
+            and self.geometry_last_odom_point is not None
+            and math.hypot(
+                x - self.geometry_last_odom_point[0],
+                y - self.geometry_last_odom_point[1],
+            )
+            > self.geometry_localization_jump_reset
+        ):
+            self.geometry_progress_tracker.reset(
+                GeometryResetReason.LOCALIZATION_JUMP
+            )
+            self._record_geometry_reset(GeometryResetReason.LOCALIZATION_JUMP)
+            self.geometry_last_projection = None
+            self.get_logger().warn(
+                "PRECISION GEOMETRY PROGRESS RESET | reason=LOCALIZATION_JUMP"
+            )
+        if (
+            self.geometry_processing_enabled
+            and self.geometry_progress_tracker is not None
+        ):
+            self.geometry_last_odom_point = (x, y)
 
         self.current_x = x
         self.current_y = y
@@ -2031,6 +2441,11 @@ class RPPController(Node):
             points.append((x, y))
 
         if not points:
+            if self.geometry_processing_enabled:
+                self.geometry_pending_nav_points = None
+                self._invalidate_installed_geometry(
+                    GeometryResetReason.SOURCE_CLEARED
+                )
             self.nav_path_points = []
             self.nav_path_received = False
             self.nav_path_segment_start_index = 0
@@ -2040,6 +2455,8 @@ class RPPController(Node):
             self.get_logger().warn("/nav_path CLEARED / RPP PATH HOLD")
             return
 
+        if self.geometry_processing_enabled:
+            self.geometry_pending_nav_points = list(points)
         self.nav_path_points = points
         self.nav_path_received = True
         self.nav_path_segment_start_index = 0
@@ -2064,6 +2481,7 @@ class RPPController(Node):
             f"/nav_path RECEIVED | points={len(points)} | "
             f"lookahead={self.nav_path_lookahead:.2f}m"
         )
+        self._try_install_path_geometry()
 
     def find_nav_path_index(self, x, y, start_index=0, end_index=None):
         if not self.nav_path_points:
@@ -2162,6 +2580,232 @@ class RPPController(Node):
         return True
 
     def nav_path_tracking_solution(self, goal_x, goal_y):
+        """Select legacy cursor or synchronized projection geometry."""
+
+        if not self.geometry_tracking_enabled:
+            # Run the production cursor path first and return that exact result.
+            # Optional diagnostics are strictly shadow evaluation and cannot
+            # veto or replace legacy motion.
+            legacy_solution = self._legacy_nav_path_tracking_solution(goal_x, goal_y)
+            if self.geometry_diagnostics_enabled:
+                try:
+                    self._geometry_tracking_solution(goal_x, goal_y, shadow=True)
+                except Exception as error:  # Observability must not stop control.
+                    # Do not retry the failed diagnostics hook here. Even the
+                    # failure logger is isolated so the legacy command result
+                    # below remains unconditional.
+                    try:
+                        self.get_logger().error(
+                            "PRECISION GEOMETRY SHADOW EVALUATION FAILED | "
+                            f"type={type(error).__name__}"
+                        )
+                    except Exception:
+                        pass
+            return legacy_solution
+        return self._geometry_tracking_solution(goal_x, goal_y, shadow=False)
+
+    def _publish_geometry_debug(self, *, projection=None, lookup=None, status):
+        if not self.geometry_processing_enabled:
+            return
+        allowed_statuses = {
+            "CONTRACT_UNAVAILABLE",
+            "GOAL_COORDINATE_MISMATCH",
+            "INTERNAL_ERROR",
+            "PROJECTION_REJECTED",
+            "SHADOW_READY",
+            "TANGENT_UNAVAILABLE",
+            "TRACKING_READY",
+        }
+        if status not in allowed_statuses:
+            status = "INTERNAL_ERROR"
+        tracker = self.geometry_progress_tracker
+        binding = self.geometry_goal_binding
+        active_span = self.geometry_active_span
+        nearest_raw_index = None
+        if projection is not None:
+            nearest_raw_index = (
+                projection.raw_start_index
+                if projection.t < 0.5
+                else projection.raw_end_index
+            )
+        payload = {
+            "schema_version": 1,
+            "status": status,
+            "ros_time_ns": self.get_clock().now().nanoseconds,
+            "geometry_tracking_enabled": self.geometry_tracking_enabled,
+            "geometry_diagnostics_enabled": self.geometry_diagnostics_enabled,
+            "path_signature": self.geometry_installed_signature,
+            "raw_path_index": nearest_raw_index,
+            "nearest_raw_index": nearest_raw_index,
+            "raw_segment_start_index": (
+                projection.raw_start_index if projection is not None else None
+            ),
+            "raw_segment_end_index": (
+                projection.raw_end_index if projection is not None else None
+            ),
+            "geometry_segment": (
+                projection.segment_index if projection is not None else None
+            ),
+            "projection_t": projection.t if projection is not None else None,
+            "projection_x": projection.point.x if projection is not None else None,
+            "projection_y": projection.point.y if projection is not None else None,
+            "raw_projected_s": (
+                projection.projected_s if projection is not None else None
+            ),
+            "projected_s": projection.progress_s if projection is not None else None,
+            "cross_track_mm": (
+                projection.signed_cross_track_m * 1000.0
+                if projection is not None
+                else None
+            ),
+            "remaining_m": (
+                projection.remaining_to_active_stop_m
+                if projection is not None
+                else None
+            ),
+            "remaining_path_m": (
+                projection.remaining_path_m if projection is not None else None
+            ),
+            "next_corner_distance_m": (
+                projection.next_corner_distance_m
+                if projection is not None
+                else None
+            ),
+            "next_corner_angle_deg": (
+                math.degrees(projection.next_corner_angle_rad)
+                if projection is not None
+                and projection.next_corner_angle_rad is not None
+                else None
+            ),
+            "active_goal_identity": (
+                binding.active_goal_identity if binding is not None else None
+            ),
+            "active_span_start_raw_index": (
+                active_span.start_raw_index if active_span is not None else None
+            ),
+            "active_span_stop_raw_index": (
+                active_span.stop_raw_index if active_span is not None else None
+            ),
+            "active_span_first_segment": (
+                active_span.first_segment_index if active_span is not None else None
+            ),
+            "active_span_last_segment": (
+                active_span.last_segment_index if active_span is not None else None
+            ),
+            "geometry_reset_reason": self.geometry_last_reset_reason,
+            "geometry_reset_count": self.geometry_reset_count,
+            "tracker_reset_count": tracker.reset_count if tracker is not None else None,
+            "monotonic_clamped": (
+                projection.monotonic_clamped if projection is not None else None
+            ),
+            "used_full_reacquire": (
+                projection.used_full_reacquire if projection is not None else None
+            ),
+            "lookup_target": (
+                {
+                    "segment": lookup.segment_index,
+                    "t": lookup.t,
+                    "x": lookup.point.x,
+                    "y": lookup.point.y,
+                    "s": lookup.s,
+                }
+                if lookup is not None
+                else None
+            ),
+        }
+        message = String()
+        message.data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        self.geometry_debug_pub.publish(message)
+
+    def _geometry_tracking_solution(self, goal_x, goal_y, *, shadow):
+        if not (
+            self.geometry_contract_synchronized
+            and self.path_geometry is not None
+            and self.geometry_progress_tracker is not None
+            and self.geometry_goal_binding is not None
+            and self.geometry_active_span is not None
+            and self.current_x is not None
+            and self.current_y is not None
+        ):
+            self._publish_geometry_debug(status="CONTRACT_UNAVAILABLE")
+            return None
+
+        raw_goal = self.path_geometry.raw_points[
+            self.geometry_goal_binding.raw_path_index
+        ].point
+        if math.hypot(raw_goal.x - goal_x, raw_goal.y - goal_y) > max(
+            self.waypoint_match_tolerance, 0.002
+        ):
+            self.geometry_goal_binding = None
+            self.geometry_active_span = None
+            self._publish_geometry_debug(status="GOAL_COORDINATE_MISMATCH")
+            return None
+
+        try:
+            projection = self.geometry_progress_tracker.update(
+                (self.current_x, self.current_y),
+                active_span=self.geometry_active_span,
+                back_window_segments=self.geometry_back_window_segments,
+                forward_window_segments=self.geometry_forward_window_segments,
+                max_backward_jump_m=self.geometry_max_backward_jump,
+                max_forward_jump_m=self.geometry_max_forward_jump,
+                full_reacquire_distance_m=self.geometry_reacquire_distance,
+            )
+            lookup = self.path_geometry.lookahead_target(
+                projection.progress_s,
+                self.nav_path_lookahead,
+                active_span=self.geometry_active_span,
+            )
+        except (TypeError, ValueError):
+            self._publish_geometry_debug(status="PROJECTION_REJECTED")
+            return None
+
+        self.geometry_last_projection = projection
+        path_bearing = None
+        if projection.segment_index is not None:
+            path_bearing = self.path_geometry.segments[
+                projection.segment_index
+            ].heading_rad
+        elif lookup.heading_rad is not None:
+            path_bearing = lookup.heading_rad
+        else:
+            dx = goal_x - self.current_x
+            dy = goal_y - self.current_y
+            if math.hypot(dx, dy) > self.WAYPOINT_CHANGE_EPSILON_M:
+                path_bearing = math.atan2(dy, dx)
+            elif self.current_yaw is not None:
+                path_bearing = self.current_yaw
+        if path_bearing is None:
+            self._publish_geometry_debug(
+                projection=projection,
+                lookup=lookup,
+                status="TANGENT_UNAVAILABLE",
+            )
+            return None
+
+        self._publish_geometry_debug(
+            projection=projection,
+            lookup=lookup,
+            status="SHADOW_READY" if shadow else "TRACKING_READY",
+        )
+        geometry_segment = (
+            projection.segment_index if projection.segment_index is not None else 0
+        )
+        lookup_segment = (
+            lookup.segment_index
+            if lookup.segment_index is not None
+            else geometry_segment
+        )
+        return (
+            projection.point.x,
+            projection.point.y,
+            path_bearing,
+            geometry_segment,
+            lookup_segment,
+            self.geometry_goal_binding.raw_path_index,
+        )
+
+    def _legacy_nav_path_tracking_solution(self, goal_x, goal_y):
         """Advance through 50 mm points and return local tangent + lookahead.
 
         Returns:
@@ -2304,11 +2948,20 @@ class RPPController(Node):
                 return
             points.append((x, y))
         if not points:
+            if self.geometry_processing_enabled:
+                self.geometry_pending_marking_waypoints = None
+                self._invalidate_installed_geometry(
+                    GeometryResetReason.SOURCE_CLEARED
+                )
             return
+
+        if self.geometry_processing_enabled:
+            self.geometry_pending_marking_waypoints = list(points)
 
         previous_p1 = self.marking_waypoints[0] if self.marking_waypoints else None
         self.marking_waypoints = points
         self.marking_metadata_received = True
+        self._try_install_path_geometry()
 
         # Reclassify an already-received semantic goal if retained marking
         # metadata arrives after /segment_goal. This closes a startup DDS
@@ -2459,6 +3112,12 @@ class RPPController(Node):
         self.target_y = y
         self.target_is_marking = new_number > 0
         self.last_waypoint_time = self.get_clock().now()
+        # The Pose and additive metadata are separate volatile topics. Bind
+        # whichever arrived second; an old metadata/pose pair cannot survive
+        # the coordinate and raw-index validation.
+        self.geometry_goal_binding = None
+        self.geometry_active_span = None
+        self._try_bind_geometry_goal(log_error=False)
 
         if not changed:
             return
