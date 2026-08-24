@@ -114,7 +114,10 @@ class MissionManager(Node):
         self.declare_parameter("spray_required", True)
         self.declare_parameter("spray_confirmation_timeout_sec", 5.0)
         self.declare_parameter("spray_status_timeout_sec", 2.0)
-        self.declare_parameter("precision_path_contract_enabled", False)
+        # Gate-1 accepted after four forward/reverse field runs. The signed
+        # path contract is now the production default; its runtime rollback
+        # gate remains available while safely stopped.
+        self.declare_parameter("precision_path_contract_enabled", True)
         self.declare_parameter("precision_terminal_enabled", False)
         self.declare_parameter("precision_terminal_heartbeat_timeout_sec", 0.50)
 

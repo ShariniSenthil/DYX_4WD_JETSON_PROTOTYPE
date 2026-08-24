@@ -21,6 +21,21 @@ PATH_SIGNATURE = make_path_signature(
 )
 
 
+def test_accepted_path_contract_is_default_on_but_terminal_stays_off():
+    """Persist Gate-1 acceptance without enabling terminal authority."""
+    source_path = (
+        Path(__file__).parents[1]
+        / "mission_manager"
+        / "mission_manager_node.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    assert (
+        'declare_parameter("precision_path_contract_enabled", True)'
+        in source
+    )
+    assert 'declare_parameter("precision_terminal_enabled", False)' in source
+
+
 def decide(updates, **overrides):
     arguments = {
         "current_path_contract_enabled": False,

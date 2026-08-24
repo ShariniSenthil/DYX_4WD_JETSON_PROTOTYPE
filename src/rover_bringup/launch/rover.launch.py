@@ -233,9 +233,9 @@ def generate_launch_description() -> LaunchDescription:
                         "waypoint_match_tolerance_m": 0.002,
                         "odom_timeout_sec": 0.50,
                         "maximum_navigation_points": 200000,
-                        # Additive Phase-1 path identity contract. Default-OFF
-                        # preserves legacy Pose-only goal publication.
-                        "precision_path_contract_enabled": False,
+                        # Gate-1 accepted in four forward/reverse field runs.
+                        # Signed semantic path identity is now the default.
+                        "precision_path_contract_enabled": True,
                         # Phase-6 verifier remains dormant until Phase-5 RPP
                         # certificate authority is deliberately enabled.
                         "precision_terminal_enabled": False,
@@ -381,11 +381,10 @@ def generate_launch_description() -> LaunchDescription:
                         "terminal_line_correction_limit_deg": 18.0,
                         "line_tracking_lookahead_m": 0.55,
                         "nav_path_lookahead_m": 0.55,
-                        # Phase-1 derived geometry sidecar. Default-OFF keeps
-                        # the production 50mm cursor command path unchanged;
-                        # enable only for explicit field A/B runs after the
-                        # synchronized path/goal contract is visible in bags.
-                        "geometry_tracking_enabled": False,
+                        # Gate-1 accepted in four forward/reverse field runs.
+                        # Geometry is installed by default but cannot change
+                        # motion until a downstream precision gate is enabled.
+                        "geometry_tracking_enabled": True,
                         # Shadow projection/diagnostics without changing the
                         # production cursor solution. Also default-OFF so old
                         # bags do not require the additive path signature.

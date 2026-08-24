@@ -461,10 +461,10 @@ class RPPController(Node):
         self.declare_parameter("odom_timeout_sec", 0.50)
         self.declare_parameter("waypoint_timeout_sec", 1.00)
 
-        # Derived path geometry is additive and default-OFF.  The retained raw
-        # path and legacy cursor remain authoritative until deliberately gated
-        # on after Phase-1 field review.
-        self.declare_parameter("geometry_tracking_enabled", False)
+        # Gate-1 geometry was accepted after four forward/reverse field runs.
+        # It is now installed by default while the legacy cursor remains the
+        # motion authority until the independently gated Phase-2 controls run.
+        self.declare_parameter("geometry_tracking_enabled", True)
         self.declare_parameter("geometry_diagnostics_enabled", False)
         self.declare_parameter("geometry_corner_threshold_deg", 45.0)
         self.declare_parameter("geometry_projection_back_window_segments", 2)

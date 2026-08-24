@@ -158,18 +158,18 @@ def test_first_goal_binding_and_transitions_seed_progress_and_hint():
     assert "hint_segment_index=hint" in source
 
 
-def test_phase_one_feature_flags_and_jump_bounds_are_default_off_in_launch():
+def test_accepted_phase_one_defaults_and_jump_bounds_are_in_launch():
     launch_source = LAUNCH_PATH.read_text(encoding="utf-8")
     node_source = NODE_PATH.read_text(encoding="utf-8")
 
     for declaration in (
-        'declare_parameter("geometry_tracking_enabled", False)',
+        'declare_parameter("geometry_tracking_enabled", True)',
         'declare_parameter("geometry_diagnostics_enabled", False)',
     ):
         assert declaration in node_source
     for launch_setting in (
-        '"precision_path_contract_enabled": False',
-        '"geometry_tracking_enabled": False',
+        '"precision_path_contract_enabled": True',
+        '"geometry_tracking_enabled": True',
         '"geometry_diagnostics_enabled": False',
     ):
         assert launch_setting in launch_source
