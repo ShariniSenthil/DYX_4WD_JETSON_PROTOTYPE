@@ -59,6 +59,7 @@ class LongitudinalRegulatorConfig:
     cross_track_recovery_start_m: float = 0.020
     cross_track_recovery_full_m: float = 0.100
     recovery_min_speed_mps: float = 0.15
+    recovery_exit_dwell_sec: float = 0.30
 
     corner_angle_threshold_rad: float = math.radians(45.0)
     corner_target_speed_mps: float = 0.12
@@ -85,6 +86,7 @@ class LongitudinalRegulatorConfig:
             "cross_track_recovery_start_m",
             "cross_track_recovery_full_m",
             "recovery_min_speed_mps",
+            "recovery_exit_dwell_sec",
             "corner_angle_threshold_rad",
             "corner_target_speed_mps",
             "corner_accel_block_buffer_m",
@@ -105,6 +107,7 @@ class LongitudinalRegulatorConfig:
             "control_dt_max_sec",
             "heading_recovery_full_rad",
             "cross_track_recovery_full_m",
+            "recovery_exit_dwell_sec",
             "lateral_acceleration_max_mps2",
             "curvature_epsilon_inv_m",
         )
@@ -185,7 +188,6 @@ class SpeedRegulatorInput:
     curvature_inv_m: Optional[float] = None
     tracking_acceleration_allowed: bool = True
     tracking_speed_cap_mps: Optional[float] = None
-    recovery_requested: bool = False
     hard_zero: bool = False
 
 
@@ -238,6 +240,8 @@ class SpeedRegulatorResult:
     acceleration_progress_m: float
     recovery_active: bool
     recovery_transition: str
+    recovery_exit_dwell_sec: float
+    recovery_exit_dwell_required_sec: float
     corner_required_braking_distance_m: Optional[float]
     terminal_required_braking_distance_m: Optional[float]
 
@@ -337,6 +341,7 @@ class LongitudinalRegulator:
         self._initial_speed_mps = 0.0
         self._last_requested_speed_mps = 0.0
         self._recovery_active = False
+        self._recovery_exit_dwell_sec = 0.0
 
     def reset(
         self,
@@ -356,6 +361,7 @@ class LongitudinalRegulator:
         self._initial_speed_mps = initial
         self._last_requested_speed_mps = initial
         self._recovery_active = False
+        self._recovery_exit_dwell_sec = 0.0
 
     def resolve(self, request: SpeedRegulatorInput) -> SpeedRegulatorResult:
         """Resolve one finite non-negative speed command."""
@@ -408,8 +414,6 @@ class LongitudinalRegulator:
         )
         if not isinstance(request.tracking_acceleration_allowed, bool):
             raise ValueError("tracking_acceleration_allowed must be boolean")
-        if not isinstance(request.recovery_requested, bool):
-            raise ValueError("recovery_requested must be boolean")
         tracking_cap = self._optional_nonnegative(
             "tracking_speed_cap_mps", request.tracking_speed_cap_mps
         )
@@ -431,21 +435,36 @@ class LongitudinalRegulator:
         )
 
         recovery_was_active = self._recovery_active
+        recovery_exit_dwell_for_result = self._recovery_exit_dwell_sec
         recovery_enter = (
-            request.recovery_requested
-            or heading_error >= config.heading_recovery_full_rad
+            heading_error >= config.heading_recovery_full_rad
             or cross_track >= config.cross_track_recovery_full_m
         )
-        recovery_exit = (
-            not request.recovery_requested
-            and heading_error <= config.heading_recovery_start_rad
+        recovery_exit_geometry = (
+            heading_error <= config.heading_recovery_start_rad
             and cross_track <= config.cross_track_recovery_start_m
         )
         if self._recovery_active:
-            if recovery_exit:
+            if recovery_exit_geometry:
+                self._recovery_exit_dwell_sec = min(
+                    config.recovery_exit_dwell_sec,
+                    self._recovery_exit_dwell_sec + bounded_dt,
+                )
+            else:
+                self._recovery_exit_dwell_sec = 0.0
+            if (
+                self._recovery_exit_dwell_sec
+                >= config.recovery_exit_dwell_sec
+            ):
+                recovery_exit_dwell_for_result = self._recovery_exit_dwell_sec
                 self._recovery_active = False
+                self._recovery_exit_dwell_sec = 0.0
+            else:
+                recovery_exit_dwell_for_result = self._recovery_exit_dwell_sec
         elif recovery_enter:
             self._recovery_active = True
+            self._recovery_exit_dwell_sec = 0.0
+            recovery_exit_dwell_for_result = 0.0
 
         if self._recovery_active and not recovery_was_active:
             recovery_transition = "ENTERED"
@@ -636,6 +655,8 @@ class LongitudinalRegulator:
             acceleration_progress_m=accel_progress,
             recovery_active=self._recovery_active,
             recovery_transition=recovery_transition,
+            recovery_exit_dwell_sec=recovery_exit_dwell_for_result,
+            recovery_exit_dwell_required_sec=config.recovery_exit_dwell_sec,
             corner_required_braking_distance_m=corner_required,
             terminal_required_braking_distance_m=terminal_required,
         )

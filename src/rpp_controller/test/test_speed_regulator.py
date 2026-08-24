@@ -21,11 +21,12 @@ def make_config(**overrides):
         "control_dt_max_sec": 0.10,
         "heading_accel_full_error_rad": math.radians(2.0),
         "heading_recovery_start_rad": math.radians(4.0),
-        "heading_recovery_full_rad": math.radians(10.0),
+        "heading_recovery_full_rad": math.radians(15.0),
         "cross_track_accel_full_m": 0.01,
         "cross_track_recovery_start_m": 0.02,
         "cross_track_recovery_full_m": 0.10,
         "recovery_min_speed_mps": 0.20,
+        "recovery_exit_dwell_sec": 0.30,
         "corner_angle_threshold_rad": math.radians(45.0),
         "corner_target_speed_mps": 0.12,
         "corner_accel_block_buffer_m": 0.10,
@@ -221,7 +222,7 @@ def test_negative_dt_is_floored_and_cannot_create_a_reverse_slew():
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("heading_error_rad", math.radians(12.0)),
+        ("heading_error_rad", math.radians(16.0)),
         ("cross_track_error_m", 0.20),
     ],
 )
@@ -247,7 +248,6 @@ def test_recovery_request_cannot_remain_trapped_at_adapter_floor():
             along_track_progress_m=0.0,
             heading_error_rad=math.radians(20.0),
             cross_track_error_m=0.20,
-            recovery_requested=True,
         )
     )
 
@@ -257,19 +257,47 @@ def test_recovery_request_cannot_remain_trapped_at_adapter_floor():
     assert result.winning_cap_owner is SpeedCapOwner.RECOVERY
 
 
-def test_external_recovery_request_selects_bounded_speed_before_full_error():
+@pytest.mark.parametrize(
+    ("cross_track", "heading_deg"),
+    [
+        (0.016, 0.0),
+        (0.050, 5.0),
+        (0.099, 0.0),
+        (0.0, 14.9),
+    ],
+)
+def test_subthreshold_tracking_error_does_not_select_full_recovery(
+    cross_track, heading_deg
+):
     regulator = primed_regulator(speed=0.60)
 
     result = regulator.resolve(
         request(
             last_commanded_speed_mps=0.60,
-            cross_track_error_m=0.05,
-            recovery_requested=True,
+            cross_track_error_m=cross_track,
+            heading_error_rad=math.radians(heading_deg),
         )
     )
 
-    assert result.requested_speed_mps == pytest.approx(0.20)
+    assert result.requested_speed_mps > 0.20
     assert result.requested_speed_mps < 1.0
+    assert result.winning_cap_owner is not SpeedCapOwner.RECOVERY
+    assert result.recovery_active is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("cross_track_error_m", 0.10),
+        ("heading_error_rad", math.radians(15.0)),
+    ],
+)
+def test_full_recovery_enters_at_existing_large_error_threshold(field, value):
+    result = primed_regulator(speed=0.60).resolve(request(**{field: value}))
+
+    assert result.recovery_active is True
+    assert result.recovery_transition == "ENTERED"
+    assert result.requested_speed_mps == pytest.approx(0.20)
     assert result.winning_cap_owner is SpeedCapOwner.RECOVERY
 
 
@@ -285,23 +313,79 @@ def test_recovery_hysteresis_requires_both_errors_inside_exit_thresholds():
             last_commanded_speed_mps=entered.requested_speed_mps,
         )
     )
-    exited = regulator.resolve(
+    inside_one = regulator.resolve(
         request(
             cross_track_error_m=0.01,
             heading_error_rad=math.radians(2.0),
             last_commanded_speed_mps=held.requested_speed_mps,
         )
     )
+    inside_two = regulator.resolve(
+        request(
+            cross_track_error_m=0.01,
+            heading_error_rad=math.radians(2.0),
+            last_commanded_speed_mps=inside_one.requested_speed_mps,
+        )
+    )
+    exited = regulator.resolve(
+        request(
+            cross_track_error_m=0.01,
+            heading_error_rad=math.radians(2.0),
+            last_commanded_speed_mps=inside_two.requested_speed_mps,
+        )
+    )
 
     assert entered.recovery_transition == "ENTERED"
     assert held.recovery_active is True
     assert held.recovery_transition == "ACTIVE"
+    assert inside_one.recovery_active is True
+    assert inside_one.recovery_exit_dwell_sec == pytest.approx(0.10)
+    assert inside_two.recovery_active is True
+    assert inside_two.recovery_exit_dwell_sec == pytest.approx(0.20)
     assert exited.recovery_active is False
     assert exited.recovery_transition == "EXITED"
+    assert exited.recovery_exit_dwell_sec == pytest.approx(0.30)
+
+
+def test_recovery_exit_dwell_resets_when_either_error_leaves_exit_band():
+    regulator = primed_regulator(speed=0.50)
+    regulator.resolve(request(cross_track_error_m=0.20))
+    inside = regulator.resolve(
+        request(
+            cross_track_error_m=0.01,
+            heading_error_rad=math.radians(2.0),
+            last_commanded_speed_mps=0.20,
+        )
+    )
+    interrupted = regulator.resolve(
+        request(
+            cross_track_error_m=0.021,
+            heading_error_rad=math.radians(2.0),
+            last_commanded_speed_mps=inside.requested_speed_mps,
+        )
+    )
+    restarted = regulator.resolve(
+        request(
+            cross_track_error_m=0.01,
+            heading_error_rad=math.radians(2.0),
+            last_commanded_speed_mps=interrupted.requested_speed_mps,
+        )
+    )
+
+    assert inside.recovery_exit_dwell_sec == pytest.approx(0.10)
+    assert interrupted.recovery_active is True
+    assert interrupted.recovery_exit_dwell_sec == 0.0
+    assert restarted.recovery_active is True
+    assert restarted.recovery_exit_dwell_sec == pytest.approx(0.10)
 
 
 def test_recovery_exit_resumes_slew_without_one_cycle_speed_spike():
-    regulator = LongitudinalRegulator(make_config(recovery_min_speed_mps=0.20))
+    regulator = LongitudinalRegulator(
+        make_config(
+            recovery_min_speed_mps=0.20,
+            recovery_exit_dwell_sec=0.20,
+        )
+    )
     regulator.reset()
     recovery = regulator.resolve(
         request(
@@ -309,7 +393,7 @@ def test_recovery_exit_resumes_slew_without_one_cycle_speed_spike():
             cross_track_error_m=0.20,
         )
     )
-    resumed = regulator.resolve(
+    settling = regulator.resolve(
         request(
             along_track_progress_m=10.0,
             last_commanded_speed_mps=recovery.requested_speed_mps,
@@ -317,8 +401,18 @@ def test_recovery_exit_resumes_slew_without_one_cycle_speed_spike():
             heading_error_rad=0.0,
         )
     )
+    resumed = regulator.resolve(
+        request(
+            along_track_progress_m=10.0,
+            last_commanded_speed_mps=settling.requested_speed_mps,
+            cross_track_error_m=0.0,
+            heading_error_rad=0.0,
+        )
+    )
 
     assert recovery.requested_speed_mps == pytest.approx(0.20)
+    assert settling.requested_speed_mps == pytest.approx(0.20)
+    assert settling.recovery_active is True
     assert resumed.recovery_transition == "EXITED"
     assert resumed.requested_speed_mps == pytest.approx(0.30)
     assert resumed.requested_speed_mps < 1.0
@@ -334,7 +428,6 @@ def test_terminal_zero_and_hard_zero_remain_above_recovery_authority():
     hard_stop = primed_regulator(speed=0.50).resolve(
         request(
             cross_track_error_m=0.20,
-            recovery_requested=True,
             hard_zero=True,
         )
     )
@@ -490,6 +583,7 @@ def test_all_active_caps_and_result_are_finite():
         {"hardware_speed_ceiling_mps": 0.0},
         {"deceleration_mps2": 0.0},
         {"control_dt_max_sec": float("nan")},
+        {"recovery_exit_dwell_sec": 0.0},
         {"heading_recovery_start_rad": 0.3, "heading_recovery_full_rad": 0.2},
         {"cross_track_recovery_start_m": 0.2, "cross_track_recovery_full_m": 0.1},
         {"recovery_min_speed_mps": 1.1},

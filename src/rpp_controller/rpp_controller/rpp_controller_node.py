@@ -1087,6 +1087,7 @@ class RPPController(Node):
             recovery_min_speed_mps=float(
                 self.get_parameter("precision_recovery_min_speed_mps").value
             ),
+            recovery_exit_dwell_sec=self.xtrack_priority_hold_sec,
             corner_angle_threshold_rad=math.radians(
                 float(
                     self.get_parameter("precision_corner_angle_threshold_deg").value
@@ -5716,7 +5717,7 @@ class RPPController(Node):
         except Exception:
             self._publish_tracking_debug(status="METRIC_SAMPLE_REJECTED")
 
-    def _resolve_precision_speed_for_cycle(self, *, recovery_requested=False):
+    def _resolve_precision_speed_for_cycle(self):
         """Resolve exactly one longitudinal command for this control tick."""
 
         if self.precision_speed_cycle_token == self.precision_cycle_token:
@@ -5768,7 +5769,6 @@ class RPPController(Node):
                 if tracking is not None
                 else None
             ),
-            recovery_requested=bool(recovery_requested),
             hard_zero=False,
         )
         try:
@@ -5880,11 +5880,12 @@ class RPPController(Node):
             "tracking_speed_cap_mps": (
                 request.tracking_speed_cap_mps if request is not None else None
             ),
-            "recovery_requested": (
-                request.recovery_requested if request is not None else None
-            ),
             "recovery_active": result.recovery_active,
             "recovery_transition": result.recovery_transition,
+            "recovery_exit_dwell_sec": result.recovery_exit_dwell_sec,
+            "recovery_exit_dwell_required_sec": (
+                result.recovery_exit_dwell_required_sec
+            ),
             "regulator_reset_reason": self.precision_regulator_reset_reason,
             "regulator_reset_count": self.precision_regulator_reset_count,
         }
@@ -8155,9 +8156,7 @@ class RPPController(Node):
             ) = self.limit_moving_guidance_bearing(xtrack_guidance_bearing)
             speed = self.xtrack_priority_speed
             if self.precision_speed_control_enabled:
-                speed_result = self._resolve_precision_speed_for_cycle(
-                    recovery_requested=True
-                )
+                speed_result = self._resolve_precision_speed_for_cycle()
                 if speed_result is None:
                     self.publish_stop()
                     self.get_logger().error(

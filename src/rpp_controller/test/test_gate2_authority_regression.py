@@ -35,15 +35,29 @@ def _control_region(start_marker: str, end_marker: str) -> str:
     return control[start:end]
 
 
-def test_recovery_branch_requests_explicit_recovery_speed_authority():
+def test_legacy_recovery_branch_does_not_force_precision_speed_recovery():
     recovery = _control_region(
         "if (\n            not self.precision_tracking_control_enabled",
         "# CONTINUOUS TWO-METRE TERMINAL APPROACH",
     )
 
     assert "and not terminal_active" in recovery
-    assert "recovery_requested=True" in recovery
+    assert "recovery_requested" not in recovery
+    assert "_resolve_precision_speed_for_cycle()" in recovery
     assert "publish_precision_velocity_ned" in recovery
+
+
+def test_longitudinal_regulator_is_the_only_precision_recovery_state_owner():
+    resolver_path = PACKAGE_ROOT / "rpp_controller" / "speed_regulator.py"
+    resolver = resolver_path.read_text(encoding="utf-8")
+    node_resolver = _method_source("_resolve_precision_speed_for_cycle")
+
+    assert "self._recovery_active" in resolver
+    assert "heading_error >= config.heading_recovery_full_rad" in resolver
+    assert "cross_track >= config.cross_track_recovery_full_m" in resolver
+    assert "heading_error <= config.heading_recovery_start_rad" in resolver
+    assert "cross_track <= config.cross_track_recovery_start_m" in resolver
+    assert "recovery_requested" not in node_resolver
 
 
 def test_recovery_contract_is_above_generic_moving_floor():
