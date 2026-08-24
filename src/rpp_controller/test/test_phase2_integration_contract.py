@@ -193,6 +193,22 @@ def test_speed_debug_contains_every_cap_and_winner():
         assert f'"{field}"' in debug
 
 
+def test_guidance_debug_exposes_endpoint_extension_and_final_angles():
+    debug = _method_source("_publish_guidance_debug")
+
+    for field in (
+        "requested_lookahead_m",
+        "actual_steering_target_distance_m",
+        "endpoint_extension_used",
+        "endpoint_extension_distance_m",
+        "target_behind_rover",
+        "path_heading_error_rad",
+        "lookahead_heading_error_rad",
+        "final_command_correction_rad",
+    ):
+        assert f'"{field}"' in debug
+
+
 def test_precision_reset_boundaries_are_explicit():
     for reason in (
         "LITERAL_STOP",

@@ -92,12 +92,19 @@ class GuidanceResult:
     lookahead_target_s: float
     lookahead_segment_index: int | None
     lookahead_point: Point2D
+    steering_target_point: Point2D
+    actual_steering_target_distance_m: float
+    endpoint_extension_used: bool
+    endpoint_extension_distance_m: float
+    target_behind_rover: bool
     lookahead_bearing_rad: float
     local_path_heading_rad: float
+    path_heading_error_rad: float
     heading_error_rad: float
     signed_cross_track_m: float
     desired_movement_bearing_rad: float
     limited_command_bearing_rad: float
+    final_command_correction_rad: float
     bearing_clamp_fired: bool
     zero_vector_fallback_used: bool
 
@@ -200,18 +207,31 @@ def compute_precision_guidance(
         target_heading_rad=target.heading_rad,
         rover_yaw_rad=rover_yaw_rad,
     )
-    delta_x = target.point.x - position.x
-    delta_y = target.point.y - position.y
+    steering_target, extension_distance = _steering_target_with_endpoint_extension(
+        geometry,
+        active_span,
+        target_point=target.point,
+        requested_target_s=projection.progress_s + lookahead_distance,
+    )
+    extension_used = extension_distance > 0.0
+    delta_x = steering_target.x - position.x
+    delta_y = steering_target.y - position.y
+    actual_target_distance = math.hypot(delta_x, delta_y)
     zero_vector = math.hypot(delta_x, delta_y) <= _ZERO_VECTOR_EPSILON_M
     desired_bearing = (
         local_path_heading if zero_vector else math.atan2(delta_y, delta_x)
     )
     desired_bearing = wrap_angle(desired_bearing)
     heading_error = wrap_heading_error(desired_bearing, rover_yaw_rad)
+    path_heading_error = wrap_heading_error(local_path_heading, rover_yaw_rad)
     limited_bearing, clamp_fired = limit_bearing_to_moving_cone(
         desired_bearing,
         rover_yaw_rad,
         config.moving_bearing_cone_rad,
+    )
+    final_command_correction = wrap_angle(limited_bearing - local_path_heading)
+    target_forward_component = (
+        delta_x * math.cos(rover_yaw_rad) + delta_y * math.sin(rover_yaw_rad)
     )
 
     return GuidanceResult(
@@ -219,14 +239,57 @@ def compute_precision_guidance(
         lookahead_target_s=target.s,
         lookahead_segment_index=target.segment_index,
         lookahead_point=target.point,
+        steering_target_point=steering_target,
+        actual_steering_target_distance_m=actual_target_distance,
+        endpoint_extension_used=extension_used,
+        endpoint_extension_distance_m=extension_distance,
+        target_behind_rover=target_forward_component < -_ZERO_VECTOR_EPSILON_M,
         lookahead_bearing_rad=desired_bearing,
         local_path_heading_rad=local_path_heading,
+        path_heading_error_rad=path_heading_error,
         heading_error_rad=heading_error,
         signed_cross_track_m=projection.signed_cross_track_m,
         desired_movement_bearing_rad=desired_bearing,
         limited_command_bearing_rad=limited_bearing,
+        final_command_correction_rad=final_command_correction,
         bearing_clamp_fired=clamp_fired,
         zero_vector_fallback_used=zero_vector,
+    )
+
+
+def _steering_target_with_endpoint_extension(
+    geometry: PathGeometryIndex,
+    active_span: ActiveSemanticSpan,
+    *,
+    target_point: Point2D,
+    requested_target_s: float,
+) -> tuple[Point2D, float]:
+    """Extend only the steering target past an active semantic endpoint.
+
+    Geometry lookup remains clamped to ``active_span.stop_s``.  If the
+    requested arc-length target lies beyond that real endpoint, the missing
+    distance is continued along the span's incoming tangent.  The returned
+    virtual point is consumed only by the desired-bearing calculation; path
+    progress, remaining distance, semantic identity and stop coordinates stay
+    tied to the unmodified geometry objects.
+    """
+
+    _require_finite("requested_target_s", requested_target_s)
+    missing_distance = requested_target_s - active_span.stop_s
+    if missing_distance <= _ZERO_VECTOR_EPSILON_M:
+        return target_point, 0.0
+    segment_index = active_span.last_segment_index
+    if segment_index is None:
+        return target_point, 0.0
+    if not 0 <= segment_index < len(geometry.segments):
+        raise ValueError("active span last_segment_index is outside geometry")
+    incoming_heading = geometry.segments[segment_index].heading_rad
+    return (
+        Point2D(
+            target_point.x + missing_distance * math.cos(incoming_heading),
+            target_point.y + missing_distance * math.sin(incoming_heading),
+        ),
+        missing_distance,
     )
 
 

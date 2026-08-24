@@ -144,6 +144,135 @@ def test_desired_bearing_targets_actual_lookahead_vector():
     assert result.desired_movement_bearing_rad == pytest.approx(expected)
     assert result.heading_error_rad == pytest.approx(expected)
     assert result.signed_cross_track_m == pytest.approx(1.0)
+    assert result.endpoint_extension_used is False
+    assert result.steering_target_point == result.lookahead_point
+
+
+def test_endpoint_overshoot_uses_forward_virtual_steering_target_only():
+    geometry = PathGeometryIndex.build(
+        [(0, 0), (10, 0)],
+        point_types=[POINT_TYPE_PASS_THROUGH, POINT_TYPE_MARKING],
+        marking_indices=[-1, 0],
+    )
+    span = geometry.active_span(start_raw_index=0, stop_raw_index=1)
+    rover_position = (10.05, 0.02)
+    projection = geometry.project(rover_position, active_span=span)
+    result = compute_precision_guidance(
+        GuidanceConfig(
+            lookahead_min_m=0.55,
+            lookahead_max_m=0.55,
+            moving_bearing_cone_rad=math.pi,
+        ),
+        geometry=geometry,
+        projection=projection,
+        active_span=span,
+        rover_position=rover_position,
+        rover_yaw_rad=0.0,
+        speed_mps=1.0,
+    )
+
+    assert result.endpoint_extension_used is True
+    assert result.endpoint_extension_distance_m == pytest.approx(0.55)
+    assert result.lookahead_point == Point2D(10.0, 0.0)
+    assert result.steering_target_point == Point2D(10.55, 0.0)
+    assert result.actual_steering_target_distance_m == pytest.approx(
+        math.hypot(0.50, 0.02)
+    )
+    assert result.target_behind_rover is False
+    assert abs(result.heading_error_rad) < math.radians(3.0)
+
+
+def test_requested_lookahead_stays_forward_at_real_semantic_endpoint():
+    geometry = PathGeometryIndex.build(
+        [(0, 0), (10, 0)],
+        point_types=[POINT_TYPE_PASS_THROUGH, POINT_TYPE_MARKING],
+        marking_indices=[-1, 0],
+    )
+    span = geometry.active_span(start_raw_index=0, stop_raw_index=1)
+    projection = geometry.project((10, 0), active_span=span)
+    result = compute_precision_guidance(
+        GuidanceConfig(
+            lookahead_min_m=0.55,
+            lookahead_max_m=0.55,
+            moving_bearing_cone_rad=math.pi,
+        ),
+        geometry=geometry,
+        projection=projection,
+        active_span=span,
+        rover_position=(10, 0),
+        rover_yaw_rad=0.0,
+        speed_mps=1.0,
+    )
+
+    assert result.lookahead_distance_m == pytest.approx(0.55)
+    assert result.actual_steering_target_distance_m == pytest.approx(0.55)
+    assert result.lookahead_bearing_rad == pytest.approx(0.0)
+    assert result.target_behind_rover is False
+
+
+def test_endpoint_extension_follows_incoming_diagonal_tangent():
+    heading = math.pi / 4.0
+    endpoint = Point2D(2.0, 2.0)
+    geometry = PathGeometryIndex.build(
+        [(0, 0), endpoint],
+        point_types=[POINT_TYPE_PASS_THROUGH, POINT_TYPE_MARKING],
+        marking_indices=[-1, 0],
+    )
+    span = geometry.active_span(start_raw_index=0, stop_raw_index=1)
+    projection = geometry.project(endpoint, active_span=span)
+    result = compute_precision_guidance(
+        GuidanceConfig(
+            lookahead_min_m=0.55,
+            lookahead_max_m=0.55,
+            moving_bearing_cone_rad=math.pi,
+        ),
+        geometry=geometry,
+        projection=projection,
+        active_span=span,
+        rover_position=endpoint,
+        rover_yaw_rad=heading,
+        speed_mps=1.0,
+    )
+
+    offset = 0.55 / math.sqrt(2.0)
+    assert result.steering_target_point.x == pytest.approx(endpoint.x + offset)
+    assert result.steering_target_point.y == pytest.approx(endpoint.y + offset)
+    assert result.lookahead_bearing_rad == pytest.approx(heading)
+    assert result.path_heading_error_rad == pytest.approx(0.0)
+    assert result.final_command_correction_rad == pytest.approx(0.0)
+
+
+def test_virtual_endpoint_target_does_not_change_geometry_or_progress():
+    geometry = PathGeometryIndex.build(
+        [(0, 0), (10, 0)],
+        point_types=[POINT_TYPE_PASS_THROUGH, POINT_TYPE_MARKING],
+        marking_indices=[-1, 0],
+    )
+    span = geometry.active_span(start_raw_index=0, stop_raw_index=1)
+    semantic_endpoint = geometry.raw_points[span.stop_raw_index].point
+    projection = geometry.project((10.05, 0), active_span=span)
+    result = compute_precision_guidance(
+        GuidanceConfig(
+            lookahead_min_m=0.55,
+            lookahead_max_m=0.55,
+        ),
+        geometry=geometry,
+        projection=projection,
+        active_span=span,
+        rover_position=(10.05, 0),
+        rover_yaw_rad=0.0,
+        speed_mps=1.0,
+    )
+
+    assert geometry.raw_points[span.stop_raw_index].point == semantic_endpoint
+    assert semantic_endpoint == Point2D(10.0, 0.0)
+    assert span.stop_s == pytest.approx(10.0)
+    assert projection.projected_s == pytest.approx(10.0)
+    assert projection.progress_s == pytest.approx(10.0)
+    assert projection.remaining_to_active_stop_m == pytest.approx(0.0)
+    assert result.lookahead_target_s == pytest.approx(span.stop_s)
+    assert result.lookahead_point == semantic_endpoint
+    assert result.steering_target_point != semantic_endpoint
 
 
 @pytest.mark.parametrize(

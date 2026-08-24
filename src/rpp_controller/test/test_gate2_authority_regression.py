@@ -80,6 +80,8 @@ def test_terminal_bounded_bearing_cannot_be_overwritten_by_precision_lookahead()
     publication = terminal.index("self.publish_velocity_ned(", bounded)
     authority_region = terminal[bounded:publication]
     assert "precision_guidance.limited_command_bearing_rad" not in authority_region
+    assert "precision_guidance.steering_target_point" not in terminal
+    assert "endpoint_extension" not in terminal
 
 
 def test_terminal_speed_cannot_be_overridden_by_generic_precision_resolver():

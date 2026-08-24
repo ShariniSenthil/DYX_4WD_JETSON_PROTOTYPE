@@ -5380,6 +5380,9 @@ class RPPController(Node):
             "lookahead_distance_m": (
                 result.lookahead_distance_m if result is not None else None
             ),
+            "requested_lookahead_m": (
+                result.lookahead_distance_m if result is not None else None
+            ),
             "lookahead_target_s": (
                 result.lookahead_target_s if result is not None else None
             ),
@@ -5388,11 +5391,39 @@ class RPPController(Node):
             ),
             "lookahead_x": result.lookahead_point.x if result is not None else None,
             "lookahead_y": result.lookahead_point.y if result is not None else None,
+            "steering_target_x": (
+                result.steering_target_point.x if result is not None else None
+            ),
+            "steering_target_y": (
+                result.steering_target_point.y if result is not None else None
+            ),
+            "actual_steering_target_distance_m": (
+                result.actual_steering_target_distance_m
+                if result is not None
+                else None
+            ),
+            "endpoint_extension_used": (
+                result.endpoint_extension_used if result is not None else None
+            ),
+            "endpoint_extension_distance_m": (
+                result.endpoint_extension_distance_m
+                if result is not None
+                else None
+            ),
+            "target_behind_rover": (
+                result.target_behind_rover if result is not None else None
+            ),
             "path_heading_rad": (
                 result.local_path_heading_rad if result is not None else None
             ),
+            "path_heading_error_rad": (
+                result.path_heading_error_rad if result is not None else None
+            ),
             "lookahead_bearing_rad": (
                 result.lookahead_bearing_rad if result is not None else None
+            ),
+            "lookahead_heading_error_rad": (
+                result.heading_error_rad if result is not None else None
             ),
             "heading_error_rad": (
                 result.heading_error_rad if result is not None else None
@@ -5405,6 +5436,11 @@ class RPPController(Node):
             ),
             "limited_command_bearing_rad": (
                 result.limited_command_bearing_rad if result is not None else None
+            ),
+            "final_command_correction_rad": (
+                result.final_command_correction_rad
+                if result is not None
+                else None
             ),
             "bearing_clamp_fired": (
                 result.bearing_clamp_fired if result is not None else None
