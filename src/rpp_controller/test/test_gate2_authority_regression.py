@@ -37,7 +37,7 @@ def _control_region(start_marker: str, end_marker: str) -> str:
 
 def test_legacy_recovery_branch_does_not_force_precision_speed_recovery():
     recovery = _control_region(
-        "if (\n            not self.precision_tracking_control_enabled",
+        "if (\n            not precision_tracking_authority",
         "# CONTINUOUS TWO-METRE TERMINAL APPROACH",
     )
 
@@ -130,6 +130,6 @@ def test_gate2_off_retains_legacy_guidance_and_terminal_publisher():
     )
 
     assert "self.line_guidance(" in normal
-    assert "if self.precision_guidance_enabled:" in normal
+    assert "if self.precision_guidance_enabled and not first_approach:" in normal
     assert "if self.precision_speed_control_enabled:" in normal
     assert "self.publish_velocity_ned(" in terminal

@@ -23,6 +23,7 @@ from rpp_controller.point_event_policy import (
     latched_stop_terminal_outcome,
     should_release_first_marking,
 )
+from rpp_controller.runtime_entry import select_runtime_entry_authority
 from rpp_controller.path_geometry import (
     GeometryProgressTracker,
     GeometryResetReason,
@@ -7546,6 +7547,19 @@ class RPPController(Node):
             self.log_waiting("semantic goal not bound to /nav_path")
             return
 
+        if first_approach:
+            # The prepared /nav_path C->P1 span remains installed and is still
+            # evaluated above for contract/diagnostics. Motion authority is
+            # the fresh C captured by lock_c_to_p1_line() and exact semantic
+            # P1. Only diagnostic indices survive from the prepared solution.
+            nav_solution = select_runtime_entry_authority(
+                nav_solution,
+                first_approach=True,
+                p1_x=goal_x,
+                p1_y=goal_y,
+                c_to_p1_bearing=self.c_line_bearing,
+            )
+
         (
             target_x,
             target_y,
@@ -7579,11 +7593,14 @@ class RPPController(Node):
         precision_guidance = None
         if self.precision_guidance_enabled or self.precision_speed_control_enabled:
             precision_guidance = self._compute_precision_guidance_for_cycle()
-            if precision_guidance is None:
+            if precision_guidance is None and not first_approach:
                 self.publish_stop()
                 self.log_waiting("precision guidance lacks current-cycle projection")
                 return
-        if self.precision_tracking_control_enabled:
+        precision_tracking_authority = (
+            self.precision_tracking_control_enabled and not first_approach
+        )
+        if precision_tracking_authority:
             tracking_output = self._compute_precision_tracking_for_cycle()
             if tracking_output is None or not tracking_output.valid:
                 self.publish_stop()
@@ -7813,7 +7830,7 @@ class RPPController(Node):
                 target_y,
                 self.segment_alignment_correction_limit,
             )
-            if self.precision_guidance_enabled:
+            if self.precision_guidance_enabled and not first_approach:
                 alignment_guidance_bearing = (
                     precision_guidance.limited_command_bearing_rad
                 )
@@ -8029,7 +8046,7 @@ class RPPController(Node):
                     self.alignment_inside_since = None
 
                 if self.segment_alignment_active:
-                    if self.precision_guidance_enabled:
+                    if self.precision_guidance_enabled and not first_approach:
                         alignment_guidance_bearing = (
                             precision_guidance.limited_command_bearing_rad
                         )
@@ -8107,7 +8124,7 @@ class RPPController(Node):
         # bearing stays within the configured moving-guidance limit and uses
         # the fixed 1.00 m/s mission speed outside terminal deceleration.
         # --------------------------------------------------------------
-        if self.precision_tracking_control_enabled:
+        if precision_tracking_authority:
             # Phase-4 authority is projection guidance plus its pure hysteresis
             # controller.  Do not call or mutate either legacy derivative/
             # filtered-guidance state or the legacy xtrack priority latch.
@@ -8163,7 +8180,7 @@ class RPPController(Node):
             self.get_logger().error("NON-FINITE XTRACK GUIDANCE / SAFE HOLD")
             return
 
-        if self.precision_tracking_control_enabled:
+        if precision_tracking_authority:
             xtrack_speed_cap_active = False
             xtrack_error_metric = abs(global_signed_cross_track)
             xtrack_release_elapsed = self.precision_tracking_output.stable_dwell_sec
@@ -8179,11 +8196,11 @@ class RPPController(Node):
             )
 
         if (
-            not self.precision_tracking_control_enabled
+            not precision_tracking_authority
             and not terminal_active
             and xtrack_speed_cap_active
         ):
-            if self.precision_guidance_enabled:
+            if self.precision_guidance_enabled and not first_approach:
                 xtrack_guidance_bearing = (
                     precision_guidance.limited_command_bearing_rad
                 )
@@ -8379,7 +8396,7 @@ class RPPController(Node):
         # --------------------------------------------------------------
         # Normal pass-through and non-terminal movement.
         # --------------------------------------------------------------
-        if self.precision_tracking_control_enabled:
+        if precision_tracking_authority:
             guidance_bearing = precision_guidance.limited_command_bearing_rad
             signed_cross_track = precision_guidance.signed_cross_track_m
         else:
@@ -8392,7 +8409,7 @@ class RPPController(Node):
                 target_y,
                 self.path_correction_limit,
             )
-            if self.precision_guidance_enabled:
+            if self.precision_guidance_enabled and not first_approach:
                 guidance_bearing = precision_guidance.limited_command_bearing_rad
                 signed_cross_track = precision_guidance.signed_cross_track_m
         heading_error = self.normalize_angle(guidance_bearing - self.current_yaw)
