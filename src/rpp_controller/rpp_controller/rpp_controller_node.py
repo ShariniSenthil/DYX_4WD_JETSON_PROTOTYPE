@@ -6,6 +6,7 @@ import math
 import rclpy
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from nav_msgs.msg import Odometry, Path
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import (
@@ -33,6 +34,11 @@ from rpp_controller.path_geometry import (
 from rpp_controller.guidance import (
     GuidanceConfig,
     compute_precision_guidance,
+)
+from rpp_controller.feature_gates import (
+    PRECISION_FEATURE_GATES,
+    geometry_processing_requested,
+    validate_precision_feature_gates,
 )
 from rpp_controller.speed_regulator import (
     LongitudinalRegulator,
@@ -1778,6 +1784,16 @@ class RPPController(Node):
         self.last_wait_log_time = now
         self.last_mm_monitor_log_time = now
 
+        # Feature gates are runtime mutable only while the vehicle is in the
+        # same safe state required for stationary configuration.  Register
+        # after all adapter state exists so an accepted transition can install
+        # already-retained geometry atomically without commanding motion.
+        self._precision_gate_parameter_callback = (
+            self.add_on_set_parameters_callback(
+                self._on_set_precision_feature_gates
+            )
+        )
+
         self.timer = self.create_timer(
             1.0 / self.CONTROL_HZ,
             self.control_loop,
@@ -1915,6 +1931,106 @@ class RPPController(Node):
             "Exact marking zero: command zero only when "
             f"distance <= {self.waypoint_tolerance:.3f}m"
         )
+
+    def _precision_feature_gate_values(self):
+        """Snapshot the control-authoritative values of all precision gates."""
+        return {
+            name: bool(getattr(self, name))
+            for name in PRECISION_FEATURE_GATES
+        }
+
+    def _on_set_precision_feature_gates(self, parameters):
+        """Apply a safe, dependency-valid feature-gate transaction."""
+        requested = {
+            parameter.name: parameter
+            for parameter in parameters
+            if parameter.name in PRECISION_FEATURE_GATES
+        }
+        if not requested:
+            return SetParametersResult(successful=True)
+
+        current = self._precision_feature_gate_values()
+        prospective = dict(current)
+        for name, parameter in requested.items():
+            if parameter.type_ != Parameter.Type.BOOL:
+                return SetParametersResult(
+                    successful=False,
+                    reason=f"{name} must be a boolean",
+                )
+            prospective[name] = bool(parameter.value)
+
+        changed = {
+            name
+            for name in requested
+            if prospective[name] != current[name]
+        }
+        if changed and (self.mission_enabled or not self.emergency_stop):
+            return SetParametersResult(
+                successful=False,
+                reason=(
+                    "precision feature gates may change only while mission_enable "
+                    "is false and emergency_stop is true"
+                ),
+            )
+
+        rejection_reason = validate_precision_feature_gates(prospective)
+        if rejection_reason is not None:
+            return SetParametersResult(
+                successful=False,
+                reason=rejection_reason,
+            )
+        if not changed:
+            return SetParametersResult(successful=True)
+
+        processing_was_enabled = self.geometry_processing_enabled
+        processing_is_enabled = geometry_processing_requested(prospective)
+
+        # No command publisher is reachable from this callback.  The complete
+        # prospective set becomes authoritative together only after all safety
+        # and dependency checks above have succeeded.
+        for name in PRECISION_FEATURE_GATES:
+            setattr(self, name, prospective[name])
+        self.geometry_processing_enabled = processing_is_enabled
+        if "precision_pivot_enabled" in changed:
+            # Clear any carrier latch even when the new gate value is false;
+            # _reset_precision_pivot() intentionally follows the active mode.
+            self.reset_terminal_native_pivot()
+
+        if processing_was_enabled and not processing_is_enabled:
+            self._invalidate_installed_geometry("FEATURE_GATES_DISABLED")
+        elif not processing_was_enabled and processing_is_enabled:
+            self._try_install_path_geometry()
+            self._try_bind_geometry_goal(log_error=False)
+        else:
+            self._reset_precision_regulator(
+                "FEATURE_GATES_CHANGED",
+                progress_s=(
+                    self.geometry_active_span.start_s
+                    if self.geometry_active_span is not None
+                    else 0.0
+                ),
+            )
+            self._reset_precision_tracking(
+                "FEATURE_GATES_CHANGED",
+                reset_metrics=False,
+                path_identity=self.geometry_installed_signature,
+            )
+            self._reset_precision_pivot(
+                "FEATURE_GATES_CHANGED",
+                clear_anchor=True,
+            )
+            self._reset_precision_terminal("FEATURE_GATES_CHANGED")
+            self._try_install_path_geometry()
+            self._try_bind_geometry_goal(log_error=False)
+
+        changed_labels = ", ".join(
+            f"{name}={str(prospective[name]).lower()}"
+            for name in sorted(changed)
+        )
+        self.get_logger().warn(
+            "PRECISION FEATURE GATES UPDATED | " + changed_labels
+        )
+        return SetParametersResult(successful=True)
 
     def validate_parameters(self):
         if not self.local_frame:
@@ -2862,58 +2978,52 @@ class RPPController(Node):
         )
 
     def path_types_callback(self, msg):
-        if not self.geometry_processing_enabled:
-            return
         values = [int(value) for value in msg.data]
         if not values:
             self.geometry_pending_path_types = None
-            self._invalidate_installed_geometry(
-                GeometryResetReason.SOURCE_CLEARED
-            )
+            if self.geometry_processing_enabled:
+                self._invalidate_installed_geometry(
+                    GeometryResetReason.SOURCE_CLEARED
+                )
             return
         self.geometry_pending_path_types = values
         self._try_install_path_geometry()
 
     def marking_indices_callback(self, msg):
-        if not self.geometry_processing_enabled:
-            return
         values = [int(value) for value in msg.data]
         if not values:
             self.geometry_pending_marking_indices = None
-            self._invalidate_installed_geometry(
-                GeometryResetReason.SOURCE_CLEARED
-            )
+            if self.geometry_processing_enabled:
+                self._invalidate_installed_geometry(
+                    GeometryResetReason.SOURCE_CLEARED
+                )
             return
         self.geometry_pending_marking_indices = values
         self._try_install_path_geometry()
 
     def path_signature_callback(self, msg):
-        if not self.geometry_processing_enabled:
-            return
         signature = str(msg.data).strip()
         if not signature:
             self.geometry_pending_path_signature = None
-            self._invalidate_installed_geometry(
-                GeometryResetReason.SOURCE_CLEARED
-            )
+            if self.geometry_processing_enabled:
+                self._invalidate_installed_geometry(
+                    GeometryResetReason.SOURCE_CLEARED
+                )
             return
         self.geometry_pending_path_signature = signature
         self._try_install_path_geometry()
 
     def trajectory_ready_callback(self, msg):
-        if not self.geometry_processing_enabled:
-            return
         self.geometry_trajectory_ready = bool(msg.data)
         if not self.geometry_trajectory_ready:
-            self._invalidate_installed_geometry(
-                GeometryResetReason.SOURCE_CLEARED
-            )
+            if self.geometry_processing_enabled:
+                self._invalidate_installed_geometry(
+                    GeometryResetReason.SOURCE_CLEARED
+                )
             return
         self._try_install_path_geometry()
 
     def segment_goal_metadata_callback(self, msg):
-        if not self.geometry_processing_enabled:
-            return
         try:
             payload = json.loads(msg.data)
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -2937,7 +3047,11 @@ class RPPController(Node):
             payload.get("mission_run_id"),
             payload.get("goal_instance_id"),
         )
-        if previous_instance != new_instance and any(new_instance):
+        if (
+            self.geometry_processing_enabled
+            and previous_instance != new_instance
+            and any(new_instance)
+        ):
             self._reset_precision_terminal("SEGMENT_GOAL_IDENTITY_CHANGED")
         self.geometry_pending_goal_metadata = payload
         self.geometry_goal_binding = None
@@ -3057,7 +3171,8 @@ class RPPController(Node):
 
     def _try_bind_geometry_goal(self, *, log_error):
         if not (
-            self.geometry_contract_synchronized
+            self.geometry_processing_enabled
+            and self.geometry_contract_synchronized
             and self.path_geometry is not None
             and self.geometry_progress_tracker is not None
             and self.geometry_installed_signature is not None
@@ -3212,8 +3327,8 @@ class RPPController(Node):
             points.append((x, y))
 
         if not points:
+            self.geometry_pending_nav_points = None
             if self.geometry_processing_enabled:
-                self.geometry_pending_nav_points = None
                 self._invalidate_installed_geometry(
                     GeometryResetReason.SOURCE_CLEARED
                 )
@@ -3226,8 +3341,7 @@ class RPPController(Node):
             self.get_logger().warn("/nav_path CLEARED / RPP PATH HOLD")
             return
 
-        if self.geometry_processing_enabled:
-            self.geometry_pending_nav_points = list(points)
+        self.geometry_pending_nav_points = list(points)
         self.nav_path_points = points
         self.nav_path_received = True
         self.nav_path_segment_start_index = 0
@@ -3728,15 +3842,14 @@ class RPPController(Node):
                 return
             points.append((x, y))
         if not points:
+            self.geometry_pending_marking_waypoints = None
             if self.geometry_processing_enabled:
-                self.geometry_pending_marking_waypoints = None
                 self._invalidate_installed_geometry(
                     GeometryResetReason.SOURCE_CLEARED
                 )
             return
 
-        if self.geometry_processing_enabled:
-            self.geometry_pending_marking_waypoints = list(points)
+        self.geometry_pending_marking_waypoints = list(points)
 
         previous_p1 = self.marking_waypoints[0] if self.marking_waypoints else None
         self.marking_waypoints = points

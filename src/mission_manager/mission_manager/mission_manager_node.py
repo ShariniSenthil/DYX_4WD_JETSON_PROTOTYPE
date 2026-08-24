@@ -37,6 +37,7 @@ from geometry_msgs.msg import PoseStamped
 from mavros_msgs.msg import GPSRAW, State
 from mavros_msgs.srv import CommandBool, SetMode
 from nav_msgs.msg import Odometry, Path
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -56,6 +57,9 @@ from mission_manager.precision_terminal_policy import (
     PrecisionTerminalDecision,
     PrecisionTerminalExpectation,
     validate_precision_terminal_heartbeat,
+)
+from mission_manager.precision_feature_gates import (
+    decide_precision_feature_gate_update,
 )
 
 
@@ -496,6 +500,10 @@ class MissionManager(Node):
         self._start_debug: dict[str, Any] = {}
         self._last_status_publish_monotonic = 0.0
 
+        self.add_on_set_parameters_callback(
+            self._on_precision_feature_parameters
+        )
+
         self._publish_safety()
         self._publish_marking_active(False)
         self._publish_mission_complete(False)
@@ -523,6 +531,55 @@ class MissionManager(Node):
     # ==============================================================
     # Basic math / validation
     # ==============================================================
+    def _on_precision_feature_parameters(
+        self, parameters: list[Any]
+    ) -> SetParametersResult:
+        """Atomically synchronize live precision parameters with authority."""
+        updates = [(parameter.name, parameter.value) for parameter in parameters]
+        with self._lock:
+            decision = decide_precision_feature_gate_update(
+                updates,
+                current_path_contract_enabled=(
+                    self.precision_path_contract_enabled
+                ),
+                current_terminal_enabled=self.precision_terminal_enabled,
+                mission_state=self._state,
+                mission_enable=self._mission_enable,
+                emergency_stop=self._emergency_stop,
+                navigation_path=self._navigation_path,
+                mission_waypoints=self._mission_waypoints,
+                path_types=self._path_types,
+                marking_indices=self._marking_indices,
+                path_signature=self._path_signature,
+                current_path_index=self._current_path_index,
+                semantic_path_indices=self._semantic_path_indices,
+                pass_through_point_type=self.POINT_PASS_THROUGH,
+            )
+            if not decision.accepted:
+                self.get_logger().warn(
+                    f"Rejected precision feature-gate update: {decision.reason}"
+                )
+                return SetParametersResult(
+                    successful=False,
+                    reason=decision.reason,
+                )
+
+            if decision.changed:
+                self.precision_path_contract_enabled = (
+                    decision.path_contract_enabled
+                )
+                self.precision_terminal_enabled = decision.terminal_enabled
+                if decision.republish_ready_goal:
+                    self._publish_goal()
+                self._publish_status(force=True)
+                self.get_logger().warn(
+                    "Precision feature gates updated: "
+                    f"path_contract={self.precision_path_contract_enabled} "
+                    f"terminal={self.precision_terminal_enabled}"
+                )
+
+            return SetParametersResult(successful=True, reason=decision.reason)
+
     def _validate_parameters(self) -> None:
         if not self.local_frame:
             raise ValueError("local_frame must not be empty")
@@ -2913,6 +2970,7 @@ class MissionManager(Node):
             "precision_path_contract_enabled": (
                 self.precision_path_contract_enabled
             ),
+            "precision_terminal_enabled": self.precision_terminal_enabled,
             "precision_path_contract_fault_latched": (
                 self._precision_path_contract_fault_latched
             ),
