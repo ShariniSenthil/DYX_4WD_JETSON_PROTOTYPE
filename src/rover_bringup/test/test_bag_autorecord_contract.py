@@ -47,11 +47,13 @@ def _field_logger_topics():
 
 
 def test_precision_topics_are_recorded_by_both_entry_points():
+    """Require precision evidence in automatic and manual recorders."""
     assert PRECISION_TOPICS <= _autorecorder_topics()
     assert PRECISION_TOPICS <= _field_logger_topics()
 
 
 def test_path_signature_uses_latched_publisher_qos():
+    """Match the path-signature publisher's retained QoS contract."""
     source = QOS_OVERRIDES.read_text(encoding="utf-8")
     match = re.search(
         r"^/trajectory_generator/path_signature:\n(?P<body>(?:  .+\n)+)",
@@ -65,6 +67,7 @@ def test_path_signature_uses_latched_publisher_qos():
 
 
 def test_volatile_precision_topics_have_no_transient_local_override():
+    """Avoid incompatible retained subscriptions to volatile publishers."""
     source = QOS_OVERRIDES.read_text(encoding="utf-8")
     retained_topic = "/trajectory_generator/path_signature"
     volatile_topics = PRECISION_TOPICS - {retained_topic}
