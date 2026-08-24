@@ -46,7 +46,7 @@ def _called_attributes(method_name: str) -> set[str]:
     return attributes
 
 
-def test_phase2_flags_default_off_in_node_and_launch():
+def test_accepted_guidance_defaults_on_while_speed_control_stays_off():
     declarations = {}
     for node in ast.walk(_method("__init__")):
         if not (
@@ -59,10 +59,12 @@ def test_phase2_flags_default_off_in_node_and_launch():
             continue
         declarations[node.args[0].value] = ast.literal_eval(node.args[1])
 
-    assert declarations["precision_guidance_enabled"] is False
+    assert declarations["precision_guidance_enabled"] is True
     assert declarations["precision_speed_control_enabled"] is False
-    assert '"precision_guidance_enabled": False' in LAUNCH_SOURCE
+    assert declarations["precision_lookahead_time_s"] == 0.90
+    assert '"precision_guidance_enabled": True' in LAUNCH_SOURCE
     assert '"precision_speed_control_enabled": False' in LAUNCH_SOURCE
+    assert '"precision_lookahead_time_s": 0.90' in LAUNCH_SOURCE
 
 
 def test_every_phase2_parameter_is_explicitly_wired_in_launch():

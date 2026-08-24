@@ -396,14 +396,14 @@ def generate_launch_description() -> LaunchDescription:
                         "geometry_localization_jump_reset_m": 0.50,
                         "geometry_max_backward_jump_m": 0.10,
                         "geometry_max_forward_jump_m": 1.00,
-                        # Phase-2 projection guidance and unified longitudinal
-                        # regulation. Both are independently default-OFF and
-                        # require geometry_tracking_enabled=true when enabled.
-                        "precision_guidance_enabled": False,
+                        # Projection guidance is field-accepted and enabled
+                        # with the tested 0.90 s horizon. Longitudinal speed
+                        # regulation remains independently default-OFF.
+                        "precision_guidance_enabled": True,
                         "precision_speed_control_enabled": False,
                         "precision_lookahead_min_m": 0.20,
                         "precision_lookahead_max_m": 1.00,
-                        "precision_lookahead_time_s": 0.55,
+                        "precision_lookahead_time_s": 0.90,
                         "precision_xtrack_lookahead_gain": 0.0,
                         "precision_moving_bearing_cone_deg": 30.0,
                         "precision_hardware_speed_ceiling_mps": 1.00,

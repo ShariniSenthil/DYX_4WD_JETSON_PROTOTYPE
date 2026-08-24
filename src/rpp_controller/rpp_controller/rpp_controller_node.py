@@ -474,13 +474,14 @@ class RPPController(Node):
         self.declare_parameter("geometry_max_backward_jump_m", 0.10)
         self.declare_parameter("geometry_max_forward_jump_m", 1.00)
 
-        # Phase-2 command math remains independently default-OFF.  Both
-        # consumers require the synchronized Phase-1 geometry contract.
-        self.declare_parameter("precision_guidance_enabled", False)
+        # Projection guidance is field-accepted and enabled by default with
+        # the tested 0.90 s horizon. Longitudinal speed control remains an
+        # independent default-OFF authority.
+        self.declare_parameter("precision_guidance_enabled", True)
         self.declare_parameter("precision_speed_control_enabled", False)
         self.declare_parameter("precision_lookahead_min_m", 0.20)
         self.declare_parameter("precision_lookahead_max_m", 1.00)
-        self.declare_parameter("precision_lookahead_time_s", 0.55)
+        self.declare_parameter("precision_lookahead_time_s", 0.90)
         self.declare_parameter("precision_xtrack_lookahead_gain", 0.0)
         self.declare_parameter("precision_moving_bearing_cone_deg", 30.0)
 
