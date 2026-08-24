@@ -22,6 +22,7 @@ Env:
   BAG_LOW_FREE_BYTES          default 2 GiB
   BAG_MAX_TOTAL_BYTES         default 50 GiB
   BAG_FCU_PARAMS              default 1
+  BAG_PARAM_DUMP_TIMEOUT_S    default 15
   BAG_AUTO_ANALYZE            default 0
 """
 
@@ -67,6 +68,7 @@ API_GRACE_S = float(os.environ.get("BAG_API_GRACE_S", "8"))
 
 IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 CAPTURE_FCU_PARAMS = os.environ.get("BAG_FCU_PARAMS", "1") == "1"
+PARAM_DUMP_TIMEOUT_S = float(os.environ.get("BAG_PARAM_DUMP_TIMEOUT_S", "15"))
 AUTO_ANALYZE = os.environ.get("BAG_AUTO_ANALYZE", "0") == "1"
 _ANALYZER = os.path.join(_REPO_ROOT, "scripts", "analyze_mission.py")
 
@@ -630,6 +632,7 @@ def _dump_node_params(bundle_dir: str) -> dict:
     os.makedirs(params_dir, exist_ok=True)
     dumped: dict[str, str] = {}
     missing: list[str] = []
+    errors: dict[str, str] = {}
     for node in PARAM_NODES:
         safe = node.strip("/").replace("/", "_")
         target = os.path.join(params_dir, f"{safe}.yaml")
@@ -638,18 +641,49 @@ def _dump_node_params(bundle_dir: str) -> dict:
                 ["ros2", "param", "dump", node],
                 capture_output=True,
                 text=True,
-                timeout=6.0,
+                timeout=PARAM_DUMP_TIMEOUT_S,
             )
-        except Exception:
+        except subprocess.TimeoutExpired:
             missing.append(node)
+            errors[node] = f"timeout_after_{PARAM_DUMP_TIMEOUT_S:g}s"
+            log(
+                "WARN ROS parameter snapshot timed out | "
+                f"node={node} timeout_s={PARAM_DUMP_TIMEOUT_S:g}"
+            )
+            continue
+        except Exception as error:
+            missing.append(node)
+            errors[node] = type(error).__name__
+            log(
+                "WARN ROS parameter snapshot failed | "
+                f"node={node} error={type(error).__name__}"
+            )
             continue
         if result.returncode != 0 or not result.stdout.strip():
             missing.append(node)
+            errors[node] = (
+                f"returncode_{result.returncode}"
+                if result.returncode != 0
+                else "empty_output"
+            )
+            log(
+                "WARN ROS parameter snapshot rejected | "
+                f"node={node} reason={errors[node]}"
+            )
             continue
-        with open(target, "w", encoding="utf-8") as handle:
-            handle.write(result.stdout)
+        try:
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write(result.stdout)
+        except OSError as error:
+            missing.append(node)
+            errors[node] = type(error).__name__
+            log(
+                "WARN ROS parameter snapshot write failed | "
+                f"node={node} error={type(error).__name__}"
+            )
+            continue
         dumped[node] = f"params/{safe}.yaml"
-    return {"dumped": dumped, "missing": missing}
+    return {"dumped": dumped, "missing": missing, "errors": errors}
 
 
 class Recorder:

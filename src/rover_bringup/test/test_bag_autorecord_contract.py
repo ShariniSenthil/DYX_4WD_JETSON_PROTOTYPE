@@ -73,3 +73,11 @@ def test_volatile_precision_topics_have_no_transient_local_override():
     volatile_topics = PRECISION_TOPICS - {retained_topic}
     for topic in volatile_topics:
         assert f"\n{topic}:" not in source
+
+
+def test_parameter_snapshots_allow_slow_rpp_dump_and_report_failures():
+    """Keep complete, diagnosable controller parameter evidence."""
+    source = AUTORECORDER.read_text(encoding="utf-8")
+    assert 'BAG_PARAM_DUMP_TIMEOUT_S", "15"' in source
+    assert "timeout=PARAM_DUMP_TIMEOUT_S" in source
+    assert '"errors": errors' in source
