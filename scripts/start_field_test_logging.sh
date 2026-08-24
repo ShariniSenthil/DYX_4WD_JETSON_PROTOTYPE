@@ -68,8 +68,12 @@ TOPICS=(
   /mavros/setpoint_raw/local
   /nav_path
   /mission_waypoints
+  /trajectory_generator/path_types
+  /trajectory_generator/marking_indices
+  /trajectory_generator/path_signature
   /active_waypoint
   /segment_goal
+  /mission_manager/segment_goal_metadata
   /mission_enable
   /emergency_stop
   /marking_active
@@ -93,6 +97,13 @@ TOPICS=(
   /rpp/along_track_remaining_mm
   /rpp/closest_goal_distance_mm
   /rpp/accuracy
+  /rpp/geometry_debug
+  /rpp/guidance_debug
+  /rpp/speed_debug
+  /rpp/tracking_debug
+  /rpp/pivot_debug
+  /rpp/terminal_certificate
+  /rpp/terminal_result
   /cmd_vel_bridge/backend_heartbeat_healthy
   /rtk_correction_bridge/healthy
   /rtk_correction_bridge/correction_age_sec
