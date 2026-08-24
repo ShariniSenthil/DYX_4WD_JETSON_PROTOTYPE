@@ -117,7 +117,7 @@ PARAM_NODES = [
     "/rpp_controller",
     "/cmd_vel_bridge",
     "/spray_controller",
-    "/rtk_correction_bridge",
+    "/ntrip_to_px4_node",
 ]
 
 WATCH_SERVICES = ["bag-autorecord"]

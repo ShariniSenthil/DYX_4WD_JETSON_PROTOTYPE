@@ -38,7 +38,7 @@ for NODE in \
   /rpp_controller \
   /cmd_vel_bridge \
   /spray_controller \
-  /rtk_correction_bridge; do
+  /ntrip_to_px4_node; do
   SAFE="$(echo "$NODE" | tr '/' '_' | sed 's/^_//')"
   timeout 4 ros2 param dump "$NODE" > "$PARAM_DIR/${SAFE}.yaml" 2> "$PARAM_DIR/${SAFE}.err" || true
 done

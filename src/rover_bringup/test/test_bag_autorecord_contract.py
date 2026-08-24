@@ -81,3 +81,15 @@ def test_parameter_snapshots_allow_slow_rpp_dump_and_report_failures():
     assert 'BAG_PARAM_DUMP_TIMEOUT_S", "15"' in source
     assert "timeout=PARAM_DUMP_TIMEOUT_S" in source
     assert '"errors": errors' in source
+    module = ast.parse(source)
+    param_nodes = next(
+        ast.literal_eval(node.value)
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "PARAM_NODES"
+            for target in node.targets
+        )
+    )
+    assert "/ntrip_to_px4_node" in param_nodes
+    assert "/rtk_correction_bridge" not in param_nodes
