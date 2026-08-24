@@ -32,6 +32,7 @@ class SpeedCapOwner(str, Enum):
     HARD_ZERO = "hard_zero"
     MISSION = "mission"
     HARDWARE = "hardware"
+    RECOVERY = "recovery"
     ACCELERATION = "acceleration"
     HEADING = "heading_alignment"
     CROSS_TRACK = "cross_track_recovery"
@@ -184,6 +185,7 @@ class SpeedRegulatorInput:
     curvature_inv_m: Optional[float] = None
     tracking_acceleration_allowed: bool = True
     tracking_speed_cap_mps: Optional[float] = None
+    recovery_requested: bool = False
     hard_zero: bool = False
 
 
@@ -193,6 +195,7 @@ class SpeedCaps:
 
     mission_mps: float
     hardware_mps: float
+    recovery_mps: Optional[float]
     acceleration_mps: float
     heading_mps: float
     cross_track_mps: float
@@ -212,6 +215,7 @@ class SpeedCaps:
             (SpeedCapOwner.CROSS_TRACK, self.cross_track_mps),
         ]
         optional = (
+            (SpeedCapOwner.RECOVERY, self.recovery_mps),
             (SpeedCapOwner.TRACKING, self.tracking_mps),
             (SpeedCapOwner.CORNER, self.corner_mps),
             (SpeedCapOwner.TERMINAL, self.terminal_mps),
@@ -232,6 +236,8 @@ class SpeedRegulatorResult:
     bounded_dt_sec: float
     acceleration_gate_scale: float
     acceleration_progress_m: float
+    recovery_active: bool
+    recovery_transition: str
     corner_required_braking_distance_m: Optional[float]
     terminal_required_braking_distance_m: Optional[float]
 
@@ -330,6 +336,7 @@ class LongitudinalRegulator:
         self._start_progress_m = 0.0
         self._initial_speed_mps = 0.0
         self._last_requested_speed_mps = 0.0
+        self._recovery_active = False
 
     def reset(
         self,
@@ -348,6 +355,7 @@ class LongitudinalRegulator:
         self._start_progress_m = progress
         self._initial_speed_mps = initial
         self._last_requested_speed_mps = initial
+        self._recovery_active = False
 
     def resolve(self, request: SpeedRegulatorInput) -> SpeedRegulatorResult:
         """Resolve one finite non-negative speed command."""
@@ -400,6 +408,8 @@ class LongitudinalRegulator:
         )
         if not isinstance(request.tracking_acceleration_allowed, bool):
             raise ValueError("tracking_acceleration_allowed must be boolean")
+        if not isinstance(request.recovery_requested, bool):
+            raise ValueError("recovery_requested must be boolean")
         tracking_cap = self._optional_nonnegative(
             "tracking_speed_cap_mps", request.tracking_speed_cap_mps
         )
@@ -419,6 +429,32 @@ class LongitudinalRegulator:
             config.cross_track_accel_full_m,
             config.cross_track_recovery_full_m,
         )
+
+        recovery_was_active = self._recovery_active
+        recovery_enter = (
+            request.recovery_requested
+            or heading_error >= config.heading_recovery_full_rad
+            or cross_track >= config.cross_track_recovery_full_m
+        )
+        recovery_exit = (
+            not request.recovery_requested
+            and heading_error <= config.heading_recovery_start_rad
+            and cross_track <= config.cross_track_recovery_start_m
+        )
+        if self._recovery_active:
+            if recovery_exit:
+                self._recovery_active = False
+        elif recovery_enter:
+            self._recovery_active = True
+
+        if self._recovery_active and not recovery_was_active:
+            recovery_transition = "ENTERED"
+        elif self._recovery_active:
+            recovery_transition = "ACTIVE"
+        elif recovery_was_active:
+            recovery_transition = "EXITED"
+        else:
+            recovery_transition = "INACTIVE"
 
         corner_cap = None
         corner_required = None
@@ -530,6 +566,11 @@ class LongitudinalRegulator:
         caps = SpeedCaps(
             mission_mps=mission_ceiling,
             hardware_mps=config.hardware_speed_ceiling_mps,
+            recovery_mps=(
+                min(base_ceiling, config.recovery_min_speed_mps)
+                if self._recovery_active
+                else None
+            ),
             acceleration_mps=acceleration_cap,
             heading_mps=heading_cap,
             cross_track_mps=cross_track_cap,
@@ -546,6 +587,35 @@ class LongitudinalRegulator:
         if request.hard_zero:
             requested_speed = 0.0
             owner = SpeedCapOwner.HARD_ZERO
+        elif self._recovery_active:
+            # Recovery is an intentional moving authority, not an
+            # acceleration request.  Normal acceleration/heading/xtrack caps
+            # therefore cannot collapse it below the calibrated recovery
+            # speed.  Higher-priority safety/preview caps remain eligible.
+            recovery_candidates = [
+                (SpeedCapOwner.MISSION, caps.mission_mps),
+                (SpeedCapOwner.HARDWARE, caps.hardware_mps),
+            ]
+            if caps.terminal_mps is not None:
+                recovery_candidates.append(
+                    (SpeedCapOwner.TERMINAL, caps.terminal_mps)
+                )
+            if caps.corner_mps is not None:
+                recovery_candidates.append((SpeedCapOwner.CORNER, caps.corner_mps))
+            recovery_candidates.append(
+                (SpeedCapOwner.RECOVERY, caps.recovery_mps)
+            )
+            if caps.tracking_mps is not None:
+                recovery_candidates.append(
+                    (SpeedCapOwner.TRACKING, caps.tracking_mps)
+                )
+            if caps.curvature_mps is not None:
+                recovery_candidates.append(
+                    (SpeedCapOwner.CURVATURE, caps.curvature_mps)
+                )
+            owner, requested_speed = min(
+                recovery_candidates, key=lambda item: item[1]
+            )
         else:
             owner, requested_speed = min(
                 caps.ordered_items(), key=lambda item: item[1]
@@ -564,6 +634,8 @@ class LongitudinalRegulator:
             bounded_dt_sec=bounded_dt,
             acceleration_gate_scale=acceleration_gate,
             acceleration_progress_m=accel_progress,
+            recovery_active=self._recovery_active,
+            recovery_transition=recovery_transition,
             corner_required_braking_distance_m=corner_required,
             terminal_required_braking_distance_m=terminal_required,
         )

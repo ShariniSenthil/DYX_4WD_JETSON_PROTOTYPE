@@ -2187,6 +2187,14 @@ class RPPController(Node):
                 "and no greater than precision_terminal_target_speed_mps"
             )
         if (
+            self.precision_speed_config.recovery_min_speed_mps
+            <= self.precision_minimum_moving_speed
+        ):
+            raise ValueError(
+                "precision_recovery_min_speed_mps must be greater than "
+                "precision_minimum_moving_speed_mps"
+            )
+        if (
             self.precision_speed_config.hardware_speed_ceiling_mps
             > self.MAXIMUM_MOVING_SPEED_MPS
         ):
@@ -5708,7 +5716,7 @@ class RPPController(Node):
         except Exception:
             self._publish_tracking_debug(status="METRIC_SAMPLE_REJECTED")
 
-    def _resolve_precision_speed_for_cycle(self):
+    def _resolve_precision_speed_for_cycle(self, *, recovery_requested=False):
         """Resolve exactly one longitudinal command for this control tick."""
 
         if self.precision_speed_cycle_token == self.precision_cycle_token:
@@ -5760,6 +5768,7 @@ class RPPController(Node):
                 if tracking is not None
                 else None
             ),
+            recovery_requested=bool(recovery_requested),
             hard_zero=False,
         )
         try:
@@ -5818,6 +5827,7 @@ class RPPController(Node):
             "caps": {
                 "mission_mps": caps.mission_mps,
                 "hardware_mps": caps.hardware_mps,
+                "recovery_mps": caps.recovery_mps,
                 "acceleration_mps": caps.acceleration_mps,
                 "heading_mps": caps.heading_mps,
                 "cross_track_mps": caps.cross_track_mps,
@@ -5870,6 +5880,11 @@ class RPPController(Node):
             "tracking_speed_cap_mps": (
                 request.tracking_speed_cap_mps if request is not None else None
             ),
+            "recovery_requested": (
+                request.recovery_requested if request is not None else None
+            ),
+            "recovery_active": result.recovery_active,
+            "recovery_transition": result.recovery_transition,
             "regulator_reset_reason": self.precision_regulator_reset_reason,
             "regulator_reset_count": self.precision_regulator_reset_count,
         }
@@ -8032,9 +8047,16 @@ class RPPController(Node):
                     )
                     return
 
+        gate2_active = (
+            self.precision_guidance_enabled
+            or self.precision_speed_control_enabled
+        )
         terminal_active = (
             goal_requires_precision_stop
-            and goal_distance <= self.terminal_goal_intercept_distance
+            and (
+                goal_distance <= self.terminal_goal_intercept_distance
+                or (gate2_active and self.terminal_precision_armed)
+            )
         )
 
         # Preserve xtrack speed-cap state across the terminal boundary.
@@ -8133,7 +8155,9 @@ class RPPController(Node):
             ) = self.limit_moving_guidance_bearing(xtrack_guidance_bearing)
             speed = self.xtrack_priority_speed
             if self.precision_speed_control_enabled:
-                speed_result = self._resolve_precision_speed_for_cycle()
+                speed_result = self._resolve_precision_speed_for_cycle(
+                    recovery_requested=True
+                )
                 if speed_result is None:
                     self.publish_stop()
                     self.get_logger().error(
@@ -8265,8 +8289,6 @@ class RPPController(Node):
                 xtrack_guidance_bearing,
                 along_remaining,
             )
-            if self.precision_guidance_enabled:
-                guidance_bearing = precision_guidance.limited_command_bearing_rad
             heading_error = self.normalize_angle(guidance_bearing - self.current_yaw)
 
             profile_target = self.terminal_speed_for_along_remaining(along_remaining)
@@ -8274,39 +8296,23 @@ class RPPController(Node):
                 self.xtrack_priority_speed if xtrack_speed_cap_active else None
             )
 
+            # The established terminal profile owns speed for Gate-2 as well
+            # as legacy operation.  Generic precision speed must not regrow
+            # the command after terminal entry or compete with its zero latch.
             speed = self.cruise_speed
-            if self.precision_speed_control_enabled:
-                speed_result = self._resolve_precision_speed_for_cycle()
-                if speed_result is None:
-                    self.publish_stop()
-                    self.get_logger().error(
-                        "PRECISION SPEED REJECTED / TERMINAL SAFE HOLD"
-                    )
-                    return
-                north, east, speed = self.publish_precision_velocity_ned(
-                    guidance_bearing,
-                    speed_result,
-                )
-            else:
-                north = speed * math.sin(guidance_bearing)
-                east = speed * math.cos(guidance_bearing)
-                north, east, speed = self.publish_velocity_ned(
-                    north,
-                    east,
-                    apply_acceleration=True,
-                    apply_deceleration=True,
-                    goal_distance=along_remaining,
-                    hard_speed_cap_mps=terminal_speed_cap,
-                )
-                self._record_published_translational_speed(speed)
+            north = speed * math.sin(guidance_bearing)
+            east = speed * math.cos(guidance_bearing)
+            north, east, speed = self.publish_velocity_ned(
+                north,
+                east,
+                apply_acceleration=True,
+                apply_deceleration=True,
+                goal_distance=along_remaining,
+                hard_speed_cap_mps=terminal_speed_cap,
+            )
+            self._record_published_translational_speed(speed)
 
-            if self.precision_speed_control_enabled:
-                speed_owner = (
-                    "PRECISION_RESOLVER:"
-                    f"{speed_result.winning_cap_owner.value}"
-                )
-                profile_target = speed_result.requested_speed_mps
-            elif xtrack_speed_cap_active:
+            if xtrack_speed_cap_active:
                 speed_owner = (
                     "MIN(DISTANCE_PROFILE,"
                     f"XTRACK_CAP={self.xtrack_priority_speed:.3f})"

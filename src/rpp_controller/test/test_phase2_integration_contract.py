@@ -182,6 +182,7 @@ def test_speed_debug_contains_every_cap_and_winner():
         "resolver_winning_cap_owner",
         "mission_mps",
         "hardware_mps",
+        "recovery_mps",
         "acceleration_mps",
         "heading_mps",
         "cross_track_mps",
