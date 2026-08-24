@@ -41,7 +41,9 @@ def _field_logger_topics():
         re.MULTILINE | re.DOTALL,
     )
     assert match is not None, "field logger does not define a TOPICS array"
-    return set(re.findall(r"^\s*(/\S+)\s*$", match.group("body"), re.MULTILINE))
+    return set(
+        re.findall(r"^\s*(/\S+)\s*$", match.group("body"), re.MULTILINE)
+    )
 
 
 def test_precision_topics_are_recorded_by_both_entry_points():
@@ -64,6 +66,7 @@ def test_path_signature_uses_latched_publisher_qos():
 
 def test_volatile_precision_topics_have_no_transient_local_override():
     source = QOS_OVERRIDES.read_text(encoding="utf-8")
-    volatile_topics = PRECISION_TOPICS - {"/trajectory_generator/path_signature"}
+    retained_topic = "/trajectory_generator/path_signature"
+    volatile_topics = PRECISION_TOPICS - {retained_topic}
     for topic in volatile_topics:
         assert f"\n{topic}:" not in source
