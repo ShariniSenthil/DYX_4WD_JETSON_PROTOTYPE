@@ -2881,6 +2881,34 @@ class RPPController(Node):
         """
         return -float(value)
 
+    def ground_terminal_certificate_payload(self, certificate):
+        """Convert internal terminal certificate for external reporting only.
+
+        Terminal FSM/certificate storage keeps the controller convention:
+        LEFT positive, RIGHT negative.
+
+        Published JSON uses the ground/report convention:
+        LEFT negative, RIGHT positive.
+        """
+        if certificate is None:
+            return None
+
+        payload = certificate.to_dict()
+        cross_error_mm = payload.get("cross_error_mm")
+
+        if cross_error_mm is not None:
+            try:
+                cross_error_mm = float(cross_error_mm)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if math.isfinite(cross_error_mm):
+                    payload["cross_error_mm"] = self.ground_xtrack(
+                        cross_error_mm
+                    )
+
+        return payload
+
     @staticmethod
     def smoothstep(value):
         value = max(0.0, min(1.0, value))
@@ -6038,7 +6066,8 @@ class RPPController(Node):
         along_remaining_mm = along_remaining * 1000.0
         closest_distance_mm = closest_distance * 1000.0
 
-        # Keep the existing individual monitoring topics unchanged.
+        # Ground-facing xtrack monitoring topic:
+        # LEFT = negative, RIGHT = positive.
         self._publish_float64(
             self.xtrack_mm_pub,
             xtrack_mm,
@@ -6950,8 +6979,8 @@ class RPPController(Node):
                     if certificate is not None
                     else None
                 ),
-                "certificate": (
-                    certificate.to_dict() if certificate is not None else None
+                "certificate": self.ground_terminal_certificate_payload(
+                    certificate
                 ),
                 "precision_certificate_version": (
                     certificate.version if certificate is not None else None
@@ -7098,10 +7127,8 @@ class RPPController(Node):
 
         if self.precision_terminal_enabled:
             components = self.precision_terminal_identity_components or {}
-            certificate_payload = (
-                precision_certificate.to_dict()
-                if precision_certificate is not None
-                else None
+            certificate_payload = self.ground_terminal_certificate_payload(
+                precision_certificate
             )
             payload.update(
                 {
