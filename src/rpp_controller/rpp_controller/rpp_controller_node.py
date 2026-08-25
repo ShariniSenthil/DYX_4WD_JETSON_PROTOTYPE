@@ -1641,7 +1641,6 @@ class RPPController(Node):
         self.alignment_inside_since = None
         self.alignment_release_x = None
         self.alignment_release_y = None
-        self.alignment_safety_hold = False
 
         # Cross-track speed-cap recovery is shared by normal and terminal motion.
         self.xtrack_priority_active = False
@@ -1859,10 +1858,6 @@ class RPPController(Node):
             "Alignment state priority: cross-track recovery outside "
             f"{self.segment_alignment_cross_track_tolerance:.3f}m, "
             "then forward-heading correction"
-        )
-        self.get_logger().warn(
-            "Alignment safety hold: stop when abs(xtrack) >= "
-            f"{self.segment_alignment_max_cross_track:.3f}m"
         )
         self.get_logger().warn(
             "Forward-heading correction: active inside the line corridor "
@@ -2903,9 +2898,7 @@ class RPPController(Node):
                 pass
             else:
                 if math.isfinite(cross_error_mm):
-                    payload["cross_error_mm"] = self.ground_xtrack(
-                        cross_error_mm
-                    )
+                    payload["cross_error_mm"] = self.ground_xtrack(cross_error_mm)
 
         return payload
 
@@ -4274,7 +4267,6 @@ class RPPController(Node):
         self.alignment_inside_since = None
         self.alignment_release_x = None
         self.alignment_release_y = None
-        self.alignment_safety_hold = False
         self.xtrack_priority_active = False
         self.xtrack_priority_inside_since = None
         self.reset_xtrack_damping_state()
@@ -4573,7 +4565,6 @@ class RPPController(Node):
                 )
             )
         except (TypeError, ValueError) as error:
-            self.alignment_safety_hold = True
             self.publish_stop()
             self.get_logger().error(f"PRECISION PIVOT INPUT REJECTED / HOLD | {error}")
             return True
@@ -4588,7 +4579,6 @@ class RPPController(Node):
         )
 
         if result.failed or result.directive is MotionDirective.HOLD_FAIL:
-            self.alignment_safety_hold = True
             self.publish_stop()
             return True
 
@@ -6979,9 +6969,7 @@ class RPPController(Node):
                     if certificate is not None
                     else None
                 ),
-                "certificate": self.ground_terminal_certificate_payload(
-                    certificate
-                ),
+                "certificate": self.ground_terminal_certificate_payload(certificate),
                 "precision_certificate_version": (
                     certificate.version if certificate is not None else None
                 ),
@@ -7349,10 +7337,6 @@ class RPPController(Node):
         if self.marking_missed:
             self.publish_stop()
             self.log_waiting("marking capture safe hold active")
-            return
-        if self.alignment_safety_hold:
-            self.publish_stop()
-            self.log_waiting("alignment cross-track safe hold active")
             return
 
         if self.post_extension_stationary_hold:
@@ -7763,16 +7747,16 @@ class RPPController(Node):
                 )
                 alignment_cross_track = precision_guidance.signed_cross_track_m
 
+            # Cross-track monitoring only.
+            # Do NOT stop or latch the rover because of large xtrack.
+            # Pivot/recovery logic below remains responsible for correcting it.
             if abs(alignment_cross_track) >= self.segment_alignment_max_cross_track:
-                self.alignment_safety_hold = True
-                self.publish_stop()
-                self.get_logger().error(
-                    "SEGMENT ALIGNMENT CROSS-TRACK LIMIT / SAFE HOLD | "
+                self.get_logger().warn(
+                    "SEGMENT ALIGNMENT LARGE CROSS-TRACK / CONTINUING RECOVERY | "
                     f"xtrack={self.ground_xtrack(alignment_cross_track):+.3f}m | "
-                    f"limit={self.segment_alignment_max_cross_track:.3f}m | "
+                    f"monitor_limit={self.segment_alignment_max_cross_track:.3f}m | "
                     f"path_error={math.degrees(path_heading_error):+.1f}deg"
                 )
-                return
 
             if self.precision_pivot_enabled:
                 self._run_precision_pivot_alignment(
@@ -7808,15 +7792,12 @@ class RPPController(Node):
                     ).nanoseconds / 1e9
 
                     if pivot_elapsed > self.segment_pivot_keeper_timeout_sec:
-                        self.alignment_safety_hold = True
-                        self.publish_stop()
-                        self.get_logger().error(
-                            "PX4 PIVOT KEEPER TIMEOUT / SAFE HOLD | "
+                        self.get_logger().warn(
+                            "PX4 PIVOT KEEPER TIMEOUT EXCEEDED / CONTINUING PIVOT | "
                             f"elapsed={pivot_elapsed:.2f}s | "
                             f"true_error={math.degrees(true_error):+.1f}deg | "
                             f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
                         )
-                        return
 
                     speed = self.segment_alignment_speed
                     north = speed * math.sin(pivot_request_bearing)
