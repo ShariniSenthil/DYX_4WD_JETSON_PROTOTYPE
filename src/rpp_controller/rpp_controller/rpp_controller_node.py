@@ -517,26 +517,16 @@ class RPPController(Node):
         self.declare_parameter("precision_tracking_control_enabled", False)
         self.declare_parameter("precision_tracking_recovery_enter_xtrack_m", 0.050)
         self.declare_parameter("precision_tracking_recovery_exit_xtrack_m", 0.020)
-        self.declare_parameter(
-            "precision_tracking_recovery_enter_heading_deg", 15.0
-        )
-        self.declare_parameter(
-            "precision_tracking_recovery_exit_heading_deg", 5.0
-        )
+        self.declare_parameter("precision_tracking_recovery_enter_heading_deg", 15.0)
+        self.declare_parameter("precision_tracking_recovery_exit_heading_deg", 5.0)
         self.declare_parameter("precision_tracking_stable_dwell_sec", 0.30)
         self.declare_parameter("precision_tracking_recovery_speed_scale", 0.35)
         self.declare_parameter("precision_tracking_recapture_speed_scale", 0.50)
         self.declare_parameter("precision_tracking_metrics_capacity", 2048)
-        self.declare_parameter(
-            "precision_tracking_histogram_bin_width_m", 0.001
-        )
+        self.declare_parameter("precision_tracking_histogram_bin_width_m", 0.001)
         self.declare_parameter("precision_tracking_histogram_max_m", 1.0)
-        self.declare_parameter(
-            "precision_tracking_monotonic_tolerance_m", 0.001
-        )
-        self.declare_parameter(
-            "precision_tracking_cruise_threshold_mps", 0.80
-        )
+        self.declare_parameter("precision_tracking_monotonic_tolerance_m", 0.001)
+        self.declare_parameter("precision_tracking_cruise_threshold_mps", 0.80)
 
         # Phase-5 measured terminal certificate.  Separately default-OFF: the
         # legacy 30 mm latch remains untouched unless the complete precision
@@ -564,9 +554,7 @@ class RPPController(Node):
         self.declare_parameter("precision_pivot_anchor_tolerance_m", 0.030)
         self.declare_parameter("precision_pivot_recenter_threshold_m", 0.030)
         self.declare_parameter("precision_pivot_stop_speed_tolerance_mps", 0.010)
-        self.declare_parameter(
-            "precision_pivot_stop_yaw_rate_tolerance_radps", 0.050
-        )
+        self.declare_parameter("precision_pivot_stop_yaw_rate_tolerance_radps", 0.050)
         self.declare_parameter("precision_pivot_telemetry_timeout_sec", 0.25)
         self.declare_parameter("precision_pivot_stop_settle_sec", 0.20)
         self.declare_parameter("precision_pivot_heading_tolerance_deg", 2.0)
@@ -1036,9 +1024,7 @@ class RPPController(Node):
                 self.get_parameter("precision_xtrack_lookahead_gain").value
             ),
             moving_bearing_cone_rad=math.radians(
-                float(
-                    self.get_parameter("precision_moving_bearing_cone_deg").value
-                )
+                float(self.get_parameter("precision_moving_bearing_cone_deg").value)
             ),
         )
         self.precision_minimum_moving_speed = float(
@@ -1062,20 +1048,14 @@ class RPPController(Node):
             ),
             heading_accel_full_error_rad=math.radians(
                 float(
-                    self.get_parameter(
-                        "precision_heading_accel_full_error_deg"
-                    ).value
+                    self.get_parameter("precision_heading_accel_full_error_deg").value
                 )
             ),
             heading_recovery_start_rad=math.radians(
-                float(
-                    self.get_parameter("precision_heading_recovery_start_deg").value
-                )
+                float(self.get_parameter("precision_heading_recovery_start_deg").value)
             ),
             heading_recovery_full_rad=math.radians(
-                float(
-                    self.get_parameter("precision_heading_recovery_full_deg").value
-                )
+                float(self.get_parameter("precision_heading_recovery_full_deg").value)
             ),
             cross_track_accel_full_m=float(
                 self.get_parameter("precision_xtrack_accel_full_m").value
@@ -1091,9 +1071,7 @@ class RPPController(Node):
             ),
             recovery_exit_dwell_sec=self.xtrack_priority_hold_sec,
             corner_angle_threshold_rad=math.radians(
-                float(
-                    self.get_parameter("precision_corner_angle_threshold_deg").value
-                )
+                float(self.get_parameter("precision_corner_angle_threshold_deg").value)
             ),
             corner_target_speed_mps=float(
                 self.get_parameter("precision_corner_target_speed_mps").value
@@ -1114,9 +1092,7 @@ class RPPController(Node):
                 self.get_parameter("precision_curvature_enabled").value
             ),
             lateral_acceleration_max_mps2=float(
-                self.get_parameter(
-                    "precision_lateral_acceleration_max_mps2"
-                ).value
+                self.get_parameter("precision_lateral_acceleration_max_mps2").value
             ),
             curvature_epsilon_inv_m=float(
                 self.get_parameter("precision_curvature_epsilon_inv_m").value
@@ -1127,14 +1103,10 @@ class RPPController(Node):
         )
         self.precision_tracking_config = TrackingControlConfig(
             recovery_enter_cross_track_m=float(
-                self.get_parameter(
-                    "precision_tracking_recovery_enter_xtrack_m"
-                ).value
+                self.get_parameter("precision_tracking_recovery_enter_xtrack_m").value
             ),
             recovery_exit_cross_track_m=float(
-                self.get_parameter(
-                    "precision_tracking_recovery_exit_xtrack_m"
-                ).value
+                self.get_parameter("precision_tracking_recovery_exit_xtrack_m").value
             ),
             recovery_enter_heading_error_rad=math.radians(
                 float(
@@ -1155,35 +1127,25 @@ class RPPController(Node):
             ),
             control_dt_max_sec=self.precision_speed_config.control_dt_max_sec,
             recovery_speed_scale=float(
-                self.get_parameter(
-                    "precision_tracking_recovery_speed_scale"
-                ).value
+                self.get_parameter("precision_tracking_recovery_speed_scale").value
             ),
             recapture_speed_scale=float(
-                self.get_parameter(
-                    "precision_tracking_recapture_speed_scale"
-                ).value
+                self.get_parameter("precision_tracking_recapture_speed_scale").value
             ),
             metrics_quantile_window_capacity=int(
                 self.get_parameter("precision_tracking_metrics_capacity").value
             ),
             metrics_histogram_bin_width_m=float(
-                self.get_parameter(
-                    "precision_tracking_histogram_bin_width_m"
-                ).value
+                self.get_parameter("precision_tracking_histogram_bin_width_m").value
             ),
             metrics_histogram_max_m=float(
                 self.get_parameter("precision_tracking_histogram_max_m").value
             ),
             metrics_monotonic_tolerance_m=float(
-                self.get_parameter(
-                    "precision_tracking_monotonic_tolerance_m"
-                ).value
+                self.get_parameter("precision_tracking_monotonic_tolerance_m").value
             ),
             metrics_cruise_speed_threshold_mps=float(
-                self.get_parameter(
-                    "precision_tracking_cruise_threshold_mps"
-                ).value
+                self.get_parameter("precision_tracking_cruise_threshold_mps").value
             ),
         )
         self.precision_tracking_controller = TrackingStabilityController(
@@ -1207,9 +1169,7 @@ class RPPController(Node):
                 self.get_parameter("precision_terminal_settle_tolerance_m").value
             ),
             stop_speed_tolerance_mps=float(
-                self.get_parameter(
-                    "precision_terminal_stop_speed_tolerance_mps"
-                ).value
+                self.get_parameter("precision_terminal_stop_speed_tolerance_mps").value
             ),
             stop_yaw_rate_tolerance_radps=float(
                 self.get_parameter(
@@ -1233,9 +1193,7 @@ class RPPController(Node):
             ),
             control_dt_max_sec=self.precision_speed_config.control_dt_max_sec,
             minimum_actuatable_speed_mps=float(
-                self.get_parameter(
-                    "precision_terminal_min_actuatable_speed_mps"
-                ).value
+                self.get_parameter("precision_terminal_min_actuatable_speed_mps").value
             ),
         )
         self.precision_terminal_fsm = TerminalStopStateMachine(
@@ -1258,19 +1216,13 @@ class RPPController(Node):
             self.get_parameter("precision_pivot_recapture_xtrack_m").value
         )
         self.precision_pivot_recapture_heading = math.radians(
-            float(
-                self.get_parameter("precision_pivot_recapture_heading_deg").value
-            )
+            float(self.get_parameter("precision_pivot_recapture_heading_deg").value)
         )
         self.precision_pivot_recapture_settle_sec = float(
             self.get_parameter("precision_pivot_recapture_settle_sec").value
         )
         self.precision_pivot_recenter_forward_cone = math.radians(
-            float(
-                self.get_parameter(
-                    "precision_pivot_recenter_forward_cone_deg"
-                ).value
-            )
+            float(self.get_parameter("precision_pivot_recenter_forward_cone_deg").value)
         )
         self.precision_pivot_config = PivotMotionConfig(
             pivot_anchor_tolerance_m=float(
@@ -1280,9 +1232,7 @@ class RPPController(Node):
                 self.get_parameter("precision_pivot_recenter_threshold_m").value
             ),
             stop_speed_tolerance_mps=float(
-                self.get_parameter(
-                    "precision_pivot_stop_speed_tolerance_mps"
-                ).value
+                self.get_parameter("precision_pivot_stop_speed_tolerance_mps").value
             ),
             stop_yaw_rate_tolerance_radps=float(
                 self.get_parameter(
@@ -1290,11 +1240,7 @@ class RPPController(Node):
                 ).value
             ),
             release_heading_tolerance_rad=math.radians(
-                float(
-                    self.get_parameter(
-                        "precision_pivot_heading_tolerance_deg"
-                    ).value
-                )
+                float(self.get_parameter("precision_pivot_heading_tolerance_deg").value)
             ),
             stop_settle_sec=float(
                 self.get_parameter("precision_pivot_stop_settle_sec").value
@@ -1791,10 +1737,8 @@ class RPPController(Node):
         # same safe state required for stationary configuration.  Register
         # after all adapter state exists so an accepted transition can install
         # already-retained geometry atomically without commanding motion.
-        self._precision_gate_parameter_callback = (
-            self.add_on_set_parameters_callback(
-                self._on_set_precision_feature_gates
-            )
+        self._precision_gate_parameter_callback = self.add_on_set_parameters_callback(
+            self._on_set_precision_feature_gates
         )
 
         self.timer = self.create_timer(
@@ -1937,10 +1881,7 @@ class RPPController(Node):
 
     def _precision_feature_gate_values(self):
         """Snapshot the control-authoritative values of all precision gates."""
-        return {
-            name: bool(getattr(self, name))
-            for name in PRECISION_FEATURE_GATES
-        }
+        return {name: bool(getattr(self, name)) for name in PRECISION_FEATURE_GATES}
 
     def _on_set_precision_feature_gates(self, parameters):
         """Apply a safe, dependency-valid feature-gate transaction."""
@@ -1962,11 +1903,7 @@ class RPPController(Node):
                 )
             prospective[name] = bool(parameter.value)
 
-        changed = {
-            name
-            for name in requested
-            if prospective[name] != current[name]
-        }
+        changed = {name for name in requested if prospective[name] != current[name]}
         if changed and (self.mission_enabled or not self.emergency_stop):
             return SetParametersResult(
                 successful=False,
@@ -2027,12 +1964,9 @@ class RPPController(Node):
             self._try_bind_geometry_goal(log_error=False)
 
         changed_labels = ", ".join(
-            f"{name}={str(prospective[name]).lower()}"
-            for name in sorted(changed)
+            f"{name}={str(prospective[name]).lower()}" for name in sorted(changed)
         )
-        self.get_logger().warn(
-            "PRECISION FEATURE GATES UPDATED | " + changed_labels
-        )
+        self.get_logger().warn("PRECISION FEATURE GATES UPDATED | " + changed_labels)
         return SetParametersResult(successful=True)
 
     def validate_parameters(self):
@@ -2073,7 +2007,8 @@ class RPPController(Node):
             )
         if not (
             math.isfinite(self.precision_terminal_telemetry_timeout_sec)
-            and 0.0 < self.precision_terminal_telemetry_timeout_sec
+            and 0.0
+            < self.precision_terminal_telemetry_timeout_sec
             <= self.odom_timeout_sec
         ):
             raise ValueError(
@@ -2100,7 +2035,8 @@ class RPPController(Node):
             )
         if not (
             math.isfinite(self.precision_pivot_telemetry_timeout_sec)
-            and 0.0 < self.precision_pivot_telemetry_timeout_sec
+            and 0.0
+            < self.precision_pivot_telemetry_timeout_sec
             <= self.odom_timeout_sec
         ):
             raise ValueError(
@@ -2119,16 +2055,15 @@ class RPPController(Node):
             )
         if not (
             math.isfinite(self.post_pivot_capture_speed)
-            and self.minimum_speed
-            <= self.post_pivot_capture_speed
-            <= self.cruise_speed
+            and self.minimum_speed <= self.post_pivot_capture_speed <= self.cruise_speed
         ):
             raise ValueError(
                 "post_pivot_capture_speed_mps must be between minimum and cruise speed"
             )
         if not (
             math.isfinite(self.precision_pivot_recapture_xtrack)
-            and 0.0 < self.precision_pivot_recapture_xtrack
+            and 0.0
+            < self.precision_pivot_recapture_xtrack
             <= self.segment_alignment_cross_track_tolerance
         ):
             raise ValueError(
@@ -2151,7 +2086,8 @@ class RPPController(Node):
             )
         if not (
             math.isfinite(self.precision_pivot_recenter_forward_cone)
-            and 0.0 < self.precision_pivot_recenter_forward_cone
+            and 0.0
+            < self.precision_pivot_recenter_forward_cone
             <= self.MAX_MOVING_HEADING_ERROR_RAD
         ):
             raise ValueError(
@@ -2182,7 +2118,8 @@ class RPPController(Node):
             )
         if not (
             math.isfinite(self.precision_minimum_moving_speed)
-            and 0.0 < self.precision_minimum_moving_speed
+            and 0.0
+            < self.precision_minimum_moving_speed
             <= self.precision_speed_config.terminal_target_speed_mps
         ):
             raise ValueError(
@@ -2931,6 +2868,20 @@ class RPPController(Node):
         return math.atan2(math.sin(angle), math.cos(angle))
 
     @staticmethod
+    def ground_xtrack(value):
+        """Convert internal RPP xtrack to ground convention.
+
+        Internal RPP:
+            LEFT  = positive
+            RIGHT = negative
+
+        Ground/report convention:
+            LEFT  = negative
+            RIGHT = positive
+        """
+        return -float(value)
+
+    @staticmethod
     def smoothstep(value):
         value = max(0.0, min(1.0, value))
         return value * value * (3.0 - 2.0 * value)
@@ -2993,9 +2944,7 @@ class RPPController(Node):
         if not values:
             self.geometry_pending_path_types = None
             if self.geometry_processing_enabled:
-                self._invalidate_installed_geometry(
-                    GeometryResetReason.SOURCE_CLEARED
-                )
+                self._invalidate_installed_geometry(GeometryResetReason.SOURCE_CLEARED)
             return
         self.geometry_pending_path_types = values
         self._try_install_path_geometry()
@@ -3005,9 +2954,7 @@ class RPPController(Node):
         if not values:
             self.geometry_pending_marking_indices = None
             if self.geometry_processing_enabled:
-                self._invalidate_installed_geometry(
-                    GeometryResetReason.SOURCE_CLEARED
-                )
+                self._invalidate_installed_geometry(GeometryResetReason.SOURCE_CLEARED)
             return
         self.geometry_pending_marking_indices = values
         self._try_install_path_geometry()
@@ -3017,9 +2964,7 @@ class RPPController(Node):
         if not signature:
             self.geometry_pending_path_signature = None
             if self.geometry_processing_enabled:
-                self._invalidate_installed_geometry(
-                    GeometryResetReason.SOURCE_CLEARED
-                )
+                self._invalidate_installed_geometry(GeometryResetReason.SOURCE_CLEARED)
             return
         self.geometry_pending_path_signature = signature
         self._try_install_path_geometry()
@@ -3028,9 +2973,7 @@ class RPPController(Node):
         self.geometry_trajectory_ready = bool(msg.data)
         if not self.geometry_trajectory_ready:
             if self.geometry_processing_enabled:
-                self._invalidate_installed_geometry(
-                    GeometryResetReason.SOURCE_CLEARED
-                )
+                self._invalidate_installed_geometry(GeometryResetReason.SOURCE_CLEARED)
             return
         self._try_install_path_geometry()
 
@@ -3051,9 +2994,13 @@ class RPPController(Node):
             return
         previous_metadata = self.geometry_pending_goal_metadata
         previous_instance = (
-            previous_metadata.get("mission_run_id"),
-            previous_metadata.get("goal_instance_id"),
-        ) if isinstance(previous_metadata, dict) else (None, None)
+            (
+                previous_metadata.get("mission_run_id"),
+                previous_metadata.get("goal_instance_id"),
+            )
+            if isinstance(previous_metadata, dict)
+            else (None, None)
+        )
         new_instance = (
             payload.get("mission_run_id"),
             payload.get("goal_instance_id"),
@@ -3089,9 +3036,7 @@ class RPPController(Node):
         signature = str(self.geometry_pending_path_signature)
         if not navigation_points or not marking_points:
             return False
-        if not (
-            len(navigation_points) == len(point_types) == len(marking_indices)
-        ):
+        if not (len(navigation_points) == len(point_types) == len(marking_indices)):
             return False
 
         try:
@@ -3273,9 +3218,7 @@ class RPPController(Node):
             )
             > self.geometry_localization_jump_reset
         ):
-            self.geometry_progress_tracker.reset(
-                GeometryResetReason.LOCALIZATION_JUMP
-            )
+            self.geometry_progress_tracker.reset(GeometryResetReason.LOCALIZATION_JUMP)
             self._record_geometry_reset(GeometryResetReason.LOCALIZATION_JUMP)
             self.geometry_last_projection = None
             self.geometry_last_projection_cycle_token = None
@@ -3285,9 +3228,7 @@ class RPPController(Node):
                 reset_metrics=False,
                 path_identity=self.geometry_installed_signature,
             )
-            self.precision_tracking_metrics.note_discontinuity(
-                "LOCALIZATION_JUMP"
-            )
+            self.precision_tracking_metrics.note_discontinuity("LOCALIZATION_JUMP")
             self._reset_precision_pivot(
                 "LOCALIZATION_JUMP",
                 clear_anchor=True,
@@ -3340,9 +3281,7 @@ class RPPController(Node):
         if not points:
             self.geometry_pending_nav_points = None
             if self.geometry_processing_enabled:
-                self._invalidate_installed_geometry(
-                    GeometryResetReason.SOURCE_CLEARED
-                )
+                self._invalidate_installed_geometry(GeometryResetReason.SOURCE_CLEARED)
             self.nav_path_points = []
             self.nav_path_received = False
             self.nav_path_segment_start_index = 0
@@ -3558,7 +3497,7 @@ class RPPController(Node):
             ),
             "projected_s": projection.progress_s if projection is not None else None,
             "cross_track_mm": (
-                projection.signed_cross_track_m * 1000.0
+                self.ground_xtrack(projection.signed_cross_track_m) * 1000.0
                 if projection is not None
                 else None
             ),
@@ -3571,9 +3510,7 @@ class RPPController(Node):
                 projection.remaining_path_m if projection is not None else None
             ),
             "next_corner_distance_m": (
-                projection.next_corner_distance_m
-                if projection is not None
-                else None
+                projection.next_corner_distance_m if projection is not None else None
             ),
             "next_corner_angle_deg": (
                 math.degrees(projection.next_corner_angle_rad)
@@ -3855,9 +3792,7 @@ class RPPController(Node):
         if not points:
             self.geometry_pending_marking_waypoints = None
             if self.geometry_processing_enabled:
-                self._invalidate_installed_geometry(
-                    GeometryResetReason.SOURCE_CLEARED
-                )
+                self._invalidate_installed_geometry(GeometryResetReason.SOURCE_CLEARED)
             return
 
         self.geometry_pending_marking_waypoints = list(points)
@@ -4579,8 +4514,7 @@ class RPPController(Node):
         recapture_complete = False
         if self.precision_pivot_fsm.state is MotionState.RECAPTURE:
             geometry_ok = (
-                abs(alignment_cross_track)
-                <= self.precision_pivot_recapture_xtrack
+                abs(alignment_cross_track) <= self.precision_pivot_recapture_xtrack
                 and abs(heading_error) <= self.precision_pivot_recapture_heading
                 and telemetry_fresh
                 and self.precision_pivot_release_certified
@@ -4617,10 +4551,7 @@ class RPPController(Node):
             return True
 
         self.precision_pivot_last_result = result
-        if (
-            result.state is MotionState.RECAPTURE
-            and result.release_certificate.valid
-        ):
+        if result.state is MotionState.RECAPTURE and result.release_certificate.valid:
             self.precision_pivot_release_certified = True
         self._publish_pivot_debug(
             result,
@@ -4896,7 +4827,7 @@ class RPPController(Node):
 
         self.get_logger().warn(
             "C->P1 POST-PIVOT TRAVEL LINE RE-ANCHORED | "
-            f"old_xtrack={old_xtrack * 1000.0:+.1f}mm | "
+            f"old_xtrack={self.ground_xtrack(old_xtrack) * 1000.0:+.1f}mm | "
             f"C_E={self.c_line_start_x:.3f} | "
             f"C_N={self.c_line_start_y:.3f} | "
             f"distance={distance:.3f}m | "
@@ -5349,17 +5280,13 @@ class RPPController(Node):
         self.precision_terminal_speed_override_mps = None
 
     def _current_cycle_projection(self):
-        if (
-            self.geometry_last_projection_cycle_token
-            != self.precision_cycle_token
-        ):
+        if self.geometry_last_projection_cycle_token != self.precision_cycle_token:
             return None
         return self.geometry_last_projection
 
     def _publish_guidance_debug(self, result, *, status):
         if not (
-            self.precision_guidance_enabled
-            or self.precision_speed_control_enabled
+            self.precision_guidance_enabled or self.precision_speed_control_enabled
         ):
             return
         payload = {
@@ -5400,17 +5327,13 @@ class RPPController(Node):
                 result.steering_target_point.y if result is not None else None
             ),
             "actual_steering_target_distance_m": (
-                result.actual_steering_target_distance_m
-                if result is not None
-                else None
+                result.actual_steering_target_distance_m if result is not None else None
             ),
             "endpoint_extension_used": (
                 result.endpoint_extension_used if result is not None else None
             ),
             "endpoint_extension_distance_m": (
-                result.endpoint_extension_distance_m
-                if result is not None
-                else None
+                result.endpoint_extension_distance_m if result is not None else None
             ),
             "target_behind_rover": (
                 result.target_behind_rover if result is not None else None
@@ -5431,7 +5354,9 @@ class RPPController(Node):
                 result.heading_error_rad if result is not None else None
             ),
             "cross_track_m": (
-                result.signed_cross_track_m if result is not None else None
+                self.ground_xtrack(result.signed_cross_track_m)
+                if result is not None
+                else None
             ),
             "desired_command_bearing_rad": (
                 result.desired_movement_bearing_rad if result is not None else None
@@ -5440,9 +5365,7 @@ class RPPController(Node):
                 result.limited_command_bearing_rad if result is not None else None
             ),
             "final_command_correction_rad": (
-                result.final_command_correction_rad
-                if result is not None
-                else None
+                result.final_command_correction_rad if result is not None else None
             ),
             "bearing_clamp_fired": (
                 result.bearing_clamp_fired if result is not None else None
@@ -5469,9 +5392,7 @@ class RPPController(Node):
             self._publish_guidance_debug(None, status="CURRENT_PROJECTION_UNAVAILABLE")
             return None
         measured_speed = (
-            self.current_speed_mps
-            if math.isfinite(self.current_speed_mps)
-            else 0.0
+            self.current_speed_mps if math.isfinite(self.current_speed_mps) else 0.0
         )
         effective_speed = max(
             0.0,
@@ -5529,9 +5450,7 @@ class RPPController(Node):
             projection_s_m=projection.progress_s,
             signed_cross_track_m=guidance.signed_cross_track_m,
             heading_error_rad=guidance.heading_error_rad,
-            commanded_speed_mps=(
-                self.precision_last_published_translational_speed_mps
-            ),
+            commanded_speed_mps=(self.precision_last_published_translational_speed_mps),
             measured_speed_mps=measured_speed,
             bearing_clamped=guidance.bearing_clamp_fired,
             telemetry_fresh=self.is_fresh(
@@ -5548,9 +5467,7 @@ class RPPController(Node):
         self.precision_tracking_cycle_token = self.precision_cycle_token
         self.precision_tracking_input = sample
         self.precision_tracking_output = output
-        self._publish_tracking_debug(
-            status="READY" if output.valid else "INVALID_STOP"
-        )
+        self._publish_tracking_debug(status="READY" if output.valid else "INVALID_STOP")
         return output
 
     def _reset_precision_tracking(
@@ -5620,8 +5537,7 @@ class RPPController(Node):
                 "winning_speed_cap_owner": (
                     self.precision_speed_result.winning_cap_owner.value
                     if self.precision_speed_result is not None
-                    and self.precision_speed_cycle_token
-                    == self.precision_cycle_token
+                    and self.precision_speed_cycle_token == self.precision_cycle_token
                     else None
                 ),
                 "stable_dwell_sec": (
@@ -5639,24 +5555,16 @@ class RPPController(Node):
                         snapshot.mean_abs_cross_track_m * 1000.0
                     ),
                     "rms_cross_track_mm": snapshot.rms_cross_track_m * 1000.0,
-                    "p95_abs_cross_track_mm": (
-                        snapshot.p95_abs_cross_track_m * 1000.0
-                    ),
+                    "p95_abs_cross_track_mm": (snapshot.p95_abs_cross_track_m * 1000.0),
                     "whole_run_p95_abs_cross_track_mm": (
                         snapshot.p95_abs_cross_track_m * 1000.0
                     ),
                     "trailing_p95_abs_cross_track_mm": (
                         snapshot.trailing_p95_abs_cross_track_m * 1000.0
                     ),
-                    "p95_histogram_saturated": (
-                        snapshot.p95_histogram_saturated
-                    ),
-                    "histogram_overflow_count": (
-                        snapshot.histogram_overflow_count
-                    ),
-                    "max_abs_cross_track_mm": (
-                        snapshot.max_abs_cross_track_m * 1000.0
-                    ),
+                    "p95_histogram_saturated": (snapshot.p95_histogram_saturated),
+                    "histogram_overflow_count": (snapshot.histogram_overflow_count),
+                    "max_abs_cross_track_mm": (snapshot.max_abs_cross_track_m * 1000.0),
                     "mean_abs_heading_error_deg": math.degrees(
                         snapshot.mean_abs_heading_error_rad
                     ),
@@ -5669,13 +5577,9 @@ class RPPController(Node):
                     "recovery_time_sec": snapshot.recovery_time_sec,
                     "recapture_time_sec": snapshot.recapture_time_sec,
                     "cruise_time_sec": snapshot.cruise_time_sec,
-                    "mean_commanded_speed_mps": (
-                        snapshot.mean_commanded_speed_mps
-                    ),
+                    "mean_commanded_speed_mps": (snapshot.mean_commanded_speed_mps),
                     "mean_measured_speed_mps": snapshot.mean_measured_speed_mps,
-                    "mean_abs_speed_error_mps": (
-                        snapshot.mean_abs_speed_error_mps
-                    ),
+                    "mean_abs_speed_error_mps": (snapshot.mean_abs_speed_error_mps),
                     "rms_speed_error_mps": snapshot.rms_speed_error_mps,
                     "max_abs_speed_error_mps": snapshot.max_abs_speed_error_mps,
                     "quantile_sample_count": snapshot.quantile_sample_count,
@@ -5685,13 +5589,10 @@ class RPPController(Node):
                         * 1000.0
                     ),
                     "histogram_max_mm": (
-                        self.precision_tracking_config.metrics_histogram_max_m
-                        * 1000.0
+                        self.precision_tracking_config.metrics_histogram_max_m * 1000.0
                     ),
                     "discontinuity_count": snapshot.discontinuity_count,
-                    "last_discontinuity_reason": (
-                        snapshot.last_discontinuity_reason
-                    ),
+                    "last_discontinuity_reason": (snapshot.last_discontinuity_reason),
                     # Evidence quality only. This field is never read by the
                     # motion FSM, terminal latch, or mission completion path.
                     "valid_for_acceptance": snapshot.valid_for_acceptance,
@@ -5773,9 +5674,7 @@ class RPPController(Node):
             projection
         )
         measured_speed = (
-            self.current_speed_mps
-            if math.isfinite(self.current_speed_mps)
-            else 0.0
+            self.current_speed_mps if math.isfinite(self.current_speed_mps) else 0.0
         )
         request = SpeedRegulatorInput(
             mission_speed_ceiling_mps=self.cruise_speed,
@@ -5845,9 +5744,7 @@ class RPPController(Node):
         request = self.precision_speed_request
         caps = result.caps
         winning_owner = (
-            "minimum_moving_floor"
-            if floor_applied
-            else result.winning_cap_owner.value
+            "minimum_moving_floor" if floor_applied else result.winning_cap_owner.value
         )
         payload = {
             "schema_version": 1,
@@ -5911,9 +5808,7 @@ class RPPController(Node):
                 request.measured_speed_mps if request is not None else None
             ),
             "tracking_acceleration_allowed": (
-                request.tracking_acceleration_allowed
-                if request is not None
-                else None
+                request.tracking_acceleration_allowed if request is not None else None
             ),
             "tracking_speed_cap_mps": (
                 request.tracking_speed_cap_mps if request is not None else None
@@ -6130,7 +6025,15 @@ class RPPController(Node):
         else:
             closest_distance = radial_error
 
-        xtrack_mm = signed_xtrack * 1000.0
+        # Internal RPP sign is kept unchanged for control:
+        # LEFT = positive, RIGHT = negative.
+        internal_xtrack_mm = signed_xtrack * 1000.0
+
+        # Ground-facing sign:
+        # LEFT = negative, RIGHT = positive.
+        ground_xtrack_m = self.ground_xtrack(signed_xtrack)
+        xtrack_mm = ground_xtrack_m * 1000.0
+
         radial_error_mm = radial_error * 1000.0
         along_remaining_mm = along_remaining * 1000.0
         closest_distance_mm = closest_distance * 1000.0
@@ -6156,9 +6059,9 @@ class RPPController(Node):
         cross_epsilon_mm = 0.5
         front_back_epsilon_mm = 0.5
 
-        if xtrack_mm > cross_epsilon_mm:
+        if internal_xtrack_mm > cross_epsilon_mm:
             cross_track_side = "LEFT"
-        elif xtrack_mm < -cross_epsilon_mm:
+        elif internal_xtrack_mm < -cross_epsilon_mm:
             cross_track_side = "RIGHT"
         else:
             cross_track_side = "CENTER"
@@ -6198,9 +6101,9 @@ class RPPController(Node):
             "available": True,
             "source": "/rpp/accuracy",
             "goal_number": goal_number,
-            "cross_track_error_m": float(signed_xtrack),
-            "cross_track_error_mm": float(xtrack_mm),
+            "cross_track_error_m": float(ground_xtrack_m),
             "cross_track_abs_mm": float(abs(xtrack_mm)),
+            "cross_track_error_mm": float(xtrack_mm),
             "cross_track_side": cross_track_side,
             "front_back_error_m": float(along_remaining),
             "front_back_error_mm": float(along_remaining_mm),
@@ -6331,8 +6234,8 @@ class RPPController(Node):
             self.xtrack_priority_inside_since = None
             self.get_logger().warn(
                 "XTRACK SPEED CAP ENGAGED | "
-                f"measured={signed_cross_track * 1000.0:+.1f}mm | "
-                f"predicted={predicted_cross_track * 1000.0:+.1f}mm | "
+                f"measured={self.ground_xtrack(signed_cross_track) * 1000.0:+.1f}mm | "
+                f"predicted={self.ground_xtrack(predicted_cross_track) * 1000.0:+.1f}mm | "
                 f"metric={error_metric * 1000.0:.1f}mm | "
                 f"cap={self.xtrack_priority_speed:.3f}m/s"
             )
@@ -6362,8 +6265,9 @@ class RPPController(Node):
                 # Preserve filter state to avoid a steering discontinuity.
                 self.get_logger().warn(
                     "XTRACK SPEED CAP RELEASED | "
-                    f"measured={signed_cross_track * 1000.0:+.1f}mm | "
-                    f"predicted={predicted_cross_track * 1000.0:+.1f}mm | "
+                    "XTRACK SPEED CAP RELEASED | "
+                    f"measured={self.ground_xtrack(signed_cross_track) * 1000.0:+.1f}mm | "
+                    f"predicted={self.ground_xtrack(predicted_cross_track) * 1000.0:+.1f}mm | "
                     f"heading={math.degrees(path_heading_error):.1f}deg | "
                     f"stable={release_elapsed:.2f}s"
                 )
@@ -6760,11 +6664,9 @@ class RPPController(Node):
         """Compatibility helper; preserve the configured acceleration slew."""
         return self.command_speed_slew_limit(requested_speed)
 
-
-#
-#
-# Current branch signature is preserved exactly.
-
+    #
+    #
+    # Current branch signature is preserved exactly.
 
     def _reset_precision_terminal(self, reason):
         """Reset Phase-5 authority only at an explicit semantic boundary."""
@@ -6805,8 +6707,7 @@ class RPPController(Node):
             and self.geometry_installed_signature is not None
             and metadata.get("path_signature") == self.geometry_installed_signature
             and metadata.get("raw_path_index") == binding.raw_path_index
-            and metadata.get("active_goal_identity")
-            == binding.active_goal_identity
+            and metadata.get("active_goal_identity") == binding.active_goal_identity
         ):
             return None, None
         mission_run_id = metadata.get("mission_run_id")
@@ -7036,7 +6937,9 @@ class RPPController(Node):
                 "raw_path_index": components.get("raw_path_index"),
                 "active_goal_identity": components.get("active_goal_identity"),
                 "radial_error_mm": sample.radial_error_m * 1000.0,
-                "cross_error_mm": sample.cross_track_error_m * 1000.0,
+                "cross_error_mm": (
+                    self.ground_xtrack(sample.cross_track_error_m) * 1000.0
+                ),
                 "along_error_mm": sample.along_track_error_m * 1000.0,
                 "heading_error_deg": sample.heading_error_deg,
                 "measured_speed_mps": sample.measured_linear_speed_mps,
@@ -7110,7 +7013,6 @@ class RPPController(Node):
                 precision_certificate=None,
             )
 
-
     def publish_terminal_result(
         self,
         outcome,
@@ -7143,8 +7045,12 @@ class RPPController(Node):
         # --------------------------------------------------------------
         # FINAL ACCURACY IS CALCULATED ONCE -- HERE IN RPP.
         # --------------------------------------------------------------
+
         radial_m = float(target_distance)
-        cross_track_m = float(signed_cross_track)
+
+        # Convert only for external/final accuracy reporting.
+        cross_track_m = self.ground_xtrack(signed_cross_track)
+
         along_track_m = float(along_remaining)
         tolerance_m = float(self.waypoint_tolerance)
 
@@ -7212,9 +7118,7 @@ class RPPController(Node):
                     "goal_instance_id": components.get("goal_instance_id"),
                     "path_signature": components.get("path_signature"),
                     "raw_path_index": components.get("raw_path_index"),
-                    "active_goal_identity": components.get(
-                        "active_goal_identity"
-                    ),
+                    "active_goal_identity": components.get("active_goal_identity"),
                     "precision_pass": bool(
                         precision_certificate is not None
                         and precision_certificate.precision_pass
@@ -7323,7 +7227,7 @@ class RPPController(Node):
                 self.get_logger().warn(
                     "EXACT WP_RADIUS ENTERED / ZERO LATCHED | "
                     f"radial={target_distance * 1000.0:.1f}mm | "
-                    f"xtrack={signed_cross_track * 1000.0:+.1f}mm | "
+                    f"xtrack={self.ground_xtrack(signed_cross_track) * 1000.0:+.1f}mm | "
                     f"along={along_remaining * 1000.0:+.1f}mm"
                 )
             speed = (
@@ -7430,9 +7334,7 @@ class RPPController(Node):
             if self.current_speed_mps <= self.stationary_speed_tolerance:
                 self.post_extension_stationary_hold = False
                 self.reset_speed_profiles()
-                self._reset_precision_regulator(
-                    "EXTENSION_STATIONARY_RECAPTURE"
-                )
+                self._reset_precision_regulator("EXTENSION_STATIONARY_RECAPTURE")
                 self.get_logger().warn(
                     "EXTENSION STATIONARY CONFIRMED / NEXT SEGMENT RELEASED | "
                     f"speed={self.current_speed_mps:.3f}m/s"
@@ -7631,8 +7533,7 @@ class RPPController(Node):
             and goal_requires_precision_stop
             and (
                 self.precision_terminal_request_armed
-                or goal_distance
-                <= self.precision_terminal_config.approach_distance_m
+                or goal_distance <= self.precision_terminal_config.approach_distance_m
             )
         ):
             terminal_result = self._step_precision_terminal_for_cycle(
@@ -7887,7 +7788,7 @@ class RPPController(Node):
                             "PX4 PIVOT KEEPER TIMEOUT / SAFE HOLD | "
                             f"elapsed={pivot_elapsed:.2f}s | "
                             f"true_error={math.degrees(true_error):+.1f}deg | "
-                            f"xtrack={alignment_cross_track * 1000.0:+.1f}mm"
+                            f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
                         )
                         return
 
@@ -7956,7 +7857,7 @@ class RPPController(Node):
                 self.get_logger().warn(
                     "PIVOT KEEPER PHASE COMPLETE / FAST CAPTURE ARMED | "
                     f"heading={math.degrees(path_heading_error):+.1f}deg | "
-                    f"xtrack={alignment_cross_track * 1000.0:+.1f}mm"
+                    f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
                 )
 
             # ----------------------------------------------------------
@@ -7995,7 +7896,7 @@ class RPPController(Node):
 
                 self.get_logger().error(
                     "FAST CAPTURE XTRACK GUARD / FALLBACK TO 1.00MPS | "
-                    f"xtrack={alignment_cross_track * 1000.0:+.1f}mm | "
+                    f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm | "
                     f"guard="
                     f"{self.segment_fast_capture_max_cross_track * 1000.0:.1f}mm"
                 )
@@ -8028,9 +7929,7 @@ class RPPController(Node):
                         self.xtrack_priority_active = False
                         self.xtrack_priority_inside_since = None
                         self.reset_xtrack_damping_state()
-                        self._reset_precision_regulator(
-                            "PIVOT_RECAPTURE_COMPLETE"
-                        )
+                        self._reset_precision_regulator("PIVOT_RECAPTURE_COMPLETE")
 
                         self.get_logger().warn(
                             "FAST POST-PIVOT LINE CAPTURE RELEASED | "
@@ -8103,15 +8002,11 @@ class RPPController(Node):
                     return
 
         gate2_active = (
-            self.precision_guidance_enabled
-            or self.precision_speed_control_enabled
+            self.precision_guidance_enabled or self.precision_speed_control_enabled
         )
-        terminal_active = (
-            goal_requires_precision_stop
-            and (
-                goal_distance <= self.terminal_goal_intercept_distance
-                or (gate2_active and self.terminal_precision_armed)
-            )
+        terminal_active = goal_requires_precision_stop and (
+            goal_distance <= self.terminal_goal_intercept_distance
+            or (gate2_active and self.terminal_precision_armed)
         )
 
         # Preserve xtrack speed-cap state across the terminal boundary.
@@ -8128,9 +8023,7 @@ class RPPController(Node):
             # Phase-4 authority is projection guidance plus its pure hysteresis
             # controller.  Do not call or mutate either legacy derivative/
             # filtered-guidance state or the legacy xtrack priority latch.
-            xtrack_guidance_bearing = (
-                precision_guidance.limited_command_bearing_rad
-            )
+            xtrack_guidance_bearing = precision_guidance.limited_command_bearing_rad
             global_signed_cross_track = precision_guidance.signed_cross_track_m
             global_xtrack_rate = 0.0
             predicted_cross_track = global_signed_cross_track
@@ -8201,9 +8094,7 @@ class RPPController(Node):
             and xtrack_speed_cap_active
         ):
             if self.precision_guidance_enabled and not first_approach:
-                xtrack_guidance_bearing = (
-                    precision_guidance.limited_command_bearing_rad
-                )
+                xtrack_guidance_bearing = precision_guidance.limited_command_bearing_rad
             (
                 xtrack_guidance_bearing,
                 command_heading_error,
@@ -8291,7 +8182,7 @@ class RPPController(Node):
                 self.reset_terminal_native_pivot()
                 self.get_logger().warn(
                     "CONTINUOUS TERMINAL GUIDANCE ENTERED | "
-                    f"xtrack={signed_cross_track * 1000.0:+.1f}mm | "
+                    f"xtrack={self.ground_xtrack(signed_cross_track) * 1000.0:+.1f}mm | "
                     f"heading={math.degrees(path_heading_error):+.1f}deg | "
                     f"along={along_remaining * 1000.0:+.1f}mm"
                 )
@@ -8377,8 +8268,8 @@ class RPPController(Node):
                 "CONTINUOUS LINE + HARDENED SPEED ARBITRATION / "
                 f"profile_target={profile_target:.3f}mps / "
                 f"speed_owner={speed_owner} / "
-                f"xtrack={global_signed_cross_track * 1000.0:+.1f}mm / "
-                f"predicted={predicted_cross_track * 1000.0:+.1f}mm / "
+                f"xtrack={self.ground_xtrack(global_signed_cross_track) * 1000.0:+.1f}mm / "
+                f"predicted={self.ground_xtrack(predicted_cross_track) * 1000.0:+.1f}mm / "
                 f"correction={math.degrees(self.terminal_limited_correction):+.2f}deg"
             )
             self.publish_terminal_state()
