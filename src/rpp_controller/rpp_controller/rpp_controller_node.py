@@ -6265,7 +6265,6 @@ class RPPController(Node):
                 # Preserve filter state to avoid a steering discontinuity.
                 self.get_logger().warn(
                     "XTRACK SPEED CAP RELEASED | "
-                    "XTRACK SPEED CAP RELEASED | "
                     f"measured={self.ground_xtrack(signed_cross_track) * 1000.0:+.1f}mm | "
                     f"predicted={self.ground_xtrack(predicted_cross_track) * 1000.0:+.1f}mm | "
                     f"heading={math.degrees(path_heading_error):.1f}deg | "
@@ -7742,7 +7741,7 @@ class RPPController(Node):
                 self.publish_stop()
                 self.get_logger().error(
                     "SEGMENT ALIGNMENT CROSS-TRACK LIMIT / SAFE HOLD | "
-                    f"xtrack={alignment_cross_track:.3f}m | "
+                    f"xtrack={self.ground_xtrack(alignment_cross_track):+.3f}m | "
                     f"limit={self.segment_alignment_max_cross_track:.3f}m | "
                     f"path_error={math.degrees(path_heading_error):+.1f}deg"
                 )
@@ -7814,7 +7813,7 @@ class RPPController(Node):
                         + f" | true_error="
                         + f"{math.degrees(true_error):+.1f}deg"
                         + f" | xtrack="
-                        + f"{alignment_cross_track * 1000.0:+.1f}mm"
+                        + f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
                         + f" | elapsed={pivot_elapsed:.2f}s",
                         target_distance,
                         goal_distance,
@@ -7936,7 +7935,7 @@ class RPPController(Node):
                             f"heading="
                             f"{math.degrees(path_heading_error):+.1f}deg | "
                             f"xtrack="
-                            f"{alignment_cross_track * 1000.0:+.1f}mm | "
+                            f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm | "
                             f"hold={alignment_hold_elapsed:.2f}s | "
                             f"speed="
                             f"{self.segment_alignment_recovery_speed:.3f}m/s"
@@ -7989,7 +7988,7 @@ class RPPController(Node):
                         + f" | hold={alignment_hold_elapsed:.2f}/"
                         + f"{self.alignment_hold_sec:.2f}s"
                         + f" | xtrack="
-                        + f"{alignment_cross_track * 1000.0:+.1f}mm"
+                        + f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
                         + f" | command_error="
                         + f"{math.degrees(command_heading_error):+.1f}deg",
                         target_distance,
@@ -8129,9 +8128,9 @@ class RPPController(Node):
                 + f"HARD SPEED CAP {self.xtrack_priority_speed:.2f}MPS"
                 + f" / correction_limit="
                 + f"{math.degrees(self.xtrack_priority_correction_limit):.1f}deg"
-                + f" | xtrack={global_signed_cross_track * 1000.0:+.1f}mm"
-                + f" | xtrack_rate={global_xtrack_rate * 1000.0:+.1f}mm/s"
-                + f" | predicted={predicted_cross_track * 1000.0:+.1f}mm"
+                + f" | xtrack={self.ground_xtrack(global_signed_cross_track) * 1000.0:+.1f}mm"
+                + f" | xtrack_rate={self.ground_xtrack(global_xtrack_rate) * 1000.0:+.1f}mm/s"
+                + f" | predicted={self.ground_xtrack(predicted_cross_track) * 1000.0:+.1f}mm"
                 + f" | metric={xtrack_error_metric * 1000.0:.1f}mm"
                 + f" | release_hold={xtrack_release_elapsed:.2f}/"
                 + f"{self.xtrack_priority_hold_sec:.2f}s"
@@ -8311,13 +8310,13 @@ class RPPController(Node):
             status = (
                 "C->P1 FIXED C-LINE / ACTIVE 50MM PATH / "
                 "200MM ACCEL / SEMANTIC-GOAL 500MM DECEL | "
-                f"xtrack={signed_cross_track:.3f}m"
+                f"xtrack={self.ground_xtrack(signed_cross_track):+.3f}m"
             )
         else:
             status = (
                 "INTERPOLATED 50MM STRAIGHT PATH / "
                 "200MM ACCEL / SEMANTIC-GOAL 500MM DECEL | "
-                f"xtrack={signed_cross_track:.3f}m"
+                f"xtrack={self.ground_xtrack(signed_cross_track):+.3f}m"
             )
 
         if self.precision_guidance_enabled or self.precision_speed_control_enabled:
