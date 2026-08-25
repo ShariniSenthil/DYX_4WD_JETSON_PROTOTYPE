@@ -149,14 +149,18 @@ def test_legacy_publisher_and_native_pivot_math_remain_byte_exact():
 
 def test_native_pivot_carrier_remains_on_legacy_publication_path():
     control = _method_source("control_loop")
-    pivot_start = control.index("if pivot_active:")
-    pivot_end = control.index("# REAL line is now aligned", pivot_start)
-    pivot_branch = control[pivot_start:pivot_end]
+    adapter = _method_source("_run_legacy_segment_alignment")
+    carrier = _method_source("_publish_legacy_native_carrier")
 
-    assert "self.publish_velocity_ned(" in pivot_branch
-    assert "apply_acceleration=False" in pivot_branch
-    assert "apply_deceleration=False" in pivot_branch
-    assert "publish_precision_velocity_ned" not in pivot_branch
+    assert "self._run_legacy_segment_alignment(" in control
+    assert "LegacyAlignmentDirective.NATIVE_CARRIER" in adapter
+    assert "self.publish_velocity_ned(" in carrier
+    assert "apply_acceleration=False" in carrier
+    assert "apply_deceleration=False" in carrier
+    assert "publish_precision_velocity_ned" not in carrier
+    assert "publish_precision_velocity_ned" not in adapter[
+        adapter.index("NATIVE_CARRIER") : adapter.index("HOLD_ZERO")
+    ]
 
 
 def test_projection_and_regulator_results_are_current_cycle_scoped():

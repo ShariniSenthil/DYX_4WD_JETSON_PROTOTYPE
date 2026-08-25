@@ -316,7 +316,9 @@ def generate_launch_description() -> LaunchDescription:
                         #   for the fixed 1.00 m/s cruise speed.
                         # Recovery contract for field precision:
                         #   pivot carrier              = CRUISE_SPEED_MPS (no translational accel)
-                        #   post-pivot line capture = 1.00 m/s
+                        #   genuine native-pivot release holds zero through
+                        #   measured settle + 1.00 s, then recapture at 0.20 m/s
+                        #   aligned-start (no carrier latch) still uses 1.00 m/s
                         #   global xtrack recovery      = 1.00 m/s
                         #   xtrack engage/release      = 15 mm / 8 mm
                         #   release heading            = <=4 deg stable for 0.30 s
@@ -480,6 +482,14 @@ def generate_launch_description() -> LaunchDescription:
                         "precision_pivot_realign_timeout_sec": 9.0,
                         "precision_pivot_recapture_timeout_sec": 8.0,
                         "post_pivot_capture_speed_mps": 0.20,
+                        "legacy_pivot_post_settle_hold_sec": 1.00,
+                        "legacy_pivot_realign_grace_sec": 0.30,
+                        "legacy_pivot_realign_split_heading_deg": 15.0,
+                        "legacy_pivot_realign_near_speed_mps": 0.20,
+                        "legacy_pivot_realign_far_speed_mps": 0.12,
+                        "legacy_pivot_realign_bearing_cone_deg": 30.0,
+                        "legacy_pivot_realign_max_translation_m": 0.30,
+                        "legacy_pivot_realign_timeout_sec": 9.0,
                         "precision_pivot_recapture_xtrack_m": 0.020,
                         "precision_pivot_recapture_heading_deg": 2.0,
                         "precision_pivot_recapture_settle_sec": 0.20,

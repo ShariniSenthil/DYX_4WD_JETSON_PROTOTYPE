@@ -79,6 +79,11 @@ class _Controller:
         self.alignment_inside_since = None
         self.line_tracking_lookahead = 0.55
 
+    def _reset_legacy_alignment_lifecycle(self, _reason):
+        self.segment_alignment_pivot_complete = False
+        self.segment_pivot_keeper_started_at = None
+        self.alignment_inside_since = None
+
     def get_logger(self):
         return _Logger()
 
@@ -165,7 +170,10 @@ def test_nav_tangent_cannot_overwrite_first_approach_path_heading():
 def test_precision_guidance_cannot_overwrite_first_approach_steering():
     control = _method_source("control_loop")
 
-    assert control.count("self.precision_guidance_enabled and not first_approach") >= 4
+    assert (
+        NODE_SOURCE.count("self.precision_guidance_enabled and not first_approach")
+        >= 4
+    )
     assert "self.precision_tracking_control_enabled and not first_approach" in control
 
 
