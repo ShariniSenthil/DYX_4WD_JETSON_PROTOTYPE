@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable
 from typing import Optional
 
+from rover_backend.config import settings
 from rover_backend.rtk_manager_core import (
     DesiredState,
 )
@@ -31,10 +32,10 @@ from rover_backend.rtk_process_protocol import (
 )
 
 
-RTK_PROFILE_SCHEMA_VERSION = 1
+RTK_PROFILE_SCHEMA_VERSION = 3
 
-DEFAULT_RTK_DATABASE_FILE = Path(
-    "/var/lib/rover_backend/rtk/rtk.sqlite3"
+DEFAULT_RTK_DATABASE_FILE = (
+    settings.rtk_database_file
 )
 
 
@@ -93,6 +94,12 @@ class RtkProfileSnapshot:
     reconnect_delay_sec: float
     first_data_timeout_sec: float
 
+    gga_enabled: bool
+    gga_interval_sec: float
+    gga_max_age_sec: float
+
+    tls_mode: str
+
     max_mavros_rtcm_frame_bytes: int
 
     enabled: bool
@@ -116,12 +123,26 @@ class RtkPersistedRuntimeState:
     updated_at_epoch: int
 
 
+def _contains_control_characters(
+    value: str,
+) -> bool:
+    """Return True for ASCII control bytes unsafe in protocol/log fields."""
+
+    return any(
+        ord(character) < 32
+        or ord(character) == 127
+        for character in value
+    )
+
+
 def _normalise_text(
     value: object,
     name: str,
     *,
     max_chars: int,
 ) -> str:
+    """Normalize ordinary human-readable configuration text."""
+
     if not isinstance(value, str):
         raise RtkProfileValidationError(
             f"{name} must be a string"
@@ -139,7 +160,82 @@ def _normalise_text(
             f"{name} exceeds {max_chars} characters"
         )
 
+    if _contains_control_characters(
+        text
+    ):
+        raise RtkProfileValidationError(
+            f"{name} must not contain control characters"
+        )
+
     return text
+
+
+def _normalise_protocol_token(
+    value: object,
+    name: str,
+    *,
+    max_chars: int,
+) -> str:
+    """Validate one whitespace-free protocol token."""
+
+    text = _normalise_text(
+        value,
+        name,
+        max_chars=max_chars,
+    )
+
+    if any(
+        character.isspace()
+        for character in text
+    ):
+        raise RtkProfileValidationError(
+            f"{name} must not contain whitespace"
+        )
+
+    try:
+        text.encode("ascii")
+
+    except UnicodeEncodeError as error:
+        raise RtkProfileValidationError(
+            f"{name} must contain ASCII characters only"
+        ) from error
+
+    return text
+
+
+def _validate_secret(
+    value: object,
+    name: str = "password",
+    *,
+    max_chars: int = 2048,
+) -> str:
+    """Validate a secret without changing any significant whitespace."""
+
+    if not isinstance(value, str):
+        raise RtkProfileValidationError(
+            f"{name} must be a string"
+        )
+
+    # Password bytes/text are semantically opaque. In particular, leading
+    # and trailing ordinary spaces must NOT be stripped or normalized.
+    if value == "":
+        raise RtkProfileValidationError(
+            f"{name} must be non-empty"
+        )
+
+    if len(value) > max_chars:
+        raise RtkProfileValidationError(
+            f"{name} exceeds {max_chars} characters"
+        )
+
+    if _contains_control_characters(
+        value
+    ):
+        raise RtkProfileValidationError(
+            f"{name} must not contain control characters"
+        )
+
+    return value
 
 
 def _normalise_name(
@@ -286,6 +382,8 @@ class RtkProfileStore:
 
                 if existing_version not in {
                     0,
+                    1,
+                    2,
                     RTK_PROFILE_SCHEMA_VERSION,
                 }:
                     raise RtkProfileStoreError(
@@ -331,6 +429,23 @@ class RtkProfileStore:
                             reconnect_delay_sec REAL NOT NULL,
                             first_data_timeout_sec REAL NOT NULL,
 
+                            gga_enabled INTEGER NOT NULL
+                                DEFAULT 0
+                                CHECK(gga_enabled IN (0, 1)),
+                            gga_interval_sec REAL NOT NULL
+                                DEFAULT 10.0,
+                            gga_max_age_sec REAL NOT NULL
+                                DEFAULT 5.0,
+
+                            tls_mode TEXT NOT NULL
+                                DEFAULT 'REQUIRED'
+                                CHECK(
+                                    tls_mode IN (
+                                        'REQUIRED',
+                                        'DISABLED'
+                                    )
+                                ),
+
                             max_mavros_rtcm_frame_bytes
                                 INTEGER NOT NULL,
 
@@ -345,6 +460,58 @@ class RtkProfileStore:
                         )
                         """
                     )
+
+                    # Schema v1 -> v2 adds optional GGA/VRS policy.
+                    #
+                    # Existing fixed-base profiles remain behaviorally
+                    # unchanged because gga_enabled defaults to false.
+                    if existing_version == 1:
+                        connection.execute(
+                            """
+                            ALTER TABLE rtk_profiles
+                            ADD COLUMN gga_enabled INTEGER NOT NULL
+                                DEFAULT 0
+                                CHECK(gga_enabled IN (0, 1))
+                            """
+                        )
+
+                        connection.execute(
+                            """
+                            ALTER TABLE rtk_profiles
+                            ADD COLUMN gga_interval_sec REAL NOT NULL
+                                DEFAULT 10.0
+                            """
+                        )
+
+                        connection.execute(
+                            """
+                            ALTER TABLE rtk_profiles
+                            ADD COLUMN gga_max_age_sec REAL NOT NULL
+                                DEFAULT 5.0
+                            """
+                        )
+
+                    # Schema v1/v2 -> v3:
+                    # fail secure. Existing profiles become REQUIRED TLS.
+                    # A plaintext caster requires an explicit operator PATCH
+                    # selecting tls_mode=DISABLED.
+                    if existing_version in {
+                        1,
+                        2,
+                    }:
+                        connection.execute(
+                            """
+                            ALTER TABLE rtk_profiles
+                            ADD COLUMN tls_mode TEXT NOT NULL
+                                DEFAULT 'REQUIRED'
+                                CHECK(
+                                    tls_mode IN (
+                                        'REQUIRED',
+                                        'DISABLED'
+                                    )
+                                )
+                            """
+                        )
 
                     connection.execute(
                         """
@@ -447,6 +614,10 @@ class RtkProfileStore:
         stale_reconnect_sec: object,
         reconnect_delay_sec: object,
         first_data_timeout_sec: object,
+        gga_enabled: object,
+        gga_interval_sec: object,
+        gga_max_age_sec: object,
+        tls_mode: object,
         max_mavros_rtcm_frame_bytes: object,
         enabled: object,
     ) -> dict[str, object]:
@@ -454,13 +625,13 @@ class RtkProfileStore:
             name
         )
 
-        host = _normalise_text(
+        host = _normalise_protocol_token(
             caster_host,
             "caster_host",
             max_chars=255,
         )
 
-        point = _normalise_text(
+        point = _normalise_protocol_token(
             mountpoint,
             "mountpoint",
             max_chars=255,
@@ -477,13 +648,13 @@ class RtkProfileStore:
             max_chars=255,
         )
 
-        secret = _normalise_text(
+        secret = _validate_secret(
             password,
             "password",
             max_chars=2048,
         )
 
-        topic = _normalise_text(
+        topic = _normalise_protocol_token(
             rtcm_topic,
             "rtcm_topic",
             max_chars=255,
@@ -529,6 +700,14 @@ class RtkProfileStore:
                 first_data_timeout_sec=(
                     first_data_timeout_sec
                 ),
+                gga_enabled=gga_enabled,
+                gga_interval_sec=(
+                    gga_interval_sec
+                ),
+                gga_max_age_sec=(
+                    gga_max_age_sec
+                ),
+                tls_mode=tls_mode,
                 max_mavros_rtcm_frame_bytes=(
                     max_mavros_rtcm_frame_bytes
                 ),
@@ -565,6 +744,16 @@ class RtkProfileStore:
             "first_data_timeout_sec": (
                 config.first_data_timeout_sec
             ),
+            "gga_enabled": (
+                config.gga_enabled
+            ),
+            "gga_interval_sec": (
+                config.gga_interval_sec
+            ),
+            "gga_max_age_sec": (
+                config.gga_max_age_sec
+            ),
+            "tls_mode": config.tls_mode,
             "max_mavros_rtcm_frame_bytes": (
                 config.max_mavros_rtcm_frame_bytes
             ),
@@ -623,6 +812,18 @@ class RtkProfileStore:
             ),
             first_data_timeout_sec=float(
                 row["first_data_timeout_sec"]
+            ),
+            gga_enabled=bool(
+                row["gga_enabled"]
+            ),
+            gga_interval_sec=float(
+                row["gga_interval_sec"]
+            ),
+            gga_max_age_sec=float(
+                row["gga_max_age_sec"]
+            ),
+            tls_mode=str(
+                row["tls_mode"]
             ),
             max_mavros_rtcm_frame_bytes=int(
                 row[
@@ -692,6 +893,10 @@ class RtkProfileStore:
         stale_reconnect_sec: float = 10.0,
         reconnect_delay_sec: float = 5.0,
         first_data_timeout_sec: float = 10.0,
+        gga_enabled: bool = False,
+        gga_interval_sec: float = 10.0,
+        gga_max_age_sec: float = 5.0,
+        tls_mode: str = "REQUIRED",
         max_mavros_rtcm_frame_bytes: int = 720,
         enabled: bool = True,
     ) -> RtkProfileSnapshot:
@@ -721,6 +926,14 @@ class RtkProfileStore:
             first_data_timeout_sec=(
                 first_data_timeout_sec
             ),
+            gga_enabled=gga_enabled,
+            gga_interval_sec=(
+                gga_interval_sec
+            ),
+            gga_max_age_sec=(
+                gga_max_age_sec
+            ),
+            tls_mode=tls_mode,
             max_mavros_rtcm_frame_bytes=(
                 max_mavros_rtcm_frame_bytes
             ),
@@ -750,6 +963,10 @@ class RtkProfileStore:
                             stale_reconnect_sec,
                             reconnect_delay_sec,
                             first_data_timeout_sec,
+                            gga_enabled,
+                            gga_interval_sec,
+                            gga_max_age_sec,
+                            tls_mode,
                             max_mavros_rtcm_frame_bytes,
                             enabled,
                             revision,
@@ -758,8 +975,9 @@ class RtkProfileStore:
                         )
                         VALUES (
                             ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, ?, ?, ?,
-                            ?, 1, ?, ?
+                            ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?,
+                            1, ?, ?
                         )
                         """,
                         (
@@ -776,6 +994,12 @@ class RtkProfileStore:
                             values["stale_reconnect_sec"],
                             values["reconnect_delay_sec"],
                             values["first_data_timeout_sec"],
+                            int(
+                                values["gga_enabled"]
+                            ),
+                            values["gga_interval_sec"],
+                            values["gga_max_age_sec"],
+                            values["tls_mode"],
                             values[
                                 "max_mavros_rtcm_frame_bytes"
                             ],
@@ -915,6 +1139,14 @@ class RtkProfileStore:
         first_data_timeout_sec: Optional[
             float
         ] = None,
+        gga_enabled: Optional[bool] = None,
+        gga_interval_sec: Optional[
+            float
+        ] = None,
+        gga_max_age_sec: Optional[
+            float
+        ] = None,
+        tls_mode: Optional[str] = None,
         max_mavros_rtcm_frame_bytes: Optional[
             int
         ] = None,
@@ -1030,6 +1262,28 @@ class RtkProfileStore:
                             is None
                             else first_data_timeout_sec
                         ),
+                        "gga_enabled": (
+                            bool(
+                                row["gga_enabled"]
+                            )
+                            if gga_enabled is None
+                            else gga_enabled
+                        ),
+                        "gga_interval_sec": (
+                            row["gga_interval_sec"]
+                            if gga_interval_sec is None
+                            else gga_interval_sec
+                        ),
+                        "gga_max_age_sec": (
+                            row["gga_max_age_sec"]
+                            if gga_max_age_sec is None
+                            else gga_max_age_sec
+                        ),
+                        "tls_mode": (
+                            row["tls_mode"]
+                            if tls_mode is None
+                            else tls_mode
+                        ),
                         "max_mavros_rtcm_frame_bytes": (
                             row[
                                 "max_mavros_rtcm_frame_bytes"
@@ -1100,6 +1354,18 @@ class RtkProfileStore:
                                 "first_data_timeout_sec"
                             ]
                         ),
+                        "gga_enabled": bool(
+                            row["gga_enabled"]
+                        ),
+                        "gga_interval_sec": float(
+                            row["gga_interval_sec"]
+                        ),
+                        "gga_max_age_sec": float(
+                            row["gga_max_age_sec"]
+                        ),
+                        "tls_mode": str(
+                            row["tls_mode"]
+                        ),
                         "max_mavros_rtcm_frame_bytes": int(
                             row[
                                 "max_mavros_rtcm_frame_bytes"
@@ -1157,6 +1423,10 @@ class RtkProfileStore:
                                 stale_reconnect_sec = ?,
                                 reconnect_delay_sec = ?,
                                 first_data_timeout_sec = ?,
+                                gga_enabled = ?,
+                                gga_interval_sec = ?,
+                                gga_max_age_sec = ?,
+                                tls_mode = ?,
                                 max_mavros_rtcm_frame_bytes = ?,
                                 enabled = ?,
                                 revision = revision + 1,
@@ -1191,6 +1461,16 @@ class RtkProfileStore:
                                 values[
                                     "first_data_timeout_sec"
                                 ],
+                                int(
+                                    values["gga_enabled"]
+                                ),
+                                values[
+                                    "gga_interval_sec"
+                                ],
+                                values[
+                                    "gga_max_age_sec"
+                                ],
+                                values["tls_mode"],
                                 values[
                                     "max_mavros_rtcm_frame_bytes"
                                 ],
@@ -1918,6 +2198,18 @@ class RtkProfileStore:
                             row[
                                 "first_data_timeout_sec"
                             ]
+                        ),
+                        gga_enabled=bool(
+                            row["gga_enabled"]
+                        ),
+                        gga_interval_sec=float(
+                            row["gga_interval_sec"]
+                        ),
+                        gga_max_age_sec=float(
+                            row["gga_max_age_sec"]
+                        ),
+                        tls_mode=str(
+                            row["tls_mode"]
                         ),
                         max_mavros_rtcm_frame_bytes=int(
                             row[

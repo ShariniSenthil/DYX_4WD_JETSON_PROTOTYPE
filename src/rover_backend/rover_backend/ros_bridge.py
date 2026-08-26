@@ -411,6 +411,13 @@ class RoverBackendRosNode(Node):
         )
 
         self.create_subscription(
+            String,
+            "/rtk_correction_bridge/status",
+            self._rtk_stream_status_callback,
+            retained_qos,
+        )
+
+        self.create_subscription(
             Bool,
             "/cmd_vel_bridge/backend_heartbeat_healthy",
             self._heartbeat_health_callback,
@@ -614,6 +621,8 @@ class RoverBackendRosNode(Node):
             rover_state.update(
                 "rtk",
                 healthy=False,
+                stream_connected=False,
+                stream_state="STALE",
                 status="STALE",
             )
 
@@ -1273,11 +1282,6 @@ class RoverBackendRosNode(Node):
         rover_state.update(
             "rtk",
             healthy=self._rtk_healthy,
-            status=(
-                "RTK_FIXED"
-                if (self._rtk_healthy and self._gps_fix_type == 6)
-                else ("HEALTHY" if self._rtk_healthy else "UNHEALTHY")
-            ),
         )
 
     def _rtk_correction_age_callback(
@@ -1287,11 +1291,279 @@ class RoverBackendRosNode(Node):
         self._mark_ros_message()
         self._last_rtk_message_monotonic = time.monotonic()
 
-        self._rtk_correction_age_sec = _finite_float(message.data)
+        self._rtk_correction_age_sec = _finite_float(
+            message.data
+        )
+
+        if (
+            self._rtk_correction_age_sec is None
+            or self._rtk_correction_age_sec < 0.0
+        ):
+            self._rtk_correction_age_sec = None
 
         rover_state.update(
             "rtk",
-            correction_age_sec=(self._rtk_correction_age_sec),
+            correction_age_sec=(
+                self._rtk_correction_age_sec
+            ),
+        )
+
+    def _rtk_stream_status_callback(
+        self,
+        message: String,
+    ) -> None:
+        """Mirror credential-free worker RTCM status into backend state."""
+
+        self._mark_ros_message()
+        self._last_rtk_message_monotonic = (
+            time.monotonic()
+        )
+
+        payload = _json_object(
+            message.data
+        )
+
+        if payload is None:
+            return
+
+        state_name = str(
+            payload.get(
+                "state",
+                "UNKNOWN",
+            )
+        ).strip().upper()
+
+        allowed_states = {
+            "DISCONNECTED",
+            "WAITING_FOR_FIRST_PUBLISHED_FRAME",
+            "HEALTHY",
+            "UNHEALTHY",
+        }
+
+        if state_name not in allowed_states:
+            state_name = "UNKNOWN"
+
+        connected = bool(
+            payload.get(
+                "connected",
+                False,
+            )
+        )
+
+        healthy = bool(
+            connected
+            and payload.get(
+                "healthy",
+                False,
+            )
+        )
+
+        correction_age = _finite_float(
+            payload.get(
+                "correction_age_sec"
+            )
+        )
+
+        if (
+            correction_age is not None
+            and correction_age < 0.0
+        ):
+            correction_age = None
+
+        self._rtk_healthy = healthy
+        self._rtk_correction_age_sec = (
+            correction_age
+        )
+
+        gga = payload.get(
+            "gga"
+        )
+
+        if not isinstance(
+            gga,
+            dict,
+        ):
+            gga = {}
+
+        gga_state = str(
+            gga.get(
+                "state",
+                "DISABLED",
+            )
+        ).strip().upper()
+
+        allowed_gga_states = {
+            "DISABLED",
+            "WAITING_FOR_FIX",
+            "NO_FIX",
+            "STALE",
+            "READY",
+        }
+
+        if gga_state not in allowed_gga_states:
+            gga_state = "UNKNOWN"
+
+        gga_source_age = _finite_float(
+            gga.get(
+                "source_age_sec"
+            )
+        )
+
+        gga_sent_age = _finite_float(
+            gga.get(
+                "last_sent_age_sec"
+            )
+        )
+
+        if (
+            gga_source_age is not None
+            and gga_source_age < 0.0
+        ):
+            gga_source_age = None
+
+        if (
+            gga_sent_age is not None
+            and gga_sent_age < 0.0
+        ):
+            gga_sent_age = None
+
+        rover_state.update(
+            "rtk",
+            stream_state=state_name,
+            stream_connected=connected,
+            healthy=healthy,
+            correction_age_sec=(
+                correction_age
+            ),
+            socket_bytes_received=max(
+                0,
+                _safe_int(
+                    payload.get(
+                        "socket_bytes_received"
+                    ),
+                    0,
+                ),
+            ),
+            valid_frames=max(
+                0,
+                _safe_int(
+                    payload.get(
+                        "valid_frames"
+                    ),
+                    0,
+                ),
+            ),
+            published_frames=max(
+                0,
+                _safe_int(
+                    payload.get(
+                        "published_frames"
+                    ),
+                    0,
+                ),
+            ),
+            crc_failures=max(
+                0,
+                _safe_int(
+                    payload.get(
+                        "crc_failures"
+                    ),
+                    0,
+                ),
+            ),
+            invalid_headers=max(
+                0,
+                _safe_int(
+                    payload.get(
+                        "invalid_headers"
+                    ),
+                    0,
+                ),
+            ),
+            resync_bytes_discarded=max(
+                0,
+                _safe_int(
+                    payload.get(
+                        "resync_bytes_discarded"
+                    ),
+                    0,
+                ),
+            ),
+            partial_frame_timeouts=max(
+                0,
+                _safe_int(
+                    payload.get(
+                        "partial_frame_timeouts"
+                    ),
+                    0,
+                ),
+            ),
+            oversize_drops=max(
+                0,
+                _safe_int(
+                    payload.get(
+                        "oversize_drops"
+                    ),
+                    0,
+                ),
+            ),
+            publish_errors=max(
+                0,
+                _safe_int(
+                    payload.get(
+                        "publish_errors"
+                    ),
+                    0,
+                ),
+            ),
+            worker_mavros_subscribers=(
+                _safe_int(
+                    payload.get(
+                        "mavros_subscribers"
+                    ),
+                    -1,
+                )
+            ),
+            max_mavros_rtcm_frame_bytes=(
+                _safe_int(
+                    payload.get(
+                        "max_mavros_rtcm_frame_bytes"
+                    ),
+                    0,
+                )
+                or None
+            ),
+            gga_enabled=bool(
+                gga.get(
+                    "enabled",
+                    False,
+                )
+            ),
+            gga_state=gga_state,
+            gga_source_age_sec=(
+                gga_source_age
+            ),
+            gga_last_sent_age_sec=(
+                gga_sent_age
+            ),
+            gga_sent_total=max(
+                0,
+                _safe_int(
+                    gga.get(
+                        "sent_total"
+                    ),
+                    0,
+                ),
+            ),
+            gga_send_errors=max(
+                0,
+                _safe_int(
+                    gga.get(
+                        "send_errors"
+                    ),
+                    0,
+                ),
+            ),
         )
 
     def _heartbeat_health_callback(

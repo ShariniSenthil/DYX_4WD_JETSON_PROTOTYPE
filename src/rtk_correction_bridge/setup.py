@@ -23,9 +23,4 @@ setup(
     description='NTRIP RTCM correction bridge from Emlid caster to PX4 using MAVROS',
     license='Proprietary',
     tests_require=['pytest'],
-    entry_points={
-        'console_scripts': [
-            'ntrip_to_px4_node = rtk_correction_bridge.ntrip_to_px4_node:main',
-        ],
-    },
 )

@@ -46,7 +46,11 @@ from rover_backend.realtime import make_asgi_app
 from rover_backend.realtime import start_realtime
 from rover_backend.realtime import stop_realtime
 from rover_backend.ros_bridge import ros_bridge
-from rover_backend.rtk_backend_lifecycle import RtkBackendLifecycle
+from rover_backend.rtk_backend_lifecycle import (
+    RtkBackendLifecycle,
+    RtkBackendLifecycleCleanupError,
+    RtkBackendLifecycleError,
+)
 from rover_backend.rtk_profile_store import rtk_profile_store
 from rover_backend.rtk_routes import rtk_router
 from rover_backend.spray_routes import spray_router
@@ -241,6 +245,46 @@ async def _best_effort_stop_ros_bridge() -> None:
         LOGGER.exception("ROS bridge shutdown failed")
 
 
+async def _start_rtk_backend_degraded() -> bool:
+    """Start RTK without making ordinary RTK failure backend-fatal.
+
+    A cleanly rolled-back RTK failure leaves mission control, telemetry,
+    emergency APIs and realtime services available while RTK routes remain
+    unavailable.
+
+    Cleanup failure is different: ownership may still exist, so it must
+    propagate and abort backend startup.
+    """
+
+    try:
+        await asyncio.to_thread(
+            rtk_backend_lifecycle.start
+        )
+
+    except RtkBackendLifecycleCleanupError:
+        LOGGER.exception(
+            "RTK startup failed and ownership cleanup is incomplete; "
+            "aborting backend startup"
+        )
+        raise
+
+    except RtkBackendLifecycleError as error:
+        LOGGER.exception(
+            "RTK control unavailable; backend will continue without RTK"
+        )
+
+        rover_state.update(
+            "rtk",
+            healthy=False,
+            correction_age_sec=None,
+            status="CONTROL_UNAVAILABLE",
+        )
+
+        return False
+
+    return True
+
+
 async def _best_effort_stop_rtk_backend() -> None:
     """Stop/reap RTK without changing persisted operator intent."""
 
@@ -326,11 +370,9 @@ async def startup_backend() -> None:
         if not ros_bridge.running:
             raise RuntimeError("ROS bridge did not enter the running state")
 
-        await asyncio.to_thread(
-            rtk_backend_lifecycle.start
+        rtk_started = (
+            await _start_rtk_backend_degraded()
         )
-
-        rtk_started = True
 
         await start_realtime()
         realtime_started = True

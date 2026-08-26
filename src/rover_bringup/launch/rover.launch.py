@@ -9,8 +9,10 @@ Startup remains safe:
 - no mission is prepared or started automatically;
 - cmd_vel_bridge requires a fresh backend heartbeat.
 
-The RTK correction bridge remains started separately using start_rtk.sh
-because the current RTK script requests the NTRIP password interactively.
+RTK correction ownership is backend-managed. rover_backend restores the
+persisted RTK desired state and supervises the only production correction
+worker. Operators must use the authenticated /api/rtk control surface rather
+than launching an NTRIP/RTCM ROS node directly.
 """
 
 from launch import LaunchDescription

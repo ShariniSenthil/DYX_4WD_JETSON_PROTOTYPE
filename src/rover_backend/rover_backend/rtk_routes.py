@@ -10,6 +10,7 @@ responses, status payloads, exceptions, or public profile snapshots.
 
 from __future__ import annotations
 
+import logging
 import threading
 
 from typing import Any
@@ -48,6 +49,12 @@ from rover_backend.rtk_profile_store import (
 from rover_backend.rtk_runtime_service import (
     RtkRuntimeServiceSnapshot,
 )
+from rover_backend.state import (
+    rover_state,
+)
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 rtk_router = APIRouter(
@@ -172,6 +179,12 @@ class RtkProfileCreateRequest(BaseModel):
     reconnect_delay_sec: Any = 5.0
     first_data_timeout_sec: Any = 10.0
 
+    gga_enabled: Any = False
+    gga_interval_sec: Any = 10.0
+    gga_max_age_sec: Any = 5.0
+
+    tls_mode: Any = "REQUIRED"
+
     max_mavros_rtcm_frame_bytes: Any = 720
 
     enabled: Any = True
@@ -202,6 +215,12 @@ class RtkProfileUpdateRequest(BaseModel):
     stale_reconnect_sec: Any = None
     reconnect_delay_sec: Any = None
     first_data_timeout_sec: Any = None
+
+    gga_enabled: Any = None
+    gga_interval_sec: Any = None
+    gga_max_age_sec: Any = None
+
+    tls_mode: Any = None
 
     max_mavros_rtcm_frame_bytes: Any = None
 
@@ -285,6 +304,14 @@ def _profile_payload(
         "first_data_timeout_sec": (
             profile.first_data_timeout_sec
         ),
+        "gga_enabled": profile.gga_enabled,
+        "gga_interval_sec": (
+            profile.gga_interval_sec
+        ),
+        "gga_max_age_sec": (
+            profile.gga_max_age_sec
+        ),
+        "tls_mode": profile.tls_mode,
         "max_mavros_rtcm_frame_bytes": (
             profile.max_mavros_rtcm_frame_bytes
         ),
@@ -424,6 +451,217 @@ def _runtime_payload(
     )
 
     return payload
+
+
+def _telemetry_payload() -> dict[str, Any]:
+    """Project correction stream and GNSS solution as separate truths."""
+
+    rtk = rover_state.section(
+        "rtk"
+    )
+
+    gps = rover_state.section(
+        "gps"
+    )
+
+    fix_type = int(
+        gps.get(
+            "fix_type",
+            0,
+        )
+        or 0
+    )
+
+    return {
+        "correction_stream": {
+            "state": str(
+                rtk.get(
+                    "stream_state",
+                    "UNAVAILABLE",
+                )
+            ),
+            "connected": bool(
+                rtk.get(
+                    "stream_connected",
+                    False,
+                )
+            ),
+            "healthy": bool(
+                rtk.get(
+                    "healthy",
+                    False,
+                )
+            ),
+            "correction_age_sec": (
+                rtk.get(
+                    "correction_age_sec"
+                )
+            ),
+            "socket_bytes_received": int(
+                rtk.get(
+                    "socket_bytes_received",
+                    0,
+                )
+                or 0
+            ),
+            "valid_frames": int(
+                rtk.get(
+                    "valid_frames",
+                    0,
+                )
+                or 0
+            ),
+            "published_frames": int(
+                rtk.get(
+                    "published_frames",
+                    0,
+                )
+                or 0
+            ),
+            "crc_failures": int(
+                rtk.get(
+                    "crc_failures",
+                    0,
+                )
+                or 0
+            ),
+            "invalid_headers": int(
+                rtk.get(
+                    "invalid_headers",
+                    0,
+                )
+                or 0
+            ),
+            "resync_bytes_discarded": int(
+                rtk.get(
+                    "resync_bytes_discarded",
+                    0,
+                )
+                or 0
+            ),
+            "partial_frame_timeouts": int(
+                rtk.get(
+                    "partial_frame_timeouts",
+                    0,
+                )
+                or 0
+            ),
+            "oversize_drops": int(
+                rtk.get(
+                    "oversize_drops",
+                    0,
+                )
+                or 0
+            ),
+            "publish_errors": int(
+                rtk.get(
+                    "publish_errors",
+                    0,
+                )
+                or 0
+            ),
+            "mavros_ready": bool(
+                rtk.get(
+                    "mavros_ready",
+                    False,
+                )
+            ),
+            "mavros_rtcm_subscribers": int(
+                rtk.get(
+                    "mavros_rtcm_subscribers",
+                    0,
+                )
+                or 0
+            ),
+            "worker_mavros_subscribers": int(
+                rtk.get(
+                    "worker_mavros_subscribers",
+                    -1,
+                )
+            ),
+            "max_mavros_rtcm_frame_bytes": (
+                rtk.get(
+                    "max_mavros_rtcm_frame_bytes"
+                )
+            ),
+            "gga": {
+                "enabled": bool(
+                    rtk.get(
+                        "gga_enabled",
+                        False,
+                    )
+                ),
+                "state": str(
+                    rtk.get(
+                        "gga_state",
+                        "DISABLED",
+                    )
+                ),
+                "source_age_sec": (
+                    rtk.get(
+                        "gga_source_age_sec"
+                    )
+                ),
+                "last_sent_age_sec": (
+                    rtk.get(
+                        "gga_last_sent_age_sec"
+                    )
+                ),
+                "sent_total": int(
+                    rtk.get(
+                        "gga_sent_total",
+                        0,
+                    )
+                    or 0
+                ),
+                "send_errors": int(
+                    rtk.get(
+                        "gga_send_errors",
+                        0,
+                    )
+                    or 0
+                ),
+            },
+        },
+        "gnss_solution": {
+            "fix_type": fix_type,
+            "fix_name": str(
+                gps.get(
+                    "fix_name",
+                    "NO_GPS",
+                )
+            ),
+            "rtk_float": (
+                fix_type == 5
+            ),
+            "rtk_fixed": (
+                fix_type == 6
+            ),
+            "satellites_visible": int(
+                gps.get(
+                    "satellites_visible",
+                    0,
+                )
+                or 0
+            ),
+            "horizontal_accuracy_m": (
+                gps.get(
+                    "horizontal_accuracy_m"
+                )
+            ),
+            "vertical_accuracy_m": (
+                gps.get(
+                    "vertical_accuracy_m"
+                )
+            ),
+            "hdop": gps.get(
+                "hdop"
+            ),
+            "vdop": gps.get(
+                "vdop"
+            ),
+        },
+    }
 
 
 def _control_payload(
@@ -659,6 +897,14 @@ async def create_rtk_profile(
         )
     )
 
+    LOGGER.info(
+        "RTK_AUDIT action=PROFILE_CREATE "
+        "user=%s profile_id=%s revision=%s",
+        _session.username,
+        profile.profile_id,
+        profile.revision,
+    )
+
     return {
         "profile": _profile_payload(
             profile
@@ -715,6 +961,27 @@ async def update_rtk_profile(
         )
     )
 
+    changed_fields = ",".join(
+        sorted(
+            (
+                "password_changed"
+                if name == "password"
+                else str(name)
+            )
+            for name in changes
+        )
+    ) or "NONE"
+
+    LOGGER.info(
+        "RTK_AUDIT action=PROFILE_UPDATE "
+        "user=%s profile_id=%s revision=%s "
+        "fields=%s",
+        _session.username,
+        profile.profile_id,
+        profile.revision,
+        changed_fields,
+    )
+
     return {
         "profile": _profile_payload(
             profile
@@ -738,6 +1005,13 @@ async def delete_rtk_profile(
         lambda: control.delete_profile(
             profile_id
         )
+    )
+
+    LOGGER.info(
+        "RTK_AUDIT action=PROFILE_DELETE "
+        "user=%s profile_id=%s",
+        _session.username,
+        profile_id,
     )
 
     return {
@@ -764,6 +1038,14 @@ async def activate_rtk_profile(
         )
     )
 
+    LOGGER.info(
+        "RTK_AUDIT action=PROFILE_ACTIVATE "
+        "user=%s profile_id=%s revision=%s",
+        _session.username,
+        profile_id,
+        persisted.revision,
+    )
+
     return {
         "success": True,
         "persisted": _persisted_payload(
@@ -785,6 +1067,13 @@ async def clear_active_rtk_profile(
 ) -> dict[str, Any]:
     persisted = await _control_call(
         control.clear_active_profile
+    )
+
+    LOGGER.info(
+        "RTK_AUDIT action=ACTIVE_PROFILE_CLEAR "
+        "user=%s revision=%s",
+        _session.username,
+        persisted.revision,
     )
 
     return {
@@ -815,10 +1104,16 @@ async def read_rtk_status(
         lambda: control.snapshot
     )
 
+    payload = _control_payload(
+        snapshot
+    )
+
+    payload.update(
+        _telemetry_payload()
+    )
+
     return {
-        "status": _control_payload(
-            snapshot
-        ),
+        "status": payload,
     }
 
 
@@ -835,6 +1130,14 @@ async def start_rtk(
 ) -> dict[str, Any]:
     persisted = await _control_call(
         control.request_start
+    )
+
+    LOGGER.info(
+        "RTK_AUDIT action=START "
+        "user=%s profile_id=%s revision=%s",
+        _session.username,
+        persisted.active_profile_id,
+        persisted.revision,
     )
 
     return {
@@ -861,6 +1164,14 @@ async def stop_rtk(
 ) -> dict[str, Any]:
     persisted = await _control_call(
         control.request_stop
+    )
+
+    LOGGER.info(
+        "RTK_AUDIT action=STOP "
+        "user=%s profile_id=%s revision=%s",
+        _session.username,
+        persisted.active_profile_id,
+        persisted.revision,
     )
 
     return {

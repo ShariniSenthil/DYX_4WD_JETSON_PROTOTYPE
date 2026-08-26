@@ -21,7 +21,7 @@ from typing import Optional
 from rover_backend.rtk_manager_core import WorkerExitReason
 
 
-WORKER_CONFIG_SCHEMA_VERSION = 1
+WORKER_CONFIG_SCHEMA_VERSION = 3
 WORKER_STATUS_SCHEMA_VERSION = 1
 MAX_WORKER_CONFIG_BYTES = 16 * 1024
 MAX_WORKER_STATUS_BYTES = 4 * 1024
@@ -71,15 +71,98 @@ class OwnershipConflictError(ProcessProtocolError):
     """Another owner currently holds the requested advisory file lock."""
 
 
+def _contains_control_characters(
+    value: str,
+) -> bool:
+    return any(
+        ord(character) < 32
+        or ord(character) == 127
+        for character in value
+    )
+
+
 def _require_nonempty_string(
     value: object,
     name: str,
     error_type: type[ValueError],
 ) -> str:
     if not isinstance(value, str):
-        raise error_type("%s must be a string" % name)
+        raise error_type(
+            "%s must be a string" % name
+        )
+
     if not value.strip():
-        raise error_type("%s must be non-empty" % name)
+        raise error_type(
+            "%s must be non-empty" % name
+        )
+
+    if _contains_control_characters(
+        value
+    ):
+        raise error_type(
+            "%s must not contain control characters"
+            % name
+        )
+
+    return value
+
+
+def _require_protocol_token(
+    value: object,
+    name: str,
+    error_type: type[ValueError],
+) -> str:
+    text = _require_nonempty_string(
+        value,
+        name,
+        error_type,
+    )
+
+    if any(
+        character.isspace()
+        for character in text
+    ):
+        raise error_type(
+            "%s must not contain whitespace"
+            % name
+        )
+
+    try:
+        text.encode("ascii")
+
+    except UnicodeEncodeError as error:
+        raise error_type(
+            "%s must contain ASCII characters only"
+            % name
+        ) from error
+
+    return text
+
+
+def _require_secret_string(
+    value: object,
+    name: str,
+    error_type: type[ValueError],
+) -> str:
+    # Secrets are opaque. Do not strip or otherwise normalize them.
+    if not isinstance(value, str):
+        raise error_type(
+            "%s must be a string" % name
+        )
+
+    if value == "":
+        raise error_type(
+            "%s must be non-empty" % name
+        )
+
+    if _contains_control_characters(
+        value
+    ):
+        raise error_type(
+            "%s must not contain control characters"
+            % name
+        )
+
     return value
 
 
@@ -114,7 +197,17 @@ class WorkerConfig:
     stale_reconnect_sec: float
     reconnect_delay_sec: float
     first_data_timeout_sec: float
+
+    # GGA/VRS support. Disabled by default for ordinary fixed-base casters.
+    gga_enabled: bool
+    gga_interval_sec: float
+    gga_max_age_sec: float
+
     max_mavros_rtcm_frame_bytes: int
+
+    # REQUIRED = verified TLS, no fallback.
+    # DISABLED = explicit plaintext operator policy.
+    tls_mode: str = "REQUIRED"
 
     def __post_init__(self) -> None:
         if (
@@ -127,8 +220,10 @@ class WorkerConfig:
             )
 
         _require_nonempty_string(self.run_id, "run_id", ConfigValidationError)
-        _require_nonempty_string(
-            self.caster_host, "caster_host", ConfigValidationError
+        _require_protocol_token(
+            self.caster_host,
+            "caster_host",
+            ConfigValidationError,
         )
         if isinstance(self.caster_port, bool) or not isinstance(
             self.caster_port, int
@@ -136,16 +231,54 @@ class WorkerConfig:
             raise ConfigValidationError("caster_port must be an int in 1..65535")
         if not 1 <= self.caster_port <= 65535:
             raise ConfigValidationError("caster_port must be an int in 1..65535")
-        _require_nonempty_string(
-            self.mountpoint, "mountpoint", ConfigValidationError
+        _require_protocol_token(
+            self.mountpoint,
+            "mountpoint",
+            ConfigValidationError,
         )
-        _require_nonempty_string(self.username, "username", ConfigValidationError)
-        _require_nonempty_string(self.password, "password", ConfigValidationError)
-        topic = _require_nonempty_string(
-            self.rtcm_topic, "rtcm_topic", ConfigValidationError
+
+        _require_nonempty_string(
+            self.username,
+            "username",
+            ConfigValidationError,
+        )
+
+        _require_secret_string(
+            self.password,
+            "password",
+            ConfigValidationError,
+        )
+
+        topic = _require_protocol_token(
+            self.rtcm_topic,
+            "rtcm_topic",
+            ConfigValidationError,
         )
         if not topic.startswith("/"):
             raise ConfigValidationError("rtcm_topic must be an absolute path")
+
+        if not isinstance(
+            self.gga_enabled,
+            bool,
+        ):
+            raise ConfigValidationError(
+                "gga_enabled must be a bool"
+            )
+
+        if (
+            not isinstance(
+                self.tls_mode,
+                str,
+            )
+            or self.tls_mode
+            not in {
+                "REQUIRED",
+                "DISABLED",
+            }
+        ):
+            raise ConfigValidationError(
+                "tls_mode must be REQUIRED or DISABLED"
+            )
 
         timeout_names = (
             "connect_timeout_sec",
@@ -154,6 +287,8 @@ class WorkerConfig:
             "stale_reconnect_sec",
             "reconnect_delay_sec",
             "first_data_timeout_sec",
+            "gga_interval_sec",
+            "gga_max_age_sec",
         )
         for name in timeout_names:
             value = _require_positive_finite(
@@ -185,7 +320,9 @@ class WorkerConfig:
             "mountpoint=%r, username=%r, password=<redacted>, rtcm_topic=%r, "
             "connect_timeout_sec=%r, socket_timeout_sec=%r, healthy_age_sec=%r, "
             "stale_reconnect_sec=%r, reconnect_delay_sec=%r, "
-            "first_data_timeout_sec=%r, max_mavros_rtcm_frame_bytes=%r)"
+            "first_data_timeout_sec=%r, gga_enabled=%r, "
+            "gga_interval_sec=%r, gga_max_age_sec=%r, "
+            "max_mavros_rtcm_frame_bytes=%r, tls_mode=%r)"
             % (
                 self.schema_version,
                 self.run_id,
@@ -200,7 +337,11 @@ class WorkerConfig:
                 self.stale_reconnect_sec,
                 self.reconnect_delay_sec,
                 self.first_data_timeout_sec,
+                self.gga_enabled,
+                self.gga_interval_sec,
+                self.gga_max_age_sec,
                 self.max_mavros_rtcm_frame_bytes,
+                self.tls_mode,
             )
         )
 
@@ -221,7 +362,11 @@ _WORKER_CONFIG_FIELDS = frozenset(
         "stale_reconnect_sec",
         "reconnect_delay_sec",
         "first_data_timeout_sec",
+        "gga_enabled",
+        "gga_interval_sec",
+        "gga_max_age_sec",
         "max_mavros_rtcm_frame_bytes",
+        "tls_mode",
     }
 )
 
@@ -286,7 +431,11 @@ def encode_worker_config(config: WorkerConfig) -> bytes:
         "stale_reconnect_sec": config.stale_reconnect_sec,
         "reconnect_delay_sec": config.reconnect_delay_sec,
         "first_data_timeout_sec": config.first_data_timeout_sec,
+        "gga_enabled": config.gga_enabled,
+        "gga_interval_sec": config.gga_interval_sec,
+        "gga_max_age_sec": config.gga_max_age_sec,
         "max_mavros_rtcm_frame_bytes": config.max_mavros_rtcm_frame_bytes,
+        "tls_mode": config.tls_mode,
     }
     encoded = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), allow_nan=False

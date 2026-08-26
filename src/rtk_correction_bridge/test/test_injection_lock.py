@@ -50,7 +50,9 @@ def test_lock_can_be_reacquired_after_release(tmp_path):
         second.close()
 
 
-def test_standalone_ntrip_entrypoint_is_wired_to_injection_lock():
+def test_standalone_ntrip_entrypoint_fails_closed():
+    """Standalone execution must never become a second RTCM owner."""
+
     from pathlib import Path
     import ast
 
@@ -76,14 +78,33 @@ def test_standalone_ntrip_entrypoint_is_wired_to_injection_lock():
         if isinstance(node, ast.Call)
     ]
 
-    assert any(
+    # The standalone path must not acquire correction ownership.
+    assert not any(
         isinstance(call.func, ast.Name)
         and call.func.id == "InjectionOwnershipLock"
         for call in calls
     )
 
-    assert any(
-        isinstance(call.func, ast.Attribute)
-        and call.func.attr == "acquire_nonblocking"
+    assert not any(
+        isinstance(call.func, ast.Name)
+        and call.func.id == "NtripToPx4Node"
         for call in calls
+    )
+
+    # It must explicitly fail closed.
+    returns = [
+        node
+        for node in ast.walk(main_function)
+        if isinstance(node, ast.Return)
+    ]
+
+    assert any(
+        isinstance(node.value, ast.Constant)
+        and node.value.value == 2
+        for node in returns
+    )
+
+    assert (
+        "Standalone RTK launch is disabled"
+        in source
     )

@@ -12,6 +12,7 @@ from fastapi import HTTPException
 
 from rover_backend.rtk_backend_lifecycle import (
     RtkBackendLifecycle,
+    RtkBackendLifecycleCleanupError,
     RtkBackendLifecycleError,
     build_production_runtime,
 )
@@ -395,6 +396,93 @@ def test_runtime_start_failure_gets_shutdown_cleanup(
 
     assert factory.created[0].shutdown_calls == 1
     assert lifecycle.started is False
+
+
+def test_profile_store_initialization_failure_is_clean_unavailability(
+    tmp_path,
+    monkeypatch,
+):
+    """Persistence failure before runtime creation leaves no RTK authority."""
+
+    store = RtkProfileStore(
+        tmp_path / "unavailable.sqlite3"
+    )
+
+    factory = FakeRuntimeFactory()
+
+    def fail_initialize():
+        raise PermissionError(
+            "synthetic RTK persistence permission failure"
+        )
+
+    monkeypatch.setattr(
+        store,
+        "initialize",
+        fail_initialize,
+    )
+
+    lifecycle = RtkBackendLifecycle(
+        store,
+        lambda: False,
+        runtime_factory=factory,
+    )
+
+    with pytest.raises(
+        RtkBackendLifecycleError
+    ) as caught:
+        lifecycle.start()
+
+    assert not isinstance(
+        caught.value,
+        RtkBackendLifecycleCleanupError,
+    )
+
+    assert lifecycle.started is False
+    assert factory.created == []
+
+    with pytest.raises(
+        HTTPException
+    ):
+        get_rtk_control_service()
+
+
+def test_startup_cleanup_failure_has_distinct_fatal_error(
+    tmp_path,
+):
+    """Incomplete startup rollback must never be treated as degradable."""
+
+    store = RtkProfileStore(
+        tmp_path / "cleanup-fail.sqlite3"
+    )
+
+    factory = FakeRuntimeFactory()
+
+    def configure(runtime):
+        runtime.fail_start = True
+        runtime.shutdown_result = False
+
+    factory.configure = configure
+
+    lifecycle = RtkBackendLifecycle(
+        store,
+        lambda: False,
+        runtime_factory=factory,
+    )
+
+    with pytest.raises(
+        RtkBackendLifecycleCleanupError
+    ):
+        lifecycle.start()
+
+    runtime = factory.created[0]
+
+    assert runtime.shutdown_calls == 1
+    assert lifecycle.started is False
+
+    with pytest.raises(
+        HTTPException
+    ):
+        get_rtk_control_service()
 
 
 def test_shutdown_timeout_is_failure_and_registry_is_removed(

@@ -32,6 +32,9 @@ from rover_backend.rtk_routes import (
 from rover_backend.rtk_runtime_service import (
     RtkRuntimeServiceSnapshot,
 )
+from rover_backend.state import (
+    rover_state,
+)
 
 
 SECRET = "ROUTE_SECRET_3819"
@@ -687,6 +690,138 @@ def test_status_payload_is_credential_free(
 
     assert SECRET not in response.text
     assert "password_secret" not in response.text
+
+
+def test_status_separates_correction_health_from_gnss_solution(
+    api,
+):
+    client, _, _, _ = api
+
+    rover_state.update(
+        "rtk",
+        stream_state="HEALTHY",
+        stream_connected=True,
+        healthy=True,
+        correction_age_sec=0.20,
+        valid_frames=42,
+        published_frames=40,
+        crc_failures=2,
+        oversize_drops=1,
+        publish_errors=0,
+        mavros_ready=True,
+        mavros_rtcm_subscribers=1,
+        worker_mavros_subscribers=1,
+        max_mavros_rtcm_frame_bytes=720,
+    )
+
+    rover_state.update(
+        "gps",
+        fix_type=5,
+        fix_name="RTK_FLOAT",
+        satellites_visible=18,
+        horizontal_accuracy_m=0.025,
+        vertical_accuracy_m=0.040,
+        hdop=0.7,
+        vdop=1.0,
+        rtk_fixed=False,
+    )
+
+    response = client.get(
+        "/api/rtk/status"
+    )
+
+    assert response.status_code == 200
+
+    status = response.json()[
+        "status"
+    ]
+
+    stream = status[
+        "correction_stream"
+    ]
+
+    gnss = status[
+        "gnss_solution"
+    ]
+
+    assert stream["connected"] is True
+    assert stream["healthy"] is True
+    assert stream["state"] == "HEALTHY"
+    assert stream["published_frames"] == 40
+    assert stream["crc_failures"] == 2
+
+    # Healthy correction transport is NOT equivalent to RTK FIXED.
+    assert gnss["fix_name"] == "RTK_FLOAT"
+    assert gnss["rtk_float"] is True
+    assert gnss["rtk_fixed"] is False
+
+
+def test_operator_audit_logs_are_secret_free(
+    api,
+    caplog,
+):
+    client, _, _, _ = api
+
+    replacement_secret = (
+        "AUDIT_REPLACEMENT_SECRET_5187"
+    )
+
+    with caplog.at_level(
+        "INFO",
+        logger="rover_backend.rtk_routes",
+    ):
+        profile_id = create_profile(
+            client,
+            password=SECRET,
+        )
+
+        activate_profile(
+            client,
+            profile_id,
+        )
+
+        assert (
+            client.post(
+                "/api/rtk/start"
+            ).status_code
+            == 200
+        )
+
+        assert (
+            client.post(
+                "/api/rtk/stop"
+            ).status_code
+            == 200
+        )
+
+        assert (
+            client.patch(
+                f"/api/rtk/profiles/{profile_id}",
+                json={
+                    "password": (
+                        replacement_secret
+                    )
+                },
+            ).status_code
+            == 200
+        )
+
+    messages = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+    )
+
+    assert "RTK_AUDIT" in messages
+    assert "user=operator" in messages
+    assert "action=PROFILE_CREATE" in messages
+    assert "action=PROFILE_ACTIVATE" in messages
+    assert "action=START" in messages
+    assert "action=STOP" in messages
+    assert "action=PROFILE_UPDATE" in messages
+    assert "password_changed" in messages
+
+    assert SECRET not in messages
+    assert replacement_secret not in messages
 
 
 def test_registry_install_is_idempotent_and_clear(

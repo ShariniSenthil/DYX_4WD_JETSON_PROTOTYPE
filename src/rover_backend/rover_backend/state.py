@@ -213,9 +213,37 @@ class RoverState:
                 "updated_at": now,
             },
             "rtk": {
+                # Legacy compatibility field. Dedicated RTK API exposes
+                # correction stream and GNSS solution independently.
+                "status": "UNAVAILABLE",
+
                 "healthy": False,
                 "correction_age_sec": None,
-                "status": "UNAVAILABLE",
+
+                "stream_state": "UNAVAILABLE",
+                "stream_connected": False,
+                "socket_bytes_received": 0,
+                "valid_frames": 0,
+                "published_frames": 0,
+                "crc_failures": 0,
+                "invalid_headers": 0,
+                "resync_bytes_discarded": 0,
+                "partial_frame_timeouts": 0,
+                "oversize_drops": 0,
+                "publish_errors": 0,
+
+                "mavros_ready": False,
+                "mavros_rtcm_subscribers": 0,
+                "worker_mavros_subscribers": -1,
+                "max_mavros_rtcm_frame_bytes": None,
+
+                "gga_enabled": False,
+                "gga_state": "DISABLED",
+                "gga_source_age_sec": None,
+                "gga_last_sent_age_sec": None,
+                "gga_sent_total": 0,
+                "gga_send_errors": 0,
+
                 "updated_at": now,
             },
             "battery": {

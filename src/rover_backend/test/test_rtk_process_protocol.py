@@ -56,6 +56,9 @@ def make_config(**overrides) -> WorkerConfig:
         "stale_reconnect_sec": 15.0,
         "reconnect_delay_sec": 2.0,
         "first_data_timeout_sec": 12.0,
+        "gga_enabled": False,
+        "gga_interval_sec": 10.0,
+        "gga_max_age_sec": 5.0,
         "max_mavros_rtcm_frame_bytes": 720,
     }
     values.update(overrides)
@@ -127,7 +130,10 @@ def test_06_unknown_field_rejected():
 
 def test_07_wrong_schema_version_rejected():
     value = json.loads(encode_worker_config(make_config()))
-    value["schema_version"] = 2
+    value["schema_version"] = (
+        WORKER_CONFIG_SCHEMA_VERSION
+        + 1
+    )
     with pytest.raises(ConfigDecodeError, match="unsupported"):
         decode_worker_config(json.dumps(value).encode("utf-8"))
     with pytest.raises(ConfigValidationError):
@@ -198,6 +204,100 @@ def test_18_mavros_frame_1030_rejected():
     for value in (0, 1030, True, 720.0):
         with pytest.raises(ConfigValidationError):
             make_config(max_mavros_rtcm_frame_bytes=value)
+
+
+def test_password_significant_spaces_survive_worker_round_trip():
+    secret = " secret with spaces "
+
+    config = make_config(
+        password=secret
+    )
+
+    encoded = encode_worker_config(
+        config
+    )
+
+    decoded = decode_worker_config(
+        encoded
+    )
+
+    assert decoded.password == secret
+
+
+@pytest.mark.parametrize(
+    "password",
+    (
+        "bad\nsecret",
+        "bad\rsecret",
+        "bad\tsecret",
+        "bad\x00secret",
+        "bad\x7fsecret",
+    ),
+)
+def test_password_control_characters_rejected_at_worker_boundary(
+    password,
+):
+    with pytest.raises(
+        ConfigValidationError
+    ):
+        make_config(
+            password=password
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "field_name",
+        "field_value",
+    ),
+    (
+        (
+            "caster_host",
+            "caster.test\r\nInjected: yes",
+        ),
+        (
+            "caster_host",
+            "caster test",
+        ),
+        (
+            "mountpoint",
+            "MOUNT\nInjected",
+        ),
+        (
+            "mountpoint",
+            "MOUNT POINT",
+        ),
+        (
+            "rtcm_topic",
+            "/rtcm\r\nInjected",
+        ),
+        (
+            "rtcm_topic",
+            "/rtcm topic",
+        ),
+    ),
+)
+def test_worker_protocol_tokens_reject_controls_and_whitespace(
+    field_name,
+    field_value,
+):
+    with pytest.raises(
+        ConfigValidationError
+    ):
+        make_config(
+            **{
+                field_name: field_value,
+            }
+        )
+
+
+def test_worker_username_control_characters_are_rejected():
+    with pytest.raises(
+        ConfigValidationError
+    ):
+        make_config(
+            username="user\r\nInjected"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -640,3 +740,26 @@ def test_61_newline_url_and_email_like_detail_codes_are_rejected():
             WorkerStatusEvent(
                 1, "run-061", WorkerStatusKind.TERMINAL_ERROR, detail_code
             )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    (
+        ("caster_host", "cástér.test"),
+        ("mountpoint", "MÖUNT"),
+        ("rtcm_topic", "/mavros/rtçm"),
+    ),
+)
+def test_worker_protocol_tokens_reject_non_ascii(
+    field_name,
+    field_value,
+):
+    with pytest.raises(
+        ConfigValidationError,
+        match="ASCII",
+    ):
+        make_config(
+            **{
+                field_name: field_value,
+            }
+        )

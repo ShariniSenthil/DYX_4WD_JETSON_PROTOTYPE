@@ -56,6 +56,12 @@ class RtkBackendLifecycleError(
     """Production RTK application lifecycle failed."""
 
 
+class RtkBackendLifecycleCleanupError(
+    RtkBackendLifecycleError
+):
+    """Startup failed and RTK ownership cleanup was not proven complete."""
+
+
 class _RuntimeService(Protocol):
     @property
     def snapshot(
@@ -345,19 +351,25 @@ class RtkBackendLifecycle:
                     except Exception:
                         cleanup_failed = True
 
-                message = (
+                if cleanup_failed:
+                    # The backend must NOT continue operating after this
+                    # failure. A supervisor, process lock, liveness FD, child,
+                    # or REST authority may still be owned.
+                    raise (
+                        RtkBackendLifecycleCleanupError(
+                            "RTK backend lifecycle "
+                            "startup failed; fail-closed "
+                            "runtime cleanup also failed"
+                        )
+                    ) from error
+
+                # Normal RTK initialization/runtime restore failures reach this
+                # path only after rollback has proven that no RTK authority is
+                # left behind. Application startup may safely continue with
+                # RTK control unavailable.
+                raise RtkBackendLifecycleError(
                     "RTK backend lifecycle "
                     "startup failed"
-                )
-
-                if cleanup_failed:
-                    message += (
-                        "; fail-closed runtime "
-                        "cleanup also failed"
-                    )
-
-                raise RtkBackendLifecycleError(
-                    message
                 ) from error
 
             if (

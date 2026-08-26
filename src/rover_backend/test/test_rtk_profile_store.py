@@ -281,6 +281,166 @@ def test_mountpoint_leading_slash_is_normalised(
     assert profile.mountpoint == "MOUNT"
 
 
+def test_password_whitespace_is_preserved_exactly(
+    store,
+):
+    value, _ = store
+
+    secret = (
+        " secret-with-significant-spaces "
+    )
+
+    profile = create_profile(
+        value,
+        password=secret,
+    )
+
+    value.set_active_profile(
+        profile.profile_id
+    )
+
+    config = (
+        value.build_active_worker_config(
+            "run-secret-spaces"
+        )
+    )
+
+    assert config.password == secret
+
+
+@pytest.mark.parametrize(
+    "password",
+    (
+        "bad\nsecret",
+        "bad\rsecret",
+        "bad\tsecret",
+        "bad\x00secret",
+        "bad\x7fsecret",
+    ),
+)
+def test_password_control_characters_are_rejected(
+    store,
+    password,
+):
+    value, _ = store
+
+    with pytest.raises(
+        RtkProfileValidationError
+    ):
+        create_profile(
+            value,
+            password=password,
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "field_name",
+        "field_value",
+    ),
+    (
+        (
+            "caster_host",
+            "caster.test\r\nInjected: yes",
+        ),
+        (
+            "caster_host",
+            "caster test",
+        ),
+        (
+            "mountpoint",
+            "MOUNT\r\nInjected: yes",
+        ),
+        (
+            "mountpoint",
+            "MOUNT POINT",
+        ),
+        (
+            "rtcm_topic",
+            "/mavros/rtcm\nother",
+        ),
+        (
+            "rtcm_topic",
+            "/mavros/rtcm topic",
+        ),
+    ),
+)
+def test_protocol_tokens_reject_controls_and_whitespace(
+    store,
+    field_name,
+    field_value,
+):
+    value, _ = store
+
+    kwargs = {
+        "name": "Bad Protocol",
+        "caster_host": "caster.test",
+        "caster_port": 2101,
+        "mountpoint": "MOUNT",
+        "username": "user",
+        "password": SECRET,
+        "rtcm_topic": (
+            "/mavros/gps_rtk/send_rtcm"
+        ),
+    }
+
+    kwargs[field_name] = field_value
+
+    with pytest.raises(
+        RtkProfileValidationError
+    ):
+        value.create_profile(
+            **kwargs
+        )
+
+
+def test_username_control_characters_are_rejected(
+    store,
+):
+    value, _ = store
+
+    with pytest.raises(
+        RtkProfileValidationError
+    ):
+        value.create_profile(
+            name="Bad Username",
+            caster_host="caster.test",
+            caster_port=2101,
+            mountpoint="MOUNT",
+            username="user\r\nX: injected",
+            password=SECRET,
+        )
+
+
+def test_password_update_preserves_significant_spaces(
+    store,
+):
+    value, _ = store
+
+    profile = create_profile(
+        value
+    )
+
+    value.set_active_profile(
+        profile.profile_id
+    )
+
+    replacement = " new secret "
+
+    value.update_profile(
+        profile.profile_id,
+        password=replacement,
+    )
+
+    config = (
+        value.build_active_worker_config(
+            "run-updated-secret"
+        )
+    )
+
+    assert config.password == replacement
+
+
 def test_get_missing_profile_rejected(
     store,
 ):
@@ -858,3 +1018,41 @@ def test_unsupported_schema_version_is_rejected(
         RtkProfileStoreError
     ):
         value.initialize()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    (
+        ("caster_host", "cástér.test"),
+        ("mountpoint", "MÖUNT"),
+        ("rtcm_topic", "/mavros/rtçm"),
+    ),
+)
+def test_profile_protocol_tokens_reject_non_ascii(
+    store,
+    field_name,
+    field_value,
+):
+    value, _ = store
+
+    kwargs = {
+        "name": "ASCII protocol test",
+        "caster_host": "caster.test",
+        "caster_port": 443,
+        "mountpoint": "MOUNT",
+        "username": "rover",
+        "password": SECRET,
+        "rtcm_topic": (
+            "/mavros/gps_rtk/send_rtcm"
+        ),
+    }
+
+    kwargs[field_name] = field_value
+
+    with pytest.raises(
+        RtkProfileValidationError,
+        match="ASCII",
+    ):
+        value.create_profile(
+            **kwargs
+        )

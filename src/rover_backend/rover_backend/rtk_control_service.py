@@ -17,6 +17,7 @@ Safety rules:
 
 from __future__ import annotations
 
+import logging
 import threading
 
 from dataclasses import dataclass
@@ -35,6 +36,9 @@ from rover_backend.rtk_profile_store import (
 from rover_backend.rtk_runtime_service import (
     RtkRuntimeServiceSnapshot,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class RtkControlError(RuntimeError):
@@ -272,6 +276,13 @@ class RtkControlService:
                     )
                 )
 
+            LOGGER.info(
+                "RTK_CONTROL event=START_FORWARD "
+                "profile_id=%s revision=%s",
+                running.active_profile_id,
+                running.revision,
+            )
+
             try:
                 self._runtime_service.request_start()
 
@@ -295,6 +306,14 @@ class RtkControlService:
                 except Exception:
                     pass
 
+                LOGGER.error(
+                    "RTK_CONTROL event=START_FAILED "
+                    "profile_id=%s "
+                    "stop_compensation_persisted=%s",
+                    running.active_profile_id,
+                    persistence_error is None,
+                )
+
                 if persistence_error is not None:
                     raise RtkControlConsistencyError(
                         "RTK START failed and persisted "
@@ -305,6 +324,13 @@ class RtkControlService:
                     "RTK START failed; persisted state "
                     "was restored to STOPPED"
                 ) from start_error
+
+            LOGGER.info(
+                "RTK_CONTROL event=START_ACCEPTED "
+                "profile_id=%s revision=%s",
+                running.active_profile_id,
+                running.revision,
+            )
 
             return running
 
@@ -326,6 +352,13 @@ class RtkControlService:
             except Exception as error:
                 # Never restore RUNNING here. Persisted STOPPED is the safe
                 # authoritative target and later reconciliation can retry it.
+                LOGGER.error(
+                    "RTK_CONTROL event=STOP_FORWARD_FAILED "
+                    "profile_id=%s revision=%s",
+                    stopped.active_profile_id,
+                    stopped.revision,
+                )
+
                 raise RtkControlRuntimeError(
                     "RTK STOP is persisted but runtime "
                     "STOP forwarding failed"
@@ -341,6 +374,14 @@ class RtkControlService:
         with self._lock:
             persisted = (
                 self._profile_store.runtime_state()
+            )
+
+            LOGGER.info(
+                "RTK_CONTROL event=RECONCILE "
+                "profile_id=%s revision=%s desired=%s",
+                persisted.active_profile_id,
+                persisted.revision,
+                persisted.desired_state.value,
             )
 
             try:
@@ -376,6 +417,17 @@ class RtkControlService:
             is DesiredState.STOPPED
         ):
             return
+
+        LOGGER.warning(
+            "RTK_CONTROL event=FORCED_STOP "
+            "operation=%s profile_id=%s revision=%s",
+            operation.replace(
+                " ",
+                "_",
+            ).upper(),
+            after.active_profile_id,
+            after.revision,
+        )
 
         try:
             self._runtime_service.request_stop()

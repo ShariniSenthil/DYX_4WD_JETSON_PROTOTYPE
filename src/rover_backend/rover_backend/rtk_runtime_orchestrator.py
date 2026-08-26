@@ -13,6 +13,7 @@ boundary wins before the manager evaluates the timeout.
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, Sequence
@@ -42,6 +43,9 @@ from rover_backend.rtk_process_protocol import (
     WorkerStatusKind,
     encode_worker_config,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class WorkerConfigBuildError(Exception):
@@ -155,11 +159,31 @@ class RtkRuntimeOrchestrator:
     ) -> tuple[AdapterEvent, ...]:
         """Update the MAVROS start gate and apply resulting actions."""
         self._require_open()
+
+        previous = (
+            self.core.snapshot.mavros_ready
+        )
+
         actions = self.core.set_mavros_ready(
             ready,
             now_sec,
         )
-        return self._apply_actions(actions, now_sec)
+
+        observed = self._apply_actions(
+            actions,
+            now_sec,
+        )
+
+        if bool(ready) != previous:
+            LOGGER.warning(
+                "RTK_SUPERVISOR "
+                "event=MAVROS_READY_CHANGE "
+                "ready=%s manager_state=%s",
+                bool(ready),
+                self.core.snapshot.manager_state.value,
+            )
+
+        return observed
 
     def tick(
         self,
@@ -244,6 +268,13 @@ class RtkRuntimeOrchestrator:
             run_id
         )
 
+        LOGGER.error(
+            "RTK_SUPERVISOR event=PROTOCOL_FAULT "
+            "run_id=%s pid=%s",
+            run_id,
+            process.pid,
+        )
+
         # This is deliberately an adapter-level stop rather than a manager
         # USER stop. The subsequent child exit remains an unexpected/retryable
         # failure from the manager's perspective.
@@ -289,6 +320,12 @@ class RtkRuntimeOrchestrator:
                 action,
                 StopWorker,
             ):
+                LOGGER.info(
+                    "RTK_SUPERVISOR event=STOP_WORKER "
+                    "run_id=%s",
+                    action.run_id,
+                )
+
                 events = self.adapter.stop(
                     action,
                     now_sec,
@@ -324,6 +361,12 @@ class RtkRuntimeOrchestrator:
         tuple[ManagerAction, ...],
     ]:
         """Build config and execute one spawn action safely."""
+
+        LOGGER.info(
+            "RTK_SUPERVISOR event=SPAWN_REQUEST "
+            "run_id=%s",
+            action.run_id,
+        )
 
         try:
             config = self.config_factory(
@@ -469,6 +512,13 @@ class RtkRuntimeOrchestrator:
             event,
             ChildProcessStarted,
         ):
+            LOGGER.info(
+                "RTK_SUPERVISOR event=CHILD_STARTED "
+                "run_id=%s pid=%s",
+                event.run_id,
+                event.pid,
+            )
+
             return self.core.on_child_started(
                 event.run_id,
                 now_sec,
@@ -497,9 +547,27 @@ class RtkRuntimeOrchestrator:
                 status.kind
                 is WorkerStatusKind.READY
             ):
+                LOGGER.info(
+                    "RTK_SUPERVISOR event=WORKER_READY "
+                    "run_id=%s",
+                    status.run_id,
+                )
+
                 return self.core.on_child_ready(
                     status.run_id,
                     now_sec,
+                )
+
+            if (
+                status.kind
+                is WorkerStatusKind.TERMINAL_ERROR
+            ):
+                LOGGER.error(
+                    "RTK_SUPERVISOR "
+                    "event=WORKER_TERMINAL_STATUS "
+                    "run_id=%s detail_code=%s",
+                    status.run_id,
+                    status.detail_code,
                 )
 
             # STARTED is diagnostic because Popen already provides the process
@@ -515,11 +583,52 @@ class RtkRuntimeOrchestrator:
                 event.returncode
             )
 
-            return self.core.on_child_exit(
+            actions = self.core.on_child_exit(
                 event.run_id,
                 event.reason,
                 now_sec,
             )
+
+            manager = self.core.snapshot
+
+            if (
+                manager.error_reason
+                is not None
+            ):
+                log_method = LOGGER.error
+
+            elif (
+                event.reason
+                is WorkerExitReason.CLEAN
+            ):
+                log_method = LOGGER.info
+
+            else:
+                log_method = LOGGER.warning
+
+            log_method(
+                "RTK_SUPERVISOR event=CHILD_EXIT "
+                "run_id=%s returncode=%s "
+                "reason=%s manager_state=%s "
+                "error_reason=%s restart_count=%s "
+                "consecutive_failures=%s "
+                "next_restart_at=%s",
+                event.run_id,
+                event.returncode,
+                event.reason.value,
+                manager.manager_state.value,
+                (
+                    None
+                    if manager.error_reason
+                    is None
+                    else manager.error_reason.value
+                ),
+                manager.restart_count_in_window,
+                manager.consecutive_failures,
+                manager.next_restart_at,
+            )
+
+            return actions
 
         raise TypeError(
             "unsupported RTK adapter event"

@@ -212,6 +212,7 @@ class Settings:
     maximum_active_sessions: int
 
     database_file: Path
+    rtk_database_file: Path
 
     mission_file: Path
     mission_metadata_file: Path
@@ -331,6 +332,18 @@ def load_settings() -> Settings:
         data_directory / "backend.sqlite3",
     )
 
+    # RTK persistence is independently configurable. The default deliberately
+    # lives under the normal rover data directory so an unprivileged Jetson
+    # service account does not require /var/lib provisioning.
+    #
+    # Do not eagerly create this parent directory here. RtkProfileStore owns
+    # that operation so permission/storage failures remain inside the RTK
+    # lifecycle boundary and cannot abort backend module import.
+    rtk_database_file = _read_path(
+        "DYX_RTK_DATABASE_FILE",
+        data_directory / "rtk" / "rtk.sqlite3",
+    )
+
     username = _read_text(
         "DYX_STATIC_USERNAME",
         "admin",
@@ -407,6 +420,7 @@ def load_settings() -> Settings:
             maximum=50,
         ),
         database_file=database_file,
+        rtk_database_file=rtk_database_file,
         mission_file=mission_file,
         mission_metadata_file=_read_path(
             "DYX_MISSION_METADATA_FILE",

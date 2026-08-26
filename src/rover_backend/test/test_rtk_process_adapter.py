@@ -63,6 +63,9 @@ def make_config(run_id: str = "run-A", **overrides) -> WorkerConfig:
         "stale_reconnect_sec": 15.0,
         "reconnect_delay_sec": 2.0,
         "first_data_timeout_sec": 12.0,
+        "gga_enabled": False,
+        "gga_interval_sec": 10.0,
+        "gga_max_age_sec": 5.0,
         "max_mavros_rtcm_frame_bytes": 720,
     }
     values.update(overrides)

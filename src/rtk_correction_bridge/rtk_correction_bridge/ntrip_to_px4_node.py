@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 import base64
+import json
 import math
-import os
 import socket
 import sys
 import time
@@ -16,12 +16,18 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 
-from mavros_msgs.msg import RTCM
-from std_msgs.msg import Bool, Float32
+from mavros_msgs.msg import GPSRAW, RTCM
+from sensor_msgs.msg import NavSatFix
+from std_msgs.msg import Bool, Float32, String
 
-from rtk_correction_bridge.injection_lock import (
-    InjectionOwnershipConflictError,
-    InjectionOwnershipLock,
+from rtk_correction_bridge.nmea_gga import (
+    GgaSourceFix,
+    format_gga_sentence,
+)
+from rtk_correction_bridge.ntrip_socket import (
+    TLS_DISABLED,
+    TLS_REQUIRED,
+    open_ntrip_socket,
 )
 from rtk_correction_bridge.ntrip_failures import (
     NtripAuthError,
@@ -33,6 +39,9 @@ from rtk_correction_bridge.rtcm_transport import (
     RtcmWorkerTransport,
     validate_max_mavros_rtcm_frame_bytes,
 )
+from rtk_correction_bridge.status_snapshot import (
+    build_correction_status_snapshot,
+)
 
 
 class NtripToPx4Node(Node):
@@ -40,84 +49,23 @@ class NtripToPx4Node(Node):
     def __init__(self, worker_config=None):
         super().__init__('ntrip_to_px4_node')
 
-        self.declare_parameter(
-            'caster_host',
-            'caster.emlid.com',
-        )
+        if worker_config is None:
+            raise ValueError(
+                'worker_config is required; '
+                'start RTK through rover_backend'
+            )
 
-        self.declare_parameter(
-            'caster_port',
-            2101,
-        )
-
-        self.declare_parameter(
-            'mountpoint',
-            'YOUR_MOUNTPOINT',
-        )
-
-        self.declare_parameter(
-            'username',
-            'YOUR_USERNAME',
-        )
-
-        self.declare_parameter(
-            'password',
-            '',
-        )
-
-        self.declare_parameter(
-            'rtcm_topic',
-            '/mavros/gps_rtk/send_rtcm',
-        )
-
-        self.declare_parameter(
-            'connect_timeout_sec',
-            10.0,
-        )
-
-        self.declare_parameter(
-            'socket_timeout_sec',
-            1.0,
-        )
-
-        self.declare_parameter(
-            'healthy_age_sec',
-            5.0,
-        )
-
-        self.declare_parameter(
-            'stale_reconnect_sec',
-            10.0,
-        )
-
-        self.declare_parameter(
-            'reconnect_delay_sec',
-            5.0,
-        )
-
+        # Only non-authority diagnostic timing remains ROS-configurable.
+        # Caster credentials, transport policy and injection configuration
+        # arrive exclusively through backend-owned WorkerConfig.
         self.declare_parameter(
             'health_log_period_sec',
             5.0,
         )
 
-        # Publish /healthy repeatedly so downstream safety logic can
-        # verify topic freshness. This does NOT hold RTK FIX.
         self.declare_parameter(
             'health_heartbeat_sec',
             0.25,
-        )
-
-        # Maximum wait for the first CRC-valid RTCM frame after NTRIP
-        # connects. Transport supervision only; does NOT change Mosaic
-        # RTK timeout. Arbitrary TCP bytes do not satisfy this wait.
-        self.declare_parameter(
-            'first_data_timeout_sec',
-            10.0,
-        )
-
-        self.declare_parameter(
-            'max_mavros_rtcm_frame_bytes',
-            DEFAULT_MAX_MAVROS_RTCM_FRAME_BYTES,
         )
 
         self.health_log_period_sec = float(
@@ -132,157 +80,79 @@ class NtripToPx4Node(Node):
             ).value
         )
 
-        if worker_config is None:
+        self.caster_host = str(
+            worker_config.caster_host
+        )
 
-            self.caster_host = str(
-                self.get_parameter(
-                    'caster_host'
-                ).value
-            ).strip()
+        self.caster_port = int(
+            worker_config.caster_port
+        )
 
-            self.caster_port = int(
-                self.get_parameter(
-                    'caster_port'
-                ).value
+        self.mountpoint = str(
+            worker_config.mountpoint
+        )
+
+        self.username = str(
+            worker_config.username
+        )
+
+        self.password = str(
+            worker_config.password
+        )
+
+        self.rtcm_topic = str(
+            worker_config.rtcm_topic
+        )
+
+        self.connect_timeout_sec = float(
+            worker_config.connect_timeout_sec
+        )
+
+        self.socket_timeout_sec = float(
+            worker_config.socket_timeout_sec
+        )
+
+        self.healthy_age_sec = float(
+            worker_config.healthy_age_sec
+        )
+
+        self.stale_reconnect_sec = float(
+            worker_config.stale_reconnect_sec
+        )
+
+        self.reconnect_delay_sec = float(
+            worker_config.reconnect_delay_sec
+        )
+
+        self.first_data_timeout_sec = float(
+            worker_config.first_data_timeout_sec
+        )
+
+        self.tls_mode = str(
+            worker_config.tls_mode
+        )
+
+        self.gga_enabled = bool(
+            worker_config.gga_enabled
+        )
+
+        self.gga_interval_sec = float(
+            worker_config.gga_interval_sec
+        )
+
+        self.gga_max_age_sec = float(
+            worker_config.gga_max_age_sec
+        )
+
+        self.max_mavros_rtcm_frame_bytes = (
+            validate_max_mavros_rtcm_frame_bytes(
+                worker_config.max_mavros_rtcm_frame_bytes
             )
+        )
 
-            self.mountpoint = str(
-                self.get_parameter(
-                    'mountpoint'
-                ).value
-            ).strip().lstrip('/')
-
-            self.username = str(
-                self.get_parameter(
-                    'username'
-                ).value
-            )
-
-            self.password = str(
-                self.get_parameter(
-                    'password'
-                ).value
-            )
-
-            if not self.password:
-                self.password = os.environ.get(
-                    'NTRIP_PASSWORD',
-                    '',
-                )
-
-            self.rtcm_topic = str(
-                self.get_parameter(
-                    'rtcm_topic'
-                ).value
-            ).strip()
-
-            self.connect_timeout_sec = float(
-                self.get_parameter(
-                    'connect_timeout_sec'
-                ).value
-            )
-
-            self.socket_timeout_sec = float(
-                self.get_parameter(
-                    'socket_timeout_sec'
-                ).value
-            )
-
-            self.healthy_age_sec = float(
-                self.get_parameter(
-                    'healthy_age_sec'
-                ).value
-            )
-
-            self.stale_reconnect_sec = float(
-                self.get_parameter(
-                    'stale_reconnect_sec'
-                ).value
-            )
-
-            self.reconnect_delay_sec = float(
-                self.get_parameter(
-                    'reconnect_delay_sec'
-                ).value
-            )
-
-            self.first_data_timeout_sec = float(
-                self.get_parameter(
-                    'first_data_timeout_sec'
-                ).value
-            )
-
-            self.max_mavros_rtcm_frame_bytes = (
-                validate_max_mavros_rtcm_frame_bytes(
-                    self.get_parameter(
-                        'max_mavros_rtcm_frame_bytes'
-                    ).value
-                )
-            )
-
-            self._password_source = (
-                'parameter or NTRIP_PASSWORD environment'
-            )
-
-        else:
-
-            self.caster_host = str(
-                worker_config.caster_host
-            ).strip()
-
-            self.caster_port = int(
-                worker_config.caster_port
-            )
-
-            self.mountpoint = str(
-                worker_config.mountpoint
-            ).strip().lstrip('/')
-
-            self.username = str(
-                worker_config.username
-            )
-
-            self.password = str(
-                worker_config.password
-            )
-
-            self.rtcm_topic = str(
-                worker_config.rtcm_topic
-            ).strip()
-
-            self.connect_timeout_sec = float(
-                worker_config.connect_timeout_sec
-            )
-
-            self.socket_timeout_sec = float(
-                worker_config.socket_timeout_sec
-            )
-
-            self.healthy_age_sec = float(
-                worker_config.healthy_age_sec
-            )
-
-            self.stale_reconnect_sec = float(
-                worker_config.stale_reconnect_sec
-            )
-
-            self.reconnect_delay_sec = float(
-                worker_config.reconnect_delay_sec
-            )
-
-            self.first_data_timeout_sec = float(
-                worker_config.first_data_timeout_sec
-            )
-
-            self.max_mavros_rtcm_frame_bytes = (
-                validate_max_mavros_rtcm_frame_bytes(
-                    worker_config.max_mavros_rtcm_frame_bytes
-                )
-            )
-
-            self._password_source = (
-                'inherited config FD'
-            )
+        self._password_source = (
+            'inherited backend config FD'
+        )
 
         self._validate_parameters()
 
@@ -316,6 +186,48 @@ class NtripToPx4Node(Node):
             '/rtk_correction_bridge/correction_age_sec',
             status_qos,
         )
+
+        self.status_pub = self.create_publisher(
+            String,
+            '/rtk_correction_bridge/status',
+            status_qos,
+        )
+
+        sensor_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        self.create_subscription(
+            NavSatFix,
+            '/mavros/global_position/raw/fix',
+            self._gga_position_callback,
+            sensor_qos,
+        )
+
+        self.create_subscription(
+            GPSRAW,
+            '/mavros/gpsstatus/gps1/raw',
+            self._gga_gpsraw_callback,
+            sensor_qos,
+        )
+
+        self._gga_latitude_deg = None
+        self._gga_longitude_deg = None
+        self._gga_position_at = None
+
+        self._gga_altitude_msl_m = None
+        self._gga_fix_type = 0
+        self._gga_satellites_visible = 0
+        self._gga_hdop = 99.9
+        self._gga_gpsraw_at = None
+
+        self._last_gga_sent_at = None
+        self._session_first_gga_sent_at = None
+        self.gga_sent_total = 0
+        self.gga_send_errors = 0
 
         self.connected = False
         self.connection_start = None
@@ -380,6 +292,31 @@ class NtripToPx4Node(Node):
         )
 
         self.get_logger().warn(
+            f'Transport security: {self.tls_mode}'
+        )
+
+        if self.tls_mode == TLS_DISABLED:
+            self.get_logger().error(
+                'INSECURE NTRIP PLAINTEXT explicitly enabled; '
+                'Basic credentials are not protected by TLS'
+            )
+
+        self.get_logger().warn(
+            f'GGA/VRS enabled   : {self.gga_enabled}'
+        )
+
+        if self.gga_enabled:
+            self.get_logger().warn(
+                f'GGA interval      : '
+                f'{self.gga_interval_sec:.1f} s'
+            )
+
+            self.get_logger().warn(
+                f'GGA max source age: '
+                f'{self.gga_max_age_sec:.1f} s'
+            )
+
+        self.get_logger().warn(
             f'MAVROS RTCM gate  : '
             f'{self.max_mavros_rtcm_frame_bytes} B '
             f'(protocol max 1029 B)'
@@ -441,6 +378,14 @@ class NtripToPx4Node(Node):
                 'rtcm_topic must be absolute'
             )
 
+        if self.tls_mode not in {
+            TLS_REQUIRED,
+            TLS_DISABLED,
+        }:
+            raise ValueError(
+                'tls_mode must be REQUIRED or DISABLED'
+            )
+
         positive_values = {
             'connect_timeout_sec':
                 self.connect_timeout_sec,
@@ -465,6 +410,12 @@ class NtripToPx4Node(Node):
 
             'first_data_timeout_sec':
                 self.first_data_timeout_sec,
+
+            'gga_interval_sec':
+                self.gga_interval_sec,
+
+            'gga_max_age_sec':
+                self.gga_max_age_sec,
         }
 
         for name, value in positive_values.items():
@@ -489,6 +440,252 @@ class NtripToPx4Node(Node):
         validate_max_mavros_rtcm_frame_bytes(
             self.max_mavros_rtcm_frame_bytes
         )
+
+    def _gga_position_callback(
+        self,
+        message,
+    ):
+        """Cache finite latitude/longitude from MAVROS."""
+
+        now = time.monotonic()
+
+        latitude = float(
+            message.latitude
+        )
+
+        longitude = float(
+            message.longitude
+        )
+
+        if (
+            math.isfinite(latitude)
+            and math.isfinite(longitude)
+            and -90.0 <= latitude <= 90.0
+            and -180.0 <= longitude <= 180.0
+        ):
+            self._gga_latitude_deg = latitude
+            self._gga_longitude_deg = longitude
+        else:
+            self._gga_latitude_deg = None
+            self._gga_longitude_deg = None
+
+        self._gga_position_at = now
+
+    def _gga_gpsraw_callback(
+        self,
+        message,
+    ):
+        """Cache fix type, MSL altitude, satellites and HDOP."""
+
+        now = time.monotonic()
+
+        self._gga_fix_type = int(
+            message.fix_type
+        )
+
+        satellites = int(
+            message.satellites_visible
+        )
+
+        self._gga_satellites_visible = (
+            0
+            if satellites == 255
+            else max(
+                0,
+                satellites,
+            )
+        )
+
+        eph = int(
+            message.eph
+        )
+
+        self._gga_hdop = (
+            99.9
+            if (
+                eph <= 0
+                or eph == 65535
+            )
+            else eph / 100.0
+        )
+
+        altitude = (
+            int(
+                message.alt
+            )
+            / 1000.0
+        )
+
+        self._gga_altitude_msl_m = (
+            altitude
+            if math.isfinite(altitude)
+            else None
+        )
+
+        self._gga_gpsraw_at = now
+
+    def _gga_source_age(
+        self,
+        now,
+    ):
+        if (
+            self._gga_position_at is None
+            or self._gga_gpsraw_at is None
+        ):
+            return None
+
+        return max(
+            0.0,
+            now - self._gga_position_at,
+            now - self._gga_gpsraw_at,
+        )
+
+    def _gga_source_state(
+        self,
+        now,
+    ):
+        if not self.gga_enabled:
+            return 'DISABLED', None
+
+        age = self._gga_source_age(
+            now
+        )
+
+        if (
+            age is None
+            or self._gga_latitude_deg is None
+            or self._gga_longitude_deg is None
+            or self._gga_altitude_msl_m is None
+        ):
+            return 'WAITING_FOR_FIX', age
+
+        if age > self.gga_max_age_sec:
+            return 'STALE', age
+
+        if self._gga_fix_type < 2:
+            return 'NO_FIX', age
+
+        return 'READY', age
+
+    def _build_current_gga(
+        self,
+        now,
+    ):
+        state, age = (
+            self._gga_source_state(
+                now
+            )
+        )
+
+        if state != 'READY':
+            return None, state, age
+
+        fix = GgaSourceFix(
+            latitude_deg=(
+                self._gga_latitude_deg
+            ),
+            longitude_deg=(
+                self._gga_longitude_deg
+            ),
+            altitude_msl_m=(
+                self._gga_altitude_msl_m
+            ),
+            mavlink_fix_type=(
+                self._gga_fix_type
+            ),
+            satellites_visible=(
+                self._gga_satellites_visible
+            ),
+            hdop=self._gga_hdop,
+            utc_epoch_sec=time.time(),
+        )
+
+        return (
+            format_gga_sentence(
+                fix
+            ),
+            state,
+            age,
+        )
+
+    def _maybe_send_gga(
+        self,
+        sock,
+        now,
+        *,
+        force=False,
+    ):
+        """Send fresh GGA on this authenticated caster socket."""
+
+        if not self.gga_enabled:
+            return False
+
+        if (
+            not force
+            and self._last_gga_sent_at
+            is not None
+            and (
+                now - self._last_gga_sent_at
+            ) < self.gga_interval_sec
+        ):
+            return False
+
+        sentence, _, _ = (
+            self._build_current_gga(
+                now
+            )
+        )
+
+        if sentence is None:
+            return False
+
+        try:
+            sock.sendall(
+                sentence
+            )
+
+        except OSError:
+            self.gga_send_errors += 1
+            raise
+
+        self._last_gga_sent_at = now
+
+        if (
+            self._session_first_gga_sent_at
+            is None
+        ):
+            self._session_first_gga_sent_at = now
+
+        self.gga_sent_total += 1
+
+        return True
+
+    def _gga_status(
+        self,
+        now,
+    ):
+        state, source_age = (
+            self._gga_source_state(
+                now
+            )
+        )
+
+        sent_age = None
+
+        if self._last_gga_sent_at is not None:
+            sent_age = max(
+                0.0,
+                now - self._last_gga_sent_at,
+            )
+
+        return {
+            'enabled': self.gga_enabled,
+            'state': state,
+            'source_age_sec': source_age,
+            'last_sent_age_sec': sent_age,
+            'sent_total': self.gga_sent_total,
+            'send_errors': self.gga_send_errors,
+        }
 
     def _build_request(self):
 
@@ -624,64 +821,82 @@ class NtripToPx4Node(Node):
         return b''
 
     def _connect(self):
+        """Establish one authenticated NTRIP connection.
 
-        sock = socket.create_connection(
-            (
-                self.caster_host,
-                self.caster_port,
-            ),
-            timeout=self.connect_timeout_sec,
-        )
+        In REQUIRED mode Basic credentials are not written until verified
+        TLS succeeds. Any failure before return closes the owned socket.
+        There is no TLS-to-plaintext fallback.
+        """
 
-        sock.setsockopt(
-            socket.SOL_SOCKET,
-            socket.SO_KEEPALIVE,
-            1,
-        )
+        sock = None
 
-        sock.settimeout(
-            self.connect_timeout_sec
-        )
-
-        sock.sendall(
-            self._build_request()
-        )
-
-        initial_payload = (
-            self._receive_handshake(
-                sock
+        try:
+            sock = open_ntrip_socket(
+                host=self.caster_host,
+                port=self.caster_port,
+                timeout_sec=(
+                    self.connect_timeout_sec
+                ),
+                tls_mode=self.tls_mode,
             )
-        )
 
-        sock.settimeout(
-            self.socket_timeout_sec
-        )
+            sock.settimeout(
+                self.connect_timeout_sec
+            )
 
-        self.connected = True
+            # Authentication is transmitted only after the transport policy
+            # above has been successfully established.
+            sock.sendall(
+                self._build_request()
+            )
 
-        self.connection_start = (
-            time.monotonic()
-        )
+            initial_payload = (
+                self._receive_handshake(
+                    sock
+                )
+            )
 
-        self._new_parser_session()
+            sock.settimeout(
+                self.socket_timeout_sec
+            )
 
-        self._publish_health(
-            force=True
-        )
+            self.connected = True
 
-        self.get_logger().warn(
-            'NTRIP caster connected successfully'
-        )
+            self.connection_start = (
+                time.monotonic()
+            )
 
-        return (
-            sock,
-            initial_payload,
-        )
+            self._new_parser_session()
+
+            self._publish_health(
+                force=True
+            )
+
+            self.get_logger().warn(
+                'NTRIP caster connected successfully | '
+                f'transport={self.tls_mode}'
+            )
+
+            return (
+                sock,
+                initial_payload,
+            )
+
+        except BaseException:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+            raise
 
     def _new_parser_session(self):
-        """Bind a fresh parser and clear session correction timestamps."""
+        """Bind a fresh parser and clear socket-session timestamps."""
 
         self.transport.new_parser_session()
+
+        self._session_first_gga_sent_at = None
 
     def _discard_parser_session(self):
         """Drop the current socket parser and any residual bytes."""
@@ -839,6 +1054,69 @@ class NtripToPx4Node(Node):
 
             self.age_pub.publish(age_msg)
 
+            mavros_subscribers = -1
+
+            try:
+                mavros_subscribers = (
+                    self.rtcm_pub
+                    .get_subscription_count()
+                )
+            except Exception:
+                mavros_subscribers = -1
+
+            gga_status = self._gga_status(
+                now
+            )
+
+            status_payload = (
+                build_correction_status_snapshot(
+                    connected=self.connected,
+                    healthy=healthy,
+                    correction_age_sec=age,
+                    counters=self.transport.counters,
+                    mavros_subscribers=(
+                        mavros_subscribers
+                    ),
+                    max_mavros_rtcm_frame_bytes=(
+                        self.max_mavros_rtcm_frame_bytes
+                    ),
+                    gga_enabled=(
+                        gga_status['enabled']
+                    ),
+                    gga_state=(
+                        gga_status['state']
+                    ),
+                    gga_source_age_sec=(
+                        gga_status[
+                            'source_age_sec'
+                        ]
+                    ),
+                    gga_last_sent_age_sec=(
+                        gga_status[
+                            'last_sent_age_sec'
+                        ]
+                    ),
+                    gga_sent_total=(
+                        gga_status['sent_total']
+                    ),
+                    gga_send_errors=(
+                        gga_status['send_errors']
+                    ),
+                )
+            )
+
+            status_msg = String()
+
+            status_msg.data = json.dumps(
+                status_payload,
+                separators=(',', ':'),
+                sort_keys=True,
+            )
+
+            self.status_pub.publish(
+                status_msg
+            )
+
         return (
             healthy,
             age,
@@ -977,30 +1255,73 @@ class NtripToPx4Node(Node):
         self,
         now,
     ):
-        """Raise if first-valid or stale-source deadline elapsed.
+        """Enforce RTCM deadlines without blaming a missing VRS GGA."""
 
-        Call after every parser-processing opportunity. Socket-byte arrival
-        does not postpone these deadlines. This helper does not log.
-        """
-
-        connection_start = self._session_connection_start(
-            now
+        connection_start = (
+            self._session_connection_start(
+                now
+            )
         )
 
+        first_timeout_start = (
+            connection_start
+        )
+
+        if (
+            self.gga_enabled
+            and self.transport.last_valid_frame_at
+            is None
+        ):
+            gga_state, _ = (
+                self._gga_source_state(
+                    now
+                )
+            )
+
+            # A VRS caster may legitimately send no RTCM until it receives
+            # fresh rover position. If GNSS becomes unusable while waiting
+            # for the first RTCM frame, suspend that deadline. A later
+            # successful fresh GGA starts a new first-frame deadline.
+            if gga_state != 'READY':
+                self._session_first_gga_sent_at = None
+                return
+
+            if (
+                self._session_first_gga_sent_at
+                is None
+            ):
+                return
+
+            first_timeout_start = (
+                self._session_first_gga_sent_at
+            )
+
         if self.transport.first_valid_frame_timed_out(
-            connection_start,
+            first_timeout_start,
             now,
             self.first_data_timeout_sec,
         ):
 
-            connected_for = (
-                now - connection_start
+            waiting_for = (
+                now - first_timeout_start
             )
 
             raise TimeoutError(
                 'No first CRC-valid RTCM frame for '
-                f'{connected_for:.1f} s; reconnecting'
+                f'{waiting_for:.1f} s; reconnecting'
             )
+
+        if self.gga_enabled:
+            gga_state, _ = (
+                self._gga_source_state(
+                    now
+                )
+            )
+
+            # Reconnecting cannot repair stale/no rover GNSS. Preserve the
+            # caster session and let status truthfully report the GGA problem.
+            if gga_state != 'READY':
+                return
 
         if self.transport.source_is_stale(
             now,
@@ -1094,7 +1415,22 @@ class NtripToPx4Node(Node):
                     initial_payload,
                 ) = self._connect()
 
+                # Drain a few queued MAVROS callbacks before the
+                # first VRS GGA attempt.
+                if self.gga_enabled:
+                    for _ in range(4):
+                        rclpy.spin_once(
+                            self,
+                            timeout_sec=0.0,
+                        )
+
                 now = time.monotonic()
+
+                self._maybe_send_gga(
+                    sock,
+                    now,
+                    force=True,
+                )
 
                 self._process_stream_bytes(
                     initial_payload,
@@ -1106,6 +1442,16 @@ class NtripToPx4Node(Node):
                 )
 
                 while rclpy.ok():
+
+                    rclpy.spin_once(
+                        self,
+                        timeout_sec=0.0,
+                    )
+
+                    self._maybe_send_gga(
+                        sock,
+                        time.monotonic(),
+                    )
 
                     try:
 
@@ -1198,56 +1544,22 @@ class NtripToPx4Node(Node):
 
 
 def main(args=None):
+    """Reject unmanaged RTK execution.
 
-    injection_lock = InjectionOwnershipLock()
+    Production correction ownership belongs exclusively to rover_backend's
+    supervised worker bootstrap. This function remains so stale installed
+    console wrappers fail safely instead of becoming a second authority.
+    """
 
-    try:
-        try:
-            injection_lock.acquire_nonblocking()
+    del args
 
-        except InjectionOwnershipConflictError:
-            print(
-                'RTK injection already owned; '
-                'refusing standalone launch',
-                file=sys.stderr,
-            )
-            return 1
+    print(
+        "Standalone RTK launch is disabled. "
+        "Use rover_backend /api/rtk/start.",
+        file=sys.stderr,
+    )
 
-        except OSError:
-            print(
-                'RTK injection lock unavailable; '
-                'refusing standalone launch',
-                file=sys.stderr,
-            )
-            return 1
-
-        rclpy.init(
-            args=args
-        )
-
-        node = None
-
-        try:
-            node = NtripToPx4Node()
-            node.run()
-
-        except KeyboardInterrupt:
-            pass
-
-        finally:
-            if node is not None:
-                node.destroy_node()
-
-            if rclpy.ok():
-                rclpy.shutdown()
-
-        return 0
-
-    finally:
-        try:
-            injection_lock.close()
-        except OSError:
-            pass
+    return 2
 
 
 if __name__ == '__main__':
