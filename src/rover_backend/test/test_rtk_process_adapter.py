@@ -1111,3 +1111,90 @@ def test_70_randomized_mocked_lifecycle_maintains_one_child(tmp_path):
             assert int(value.adapter.process is not None) <= 1
     finally:
         value.cleanup()
+
+
+def test_stop_oserror_preserves_supervision_until_kill(harness):
+    harness.spawn()
+
+    process = harness.process
+
+    def failing_terminate():
+        raise OSError(
+            "synthetic SIGTERM failure"
+        )
+
+    process.terminate = failing_terminate
+
+    assert (
+        harness.adapter.stop(
+            StopWorker("run-A"),
+            0.0,
+        )
+        == ()
+    )
+
+    snapshot = harness.adapter.snapshot()
+
+    assert snapshot.stop_requested is True
+    assert snapshot.stop_deadline == pytest.approx(
+        5.0
+    )
+    assert snapshot.active_run_id == "run-A"
+
+    events = harness.adapter.poll(5.0)
+
+    assert process.kill_calls == 1
+    assert any(
+        isinstance(
+            event,
+            ChildProcessExited,
+        )
+        for event in events
+    )
+    assert harness.adapter.active_run_id is None
+
+
+def test_kill_oserror_is_retried_on_later_poll(harness):
+    harness.spawn()
+
+    process = harness.process
+
+    harness.adapter.stop(
+        StopWorker("run-A"),
+        0.0,
+    )
+
+    original_kill = process.kill
+    attempts = {"count": 0}
+
+    def flaky_kill():
+        attempts["count"] += 1
+
+        if attempts["count"] == 1:
+            raise OSError(
+                "synthetic SIGKILL failure"
+            )
+
+        original_kill()
+
+    process.kill = flaky_kill
+
+    assert harness.adapter.poll(5.0) == ()
+
+    snapshot = harness.adapter.snapshot()
+
+    assert attempts["count"] == 1
+    assert snapshot.kill_sent is False
+    assert snapshot.active_run_id == "run-A"
+
+    events = harness.adapter.poll(5.1)
+
+    assert attempts["count"] == 2
+    assert any(
+        isinstance(
+            event,
+            ChildProcessExited,
+        )
+        for event in events
+    )
+    assert harness.adapter.active_run_id is None

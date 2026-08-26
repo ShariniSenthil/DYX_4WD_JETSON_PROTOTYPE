@@ -318,10 +318,19 @@ class RtkProcessAdapter:
 
         self.stop_requested = True
         self.stop_deadline = now + self.stop_grace_sec
+
         try:
             process.terminate()
         except ProcessLookupError:
+            # The child disappeared between ownership inspection and signal.
+            # Keep supervision active so poll() can reap it.
             pass
+        except OSError:
+            # A failed SIGTERM must not tear down the supervisor. Ownership
+            # and the escalation deadline remain intact so poll() can observe
+            # a natural exit or retry with SIGKILL when the deadline expires.
+            pass
+
         return ()
 
     def poll(self, now_sec: float) -> tuple[AdapterEvent, ...]:
@@ -346,11 +355,19 @@ class RtkProcessAdapter:
             and now >= self.stop_deadline
             and not self.kill_sent
         ):
-            self.kill_sent = True
             try:
                 process.kill()
             except ProcessLookupError:
+                # The child disappeared between poll() and SIGKILL.
+                # Record that escalation was attempted and let poll() reap.
+                self.kill_sent = True
+            except OSError:
+                # Do not mark the kill as sent. A later poll must be allowed
+                # to retry escalation rather than stranding a live child.
                 pass
+            else:
+                self.kill_sent = True
+
             returncode = process.poll()
 
         if returncode is None:
