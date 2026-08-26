@@ -59,10 +59,16 @@ from rover_backend.mission_report import MissionReportError
 from rover_backend.mission_report import StaleMissionTerminalEvent
 from rover_backend.mission_report import mission_report_store
 from rover_backend.mission_store import mission_store
+from rover_backend.rtk_mavros_readiness import (
+    evaluate_mavros_rtcm_readiness,
+)
 from rover_backend.state import rover_state
 from rover_backend.state import utc_now_iso
 
 LOGGER = logging.getLogger(__name__)
+
+
+RTCM_INJECTION_TOPIC = "/mavros/gps_rtk/send_rtcm"
 
 
 GPS_FIX_NAMES: dict[int, str] = {
@@ -266,6 +272,11 @@ class RoverBackendRosNode(Node):
         self._gps_fix_type = 0
         self._rtk_healthy = False
         self._rtk_correction_age_sec: float | None = None
+
+        # Cached MAVROS RTCM endpoint readiness. ROS graph inspection happens
+        # only inside this ROS node; non-ROS supervisor code reads this cache.
+        self._mavros_rtcm_ready = False
+        self._mavros_rtcm_subscriber_count = 0
 
         self._trajectory_ready = False
         self._trajectory_error: str | None = None
@@ -587,6 +598,10 @@ class RoverBackendRosNode(Node):
             connected=bool(self._fcu_connected and fcu_age <= self.FCU_STATE_STALE_SEC),
         )
 
+        self._refresh_mavros_rtcm_readiness(
+            fcu_age_sec=fcu_age,
+        )
+
         if position_age > self.POSITION_STALE_SEC:
             rover_state.update(
                 "vehicle",
@@ -624,6 +639,69 @@ class RoverBackendRosNode(Node):
             mode=self._mode,
             system_status=int(message.system_status),
         )
+
+        self._refresh_mavros_rtcm_readiness(
+            fcu_age_sec=0.0,
+        )
+
+    def _refresh_mavros_rtcm_readiness(
+        self,
+        *,
+        fcu_age_sec: float | None = None,
+    ) -> None:
+        """Refresh the cached MAVROS RTCM injection start gate."""
+
+        if fcu_age_sec is None:
+            fcu_age_sec = self._monotonic_age(
+                self._last_fcu_message_monotonic
+            )
+
+        try:
+            subscriber_count = int(
+                self.count_subscribers(
+                    RTCM_INJECTION_TOPIC
+                )
+            )
+        except Exception:
+            # ROS graph discovery is an availability signal. If graph access
+            # fails during startup/shutdown, fail closed rather than allowing
+            # an RTK worker to start against an unknown endpoint.
+            subscriber_count = 0
+
+        ready = evaluate_mavros_rtcm_readiness(
+            fcu_connected=bool(
+                self._fcu_connected
+            ),
+            fcu_state_age_sec=float(
+                fcu_age_sec
+            ),
+            rtcm_subscriber_count=(
+                subscriber_count
+            ),
+            stale_sec=self.FCU_STATE_STALE_SEC,
+        )
+
+        with self._runtime_lock:
+            self._mavros_rtcm_ready = ready
+            self._mavros_rtcm_subscriber_count = (
+                subscriber_count
+            )
+
+        rover_state.update(
+            "rtk",
+            mavros_ready=ready,
+            mavros_rtcm_subscribers=(
+                subscriber_count
+            ),
+        )
+
+    def rtk_mavros_ready(self) -> bool:
+        """Return cached MAVROS RTCM injection readiness."""
+
+        with self._runtime_lock:
+            return bool(
+                self._mavros_rtcm_ready
+            )
 
     def _global_position_callback(
         self,
@@ -2547,6 +2625,17 @@ class RosBridgeRuntime:
             error="Backend ROS bridge stopped",
         )
         rover_state.force_safe_runtime_state("BACKEND_ROS_BRIDGE_STOPPED")
+
+    def rtk_mavros_ready(self) -> bool:
+        """Return the ROS node's cached RTCM endpoint readiness."""
+
+        with self._lock:
+            node = self._node
+
+        if node is None:
+            return False
+
+        return node.rtk_mavros_ready()
 
     def force_emergency_stop(self) -> dict[str, Any]:
         with self._operation_lock:
