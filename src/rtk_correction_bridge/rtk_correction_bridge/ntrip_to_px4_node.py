@@ -4,6 +4,7 @@ import base64
 import math
 import os
 import socket
+import sys
 import time
 
 import rclpy
@@ -18,6 +19,15 @@ from rclpy.qos import (
 from mavros_msgs.msg import RTCM
 from std_msgs.msg import Bool, Float32
 
+from rtk_correction_bridge.injection_lock import (
+    InjectionOwnershipConflictError,
+    InjectionOwnershipLock,
+)
+from rtk_correction_bridge.ntrip_failures import (
+    NtripAuthError,
+    NtripMountpointRejectedError,
+    validate_ntrip_status_line,
+)
 from rtk_correction_bridge.rtcm_transport import (
     DEFAULT_MAX_MAVROS_RTCM_FRAME_BYTES,
     RtcmWorkerTransport,
@@ -27,7 +37,7 @@ from rtk_correction_bridge.rtcm_transport import (
 
 class NtripToPx4Node(Node):
 
-    def __init__(self):
+    def __init__(self, worker_config=None):
         super().__init__('ntrip_to_px4_node')
 
         self.declare_parameter(
@@ -110,78 +120,6 @@ class NtripToPx4Node(Node):
             DEFAULT_MAX_MAVROS_RTCM_FRAME_BYTES,
         )
 
-        self.caster_host = str(
-            self.get_parameter(
-                'caster_host'
-            ).value
-        ).strip()
-
-        self.caster_port = int(
-            self.get_parameter(
-                'caster_port'
-            ).value
-        )
-
-        self.mountpoint = str(
-            self.get_parameter(
-                'mountpoint'
-            ).value
-        ).strip().lstrip('/')
-
-        self.username = str(
-            self.get_parameter(
-                'username'
-            ).value
-        )
-
-        self.password = str(
-            self.get_parameter(
-                'password'
-            ).value
-        )
-
-        if not self.password:
-            self.password = os.environ.get(
-                'NTRIP_PASSWORD',
-                '',
-            )
-
-        self.rtcm_topic = str(
-            self.get_parameter(
-                'rtcm_topic'
-            ).value
-        ).strip()
-
-        self.connect_timeout_sec = float(
-            self.get_parameter(
-                'connect_timeout_sec'
-            ).value
-        )
-
-        self.socket_timeout_sec = float(
-            self.get_parameter(
-                'socket_timeout_sec'
-            ).value
-        )
-
-        self.healthy_age_sec = float(
-            self.get_parameter(
-                'healthy_age_sec'
-            ).value
-        )
-
-        self.stale_reconnect_sec = float(
-            self.get_parameter(
-                'stale_reconnect_sec'
-            ).value
-        )
-
-        self.reconnect_delay_sec = float(
-            self.get_parameter(
-                'reconnect_delay_sec'
-            ).value
-        )
-
         self.health_log_period_sec = float(
             self.get_parameter(
                 'health_log_period_sec'
@@ -194,19 +132,157 @@ class NtripToPx4Node(Node):
             ).value
         )
 
-        self.first_data_timeout_sec = float(
-            self.get_parameter(
-                'first_data_timeout_sec'
-            ).value
-        )
+        if worker_config is None:
 
-        self.max_mavros_rtcm_frame_bytes = (
-            validate_max_mavros_rtcm_frame_bytes(
+            self.caster_host = str(
                 self.get_parameter(
-                    'max_mavros_rtcm_frame_bytes'
+                    'caster_host'
+                ).value
+            ).strip()
+
+            self.caster_port = int(
+                self.get_parameter(
+                    'caster_port'
                 ).value
             )
-        )
+
+            self.mountpoint = str(
+                self.get_parameter(
+                    'mountpoint'
+                ).value
+            ).strip().lstrip('/')
+
+            self.username = str(
+                self.get_parameter(
+                    'username'
+                ).value
+            )
+
+            self.password = str(
+                self.get_parameter(
+                    'password'
+                ).value
+            )
+
+            if not self.password:
+                self.password = os.environ.get(
+                    'NTRIP_PASSWORD',
+                    '',
+                )
+
+            self.rtcm_topic = str(
+                self.get_parameter(
+                    'rtcm_topic'
+                ).value
+            ).strip()
+
+            self.connect_timeout_sec = float(
+                self.get_parameter(
+                    'connect_timeout_sec'
+                ).value
+            )
+
+            self.socket_timeout_sec = float(
+                self.get_parameter(
+                    'socket_timeout_sec'
+                ).value
+            )
+
+            self.healthy_age_sec = float(
+                self.get_parameter(
+                    'healthy_age_sec'
+                ).value
+            )
+
+            self.stale_reconnect_sec = float(
+                self.get_parameter(
+                    'stale_reconnect_sec'
+                ).value
+            )
+
+            self.reconnect_delay_sec = float(
+                self.get_parameter(
+                    'reconnect_delay_sec'
+                ).value
+            )
+
+            self.first_data_timeout_sec = float(
+                self.get_parameter(
+                    'first_data_timeout_sec'
+                ).value
+            )
+
+            self.max_mavros_rtcm_frame_bytes = (
+                validate_max_mavros_rtcm_frame_bytes(
+                    self.get_parameter(
+                        'max_mavros_rtcm_frame_bytes'
+                    ).value
+                )
+            )
+
+            self._password_source = (
+                'parameter or NTRIP_PASSWORD environment'
+            )
+
+        else:
+
+            self.caster_host = str(
+                worker_config.caster_host
+            ).strip()
+
+            self.caster_port = int(
+                worker_config.caster_port
+            )
+
+            self.mountpoint = str(
+                worker_config.mountpoint
+            ).strip().lstrip('/')
+
+            self.username = str(
+                worker_config.username
+            )
+
+            self.password = str(
+                worker_config.password
+            )
+
+            self.rtcm_topic = str(
+                worker_config.rtcm_topic
+            ).strip()
+
+            self.connect_timeout_sec = float(
+                worker_config.connect_timeout_sec
+            )
+
+            self.socket_timeout_sec = float(
+                worker_config.socket_timeout_sec
+            )
+
+            self.healthy_age_sec = float(
+                worker_config.healthy_age_sec
+            )
+
+            self.stale_reconnect_sec = float(
+                worker_config.stale_reconnect_sec
+            )
+
+            self.reconnect_delay_sec = float(
+                worker_config.reconnect_delay_sec
+            )
+
+            self.first_data_timeout_sec = float(
+                worker_config.first_data_timeout_sec
+            )
+
+            self.max_mavros_rtcm_frame_bytes = (
+                validate_max_mavros_rtcm_frame_bytes(
+                    worker_config.max_mavros_rtcm_frame_bytes
+                )
+            )
+
+            self._password_source = (
+                'inherited config FD'
+            )
 
         self._validate_parameters()
 
@@ -323,8 +399,8 @@ class NtripToPx4Node(Node):
         )
 
         self.get_logger().warn(
-            'Password source   : '
-            'parameter or NTRIP_PASSWORD environment'
+            f'Password source   : '
+            f'{self._password_source}'
         )
 
     def _validate_parameters(self):
@@ -539,29 +615,9 @@ class NtripToPx4Node(Node):
                 1,
             )[0]
 
-            if status_line.startswith(
-                b'SOURCETABLE'
-            ):
-                raise ConnectionError(
-                    'Caster returned source table, '
-                    'not RTCM stream'
-                )
-
-            parts = status_line.split()
-
-            if (
-                len(parts) < 2
-                or parts[1] != b'200'
-            ):
-                text = header.decode(
-                    'ascii',
-                    errors='replace',
-                )
-
-                raise ConnectionError(
-                    'NTRIP caster rejected '
-                    f'connection: {text}'
-                )
+            validate_ntrip_status_line(
+                status_line
+            )
 
             return payload
 
@@ -1101,6 +1157,12 @@ class NtripToPx4Node(Node):
                         timeout_sec=0.0,
                     )
 
+            except (
+                NtripAuthError,
+                NtripMountpointRejectedError,
+            ):
+                raise
+
             except Exception as exc:
 
                 if rclpy.ok():
@@ -1137,29 +1199,56 @@ class NtripToPx4Node(Node):
 
 def main(args=None):
 
-    rclpy.init(
-        args=args
-    )
-
-    node = None
+    injection_lock = InjectionOwnershipLock()
 
     try:
+        try:
+            injection_lock.acquire_nonblocking()
 
-        node = NtripToPx4Node()
+        except InjectionOwnershipConflictError:
+            print(
+                'RTK injection already owned; '
+                'refusing standalone launch',
+                file=sys.stderr,
+            )
+            return 1
 
-        node.run()
+        except OSError:
+            print(
+                'RTK injection lock unavailable; '
+                'refusing standalone launch',
+                file=sys.stderr,
+            )
+            return 1
 
-    except KeyboardInterrupt:
-        pass
+        rclpy.init(
+            args=args
+        )
+
+        node = None
+
+        try:
+            node = NtripToPx4Node()
+            node.run()
+
+        except KeyboardInterrupt:
+            pass
+
+        finally:
+            if node is not None:
+                node.destroy_node()
+
+            if rclpy.ok():
+                rclpy.shutdown()
+
+        return 0
 
     finally:
-
-        if node is not None:
-            node.destroy_node()
-
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            injection_lock.close()
+        except OSError:
+            pass
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

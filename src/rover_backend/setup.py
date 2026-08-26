@@ -56,6 +56,10 @@ setup(
                 "rover_backend = "
                 "rover_backend.main:main"
             ),
+            (
+                "rtk_worker = "
+                "rover_backend.rtk_worker_bootstrap:main"
+            ),
         ],
     },
 )
