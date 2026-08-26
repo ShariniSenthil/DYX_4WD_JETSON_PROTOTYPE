@@ -46,11 +46,20 @@ from rover_backend.realtime import make_asgi_app
 from rover_backend.realtime import start_realtime
 from rover_backend.realtime import stop_realtime
 from rover_backend.ros_bridge import ros_bridge
+from rover_backend.rtk_backend_lifecycle import RtkBackendLifecycle
+from rover_backend.rtk_profile_store import rtk_profile_store
+from rover_backend.rtk_routes import rtk_router
 from rover_backend.spray_routes import spray_router
 from rover_backend.state import rover_state
 from rover_backend.system_routes import system_router
 
 LOGGER = logging.getLogger(__name__)
+
+
+rtk_backend_lifecycle = RtkBackendLifecycle(
+    profile_store=rtk_profile_store,
+    mavros_readiness_provider=ros_bridge.rtk_mavros_ready,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +114,7 @@ fastapi_app.add_middleware(
     allow_methods=[
         "GET",
         "POST",
+        "PATCH",
         "DELETE",
         "OPTIONS",
     ],
@@ -185,6 +195,8 @@ fastapi_app.include_router(auth_router)
 
 fastapi_app.include_router(system_router)
 
+fastapi_app.include_router(rtk_router)
+
 fastapi_app.include_router(mission_router)
 
 fastapi_app.include_router(spray_router)
@@ -229,6 +241,29 @@ async def _best_effort_stop_ros_bridge() -> None:
         LOGGER.exception("ROS bridge shutdown failed")
 
 
+async def _best_effort_stop_rtk_backend() -> None:
+    """Stop/reap RTK without changing persisted operator intent."""
+
+    if not rtk_backend_lifecycle.started:
+        return
+
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                rtk_backend_lifecycle.stop
+            ),
+            timeout=10.0,
+        )
+    except asyncio.TimeoutError:
+        LOGGER.error(
+            "Timed out while stopping RTK backend lifecycle"
+        )
+    except Exception:
+        LOGGER.exception(
+            "RTK backend lifecycle shutdown failed"
+        )
+
+
 async def _force_safe_before_shutdown() -> None:
     """Assert the emergency stop before stopping backend resources."""
 
@@ -260,6 +295,7 @@ async def startup_backend() -> None:
 
     realtime_started = False
     ros_started = False
+    rtk_started = False
     beacon_started = False
 
     try:
@@ -289,6 +325,12 @@ async def startup_backend() -> None:
 
         if not ros_bridge.running:
             raise RuntimeError("ROS bridge did not enter the running state")
+
+        await asyncio.to_thread(
+            rtk_backend_lifecycle.start
+        )
+
+        rtk_started = True
 
         await start_realtime()
         realtime_started = True
@@ -349,6 +391,12 @@ async def startup_backend() -> None:
             except Exception:
                 LOGGER.exception("Realtime cleanup failed after startup error")
 
+        if (
+            rtk_started
+            or rtk_backend_lifecycle.started
+        ):
+            await _best_effort_stop_rtk_backend()
+
         if ros_started or ros_bridge.running:
             await _best_effort_stop_ros_bridge()
 
@@ -374,6 +422,10 @@ async def shutdown_backend() -> None:
         await stop_realtime()
     except Exception:
         LOGGER.exception("Realtime shutdown failed")
+
+    # RTK owns a ROS publisher inside its worker. Reap it before destroying
+    # the ROS bridge that supplies MAVROS endpoint readiness.
+    await _best_effort_stop_rtk_backend()
 
     await _best_effort_stop_ros_bridge()
 
