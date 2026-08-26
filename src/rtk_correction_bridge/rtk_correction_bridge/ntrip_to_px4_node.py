@@ -18,6 +18,12 @@ from rclpy.qos import (
 from mavros_msgs.msg import RTCM
 from std_msgs.msg import Bool, Float32
 
+from rtk_correction_bridge.rtcm_transport import (
+    DEFAULT_MAX_MAVROS_RTCM_FRAME_BYTES,
+    RtcmWorkerTransport,
+    validate_max_mavros_rtcm_frame_bytes,
+)
+
 
 class NtripToPx4Node(Node):
 
@@ -91,16 +97,17 @@ class NtripToPx4Node(Node):
             0.25,
         )
 
-        # Maximum wait for the first RTCM payload after NTRIP connects.
-        # Transport supervision only; does NOT change Mosaic RTK timeout.
+        # Maximum wait for the first CRC-valid RTCM frame after NTRIP
+        # connects. Transport supervision only; does NOT change Mosaic
+        # RTK timeout. Arbitrary TCP bytes do not satisfy this wait.
         self.declare_parameter(
             'first_data_timeout_sec',
             10.0,
         )
 
         self.declare_parameter(
-            'max_rtcm_chunk_bytes',
-            180,
+            'max_mavros_rtcm_frame_bytes',
+            DEFAULT_MAX_MAVROS_RTCM_FRAME_BYTES,
         )
 
         self.caster_host = str(
@@ -193,13 +200,21 @@ class NtripToPx4Node(Node):
             ).value
         )
 
-        self.max_rtcm_chunk_bytes = int(
-            self.get_parameter(
-                'max_rtcm_chunk_bytes'
-            ).value
+        self.max_mavros_rtcm_frame_bytes = (
+            validate_max_mavros_rtcm_frame_bytes(
+                self.get_parameter(
+                    'max_mavros_rtcm_frame_bytes'
+                ).value
+            )
         )
 
         self._validate_parameters()
+
+        self.transport = RtcmWorkerTransport(
+            max_mavros_rtcm_frame_bytes=(
+                self.max_mavros_rtcm_frame_bytes
+            ),
+        )
 
         self.rtcm_pub = self.create_publisher(
             RTCM,
@@ -228,12 +243,10 @@ class NtripToPx4Node(Node):
 
         self.connected = False
         self.connection_start = None
-        self.last_rx = None
 
-        self.total_bytes = 0
-        self.total_chunks = 0
-
-        self.stats_bytes = 0
+        self._last_logged_socket_bytes = 0
+        self._pending_oversize = 0
+        self._pending_publish_errors = 0
         self.last_stats_time = time.monotonic()
         self.last_health_log = 0.0
         self.last_health_value = None
@@ -288,6 +301,17 @@ class NtripToPx4Node(Node):
         self.get_logger().warn(
             f'First data timeout: '
             f'{self.first_data_timeout_sec:.1f} s'
+        )
+
+        self.get_logger().warn(
+            f'MAVROS RTCM gate  : '
+            f'{self.max_mavros_rtcm_frame_bytes} B '
+            f'(protocol max 1029 B)'
+        )
+
+        self.get_logger().warn(
+            'Publication       : one complete CRC-valid '
+            'RTCM3 frame per message, no chunking'
         )
 
         self.get_logger().warn(
@@ -386,10 +410,9 @@ class NtripToPx4Node(Node):
                 'than healthy_age_sec'
             )
 
-        if not 1 <= self.max_rtcm_chunk_bytes <= 180:
-            raise ValueError(
-                'max_rtcm_chunk_bytes must be 1..180'
-            )
+        validate_max_mavros_rtcm_frame_bytes(
+            self.max_mavros_rtcm_frame_bytes
+        )
 
     def _build_request(self):
 
@@ -584,7 +607,7 @@ class NtripToPx4Node(Node):
             time.monotonic()
         )
 
-        self.last_rx = None
+        self._new_parser_session()
 
         self._publish_health(
             force=True
@@ -599,73 +622,130 @@ class NtripToPx4Node(Node):
             initial_payload,
         )
 
-    def _publish_rtcm_bytes(
+    def _new_parser_session(self):
+        """Bind a fresh parser and clear session correction timestamps."""
+
+        self.transport.new_parser_session()
+
+    def _discard_parser_session(self):
+        """Drop the current socket parser and any residual bytes."""
+
+        self.transport.discard_parser_session()
+
+    def _process_stream_bytes(
         self,
         data,
+        now,
     ):
+        """Feed NTRIP body bytes through the session parser and size gate."""
 
-        if not data:
-            return
+        oversize_before = (
+            self.transport.counters.rtcm_frames_oversize_total
+        )
 
-        self.last_rx = time.monotonic()
+        candidates = self.transport.process_stream_bytes(
+            data,
+            now,
+        )
 
-        self.total_bytes += len(data)
-        self.stats_bytes += len(data)
+        self._pending_oversize += (
+            self.transport.counters.rtcm_frames_oversize_total
+            - oversize_before
+        )
 
-        for start in range(
-            0,
-            len(data),
-            self.max_rtcm_chunk_bytes,
-        ):
-
-            chunk = data[
-                start:
-                start + self.max_rtcm_chunk_bytes
-            ]
-
-            msg = RTCM()
-
-            msg.data = list(chunk)
-
-            self.rtcm_pub.publish(msg)
-
-            self.total_chunks += 1
+        self._process_parsed_frames(
+            candidates,
+            now,
+        )
 
         self._publish_health()
 
         self._maybe_log_health()
 
-    def _correction_age(self):
-        """Age of the most recently received RTCM bytes.
+    def _service_parser(
+        self,
+        now,
+    ):
+        """Advance parser timeout with no new socket bytes."""
 
-        A TCP/NTRIP connection by itself is not a correction sample. Until
-        actual RTCM payload bytes have been received, correction age stays
-        infinite so downstream nodes cannot treat an empty connection as
-        healthy RTK data.
+        oversize_before = (
+            self.transport.counters.rtcm_frames_oversize_total
+        )
+
+        candidates = self.transport.service_parser(
+            now
+        )
+
+        self._pending_oversize += (
+            self.transport.counters.rtcm_frames_oversize_total
+            - oversize_before
+        )
+
+        self._process_parsed_frames(
+            candidates,
+            now,
+        )
+
+    def _process_parsed_frames(
+        self,
+        candidates,
+        now,
+    ):
+        """Publish each size-gated complete RTCM3 frame exactly once."""
+
+        for frame_bytes in candidates:
+
+            published = self.transport.attempt_publish(
+                frame_bytes,
+                now,
+                self._publish_rtcm_frame,
+            )
+
+            if not published:
+                self._pending_publish_errors += 1
+
+    def _publish_rtcm_frame(
+        self,
+        frame_bytes,
+    ):
+        """Publish one complete RTCM3 frame, including header and CRC."""
+
+        msg = RTCM()
+
+        msg.data = list(frame_bytes)
+
+        self.rtcm_pub.publish(msg)
+
+    def _correction_age(self):
+        """Age of this session's most recently published supported frame.
+
+        Raw socket traffic, CRC-invalid bytes, oversize protocol-valid
+        frames, and a previous socket's publishes do not refresh this age.
+        Until this session publishes a supported-size CRC-valid frame, age
+        stays infinite so /healthy cannot become true from inherited
+        freshness or caster traffic alone.
         """
 
-        now = time.monotonic()
-
-        if self.last_rx is not None:
-            return now - self.last_rx
-
-        return math.inf
+        return self.transport.published_age_sec(
+            time.monotonic()
+        )
 
     def _publish_health(
         self,
         force=False,
     ):
 
-        age = self._correction_age()
+        now = time.monotonic()
 
-        healthy = (
-            self.connected
-            and self.last_rx is not None
-            and math.isfinite(age)
-            and age <= self.healthy_age_sec
+        age = self.transport.published_age_sec(
+            now
         )
 
-        now = time.monotonic()
+        healthy = self.transport.is_healthy(
+            self.connected,
+            now,
+            self.healthy_age_sec,
+        )
 
         health_changed = (
             healthy != self.last_health_value
@@ -727,8 +807,16 @@ class NtripToPx4Node(Node):
             1e-6,
         )
 
+        socket_bytes = (
+            self.transport.counters.socket_bytes_received_total
+        )
+
+        period_bytes = (
+            socket_bytes - self._last_logged_socket_bytes
+        )
+
         rate = (
-            self.stats_bytes
+            period_bytes
             / elapsed
         )
 
@@ -754,18 +842,50 @@ class NtripToPx4Node(Node):
             except Exception:
                 mavros_subscribers = -1
 
+        counters = self.transport.counters
+
+        if self._pending_oversize:
+
+            self.get_logger().warn(
+                'RTCM oversize frames dropped: '
+                f'{self._pending_oversize} '
+                f'(gate={self.max_mavros_rtcm_frame_bytes} B, '
+                f'total={counters.rtcm_frames_oversize_total})'
+            )
+
+            self._pending_oversize = 0
+
+        if self._pending_publish_errors:
+
+            self.get_logger().warn(
+                'RTCM publish errors: '
+                f'{self._pending_publish_errors} '
+                f'(total={counters.rtcm_publish_errors_total})'
+            )
+
+            self._pending_publish_errors = 0
+
         self.get_logger().info(
             'RTK HEALTH | '
             f'connected={self.connected} '
             f'healthy={healthy} '
-            f'age={age_text} '
+            f'published_age={age_text} '
             f'rate={rate:.0f} B/s '
-            f'total={self.total_bytes} B '
-            f'chunks={self.total_chunks} '
+            f'socket_bytes={socket_bytes} '
+            f'valid_frames={counters.rtcm_frames_valid_total} '
+            f'published_frames='
+            f'{counters.rtcm_frames_published_total} '
+            f'crc_invalid='
+            f'{counters.rtcm_frames_crc_invalid_total} '
+            f'resync_discarded='
+            f'{counters.rtcm_resync_bytes_discarded_total} '
+            f'oversize={counters.rtcm_frames_oversize_total} '
+            f'publish_errors='
+            f'{counters.rtcm_publish_errors_total} '
             f'mavros_subscribers={mavros_subscribers}'
         )
 
-        self.stats_bytes = 0
+        self._last_logged_socket_bytes = socket_bytes
 
         self.last_stats_time = now
 
@@ -775,7 +895,6 @@ class NtripToPx4Node(Node):
 
         self.connected = False
         self.connection_start = None
-        self.last_rx = None
 
         if rclpy.ok():
 
@@ -785,6 +904,105 @@ class NtripToPx4Node(Node):
 
             self._maybe_log_health(
                 force=True
+            )
+
+    def _session_connection_start(
+        self,
+        now,
+    ):
+        """Return this socket's connection_start, or now if unset."""
+
+        if self.connection_start is not None:
+            return self.connection_start
+
+        return now
+
+    def _check_source_deadlines(
+        self,
+        now,
+    ):
+        """Raise if first-valid or stale-source deadline elapsed.
+
+        Call after every parser-processing opportunity. Socket-byte arrival
+        does not postpone these deadlines. This helper does not log.
+        """
+
+        connection_start = self._session_connection_start(
+            now
+        )
+
+        if self.transport.first_valid_frame_timed_out(
+            connection_start,
+            now,
+            self.first_data_timeout_sec,
+        ):
+
+            connected_for = (
+                now - connection_start
+            )
+
+            raise TimeoutError(
+                'No first CRC-valid RTCM frame for '
+                f'{connected_for:.1f} s; reconnecting'
+            )
+
+        if self.transport.source_is_stale(
+            now,
+            self.stale_reconnect_sec,
+        ):
+
+            last_valid = (
+                self.transport.last_valid_frame_at
+            )
+
+            valid_age = (
+                now - last_valid
+                if last_valid is not None
+                else 0.0
+            )
+
+            raise TimeoutError(
+                'No CRC-valid RTCM frame for '
+                f'{valid_age:.1f} s; reconnecting'
+            )
+
+    def _maybe_log_source_status(
+        self,
+        now,
+        healthy,
+        published_age,
+    ):
+        """Rate-bounded source warnings. Does not enforce deadlines."""
+
+        if self.transport.last_valid_frame_at is None:
+
+            connection_start = self._session_connection_start(
+                now
+            )
+
+            connected_for = (
+                now - connection_start
+            )
+
+            self.get_logger().warn(
+                'Waiting for first valid RTCM frame '
+                'from caster | '
+                f'connected_for={connected_for:.1f}s'
+            )
+
+            return
+
+        if not healthy:
+
+            age_text = (
+                f'{published_age:.1f} s'
+                if math.isfinite(published_age)
+                else 'N/A'
+            )
+
+            self.get_logger().warn(
+                'RTCM stream temporarily unhealthy | '
+                f'published_age={age_text}'
             )
 
     def _sleep_with_ros(
@@ -820,8 +1038,15 @@ class NtripToPx4Node(Node):
                     initial_payload,
                 ) = self._connect()
 
-                self._publish_rtcm_bytes(
-                    initial_payload
+                now = time.monotonic()
+
+                self._process_stream_bytes(
+                    initial_payload,
+                    now,
+                )
+
+                self._check_source_deadlines(
+                    now
                 )
 
                 while rclpy.ok():
@@ -836,11 +1061,28 @@ class NtripToPx4Node(Node):
                                 'closed by caster'
                             )
 
-                        self._publish_rtcm_bytes(
-                            data
+                        now = time.monotonic()
+
+                        self._process_stream_bytes(
+                            data,
+                            now,
+                        )
+
+                        self._check_source_deadlines(
+                            now
                         )
 
                     except socket.timeout:
+
+                        now = time.monotonic()
+
+                        self._service_parser(
+                            now
+                        )
+
+                        self._check_source_deadlines(
+                            now
+                        )
 
                         healthy, age = (
                             self._publish_health()
@@ -848,49 +1090,11 @@ class NtripToPx4Node(Node):
 
                         self._maybe_log_health()
 
-                        now = time.monotonic()
-
-                        if self.last_rx is None:
-
-                            connected_for = (
-                                now - self.connection_start
-                                if self.connection_start is not None
-                                else 0.0
-                            )
-
-                            if (
-                                connected_for
-                                > self.first_data_timeout_sec
-                            ):
-
-                                raise TimeoutError(
-                                    'No first RTCM payload for '
-                                    f'{connected_for:.1f} s; reconnecting'
-                                )
-
-                            self.get_logger().warn(
-                                'Waiting for first RTCM bytes from caster | '
-                                f'connected_for={connected_for:.1f}s'
-                            )
-
-                        else:
-
-                            if (
-                                age
-                                > self.stale_reconnect_sec
-                            ):
-
-                                raise TimeoutError(
-                                    'No RTCM data for '
-                                    f'{age:.1f} s; reconnecting'
-                                )
-
-                            if not healthy:
-
-                                self.get_logger().warn(
-                                    'RTCM stream temporarily unhealthy | '
-                                    f'age={age:.1f} s'
-                                )
+                        self._maybe_log_source_status(
+                            now,
+                            healthy,
+                            age,
+                        )
 
                     rclpy.spin_once(
                         self,
@@ -914,6 +1118,8 @@ class NtripToPx4Node(Node):
 
                     except OSError:
                         pass
+
+                self._discard_parser_session()
 
                 self._set_disconnected()
 
