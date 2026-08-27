@@ -137,7 +137,7 @@ def test_legacy_publisher_and_native_pivot_math_remain_byte_exact():
             "006983971b3315179d85a6eeab703ca8093dbcae2634a19157b5b489b68f0627"
         ),
         "terminal_native_pivot_command": (
-            "89de9ecbc275c72378c428de25e4aa19b9e72af531a65271949ce28d1cb0790f"
+            "ab1a69086a10d69a3719dea04fdfd772887dfec02ee318020c47e93b3e0cea00"
         ),
     }
     for method_name, expected in expected_hashes.items():

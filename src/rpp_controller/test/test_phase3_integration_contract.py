@@ -115,7 +115,7 @@ def test_legacy_carrier_method_remains_byte_exact():
     digest = hashlib.sha256(
         _method_source("terminal_native_pivot_command").encode("utf-8")
     ).hexdigest()
-    assert digest == "89de9ecbc275c72378c428de25e4aa19b9e72af531a65271949ce28d1cb0790f"
+    assert digest == "ab1a69086a10d69a3719dea04fdfd772887dfec02ee318020c47e93b3e0cea00"
 
 
 def test_precision_carrier_has_no_legacy_4deg_auto_release():

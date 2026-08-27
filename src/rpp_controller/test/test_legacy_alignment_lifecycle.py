@@ -1,4 +1,4 @@
-"""Focused guards for the production native-pivot settle/recapture lifecycle."""
+"""Focused guards for the production native-pivot settle/reanchor/hold lifecycle."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from rpp_controller.legacy_alignment import (
     LegacyAlignmentInput,
     LegacyAlignmentLifecycle,
     LegacyAlignmentPhase,
-    compute_low_energy_realign_command,
 )
 
 
@@ -25,13 +24,10 @@ NODE_SOURCE = NODE_PATH.read_text(encoding="utf-8")
 LAUNCH_SOURCE = LAUNCH_PATH.read_text(encoding="utf-8")
 NODE_TREE = ast.parse(NODE_SOURCE)
 
-DEG2 = math.radians(2.0)
 DEG4 = math.radians(4.0)
-DEG15 = math.radians(15.0)
-DEG30 = math.radians(30.0)
 YAW_30DPS = math.radians(30.0)
 YAW_98DPS = math.radians(98.0)
-NATIVE_HASH = "89de9ecbc275c72378c428de25e4aa19b9e72af531a65271949ce28d1cb0790f"
+NATIVE_HASH = "ab1a69086a10d69a3719dea04fdfd772887dfec02ee318020c47e93b3e0cea00"
 
 
 def _controller_method(name: str) -> ast.FunctionDef:
@@ -70,14 +66,10 @@ def _declared_defaults() -> dict[str, object]:
 def make_config(**overrides) -> LegacyAlignmentConfig:
     values = {
         "native_release_heading_rad": DEG4,
-        "tight_heading_rad": DEG2,
         "stop_speed_mps": 0.010,
         "stop_yaw_rate_radps": 0.050,
         "settle_sec": 0.20,
         "post_settle_hold_sec": 1.00,
-        "recapture_xtrack_m": 0.020,
-        "recapture_heading_rad": DEG2,
-        "recapture_settle_sec": 0.20,
         "non_pivot_release_xtrack_m": 0.008,
         "non_pivot_release_heading_rad": DEG4,
         "non_pivot_hold_sec": 0.20,
@@ -85,13 +77,6 @@ def make_config(**overrides) -> LegacyAlignmentConfig:
         "pivot_enter_rad": math.radians(45.0),
         "pivot_keeper_timeout_sec": 10.0,
         "pre_pivot_timeout_sec": 8.0,
-        "realign_grace_sec": 0.30,
-        "realign_split_heading_rad": DEG15,
-        "realign_near_speed_mps": 0.20,
-        "realign_far_speed_mps": 0.12,
-        "realign_bearing_cone_rad": DEG30,
-        "realign_max_translation_m": 0.30,
-        "realign_timeout_sec": 9.0,
     }
     values.update(overrides)
     return LegacyAlignmentConfig(**values)
@@ -211,14 +196,28 @@ def release_to_settle(driver, heading_deg=3.5):
     return result
 
 
-def finish_certificate_and_hold(driver, heading_deg=1.0):
+def reach_settle_certificate(driver, heading_deg=1.0):
+    """Drive the stationary settle_sec dwell to completion.
+
+    Returns the tick where the certificate passes: REANCHOR_ZERO if a reanchor
+    is owed on this first approach, otherwise the first POST_SETTLE_HOLD tick.
+    """
     driver.tick(heading_deg=heading_deg, speed=0.0, yaw_rate=0.0)
-    result = driver.tick(
+    return driver.tick(
         elapsed=0.21,
         heading_deg=heading_deg,
         speed=0.0,
         yaw_rate=0.0,
     )
+
+
+def finish_settle_and_hold_after_reanchor(driver, heading_deg=1.0):
+    """Drive the post-reanchor 1.0s literal-zero hold to COMPLETE_ZERO.
+
+    Assumes reach_settle_certificate has already run and, if it requested a
+    reanchor, that reanchor has already been acked.
+    """
+    result = driver.tick(heading_deg=heading_deg, speed=0.0, yaw_rate=0.0)
     assert result.transition_reason == "POST_SETTLE_HOLD"
     return driver.tick(
         elapsed=1.01,
@@ -340,7 +339,7 @@ def test_successful_publication_ack_can_authorize_c_prime():
     complete_pre_zero_transition(driver)
     publish_native(driver)
     release_to_settle(driver, heading_deg=1.0)
-    result = finish_certificate_and_hold(driver, heading_deg=1.0)
+    result = reach_settle_certificate(driver, heading_deg=1.0)
     assert result.reanchor_requested is True
     assert result.directive is LegacyAlignmentDirective.REANCHOR_ZERO
     assert driver.life.reanchor_complete is False
@@ -402,143 +401,14 @@ def test_native_over_10s_warns_once_and_continues():
     assert second.warn_native_timeout is False
 
 
-def test_realign_grace_is_0_30s():
+def test_settle_escalates_through_pre_on_ge45_heading():
     driver = enter_pre()
     complete_pre_zero_transition(driver)
     publish_native(driver)
     release_to_settle(driver, heading_deg=3.5)
-    spinning = driver.tick(heading_deg=3.5, speed=0.10, yaw_rate=YAW_30DPS)
-    assert spinning.phase is LegacyAlignmentPhase.PIVOT_SETTLE
-    first = driver.tick(heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    assert first.transition_reason == "REALIGN_GRACE"
-    early = driver.tick(elapsed=0.29, heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    assert early.phase is LegacyAlignmentPhase.PIVOT_SETTLE
-    done = driver.tick(elapsed=0.02, heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    assert done.phase is LegacyAlignmentPhase.LOW_ENERGY_REALIGN
-    assert done.directive is LegacyAlignmentDirective.HOLD_ZERO
-
-
-def test_low_energy_near_band_is_0_20_and_far_band_is_0_12():
-    near = compute_low_energy_realign_command(
-        math.radians(10.0),
-        0.0,
-        split_heading_rad=DEG15,
-        near_speed_mps=0.20,
-        far_speed_mps=0.12,
-        bearing_cone_rad=DEG30,
-    )
-    far = compute_low_energy_realign_command(
-        math.radians(20.0),
-        0.0,
-        split_heading_rad=DEG15,
-        near_speed_mps=0.20,
-        far_speed_mps=0.12,
-        bearing_cone_rad=DEG30,
-    )
-    assert near[1] == 0.20
-    assert far[1] == 0.12
-    assert math.isclose(math.hypot(near[2], near[3]), 0.20, abs_tol=1.0e-12)
-    assert math.isclose(math.hypot(far[2], far[3]), 0.12, abs_tol=1.0e-12)
-
-
-def test_low_energy_bearing_cone_is_plus_minus_30deg():
-    bearing, speed, north, east = compute_low_energy_realign_command(
-        math.radians(44.0),
-        0.0,
-        split_heading_rad=DEG15,
-        near_speed_mps=0.20,
-        far_speed_mps=0.12,
-        bearing_cone_rad=DEG30,
-    )
-    command_error = abs(math.atan2(math.sin(bearing), math.cos(bearing)))
-    assert command_error <= DEG30 + 1.0e-12
-    assert speed == 0.12
-    del north, east
-
-
-def test_low_energy_adapter_disables_accel_decel_and_hard_caps():
-    source = _method_source("_publish_legacy_low_energy_realign")
-    assert "apply_acceleration=False" in source
-    assert "apply_deceleration=False" in source
-    assert "hard_speed_cap_mps=speed" in source
-    assert "precision_pivot_carrier_command" not in source
-    assert "terminal_native_pivot_command" not in source
-    assert "segment_alignment_recovery_speed" not in source
-
-
-def test_low_energy_displacement_and_timeout_and_nonfinite_are_local_safety():
-    driver = enter_pre()
-    complete_pre_zero_transition(driver)
-    publish_native(driver)
-    release_to_settle(driver, heading_deg=3.5)
-    driver.tick(heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    driver.tick(elapsed=0.31, heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    assert driver.life.phase is LegacyAlignmentPhase.LOW_ENERGY_REALIGN
-    moved = driver.tick(
-        heading_deg=3.5,
-        speed=0.0,
-        yaw_rate=0.0,
-        current_x=0.30,
-        current_y=0.0,
-    )
-    assert moved.phase is LegacyAlignmentPhase.SAFETY_HOLD
-
-    driver = enter_pre()
-    complete_pre_zero_transition(driver)
-    publish_native(driver)
-    release_to_settle(driver, heading_deg=3.5)
-    driver.tick(heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    driver.tick(elapsed=0.31, heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    start = driver.life.realign_started_at
-    timed = driver.tick(
-        now=start + 9.0,
-        heading_deg=3.5,
-        speed=0.0,
-        yaw_rate=0.0,
-    )
-    assert timed.phase is LegacyAlignmentPhase.SAFETY_HOLD
-
-    driver = enter_pre()
-    complete_pre_zero_transition(driver)
-    publish_native(driver)
-    release_to_settle(driver, heading_deg=3.5)
-    driver.tick(heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    driver.tick(elapsed=0.31, heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    bad = driver.tick(
-        heading_deg=3.5,
-        speed=0.0,
-        yaw_rate=0.0,
-        current_x=math.inf,
-    )
-    assert bad.phase is LegacyAlignmentPhase.SAFETY_HOLD
-
-
-def test_stale_realign_does_not_refresh_watchdog_budget():
-    driver = enter_pre()
-    complete_pre_zero_transition(driver)
-    publish_native(driver)
-    release_to_settle(driver, heading_deg=3.5)
-    driver.tick(heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    driver.tick(elapsed=0.31, heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    start = driver.life.realign_started_at
-    stale = driver.tick(
-        now=start + 5.0,
-        heading_deg=3.5,
-        speed=0.0,
-        yaw_rate=0.0,
-        fresh=False,
-    )
-    assert stale.phase is LegacyAlignmentPhase.LOW_ENERGY_REALIGN
-    assert stale.directive is LegacyAlignmentDirective.HOLD_ZERO
-    assert driver.life.realign_started_at == start
-    late = driver.tick(
-        now=start + 9.0,
-        heading_deg=3.5,
-        speed=0.0,
-        yaw_rate=0.0,
-        fresh=True,
-    )
-    assert late.phase is LegacyAlignmentPhase.SAFETY_HOLD
+    result = driver.tick(heading_deg=50.0, speed=0.0, yaw_rate=0.0)
+    assert result.phase is LegacyAlignmentPhase.PRE_PIVOT_STOP
+    assert result.directive is LegacyAlignmentDirective.HOLD_ZERO
 
 
 def test_600mm_xtrack_does_not_stop_lifecycle():
@@ -562,128 +432,121 @@ def test_no_alignment_safety_hold_symbol_in_production_source():
     ).read_text(encoding="utf-8")
 
 
-def test_two_deg_realign_exit_reacquires_full_settle():
-    driver = enter_pre()
-    complete_pre_zero_transition(driver)
-    publish_native(driver)
-    release_to_settle(driver, heading_deg=3.5)
-    driver.tick(heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    driver.tick(elapsed=0.31, heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    driver.tick(heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    back = driver.tick(heading_deg=1.0, speed=0.0, yaw_rate=0.0)
-    assert back.phase is LegacyAlignmentPhase.PIVOT_SETTLE
-    assert back.directive is LegacyAlignmentDirective.HOLD_ZERO
-    assert driver.life.settle_inside_since is None
-
-
-def test_ge45_realign_escalates_through_pre():
-    driver = enter_pre()
-    complete_pre_zero_transition(driver)
-    publish_native(driver)
-    release_to_settle(driver, heading_deg=3.5)
-    driver.tick(heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    driver.tick(elapsed=0.31, heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    result = driver.tick(heading_deg=50.0, speed=0.0, yaw_rate=0.0)
-    assert result.phase is LegacyAlignmentPhase.PRE_PIVOT_STOP
-    assert result.directive is LegacyAlignmentDirective.HOLD_ZERO
-
-
-def test_low_energy_alone_cannot_reanchor():
-    driver = enter_pre()
-    complete_pre_zero_transition(driver)
-    publish_native(driver)
-    release_to_settle(driver, heading_deg=3.5)
-    driver.tick(heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    result = driver.tick(elapsed=0.31, heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    assert result.phase is LegacyAlignmentPhase.LOW_ENERGY_REALIGN
-    assert result.reanchor_requested is False
-    moving = driver.tick(heading_deg=3.5, speed=0.0, yaw_rate=0.0)
-    assert moving.reanchor_requested is False
-    assert moving.directive is LegacyAlignmentDirective.LOW_ENERGY_REALIGN
-
-
-def test_actual_native_settle_hold_reanchors_once_and_later_geometry_unchanged():
+def test_actual_native_settle_hold_reanchors_before_hold_and_geometry_unchanged():
     driver = enter_pre()
     complete_pre_zero_transition(driver)
     publish_native(driver)
     release_to_settle(driver, heading_deg=1.0)
-    first = finish_certificate_and_hold(driver, heading_deg=1.0)
+    first = reach_settle_certificate(driver, heading_deg=1.0)
     assert first.reanchor_requested is True
+    assert first.directive is LegacyAlignmentDirective.REANCHOR_ZERO
     assert driver.life.reanchor_complete is False
     driver.life.ack_reanchor_completed()
     assert driver.life.reanchor_complete is True
     second = driver.tick(heading_deg=1.0, speed=0.0, yaw_rate=0.0, xtrack=0.010)
     assert second.reanchor_requested is False
-    assert second.phase is LegacyAlignmentPhase.POST_PIVOT_RECAPTURE
+    assert second.phase is LegacyAlignmentPhase.PIVOT_SETTLE
+    assert second.transition_reason == "POST_SETTLE_HOLD"
 
 
-def test_recapture_remains_0_20_and_zero_is_next_cycle_boundary():
-    adapter = _method_source("_run_legacy_segment_alignment")
-    recapture = adapter[
-        adapter.index("LegacyAlignmentDirective.RECAPTURE") : adapter.index(
-            "COMPLETE_ZERO"
-        )
-    ]
-    assert "speed = self.post_pivot_capture_speed" in recapture
-    assert "hard_speed_cap_mps=speed" in recapture
-    assert "apply_acceleration=False" in recapture
-    assert "apply_deceleration=False" in recapture
-    assert "segment_alignment_recovery_speed" not in recapture
-    completion = adapter[adapter.index("COMPLETE_ZERO") :]
-    assert "self.reset_speed_profiles()" in completion
-    assert "self.command_slew_speed = 0.0" in completion
-    assert "self.command_slew_last_time = None" in completion
-    assert "self.publish_stop()" in completion
-    assert "return True" in completion
+def test_bag_114356_p1_reanchor_completes_without_a_heading_gate_or_crawl():
+    """Regression for run 114356 P1.
+
+    Field bag: heading certified at 2.55deg on the old line, then the
+    C'->P1 reanchor bearing came out to 3.41deg. The old design required a
+    tighter 2deg recapture certificate against the *new* line and crawled at
+    0.20 m/s for ~33s / 6m because that gate never closed. The new design has
+    no post-reanchor heading gate at all: once the chassis is reanchored and
+    held stationary for post_settle_hold_sec, it releases straight to
+    COMPLETE_ZERO regardless of the reanchored heading, as long as it is well
+    under the 45deg re-pivot threshold.
+    """
+    driver = enter_pre()
+    complete_pre_zero_transition(driver)
+    publish_native(driver)
+    release_to_settle(driver, heading_deg=2.55)
+    settled = reach_settle_certificate(driver, heading_deg=2.55)
+    assert settled.reanchor_requested is True
+    driver.life.ack_reanchor_completed()
+    done = finish_settle_and_hold_after_reanchor(driver, heading_deg=3.41)
+    assert done.directive is LegacyAlignmentDirective.COMPLETE_ZERO
+    assert done.pivot_complete is True
 
 
-def test_recapture_cannot_complete_before_geometry_dwell_or_use_50mm_fallback():
+def test_second_pivot_after_reanchor_requests_fresh_reanchor_not_stale_c_prime():
+    """Regression: a second, genuine pivot must not complete using the first
+    pivot's stale C'1 anchor.
+
+    Sequence: first pivot -> reanchor C'1 -> heading blows back out to
+    >=45deg during the post-reanchor hold -> second native pivot -> the
+    second pivot must request its own fresh reanchor, and must not reach
+    COMPLETE_ZERO while still carrying the first pivot's stale anchor state.
+    """
     driver = enter_pre()
     complete_pre_zero_transition(driver)
     publish_native(driver)
     release_to_settle(driver, heading_deg=1.0)
-    requested = finish_certificate_and_hold(driver, heading_deg=1.0)
-    if requested.reanchor_requested:
-        driver.life.ack_reanchor_completed()
-    wide = driver.tick(heading_deg=1.0, speed=0.0, yaw_rate=0.0, xtrack=0.080)
-    assert wide.directive is LegacyAlignmentDirective.RECAPTURE
-    assert wide.directive is not LegacyAlignmentDirective.FALLBACK_GLOBAL_XTRACK
-    early = driver.tick(
-        heading_deg=1.0,
-        speed=0.0,
-        yaw_rate=0.0,
-        xtrack=0.010,
-        elapsed=0.19,
+    first_settle = reach_settle_certificate(driver, heading_deg=1.0)
+    assert first_settle.reanchor_requested is True
+    driver.life.ack_reanchor_completed()
+    # Mirrors the node: reanchor_c_to_p1_after_pivot() succeeded, so
+    # c_line_reanchored_after_pivot (fed back as already_reanchored) is True.
+    driver.already_reanchored = True
+
+    # Heading blows back out to >=45deg while holding after the first reanchor.
+    escalate = driver.tick(heading_deg=50.0, speed=0.0, yaw_rate=0.0)
+    assert escalate.phase is LegacyAlignmentPhase.PRE_PIVOT_STOP
+    assert driver.life.reanchor_complete is False
+
+    # Second, genuine native pivot. native_carrier_issued deliberately stays
+    # True from the first pivot (unrelated to this fix), so drive the
+    # stationary certificate directly instead of via complete_pre_zero_transition.
+    driver.tick(heading_deg=50.0, speed=0.0, yaw_rate=0.0)
+    second_native_pivot = driver.tick(
+        elapsed=0.21, heading_deg=50.0, speed=0.0, yaw_rate=0.0
     )
-    assert early.directive is LegacyAlignmentDirective.RECAPTURE
-    done = driver.tick(
-        heading_deg=1.0,
-        speed=0.0,
-        yaw_rate=0.0,
-        xtrack=0.010,
-        elapsed=0.21,
-    )
-    assert done.directive is LegacyAlignmentDirective.COMPLETE_ZERO
+    assert second_native_pivot.phase is LegacyAlignmentPhase.NATIVE_PIVOT
+    publish_native(driver, heading_deg=50.0)
+    # Mirrors the node-side fix: the moment the new carrier actually
+    # publishes during first_approach with a stale anchor, that stale
+    # anchor is cleared (c_line_bearing itself is left untouched).
+    driver.already_reanchored = False
+
+    second_settle = release_to_settle(driver, heading_deg=1.0)
+    assert second_settle.reanchor_requested is False
+    second_certificate = reach_settle_certificate(driver, heading_deg=1.0)
+    assert second_certificate.reanchor_requested is True
+    assert second_certificate.directive is LegacyAlignmentDirective.REANCHOR_ZERO
+    assert second_certificate.directive is not LegacyAlignmentDirective.COMPLETE_ZERO
+
+
+def test_native_carrier_publish_clears_stale_reanchor_flag_not_bearing():
+    adapter = _method_source("_run_legacy_segment_alignment")
+    carrier = adapter[
+        adapter.index(
+            "if result.directive is LegacyAlignmentDirective.NATIVE_CARRIER:"
+        ) : adapter.index("if result.directive is LegacyAlignmentDirective.HOLD_ZERO:")
+    ]
+    ack_index = carrier.index("ack_native_carrier_published")
+    reset_index = carrier.index("self.c_line_reanchored_after_pivot = False")
+    assert ack_index < reset_index
+    guard = carrier[ack_index:reset_index]
+    assert "first_approach" in guard
+    assert "self.c_line_reanchored_after_pivot" in guard
+    assert "self.c_line_bearing =" not in guard
 
 
 def test_legacy_param_and_precision_gate_remain_field_safe():
     defaults = _declared_defaults()
     assert defaults["precision_pivot_enabled"] is False
     assert defaults["legacy_pivot_post_settle_hold_sec"] == 1.00
-    assert defaults["legacy_pivot_realign_grace_sec"] == 0.30
-    assert defaults["legacy_pivot_realign_split_heading_deg"] == 15.0
-    assert defaults["legacy_pivot_realign_near_speed_mps"] == 0.20
-    assert defaults["legacy_pivot_realign_far_speed_mps"] == 0.12
-    assert defaults["legacy_pivot_realign_bearing_cone_deg"] == 30.0
-    assert defaults["legacy_pivot_realign_max_translation_m"] == 0.30
-    assert defaults["legacy_pivot_realign_timeout_sec"] == 9.0
     assert defaults["post_pivot_capture_speed_mps"] == 0.20
     assert defaults["acceleration_distance_m"] == 0.20
     assert defaults["deceleration_distance_m"] == 0.50
     assert defaults["cruise_speed_mps"] == 1.00
     assert defaults["waypoint_tolerance_m"] == 0.03
     assert '"precision_pivot_enabled": False' in LAUNCH_SOURCE
-    assert '"legacy_pivot_realign_grace_sec": 0.30' in LAUNCH_SOURCE
+    assert '"legacy_pivot_post_settle_hold_sec": 1.00' in LAUNCH_SOURCE
     assert "RD_MAX_THR_YAW_R" not in NODE_SOURCE
     assert "RO_YAW_RATE_TH" not in NODE_SOURCE
     assert "RO_YAW_RATE_LIM" not in NODE_SOURCE
@@ -740,9 +603,11 @@ def test_legacy_adapter_has_no_old_anchor_recenter_path():
     assert "_publish_precision_anchor_approach" not in adapter
     assert "anchor_radial_error_m" not in adapter
     assert "precision_pivot_carrier_command" not in adapter
+    assert "LegacyAlignmentDirective.RECAPTURE" not in adapter
+    assert "LegacyAlignmentDirective.LOW_ENERGY_REALIGN" not in adapter
 
 
-def test_native_release_without_carrier_never_reaches_post_pivot_recapture():
+def test_native_release_without_carrier_never_reaches_pivot_settle():
     driver = enter_pre()
     complete_pre_zero_transition(driver)
     result = driver.tick(heading_deg=3.0, speed=0.0, yaw_rate=0.0, ack=False)
@@ -758,7 +623,6 @@ def test_native_release_without_carrier_never_reaches_post_pivot_recapture():
             xtrack=0.004,
         )
         phases.add(later.phase)
-        assert later.phase is not LegacyAlignmentPhase.POST_PIVOT_RECAPTURE
         assert later.phase is not LegacyAlignmentPhase.PIVOT_SETTLE
     assert LegacyAlignmentPhase.NON_PIVOT_CAPTURE in phases
 
@@ -780,11 +644,14 @@ def test_pre_cancel_after_real_pivot_reacquires_full_settle_hold():
     early = driver.tick(heading_deg=1.0, speed=0.0, yaw_rate=0.0, elapsed=0.19)
     assert early.phase is LegacyAlignmentPhase.PIVOT_SETTLE
     cert = driver.tick(heading_deg=1.0, speed=0.0, yaw_rate=0.0, elapsed=0.02)
-    assert cert.transition_reason == "POST_SETTLE_HOLD"
+    assert cert.reanchor_requested is True
+    driver.life.ack_reanchor_completed()
+    hold_start = driver.tick(heading_deg=1.0, speed=0.0, yaw_rate=0.0)
+    assert hold_start.transition_reason == "POST_SETTLE_HOLD"
     hold = driver.tick(heading_deg=1.0, speed=0.0, yaw_rate=0.0, elapsed=0.99)
     assert hold.phase is LegacyAlignmentPhase.PIVOT_SETTLE
     done = driver.tick(heading_deg=1.0, speed=0.0, yaw_rate=0.0, elapsed=0.02)
-    assert done.phase is LegacyAlignmentPhase.POST_PIVOT_RECAPTURE
+    assert done.directive is LegacyAlignmentDirective.COMPLETE_ZERO
 
 
 def test_native_carrier_issued_never_coexists_with_non_pivot_capture():
@@ -806,7 +673,7 @@ def test_reanchor_request_does_not_mark_complete_before_ack():
     complete_pre_zero_transition(driver)
     publish_native(driver)
     release_to_settle(driver, heading_deg=1.0)
-    result = finish_certificate_and_hold(driver, heading_deg=1.0)
+    result = reach_settle_certificate(driver, heading_deg=1.0)
     assert result.reanchor_requested is True
     assert driver.life.reanchor_complete is False
 
@@ -816,7 +683,7 @@ def test_successful_reanchor_ack_marks_complete_exactly_once():
     complete_pre_zero_transition(driver)
     publish_native(driver)
     release_to_settle(driver, heading_deg=1.0)
-    finish_certificate_and_hold(driver, heading_deg=1.0)
+    reach_settle_certificate(driver, heading_deg=1.0)
     driver.life.ack_reanchor_completed()
     assert driver.life.reanchor_complete is True
     driver.life.ack_reanchor_completed()
@@ -825,12 +692,12 @@ def test_successful_reanchor_ack_marks_complete_exactly_once():
     assert later.reanchor_requested is False
 
 
-def test_failed_reanchor_cannot_reach_recapture_and_is_local_safety_hold():
+def test_failed_reanchor_is_local_safety_hold():
     driver = enter_pre()
     complete_pre_zero_transition(driver)
     publish_native(driver)
     release_to_settle(driver, heading_deg=1.0)
-    requested = finish_certificate_and_hold(driver, heading_deg=1.0)
+    requested = reach_settle_certificate(driver, heading_deg=1.0)
     assert requested.reanchor_requested is True
     assert driver.life.reanchor_complete is False
     driver.life.enter_safety_hold("REANCHOR_FAILED")
@@ -838,14 +705,11 @@ def test_failed_reanchor_cannot_reach_recapture_and_is_local_safety_hold():
         later = driver.tick(heading_deg=1.0, speed=0.0, yaw_rate=0.0, xtrack=0.004)
         assert later.phase is LegacyAlignmentPhase.SAFETY_HOLD
         assert later.directive is LegacyAlignmentDirective.SAFETY_HOLD
-        assert later.directive is not LegacyAlignmentDirective.RECAPTURE
     adapter = _method_source("_run_legacy_segment_alignment")
     fail = adapter.index("REANCHOR_FAILED")
-    recapture = adapter.index("LegacyAlignmentDirective.RECAPTURE")
     assert "enter_safety_hold" in adapter
     assert "ack_reanchor_completed" in adapter
     assert adapter.index("ack_reanchor_completed") < fail
-    assert fail < recapture
 
 
 def test_failed_reanchor_later_semantic_geometry_remains_unchanged():
@@ -853,7 +717,7 @@ def test_failed_reanchor_later_semantic_geometry_remains_unchanged():
     complete_pre_zero_transition(driver)
     publish_native(driver)
     release_to_settle(driver, heading_deg=1.0)
-    finish_certificate_and_hold(driver, heading_deg=1.0)
+    reach_settle_certificate(driver, heading_deg=1.0)
     driver.life.enter_safety_hold("REANCHOR_FAILED")
     driver.life.reset("SEGMENT_GOAL_CHANGED")
     assert driver.life.phase is LegacyAlignmentPhase.ENTRY

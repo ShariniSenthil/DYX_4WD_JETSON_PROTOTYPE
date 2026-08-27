@@ -52,7 +52,6 @@ from rpp_controller.legacy_alignment import (
     LegacyAlignmentInput,
     LegacyAlignmentLifecycle,
     LegacyAlignmentPhase,
-    compute_low_energy_realign_command,
 )
 from rpp_controller.motion_state_machine import (
     MotionDirective,
@@ -582,13 +581,6 @@ class RPPController(Node):
         # Extra literal-zero hold after the measured native-pivot stop
         # certificate.  Independent of the default-off precision pivot FSM.
         self.declare_parameter("legacy_pivot_post_settle_hold_sec", 1.00)
-        self.declare_parameter("legacy_pivot_realign_grace_sec", 0.30)
-        self.declare_parameter("legacy_pivot_realign_split_heading_deg", 15.0)
-        self.declare_parameter("legacy_pivot_realign_near_speed_mps", 0.20)
-        self.declare_parameter("legacy_pivot_realign_far_speed_mps", 0.12)
-        self.declare_parameter("legacy_pivot_realign_bearing_cone_deg", 30.0)
-        self.declare_parameter("legacy_pivot_realign_max_translation_m", 0.30)
-        self.declare_parameter("legacy_pivot_realign_timeout_sec", 9.0)
 
         self.local_frame = str(self.get_parameter("local_frame").value).strip()
         self.cruise_speed = float(self.get_parameter("cruise_speed_mps").value)
@@ -1245,27 +1237,6 @@ class RPPController(Node):
         self.legacy_pivot_post_settle_hold_sec = float(
             self.get_parameter("legacy_pivot_post_settle_hold_sec").value
         )
-        self.legacy_pivot_realign_grace_sec = float(
-            self.get_parameter("legacy_pivot_realign_grace_sec").value
-        )
-        self.legacy_pivot_realign_split_heading = math.radians(
-            float(self.get_parameter("legacy_pivot_realign_split_heading_deg").value)
-        )
-        self.legacy_pivot_realign_near_speed = float(
-            self.get_parameter("legacy_pivot_realign_near_speed_mps").value
-        )
-        self.legacy_pivot_realign_far_speed = float(
-            self.get_parameter("legacy_pivot_realign_far_speed_mps").value
-        )
-        self.legacy_pivot_realign_bearing_cone = math.radians(
-            float(self.get_parameter("legacy_pivot_realign_bearing_cone_deg").value)
-        )
-        self.legacy_pivot_realign_max_translation = float(
-            self.get_parameter("legacy_pivot_realign_max_translation_m").value
-        )
-        self.legacy_pivot_realign_timeout_sec = float(
-            self.get_parameter("legacy_pivot_realign_timeout_sec").value
-        )
         self.precision_pivot_config = PivotMotionConfig(
             pivot_anchor_tolerance_m=float(
                 self.get_parameter("precision_pivot_anchor_tolerance_m").value
@@ -1324,18 +1295,12 @@ class RPPController(Node):
         self.legacy_alignment = LegacyAlignmentLifecycle(
             LegacyAlignmentConfig(
                 native_release_heading_rad=self.terminal_native_pivot_release_error,
-                tight_heading_rad=(
-                    self.precision_pivot_config.release_heading_tolerance_rad
-                ),
                 stop_speed_mps=self.precision_pivot_config.stop_speed_tolerance_mps,
                 stop_yaw_rate_radps=(
                     self.precision_pivot_config.stop_yaw_rate_tolerance_radps
                 ),
                 settle_sec=self.precision_pivot_config.pivot_release_settle_sec,
                 post_settle_hold_sec=self.legacy_pivot_post_settle_hold_sec,
-                recapture_xtrack_m=self.precision_pivot_recapture_xtrack,
-                recapture_heading_rad=self.precision_pivot_recapture_heading,
-                recapture_settle_sec=self.precision_pivot_recapture_settle_sec,
                 non_pivot_release_xtrack_m=self.xtrack_priority_exit,
                 non_pivot_release_heading_rad=(
                     self.terminal_native_pivot_release_error
@@ -1347,13 +1312,6 @@ class RPPController(Node):
                 pivot_enter_rad=self.pivot_enter_angle,
                 pivot_keeper_timeout_sec=self.segment_pivot_keeper_timeout_sec,
                 pre_pivot_timeout_sec=self.precision_pivot_config.brake_timeout_sec,
-                realign_grace_sec=self.legacy_pivot_realign_grace_sec,
-                realign_split_heading_rad=self.legacy_pivot_realign_split_heading,
-                realign_near_speed_mps=self.legacy_pivot_realign_near_speed,
-                realign_far_speed_mps=self.legacy_pivot_realign_far_speed,
-                realign_bearing_cone_rad=self.legacy_pivot_realign_bearing_cone,
-                realign_max_translation_m=self.legacy_pivot_realign_max_translation,
-                realign_timeout_sec=self.legacy_pivot_realign_timeout_sec,
             )
         )
         self.get_logger().warn(
@@ -2155,53 +2113,6 @@ class RPPController(Node):
                 "legacy_pivot_post_settle_hold_sec must be finite and > 0"
             )
         if not (
-            math.isfinite(self.legacy_pivot_realign_grace_sec)
-            and self.legacy_pivot_realign_grace_sec > 0.0
-        ):
-            raise ValueError("legacy_pivot_realign_grace_sec must be finite and > 0")
-        if not (
-            math.radians(2.0)
-            < self.legacy_pivot_realign_split_heading
-            < math.radians(45.0)
-        ):
-            raise ValueError(
-                "legacy_pivot_realign_split_heading_deg must satisfy 2 < split < 45"
-            )
-        if not (
-            math.isfinite(self.legacy_pivot_realign_far_speed)
-            and math.isfinite(self.legacy_pivot_realign_near_speed)
-            and self.minimum_speed
-            <= self.legacy_pivot_realign_far_speed
-            <= self.legacy_pivot_realign_near_speed
-            <= self.cruise_speed
-        ):
-            raise ValueError(
-                "legacy_pivot_realign speeds must satisfy "
-                "minimum_speed <= far <= near <= cruise"
-            )
-        if not (
-            0.0
-            < self.legacy_pivot_realign_bearing_cone
-            < math.radians(45.0)
-        ):
-            raise ValueError(
-                "legacy_pivot_realign_bearing_cone_deg must be in (0, 45)"
-            )
-        if not (
-            math.isfinite(self.legacy_pivot_realign_max_translation)
-            and self.legacy_pivot_realign_max_translation > 0.0
-        ):
-            raise ValueError(
-                "legacy_pivot_realign_max_translation_m must be finite and > 0"
-            )
-        if not (
-            math.isfinite(self.legacy_pivot_realign_timeout_sec)
-            and self.legacy_pivot_realign_timeout_sec > 0.0
-        ):
-            raise ValueError(
-                "legacy_pivot_realign_timeout_sec must be finite and > 0"
-            )
-        if not (
             math.isfinite(self.precision_pivot_recapture_xtrack)
             and 0.0
             < self.precision_pivot_recapture_xtrack
@@ -2491,25 +2402,6 @@ class RPPController(Node):
             "segment_pivot_keeper_timeout_sec": (self.segment_pivot_keeper_timeout_sec),
             "legacy_pivot_post_settle_hold_sec": (
                 self.legacy_pivot_post_settle_hold_sec
-            ),
-            "legacy_pivot_realign_grace_sec": self.legacy_pivot_realign_grace_sec,
-            "legacy_pivot_realign_split_heading_deg": (
-                self.legacy_pivot_realign_split_heading
-            ),
-            "legacy_pivot_realign_near_speed_mps": (
-                self.legacy_pivot_realign_near_speed
-            ),
-            "legacy_pivot_realign_far_speed_mps": (
-                self.legacy_pivot_realign_far_speed
-            ),
-            "legacy_pivot_realign_bearing_cone_deg": (
-                self.legacy_pivot_realign_bearing_cone
-            ),
-            "legacy_pivot_realign_max_translation_m": (
-                self.legacy_pivot_realign_max_translation
-            ),
-            "legacy_pivot_realign_timeout_sec": (
-                self.legacy_pivot_realign_timeout_sec
             ),
             "segment_fast_capture_max_cross_track_m": (
                 self.segment_fast_capture_max_cross_track
@@ -4918,33 +4810,6 @@ class RPPController(Node):
         )
         return north, east, speed
 
-    def _publish_legacy_low_energy_realign(self, path_heading_error):
-        bearing_cmd, speed, north, east = compute_low_energy_realign_command(
-            path_heading_error,
-            self.current_yaw,
-            split_heading_rad=self.legacy_pivot_realign_split_heading,
-            near_speed_mps=self.legacy_pivot_realign_near_speed,
-            far_speed_mps=self.legacy_pivot_realign_far_speed,
-            bearing_cone_rad=self.legacy_pivot_realign_bearing_cone,
-        )
-        command_error = abs(
-            self.normalize_angle(bearing_cmd - self.current_yaw)
-        )
-        if command_error > self.legacy_pivot_realign_bearing_cone + 1.0e-9:
-            self.publish_stop()
-            self.get_logger().error(
-                "LOW-ENERGY REALIGN CONE VIOLATION / LOCAL HOLD | "
-                f"command_error={math.degrees(command_error):+.1f}deg"
-            )
-            return 0.0, 0.0, 0.0
-        return self.publish_velocity_ned(
-            north,
-            east,
-            apply_acceleration=False,
-            apply_deceleration=False,
-            hard_speed_cap_mps=speed,
-        )
-
     def _run_legacy_segment_alignment(
         self,
         *,
@@ -5041,21 +4906,18 @@ class RPPController(Node):
                     )
                     return True
                 self.legacy_alignment.ack_native_carrier_published()
+                if first_approach and self.c_line_reanchored_after_pivot:
+                    # A new pivot can displace the rover away from the prior
+                    # C'->P1 anchor. Invalidate that stale reanchor without
+                    # touching c_line_bearing: the old line remains the pivot
+                    # heading target until this pivot finishes and reanchors.
+                    self.c_line_reanchored_after_pivot = False
             else:
                 self.publish_stop()
             return True
 
         if result.directive is LegacyAlignmentDirective.HOLD_ZERO:
-            if (
-                result.phase is LegacyAlignmentPhase.POST_PIVOT_RECAPTURE
-                and previous_phase is LegacyAlignmentPhase.PIVOT_SETTLE
-            ):
-                self._reset_precision_regulator("PIVOT_COMPLETE_RECAPTURE_ARMED")
             self.publish_stop()
-            return True
-
-        if result.directive is LegacyAlignmentDirective.LOW_ENERGY_REALIGN:
-            self._publish_legacy_low_energy_realign(path_heading_error)
             return True
 
         if result.directive is LegacyAlignmentDirective.REANCHOR_ZERO:
@@ -5077,74 +4939,24 @@ class RPPController(Node):
             )
             return True
 
-        if result.directive is LegacyAlignmentDirective.RECAPTURE:
-            if first_approach and self.c_line_bearing is not None:
-                path_bearing = self.c_line_bearing
-                path_heading_error = self.normalize_angle(
-                    path_bearing - self.current_yaw
-                )
-                (
-                    alignment_guidance_bearing,
-                    alignment_cross_track,
-                ) = self.line_guidance(
-                    path_bearing,
-                    goal_x,
-                    goal_y,
-                    self.segment_alignment_correction_limit,
-                )
-            if self.precision_guidance_enabled and not first_approach:
-                alignment_guidance_bearing = (
-                    precision_guidance.limited_command_bearing_rad
-                )
-            command_bearing, command_heading_error = (
-                self.limit_moving_guidance_bearing(alignment_guidance_bearing)
-            )
-            speed = self.post_pivot_capture_speed
-            north = speed * math.sin(command_bearing)
-            east = speed * math.cos(command_bearing)
-            north, east, speed = self.publish_velocity_ned(
-                north,
-                east,
-                apply_acceleration=False,
-                apply_deceleration=False,
-                hard_speed_cap_mps=speed,
-            )
-            self.log_control(
-                mode_prefix
-                + "POST-PIVOT RECAPTURE "
-                + f"{self.post_pivot_capture_speed:.2f}MPS"
-                + f" | heading={math.degrees(path_heading_error):+.1f}deg"
-                + f" | xtrack="
-                + f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
-                + f" | command_error="
-                + f"{math.degrees(command_heading_error):+.1f}deg",
-                target_distance,
-                goal_distance,
-                command_heading_error,
-                speed,
-                north,
-                east,
-            )
-            return True
-
         if result.directive is LegacyAlignmentDirective.COMPLETE_ZERO:
             self.segment_alignment_active = False
-            self._reset_legacy_alignment_lifecycle("POST_PIVOT_RECAPTURE_COMPLETE")
+            self._reset_legacy_alignment_lifecycle("PIVOT_SETTLE_HOLD_COMPLETE")
             self.reset_speed_profiles()
             self.command_slew_speed = 0.0
             self.command_slew_last_time = None
             self.xtrack_priority_active = False
             self.xtrack_priority_inside_since = None
             self.reset_xtrack_damping_state()
-            self._reset_precision_regulator("POST_PIVOT_RECAPTURE_COMPLETE")
+            self._reset_precision_regulator("PIVOT_SETTLE_HOLD_COMPLETE")
             self._reset_precision_tracking(
-                "POST_PIVOT_RECAPTURE_COMPLETE",
+                "PIVOT_SETTLE_HOLD_COMPLETE",
                 reset_metrics=False,
                 path_identity=self.geometry_installed_signature,
             )
             self.publish_stop()
             self.get_logger().warn(
-                "POST-PIVOT RECAPTURE RELEASED / LITERAL ZERO | "
+                "PIVOT SETTLE HOLD COMPLETE / RELEASING TO PATH TRACKING | "
                 f"heading={math.degrees(path_heading_error):+.1f}deg | "
                 f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
             )
@@ -8270,8 +8082,10 @@ class RPPController(Node):
         # Native ±60deg carrier is unchanged.  A genuine latch no longer
         # falls through into 1.00 m/s capture at the 4deg heading gate.
         # After native release the chassis must prove a measured stop,
-        # hold literal zero for legacy_pivot_post_settle_hold_sec, then
-        # recapture at post_pivot_capture_speed_mps.  Aligned starts that
+        # reanchor C->P1 to the actual post-pivot position once, hold
+        # literal zero for legacy_pivot_post_settle_hold_sec, then release
+        # straight into normal path tracking and the existing acceleration
+        # ramp -- there is no moving recapture phase.  Aligned starts that
         # never latch a carrier keep the previous non-pivot capture path.
         # --------------------------------------------------------------
         if (
