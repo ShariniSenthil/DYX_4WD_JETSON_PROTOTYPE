@@ -281,7 +281,20 @@ def generate_launch_description() -> LaunchDescription:
                         # Pass-through/interpolation points do not stop/decelerate.
                         "cruise_speed_mps": CRUISE_SPEED_MPS,
                         "acceleration_enabled": True,
-                        "acceleration_distance_m": 0.20,
+                        # Lengthened from 0.20m -- P4 bag forensic analysis
+                        # showed the two catastrophic later-leg swings
+                        # (163805 t=127s, 164150 t=68s) peaked at 92-268mm
+                        # of travel, i.e. inside the launch ramp's own
+                        # distance window. Matches deceleration_distance_m
+                        # for a symmetric envelope. Derived accel rate drops
+                        # from 2.5 m/s^2 to 1.0 m/s^2. Does not fix leg1
+                        # cruise-phase swings (150503/151020 pattern), which
+                        # peak past 1m, well outside this window, and does
+                        # not fix the later-leg missing-reanchor root cause
+                        # -- it only reduces speed while that pre-existing
+                        # offset is still being corrected. See P4 bag
+                        # forensic analysis (2026-08-27).
+                        "acceleration_distance_m": 0.50,
                         # Small bootstrap ceiling only prevents drivetrain deadlock;
                         # the profile itself starts from literal zero. Lowered
                         # from 0.15 -- field bags show this jump (0->0.15 m/s
