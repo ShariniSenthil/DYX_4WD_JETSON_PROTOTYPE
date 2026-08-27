@@ -46,14 +46,6 @@ from rpp_controller.speed_regulator import (
     LongitudinalRegulatorConfig,
     SpeedRegulatorInput,
 )
-from rpp_controller.legacy_alignment import (
-    LegacyAlignmentConfig,
-    LegacyAlignmentDirective,
-    LegacyAlignmentInput,
-    LegacyAlignmentLifecycle,
-    LegacyAlignmentPhase,
-    compute_low_energy_realign_command,
-)
 from rpp_controller.motion_state_machine import (
     MotionDirective,
     MotionState,
@@ -579,16 +571,6 @@ class RPPController(Node):
         self.declare_parameter("precision_pivot_recapture_heading_deg", 2.0)
         self.declare_parameter("precision_pivot_recapture_settle_sec", 0.20)
         self.declare_parameter("precision_pivot_recenter_forward_cone_deg", 30.0)
-        # Extra literal-zero hold after the measured native-pivot stop
-        # certificate.  Independent of the default-off precision pivot FSM.
-        self.declare_parameter("legacy_pivot_post_settle_hold_sec", 1.00)
-        self.declare_parameter("legacy_pivot_realign_grace_sec", 0.30)
-        self.declare_parameter("legacy_pivot_realign_split_heading_deg", 15.0)
-        self.declare_parameter("legacy_pivot_realign_near_speed_mps", 0.20)
-        self.declare_parameter("legacy_pivot_realign_far_speed_mps", 0.12)
-        self.declare_parameter("legacy_pivot_realign_bearing_cone_deg", 30.0)
-        self.declare_parameter("legacy_pivot_realign_max_translation_m", 0.30)
-        self.declare_parameter("legacy_pivot_realign_timeout_sec", 9.0)
 
         self.local_frame = str(self.get_parameter("local_frame").value).strip()
         self.cruise_speed = float(self.get_parameter("cruise_speed_mps").value)
@@ -1242,30 +1224,6 @@ class RPPController(Node):
         self.precision_pivot_recenter_forward_cone = math.radians(
             float(self.get_parameter("precision_pivot_recenter_forward_cone_deg").value)
         )
-        self.legacy_pivot_post_settle_hold_sec = float(
-            self.get_parameter("legacy_pivot_post_settle_hold_sec").value
-        )
-        self.legacy_pivot_realign_grace_sec = float(
-            self.get_parameter("legacy_pivot_realign_grace_sec").value
-        )
-        self.legacy_pivot_realign_split_heading = math.radians(
-            float(self.get_parameter("legacy_pivot_realign_split_heading_deg").value)
-        )
-        self.legacy_pivot_realign_near_speed = float(
-            self.get_parameter("legacy_pivot_realign_near_speed_mps").value
-        )
-        self.legacy_pivot_realign_far_speed = float(
-            self.get_parameter("legacy_pivot_realign_far_speed_mps").value
-        )
-        self.legacy_pivot_realign_bearing_cone = math.radians(
-            float(self.get_parameter("legacy_pivot_realign_bearing_cone_deg").value)
-        )
-        self.legacy_pivot_realign_max_translation = float(
-            self.get_parameter("legacy_pivot_realign_max_translation_m").value
-        )
-        self.legacy_pivot_realign_timeout_sec = float(
-            self.get_parameter("legacy_pivot_realign_timeout_sec").value
-        )
         self.precision_pivot_config = PivotMotionConfig(
             pivot_anchor_tolerance_m=float(
                 self.get_parameter("precision_pivot_anchor_tolerance_m").value
@@ -1315,47 +1273,11 @@ class RPPController(Node):
         self.precision_pivot_fsm = VerifiedPivotStateMachine(
             self.precision_pivot_config
         )
-        self.legacy_alignment = None
 
         # --------------------------------------------------------------
         # RPP ACCELERATION + MARKING-ONLY DECELERATION CONTRACT
         # --------------------------------------------------------------
         self.validate_parameters()
-        self.legacy_alignment = LegacyAlignmentLifecycle(
-            LegacyAlignmentConfig(
-                native_release_heading_rad=self.terminal_native_pivot_release_error,
-                tight_heading_rad=(
-                    self.precision_pivot_config.release_heading_tolerance_rad
-                ),
-                stop_speed_mps=self.precision_pivot_config.stop_speed_tolerance_mps,
-                stop_yaw_rate_radps=(
-                    self.precision_pivot_config.stop_yaw_rate_tolerance_radps
-                ),
-                settle_sec=self.precision_pivot_config.pivot_release_settle_sec,
-                post_settle_hold_sec=self.legacy_pivot_post_settle_hold_sec,
-                recapture_xtrack_m=self.precision_pivot_recapture_xtrack,
-                recapture_heading_rad=self.precision_pivot_recapture_heading,
-                recapture_settle_sec=self.precision_pivot_recapture_settle_sec,
-                non_pivot_release_xtrack_m=self.xtrack_priority_exit,
-                non_pivot_release_heading_rad=(
-                    self.terminal_native_pivot_release_error
-                ),
-                non_pivot_hold_sec=self.alignment_hold_sec,
-                fast_capture_max_cross_track_m=(
-                    self.segment_fast_capture_max_cross_track
-                ),
-                pivot_enter_rad=self.pivot_enter_angle,
-                pivot_keeper_timeout_sec=self.segment_pivot_keeper_timeout_sec,
-                pre_pivot_timeout_sec=self.precision_pivot_config.brake_timeout_sec,
-                realign_grace_sec=self.legacy_pivot_realign_grace_sec,
-                realign_split_heading_rad=self.legacy_pivot_realign_split_heading,
-                realign_near_speed_mps=self.legacy_pivot_realign_near_speed,
-                realign_far_speed_mps=self.legacy_pivot_realign_far_speed,
-                realign_bearing_cone_rad=self.legacy_pivot_realign_bearing_cone,
-                realign_max_translation_m=self.legacy_pivot_realign_max_translation,
-                realign_timeout_sec=self.legacy_pivot_realign_timeout_sec,
-            )
-        )
         self.get_logger().warn(
             "RPP ACCELERATION + MARKING DECELERATION ENABLED | "
             f"accel={self.acceleration_rate:.4f}m/s^2 over "
@@ -1714,7 +1636,6 @@ class RPPController(Node):
         self.segment_alignment_active = True
         self.segment_alignment_pivot_complete = False
         self.segment_pivot_keeper_started_at = None
-        self._reset_legacy_alignment_lifecycle("INITIALIZE")
         self.alignment_forward_heading_recovery_active = False
         self.alignment_deadband_recovery_active = False
         self.alignment_inside_since = None
@@ -1916,15 +1837,6 @@ class RPPController(Node):
             "translation targets the fixed 1.00m/s mission speed after alignment"
         )
         self.get_logger().warn(
-            "Legacy native-pivot lifecycle: >4deg requests PRE-stop then native "
-            "carrier; 4deg release holds zero until measured stop "
-            "(2deg, 0.01m/s, 0.05rad/s) for "
-            f"{self.precision_pivot_config.pivot_release_settle_sec:.2f}s plus "
-            f"{self.legacy_pivot_post_settle_hold_sec:.2f}s; "
-            f"post-pivot recapture<={self.post_pivot_capture_speed:.2f}m/s; "
-            "precision_pivot_enabled remains off"
-        )
-        self.get_logger().warn(
             "Close terminal movement: constant "
             f"{self.cruise_speed:.3f}m/s; no reduced-speed state"
         )
@@ -1946,10 +1858,6 @@ class RPPController(Node):
             "Alignment state priority: cross-track recovery outside "
             f"{self.segment_alignment_cross_track_tolerance:.3f}m, "
             "then forward-heading correction"
-        )
-        self.get_logger().warn(
-            "Alignment cross-track monitor: warn when abs(xtrack) >= "
-            f"{self.segment_alignment_max_cross_track:.3f}m; recovery continues"
         )
         self.get_logger().warn(
             "Forward-heading correction: active inside the line corridor "
@@ -2146,60 +2054,6 @@ class RPPController(Node):
         ):
             raise ValueError(
                 "post_pivot_capture_speed_mps must be between minimum and cruise speed"
-            )
-        if not (
-            math.isfinite(self.legacy_pivot_post_settle_hold_sec)
-            and self.legacy_pivot_post_settle_hold_sec > 0.0
-        ):
-            raise ValueError(
-                "legacy_pivot_post_settle_hold_sec must be finite and > 0"
-            )
-        if not (
-            math.isfinite(self.legacy_pivot_realign_grace_sec)
-            and self.legacy_pivot_realign_grace_sec > 0.0
-        ):
-            raise ValueError("legacy_pivot_realign_grace_sec must be finite and > 0")
-        if not (
-            math.radians(2.0)
-            < self.legacy_pivot_realign_split_heading
-            < math.radians(45.0)
-        ):
-            raise ValueError(
-                "legacy_pivot_realign_split_heading_deg must satisfy 2 < split < 45"
-            )
-        if not (
-            math.isfinite(self.legacy_pivot_realign_far_speed)
-            and math.isfinite(self.legacy_pivot_realign_near_speed)
-            and self.minimum_speed
-            <= self.legacy_pivot_realign_far_speed
-            <= self.legacy_pivot_realign_near_speed
-            <= self.cruise_speed
-        ):
-            raise ValueError(
-                "legacy_pivot_realign speeds must satisfy "
-                "minimum_speed <= far <= near <= cruise"
-            )
-        if not (
-            0.0
-            < self.legacy_pivot_realign_bearing_cone
-            < math.radians(45.0)
-        ):
-            raise ValueError(
-                "legacy_pivot_realign_bearing_cone_deg must be in (0, 45)"
-            )
-        if not (
-            math.isfinite(self.legacy_pivot_realign_max_translation)
-            and self.legacy_pivot_realign_max_translation > 0.0
-        ):
-            raise ValueError(
-                "legacy_pivot_realign_max_translation_m must be finite and > 0"
-            )
-        if not (
-            math.isfinite(self.legacy_pivot_realign_timeout_sec)
-            and self.legacy_pivot_realign_timeout_sec > 0.0
-        ):
-            raise ValueError(
-                "legacy_pivot_realign_timeout_sec must be finite and > 0"
             )
         if not (
             math.isfinite(self.precision_pivot_recapture_xtrack)
@@ -2489,28 +2343,6 @@ class RPPController(Node):
                 self.terminal_native_pivot_request_error
             ),
             "segment_pivot_keeper_timeout_sec": (self.segment_pivot_keeper_timeout_sec),
-            "legacy_pivot_post_settle_hold_sec": (
-                self.legacy_pivot_post_settle_hold_sec
-            ),
-            "legacy_pivot_realign_grace_sec": self.legacy_pivot_realign_grace_sec,
-            "legacy_pivot_realign_split_heading_deg": (
-                self.legacy_pivot_realign_split_heading
-            ),
-            "legacy_pivot_realign_near_speed_mps": (
-                self.legacy_pivot_realign_near_speed
-            ),
-            "legacy_pivot_realign_far_speed_mps": (
-                self.legacy_pivot_realign_far_speed
-            ),
-            "legacy_pivot_realign_bearing_cone_deg": (
-                self.legacy_pivot_realign_bearing_cone
-            ),
-            "legacy_pivot_realign_max_translation_m": (
-                self.legacy_pivot_realign_max_translation
-            ),
-            "legacy_pivot_realign_timeout_sec": (
-                self.legacy_pivot_realign_timeout_sec
-            ),
             "segment_fast_capture_max_cross_track_m": (
                 self.segment_fast_capture_max_cross_track
             ),
@@ -3123,7 +2955,6 @@ class RPPController(Node):
         )
         self._reset_precision_pivot("GEOMETRY_INVALIDATED", clear_anchor=True)
         self._reset_precision_terminal("GEOMETRY_INVALIDATED")
-        self._reset_legacy_alignment_lifecycle("GEOMETRY_INVALIDATED")
         self._record_geometry_reset(reason)
         self.get_logger().warn(
             f"PRECISION GEOMETRY AUTHORITY INVALIDATED | reason={reason}"
@@ -3306,7 +3137,6 @@ class RPPController(Node):
         )
         self._reset_precision_pivot("PATH_INSTALLED", clear_anchor=True)
         self._reset_precision_terminal("PATH_INSTALLED")
-        self._reset_legacy_alignment_lifecycle("PATH_INSTALLED")
         self._try_bind_geometry_goal(log_error=False)
         self.get_logger().warn(
             "PRECISION PATH GEOMETRY INSTALLED | "
@@ -3425,7 +3255,6 @@ class RPPController(Node):
                 clear_anchor=True,
             )
             self._reset_precision_terminal("LOCALIZATION_JUMP")
-            self._reset_legacy_alignment_lifecycle("LOCALIZATION_JUMP")
             self.get_logger().warn(
                 "PRECISION GEOMETRY PROGRESS RESET | reason=LOCALIZATION_JUMP"
             )
@@ -4212,7 +4041,8 @@ class RPPController(Node):
         # Every semantic segment (marking OR extension/dummy) must complete
         # heading/cross-track alignment before translational drive is released.
         self.segment_alignment_active = True
-        self._reset_legacy_alignment_lifecycle("SEGMENT_GOAL_CHANGED")
+        self.segment_alignment_pivot_complete = False
+        self.segment_pivot_keeper_started_at = None
         self.alignment_forward_heading_recovery_active = False
         self.alignment_deadband_recovery_active = False
         self.alignment_inside_since = None
@@ -4315,8 +4145,6 @@ class RPPController(Node):
             )
             self._reset_precision_pivot("MISSION_ENABLED", clear_anchor=True)
             self._reset_precision_terminal("MISSION_ENABLED")
-            self.segment_alignment_active = True
-            self._reset_legacy_alignment_lifecycle("MISSION_ENABLED")
             self.terminal_gate_inside_since = None
             self.terminal_gate_ready = False
             if not self.first_marking_completed:
@@ -4361,7 +4189,6 @@ class RPPController(Node):
         self.emergency_stop = active
         if active:
             self._reset_precision_pivot("EMERGENCY_STOP", clear_anchor=True)
-            self._reset_legacy_alignment_lifecycle("EMERGENCY_STOP")
             if not previous:
                 self._reset_precision_terminal("EMERGENCY_STOP")
             self.publish_stop()
@@ -4383,7 +4210,6 @@ class RPPController(Node):
         if active:
             self.reset_terminal_native_pivot()
             self._reset_precision_pivot("MARKING_HOLD", clear_anchor=True)
-            self._reset_legacy_alignment_lifecycle("MARKING_HOLD")
 
         self.marking_active = active
 
@@ -4411,7 +4237,6 @@ class RPPController(Node):
             self._reset_precision_regulator("POINT_COMPLETED", progress_s=0.0)
             self._reset_precision_pivot("POINT_COMPLETED", clear_anchor=True)
             self._reset_precision_terminal("POINT_COMPLETED")
-            self._reset_legacy_alignment_lifecycle("POINT_COMPLETED")
             self.get_logger().warn(
                 "MARKING COMPLETED / NEXT-LEG ACCELERATION ARMED | "
                 f"point_index={point_index} | "
@@ -4432,27 +4257,11 @@ class RPPController(Node):
                 f"P1 RESOLVED ({event}) / " "P1->P2 INTERPOLATED GUIDANCE RELEASED"
             )
 
-    def _reset_legacy_alignment_lifecycle(self, reason):
-        """Reset the inner native-pivot lifecycle. Outer alignment is caller-owned."""
-        if getattr(self, "legacy_alignment", None) is not None:
-            self.legacy_alignment.reset(reason)
-        self.segment_alignment_pivot_complete = False
-        self.segment_pivot_keeper_started_at = None
-        self.alignment_inside_since = None
-        self.reset_terminal_native_pivot()
-
-    def _sync_legacy_alignment_shadow(self):
-        if getattr(self, "legacy_alignment", None) is None:
-            self.segment_alignment_pivot_complete = False
-            return
-        self.segment_alignment_pivot_complete = bool(
-            self.legacy_alignment.pivot_complete
-        )
-
     def reset_motion_state(self):
         self.post_extension_stationary_hold = False
         self.segment_alignment_active = True
-        self._reset_legacy_alignment_lifecycle("MOTION_STATE_RESET")
+        self.segment_alignment_pivot_complete = False
+        self.segment_pivot_keeper_started_at = None
         self.alignment_forward_heading_recovery_active = False
         self.alignment_deadband_recovery_active = False
         self.alignment_inside_since = None
@@ -4870,394 +4679,6 @@ class RPPController(Node):
         self.publish_stop()
         return True
 
-    def _legacy_alignment_telemetry_fresh(self):
-        return (
-            self.is_fresh(
-                self.last_odom_time,
-                self.precision_pivot_telemetry_timeout_sec,
-            )
-            and math.isfinite(self.current_yaw_rate_radps)
-            and math.isfinite(self.current_speed_mps)
-        )
-
-    def _publish_legacy_native_carrier(
-        self,
-        request_bearing,
-        true_error,
-        alignment_cross_track,
-        mode_prefix,
-        target_distance,
-        goal_distance,
-        status_prefix,
-    ):
-        speed = self.segment_alignment_speed
-        north = speed * math.sin(request_bearing)
-        east = speed * math.cos(request_bearing)
-        north, east, speed = self.publish_velocity_ned(
-            north,
-            east,
-            apply_acceleration=False,
-            apply_deceleration=False,
-        )
-        carrier_error = self.normalize_angle(request_bearing - self.current_yaw)
-        self.log_control(
-            mode_prefix
-            + status_prefix
-            + f" {self.segment_alignment_speed:.2f}MPS VECTOR"
-            + f" | carrier_error={math.degrees(carrier_error):+.1f}deg"
-            + f" | true_error={math.degrees(true_error):+.1f}deg"
-            + f" | xtrack="
-            + f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
-            + f" | phase={self.legacy_alignment.phase.value}",
-            target_distance,
-            goal_distance,
-            true_error,
-            speed,
-            north,
-            east,
-        )
-        return north, east, speed
-
-    def _publish_legacy_low_energy_realign(self, path_heading_error):
-        bearing_cmd, speed, north, east = compute_low_energy_realign_command(
-            path_heading_error,
-            self.current_yaw,
-            split_heading_rad=self.legacy_pivot_realign_split_heading,
-            near_speed_mps=self.legacy_pivot_realign_near_speed,
-            far_speed_mps=self.legacy_pivot_realign_far_speed,
-            bearing_cone_rad=self.legacy_pivot_realign_bearing_cone,
-        )
-        command_error = abs(
-            self.normalize_angle(bearing_cmd - self.current_yaw)
-        )
-        if command_error > self.legacy_pivot_realign_bearing_cone + 1.0e-9:
-            self.publish_stop()
-            self.get_logger().error(
-                "LOW-ENERGY REALIGN CONE VIOLATION / LOCAL HOLD | "
-                f"command_error={math.degrees(command_error):+.1f}deg"
-            )
-            return 0.0, 0.0, 0.0
-        return self.publish_velocity_ned(
-            north,
-            east,
-            apply_acceleration=False,
-            apply_deceleration=False,
-            hard_speed_cap_mps=speed,
-        )
-
-    def _run_legacy_segment_alignment(
-        self,
-        *,
-        path_bearing,
-        path_heading_error,
-        alignment_guidance_bearing,
-        alignment_cross_track,
-        target_x,
-        target_y,
-        goal_x,
-        goal_y,
-        first_approach,
-        precision_guidance,
-        mode_prefix,
-        target_distance,
-        goal_distance,
-    ):
-        """Map the legacy lifecycle directive and return True if the cycle is consumed."""
-        native_active = False
-        pivot_request_bearing = path_bearing
-        true_error = path_heading_error
-        telemetry_fresh = self._legacy_alignment_telemetry_fresh()
-        if self.legacy_alignment.needs_native_command and telemetry_fresh:
-            (
-                native_active,
-                pivot_request_bearing,
-                true_error,
-            ) = self.terminal_native_pivot_command(
-                path_bearing,
-                "SEGMENT-ENTRY-PIVOT-KEEPER",
-            )
-
-        previous_phase = self.legacy_alignment.phase
-        result = self.legacy_alignment.step(
-            LegacyAlignmentInput(
-                now_sec=self._precision_now_sec(),
-                telemetry_fresh=telemetry_fresh,
-                measured_speed_mps=self.current_speed_mps,
-                measured_yaw_rate_radps=self.current_yaw_rate_radps,
-                path_heading_error_rad=path_heading_error,
-                alignment_cross_track_m=alignment_cross_track,
-                native_pivot_active=bool(native_active),
-                first_approach=bool(first_approach),
-                already_reanchored=bool(self.c_line_reanchored_after_pivot),
-                current_x=self.current_x,
-                current_y=self.current_y,
-            )
-        )
-        self._sync_legacy_alignment_shadow()
-        if result.reset_native_carrier:
-            self.reset_terminal_native_pivot()
-        if result.phase is not previous_phase:
-            self.get_logger().warn(
-                "LEGACY ALIGNMENT "
-                f"{previous_phase.value}->{result.phase.value} | "
-                f"reason={result.transition_reason} | "
-                f"heading={math.degrees(path_heading_error):+.1f}deg | "
-                f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
-            )
-
-        if result.directive is LegacyAlignmentDirective.SAFETY_HOLD:
-            self.publish_stop()
-            self.get_logger().error(
-                "LEGACY ALIGNMENT LOCAL SAFETY HOLD | "
-                f"phase={result.phase.value} | "
-                f"reason={result.transition_reason} | "
-                f"heading={math.degrees(path_heading_error):+.1f}deg | "
-                f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
-            )
-            return True
-
-        if result.directive is LegacyAlignmentDirective.NATIVE_CARRIER:
-            if result.warn_native_timeout:
-                self.get_logger().warn(
-                    "PX4 PIVOT KEEPER TIMEOUT EXCEEDED / CONTINUING PIVOT | "
-                    f"true_error={math.degrees(true_error):+.1f}deg | "
-                    f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
-                )
-            if native_active:
-                try:
-                    self._publish_legacy_native_carrier(
-                        pivot_request_bearing,
-                        true_error,
-                        alignment_cross_track,
-                        mode_prefix,
-                        target_distance,
-                        goal_distance,
-                        "PX4 PIVOT KEEPER / NATIVE TURN HELD",
-                    )
-                except Exception as error:
-                    self.publish_stop()
-                    self.get_logger().error(
-                        f"NATIVE CARRIER PUBLISH FAILED / NO ACK | {error}"
-                    )
-                    return True
-                self.legacy_alignment.ack_native_carrier_published()
-            else:
-                self.publish_stop()
-            return True
-
-        if result.directive is LegacyAlignmentDirective.HOLD_ZERO:
-            if (
-                result.phase is LegacyAlignmentPhase.POST_PIVOT_RECAPTURE
-                and previous_phase is LegacyAlignmentPhase.PIVOT_SETTLE
-            ):
-                self._reset_precision_regulator("PIVOT_COMPLETE_RECAPTURE_ARMED")
-            self.publish_stop()
-            return True
-
-        if result.directive is LegacyAlignmentDirective.LOW_ENERGY_REALIGN:
-            self._publish_legacy_low_energy_realign(path_heading_error)
-            return True
-
-        if result.directive is LegacyAlignmentDirective.REANCHOR_ZERO:
-            success = False
-            if first_approach:
-                success = bool(self.reanchor_c_to_p1_after_pivot())
-            if success:
-                self.legacy_alignment.ack_reanchor_completed()
-                self.reset_terminal_native_pivot()
-                self._reset_precision_regulator("PIVOT_COMPLETE_RECAPTURE_ARMED")
-                self.publish_stop()
-                return True
-            self.legacy_alignment.enter_safety_hold("REANCHOR_FAILED")
-            self.publish_stop()
-            self.get_logger().error(
-                "C-PRIME REANCHOR FAILED / LOCAL SAFETY HOLD | "
-                f"heading={math.degrees(path_heading_error):+.1f}deg | "
-                f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
-            )
-            return True
-
-        if result.directive is LegacyAlignmentDirective.RECAPTURE:
-            if first_approach and self.c_line_bearing is not None:
-                path_bearing = self.c_line_bearing
-                path_heading_error = self.normalize_angle(
-                    path_bearing - self.current_yaw
-                )
-                (
-                    alignment_guidance_bearing,
-                    alignment_cross_track,
-                ) = self.line_guidance(
-                    path_bearing,
-                    goal_x,
-                    goal_y,
-                    self.segment_alignment_correction_limit,
-                )
-            if self.precision_guidance_enabled and not first_approach:
-                alignment_guidance_bearing = (
-                    precision_guidance.limited_command_bearing_rad
-                )
-            command_bearing, command_heading_error = (
-                self.limit_moving_guidance_bearing(alignment_guidance_bearing)
-            )
-            speed = self.post_pivot_capture_speed
-            north = speed * math.sin(command_bearing)
-            east = speed * math.cos(command_bearing)
-            north, east, speed = self.publish_velocity_ned(
-                north,
-                east,
-                apply_acceleration=False,
-                apply_deceleration=False,
-                hard_speed_cap_mps=speed,
-            )
-            self.log_control(
-                mode_prefix
-                + "POST-PIVOT RECAPTURE "
-                + f"{self.post_pivot_capture_speed:.2f}MPS"
-                + f" | heading={math.degrees(path_heading_error):+.1f}deg"
-                + f" | xtrack="
-                + f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
-                + f" | command_error="
-                + f"{math.degrees(command_heading_error):+.1f}deg",
-                target_distance,
-                goal_distance,
-                command_heading_error,
-                speed,
-                north,
-                east,
-            )
-            return True
-
-        if result.directive is LegacyAlignmentDirective.COMPLETE_ZERO:
-            self.segment_alignment_active = False
-            self._reset_legacy_alignment_lifecycle("POST_PIVOT_RECAPTURE_COMPLETE")
-            self.reset_speed_profiles()
-            self.command_slew_speed = 0.0
-            self.command_slew_last_time = None
-            self.xtrack_priority_active = False
-            self.xtrack_priority_inside_since = None
-            self.reset_xtrack_damping_state()
-            self._reset_precision_regulator("POST_PIVOT_RECAPTURE_COMPLETE")
-            self._reset_precision_tracking(
-                "POST_PIVOT_RECAPTURE_COMPLETE",
-                reset_metrics=False,
-                path_identity=self.geometry_installed_signature,
-            )
-            self.publish_stop()
-            self.get_logger().warn(
-                "POST-PIVOT RECAPTURE RELEASED / LITERAL ZERO | "
-                f"heading={math.degrees(path_heading_error):+.1f}deg | "
-                f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
-            )
-            return True
-
-        if result.directive is LegacyAlignmentDirective.FALLBACK_GLOBAL_XTRACK:
-            self.segment_alignment_active = False
-            self._reset_legacy_alignment_lifecycle("NON_PIVOT_CAPTURE_FALLBACK")
-            self.xtrack_priority_active = True
-            self.xtrack_priority_inside_since = None
-            self.reset_xtrack_damping_state()
-            self._reset_precision_regulator("PIVOT_RECAPTURE_FALLBACK")
-            self.get_logger().error(
-                "FAST CAPTURE XTRACK GUARD / FALLBACK TO 1.00MPS | "
-                f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm | "
-                f"guard="
-                f"{self.segment_fast_capture_max_cross_track * 1000.0:.1f}mm"
-            )
-            return False
-
-        if result.directive is LegacyAlignmentDirective.COMPLETE_FALLTHROUGH:
-            self.segment_alignment_active = False
-            self._reset_legacy_alignment_lifecycle("NON_PIVOT_CAPTURE_COMPLETE")
-            self.xtrack_priority_active = False
-            self.xtrack_priority_inside_since = None
-            self.reset_xtrack_damping_state()
-            self._reset_precision_regulator("PIVOT_RECAPTURE_COMPLETE")
-            self.get_logger().warn(
-                "ALIGNED-START LINE CAPTURE RELEASED | "
-                f"heading={math.degrees(path_heading_error):+.1f}deg | "
-                f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm | "
-                f"speed={self.segment_alignment_recovery_speed:.3f}m/s"
-            )
-            return False
-
-        # NON_PIVOT_CAPTURE preserves the previous aligned-start Phase B path,
-        # including immediate C->P1 reanchor when no native carrier latched.
-        if (
-            result.phase is LegacyAlignmentPhase.NON_PIVOT_CAPTURE
-            and previous_phase is LegacyAlignmentPhase.ENTRY
-            and first_approach
-        ):
-            self.reanchor_c_to_p1_after_pivot()
-            if self.c_line_bearing is not None:
-                path_bearing = self.c_line_bearing
-                path_heading_error = self.normalize_angle(
-                    path_bearing - self.current_yaw
-                )
-                (
-                    alignment_guidance_bearing,
-                    alignment_cross_track,
-                ) = self.line_guidance(
-                    path_bearing,
-                    goal_x,
-                    goal_y,
-                    self.segment_alignment_correction_limit,
-                )
-            self.reset_xtrack_damping_state()
-            self.xtrack_priority_active = False
-            self.xtrack_priority_inside_since = None
-            self._reset_precision_regulator("ALIGNED_START_CAPTURE_ARMED")
-
-        if self.precision_guidance_enabled and not first_approach:
-            alignment_guidance_bearing = (
-                precision_guidance.limited_command_bearing_rad
-            )
-        command_bearing, command_heading_error = (
-            self.limit_moving_guidance_bearing(alignment_guidance_bearing)
-        )
-        speed = self.segment_alignment_recovery_speed
-        if self.precision_speed_control_enabled:
-            speed_result = self._resolve_precision_speed_for_cycle()
-            if speed_result is None:
-                self.publish_stop()
-                self.get_logger().error(
-                    "PRECISION SPEED REJECTED / POST-PIVOT SAFE HOLD"
-                )
-                return True
-            north, east, speed = self.publish_precision_velocity_ned(
-                command_bearing,
-                speed_result,
-            )
-        else:
-            north = speed * math.sin(command_bearing)
-            east = speed * math.cos(command_bearing)
-            north, east, speed = self.publish_velocity_ned(
-                north,
-                east,
-                apply_acceleration=True,
-                apply_deceleration=False,
-            )
-            self._record_published_translational_speed(speed)
-        self.log_control(
-            mode_prefix
-            + "ALIGNED-START LINE CAPTURE "
-            + f"{self.segment_alignment_recovery_speed:.2f}MPS"
-            + f" | release_heading<="
-            + f"{math.degrees(self.terminal_native_pivot_release_error):.1f}deg"
-            + f" | release_xtrack<="
-            + f"{self.xtrack_priority_exit * 1000.0:.1f}mm"
-            + f" | xtrack="
-            + f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
-            + f" | command_error="
-            + f"{math.degrees(command_heading_error):+.1f}deg",
-            target_distance,
-            goal_distance,
-            command_heading_error,
-            speed,
-            north,
-            east,
-        )
-        return True
-
     def reset_terminal_native_pivot(self):
         self.terminal_native_pivot_active = False
         self.terminal_native_pivot_true_bearing = None
@@ -5301,9 +4722,7 @@ class RPPController(Node):
             true_bearing = self.terminal_native_pivot_true_bearing
             true_error = self.normalize_angle(true_bearing - self.current_yaw)
         else:
-            # Enter stationary/native pivot only when heading error is >=45 deg.
-            # Once pivot is active, the existing <=4 deg release remains unchanged.
-            if abs(true_error) < self.terminal_native_pivot_enter_error:
+            if abs(true_error) <= self.terminal_native_pivot_release_error:
                 return False, true_bearing, true_error
 
             self.terminal_native_pivot_active = True
@@ -5367,7 +4786,9 @@ class RPPController(Node):
         self.c_line_locked = True
         self.c_line_reanchored_after_pivot = False
         self.segment_alignment_active = True
-        self._reset_legacy_alignment_lifecycle("C_LINE_LOCKED")
+        self.segment_alignment_pivot_complete = False
+        self.segment_pivot_keeper_started_at = None
+        self.alignment_inside_since = None
 
         self.get_logger().warn(
             "C->P1 FIXED LINE LOCKED | "
@@ -7908,10 +7329,6 @@ class RPPController(Node):
             self.odom_timeout_sec,
         ):
             self.publish_stop()
-            if self.segment_alignment_active and getattr(
-                self, "legacy_alignment", None
-            ) is not None:
-                self.legacy_alignment.reset_dwell_timers()
             if self.precision_terminal_enabled:
                 stale_result = self._step_precision_terminal_stale_cycle()
                 self._publish_precision_terminal_result_if_ready(stale_result)
@@ -8245,7 +7662,6 @@ class RPPController(Node):
                     self.closest_marking_distance = goal_distance
                 self.marking_missed = True
                 self.reset_terminal_native_pivot()
-                self._reset_legacy_alignment_lifecycle("TERMINAL_MISS")
                 self.publish_stop()
                 self.publish_terminal_result(
                     "MISSED",
@@ -8265,14 +7681,29 @@ class RPPController(Node):
                 return
 
         # --------------------------------------------------------------
-        # LEGACY NATIVE-PIVOT LIFECYCLE
+        # PX4 PIVOT KEEPER + LATCHED POST-PIVOT LINE CAPTURE
         #
-        # Native ±60deg carrier is unchanged.  A genuine latch no longer
-        # falls through into 1.00 m/s capture at the 4deg heading gate.
-        # After native release the chassis must prove a measured stop,
-        # hold literal zero for legacy_pivot_post_settle_hold_sec, then
-        # recapture at post_pivot_capture_speed_mps.  Aligned starts that
-        # never latch a carrier keep the previous non-pivot capture path.
+        # Field failure fixed here:
+        # the previous code sent the TRUE segment vector throughout the
+        # 45->12deg PX4 turn-to-drive band. PX4 therefore started translating
+        # before the chassis was aligned and xtrack grew to hundreds of mm.
+        #
+        # Phase A — PIVOT KEEPER
+        #   While real path heading error is >4deg, command a dynamic 60deg
+        #   carrier vector on the required turn side. PX4 therefore remains in
+        #   its native differential pivot state instead of entering drive mode.
+        #
+        # Phase B — FAST LINE CAPTURE
+        #   Once real heading is <=4deg, latch pivot complete and never fall
+        #   back into the 12deg moving transition. Follow bounded line guidance
+        #   at 1.00m/s until xtrack <=8mm and heading <=4deg for 0.20s.
+        #
+        # Guard:
+        #   If post-pivot xtrack is already >50mm, leave the short capture phase
+        #   and hand control to the global xtrack controller, still at 1.00m/s.
+        #
+        # Final 500 mm semantic-goal distance deceleration to 0.15 m/s and
+        # exact 30 mm radial zero are handled by the active speed profile.
         # --------------------------------------------------------------
         if (
             not self.segment_alignment_active
@@ -8280,7 +7711,10 @@ class RPPController(Node):
             and abs(path_heading_error) >= self.pivot_enter_angle
         ):
             self.segment_alignment_active = True
-            self._reset_legacy_alignment_lifecycle("MID_LEG_ALIGNMENT_REENTRY")
+            self.segment_alignment_pivot_complete = False
+            self.segment_pivot_keeper_started_at = None
+            self.alignment_inside_since = None
+            self.reset_terminal_native_pivot()
             if self.precision_pivot_enabled:
                 self._reset_precision_pivot(
                     "MID_LEG_ALIGNMENT_REENTRY",
@@ -8335,22 +7769,244 @@ class RPPController(Node):
                 )
                 return
 
-            if self._run_legacy_segment_alignment(
-                path_bearing=path_bearing,
-                path_heading_error=path_heading_error,
-                alignment_guidance_bearing=alignment_guidance_bearing,
-                alignment_cross_track=alignment_cross_track,
-                target_x=target_x,
-                target_y=target_y,
-                goal_x=goal_x,
-                goal_y=goal_y,
-                first_approach=first_approach,
-                precision_guidance=precision_guidance,
-                mode_prefix=mode_prefix,
-                target_distance=target_distance,
-                goal_distance=goal_distance,
+            # ----------------------------------------------------------
+            # Phase A: strict native differential pivot keeper.
+            # ----------------------------------------------------------
+            if not self.segment_alignment_pivot_complete:
+                (
+                    pivot_active,
+                    pivot_request_bearing,
+                    true_error,
+                ) = self.terminal_native_pivot_command(
+                    path_bearing,
+                    "SEGMENT-ENTRY-PIVOT-KEEPER",
+                )
+
+                if pivot_active:
+                    now = self.get_clock().now()
+                    if self.segment_pivot_keeper_started_at is None:
+                        self.segment_pivot_keeper_started_at = now
+
+                    pivot_elapsed = (
+                        now - self.segment_pivot_keeper_started_at
+                    ).nanoseconds / 1e9
+
+                    if pivot_elapsed > self.segment_pivot_keeper_timeout_sec:
+                        self.get_logger().warn(
+                            "PX4 PIVOT KEEPER TIMEOUT EXCEEDED / CONTINUING PIVOT | "
+                            f"elapsed={pivot_elapsed:.2f}s | "
+                            f"true_error={math.degrees(true_error):+.1f}deg | "
+                            f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
+                        )
+
+                    speed = self.segment_alignment_speed
+                    north = speed * math.sin(pivot_request_bearing)
+                    east = speed * math.cos(pivot_request_bearing)
+                    north, east, speed = self.publish_velocity_ned(
+                        north,
+                        east,
+                        apply_acceleration=False,
+                        apply_deceleration=False,
+                    )
+
+                    carrier_error = self.normalize_angle(
+                        pivot_request_bearing - self.current_yaw
+                    )
+                    self.log_control(
+                        mode_prefix
+                        + "PX4 PIVOT KEEPER / NATIVE TURN HELD "
+                        + f"{self.segment_alignment_speed:.2f}MPS VECTOR"
+                        + f" | carrier_error="
+                        + f"{math.degrees(carrier_error):+.1f}deg"
+                        + f" | true_error="
+                        + f"{math.degrees(true_error):+.1f}deg"
+                        + f" | xtrack="
+                        + f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
+                        + f" | elapsed={pivot_elapsed:.2f}s",
+                        target_distance,
+                        goal_distance,
+                        true_error,
+                        speed,
+                        north,
+                        east,
+                    )
+                    return
+
+                # REAL line is now aligned to <=4deg. Latch this phase
+                # complete so a later 12deg transient cannot put the rover
+                # back into the old turn-to-drive moving transition.
+                self.segment_alignment_pivot_complete = True
+                self.segment_pivot_keeper_started_at = None
+                self.alignment_inside_since = None
+                self.reset_terminal_native_pivot()
+                self._reset_precision_regulator("PIVOT_COMPLETE_RECAPTURE_ARMED")
+
+                if first_approach:
+                    self.reanchor_c_to_p1_after_pivot()
+                    path_bearing = self.c_line_bearing
+                    path_heading_error = self.normalize_angle(
+                        path_bearing - self.current_yaw
+                    )
+                    (
+                        alignment_guidance_bearing,
+                        alignment_cross_track,
+                    ) = self.line_guidance(
+                        path_bearing,
+                        goal_x,
+                        goal_y,
+                        self.segment_alignment_correction_limit,
+                    )
+
+                self.reset_xtrack_damping_state()
+                self.xtrack_priority_active = False
+                self.xtrack_priority_inside_since = None
+
+                self.get_logger().warn(
+                    "PIVOT KEEPER PHASE COMPLETE / FAST CAPTURE ARMED | "
+                    f"heading={math.degrees(path_heading_error):+.1f}deg | "
+                    f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
+                )
+
+            # ----------------------------------------------------------
+            # Phase B: post-pivot line capture.
+            # Never re-enter the 12deg transition after pivot completion.
+            # ----------------------------------------------------------
+            if (
+                self.segment_alignment_pivot_complete
+                and abs(path_heading_error) >= self.pivot_enter_angle
             ):
+                # A genuine >=45deg heading loss is exceptional and warrants
+                # a new in-place pivot cycle.
+                self.segment_alignment_pivot_complete = False
+                self.segment_pivot_keeper_started_at = None
+                self.alignment_inside_since = None
+                self.reset_terminal_native_pivot()
+                self.get_logger().warn(
+                    "FAST CAPTURE LOST >=45DEG / PIVOT KEEPER RE-ARMED | "
+                    f"path_error={math.degrees(path_heading_error):+.1f}deg"
+                )
                 return
+
+            if abs(alignment_cross_track) > self.segment_fast_capture_max_cross_track:
+                # Hardened fallback: if post-pivot xtrack is already too
+                # large for the short capture phase, hand ownership to the
+                # global 1.00 m/s xtrack recovery controller instead.
+                self.segment_alignment_active = False
+                self.segment_alignment_pivot_complete = False
+                self.segment_pivot_keeper_started_at = None
+                self.alignment_inside_since = None
+                self.reset_terminal_native_pivot()
+                self.xtrack_priority_active = True
+                self.xtrack_priority_inside_since = None
+                self.reset_xtrack_damping_state()
+                self._reset_precision_regulator("PIVOT_RECAPTURE_FALLBACK")
+
+                self.get_logger().error(
+                    "FAST CAPTURE XTRACK GUARD / FALLBACK TO 1.00MPS | "
+                    f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm | "
+                    f"guard="
+                    f"{self.segment_fast_capture_max_cross_track * 1000.0:.1f}mm"
+                )
+                # Do not return. Continue into the hardened xtrack arbitration
+                # in this same controller cycle.
+            else:
+                release_heading_limit = self.terminal_native_pivot_release_error
+                release_xtrack_limit = self.xtrack_priority_exit
+
+                release_geometry_valid = (
+                    abs(path_heading_error) <= release_heading_limit
+                    and abs(alignment_cross_track) <= release_xtrack_limit
+                )
+
+                alignment_hold_elapsed = 0.0
+                if release_geometry_valid:
+                    if self.alignment_inside_since is None:
+                        self.alignment_inside_since = self.get_clock().now()
+
+                    alignment_hold_elapsed = (
+                        self.get_clock().now() - self.alignment_inside_since
+                    ).nanoseconds / 1e9
+
+                    if alignment_hold_elapsed >= self.alignment_hold_sec:
+                        self.segment_alignment_active = False
+                        self.segment_alignment_pivot_complete = False
+                        self.segment_pivot_keeper_started_at = None
+                        self.alignment_inside_since = None
+                        self.reset_terminal_native_pivot()
+                        self.xtrack_priority_active = False
+                        self.xtrack_priority_inside_since = None
+                        self.reset_xtrack_damping_state()
+                        self._reset_precision_regulator("PIVOT_RECAPTURE_COMPLETE")
+
+                        self.get_logger().warn(
+                            "FAST POST-PIVOT LINE CAPTURE RELEASED | "
+                            f"heading="
+                            f"{math.degrees(path_heading_error):+.1f}deg | "
+                            f"xtrack="
+                            f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm | "
+                            f"hold={alignment_hold_elapsed:.2f}s | "
+                            f"speed="
+                            f"{self.segment_alignment_recovery_speed:.3f}m/s"
+                        )
+                else:
+                    self.alignment_inside_since = None
+
+                if self.segment_alignment_active:
+                    if self.precision_guidance_enabled and not first_approach:
+                        alignment_guidance_bearing = (
+                            precision_guidance.limited_command_bearing_rad
+                        )
+                    (
+                        command_bearing,
+                        command_heading_error,
+                    ) = self.limit_moving_guidance_bearing(alignment_guidance_bearing)
+
+                    speed = self.segment_alignment_recovery_speed
+                    if self.precision_speed_control_enabled:
+                        speed_result = self._resolve_precision_speed_for_cycle()
+                        if speed_result is None:
+                            self.publish_stop()
+                            self.get_logger().error(
+                                "PRECISION SPEED REJECTED / POST-PIVOT SAFE HOLD"
+                            )
+                            return
+                        north, east, speed = self.publish_precision_velocity_ned(
+                            command_bearing,
+                            speed_result,
+                        )
+                    else:
+                        north = speed * math.sin(command_bearing)
+                        east = speed * math.cos(command_bearing)
+                        north, east, speed = self.publish_velocity_ned(
+                            north,
+                            east,
+                            apply_acceleration=True,
+                            apply_deceleration=False,
+                        )
+                        self._record_published_translational_speed(speed)
+
+                    self.log_control(
+                        mode_prefix
+                        + "FAST POST-PIVOT LINE CAPTURE "
+                        + f"{self.segment_alignment_recovery_speed:.2f}MPS"
+                        + f" | release_heading<="
+                        + f"{math.degrees(release_heading_limit):.1f}deg"
+                        + f" | release_xtrack<="
+                        + f"{release_xtrack_limit * 1000.0:.1f}mm"
+                        + f" | hold={alignment_hold_elapsed:.2f}/"
+                        + f"{self.alignment_hold_sec:.2f}s"
+                        + f" | xtrack="
+                        + f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
+                        + f" | command_error="
+                        + f"{math.degrees(command_heading_error):+.1f}deg",
+                        target_distance,
+                        goal_distance,
+                        command_heading_error,
+                        speed,
+                        north,
+                        east,
+                    )
+                    return
 
         gate2_active = (
             self.precision_guidance_enabled or self.precision_speed_control_enabled
@@ -8562,7 +8218,6 @@ class RPPController(Node):
                 if radial_increased and confirmed_overshoot:
                     self.marking_missed = True
                     self.reset_terminal_native_pivot()
-                    self._reset_legacy_alignment_lifecycle("TERMINAL_MISS")
                     self.publish_stop()
                     self.publish_terminal_result(
                         "MISSED",
@@ -8720,7 +8375,6 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node._reset_legacy_alignment_lifecycle("SHUTDOWN")
         node.publish_stop()
         node.destroy_node()
         if rclpy.ok():

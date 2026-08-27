@@ -5301,9 +5301,7 @@ class RPPController(Node):
             true_bearing = self.terminal_native_pivot_true_bearing
             true_error = self.normalize_angle(true_bearing - self.current_yaw)
         else:
-            # Enter stationary/native pivot only when heading error is >=45 deg.
-            # Once pivot is active, the existing <=4 deg release remains unchanged.
-            if abs(true_error) < self.terminal_native_pivot_enter_error:
+            if abs(true_error) <= self.terminal_native_pivot_release_error:
                 return False, true_bearing, true_error
 
             self.terminal_native_pivot_active = True
