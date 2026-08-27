@@ -283,8 +283,13 @@ def generate_launch_description() -> LaunchDescription:
                         "acceleration_enabled": True,
                         "acceleration_distance_m": 0.20,
                         # Small bootstrap ceiling only prevents drivetrain deadlock;
-                        # the profile itself starts from literal zero.
-                        "acceleration_startup_ceiling_mps": 0.15,
+                        # the profile itself starts from literal zero. Lowered
+                        # from 0.15 -- field bags show this jump (0->0.15 m/s
+                        # within ~0.1s) combined with residual heading/
+                        # lookahead correction produces a visible left/right
+                        # swing at launch. See P3 bag forensic analysis
+                        # (2026-08-27).
+                        "acceleration_startup_ceiling_mps": 0.08,
                         "acceleration_max_progress_jump_m": 0.10,
                         "acceleration_max_dt_sec": 0.10,
                         # 1.00 m/s over 0.20 m requires 2.50 m/s^2, so this
@@ -472,7 +477,17 @@ def generate_launch_description() -> LaunchDescription:
                         "precision_pivot_enabled": False,
                         "precision_pivot_anchor_tolerance_m": 0.030,
                         "precision_pivot_recenter_threshold_m": 0.030,
-                        "precision_pivot_stop_speed_tolerance_mps": 0.010,
+                        # Shared with the legacy pivot lifecycle's stationary
+                        # certificate (LegacyAlignmentConfig.stop_speed_mps)
+                        # even though precision_pivot_enabled is False -- this
+                        # value gates the legacy settle/hold dwell too. Raised
+                        # from 0.010 because measured/estimated speed while
+                        # genuinely stationary (yaw_rate<0.01) sits at a
+                        # median of 0.016-0.033 m/s in field bags, causing the
+                        # dwell certificate to repeatedly reset and stall for
+                        # 15-20+ seconds. See P3 bag forensic analysis
+                        # (2026-08-27).
+                        "precision_pivot_stop_speed_tolerance_mps": 0.030,
                         "precision_pivot_stop_yaw_rate_tolerance_radps": 0.050,
                         "precision_pivot_telemetry_timeout_sec": 0.25,
                         "precision_pivot_stop_settle_sec": 0.20,
