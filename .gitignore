@@ -49,3 +49,4 @@ config/bag_autorecord.token
 
 # Colcon metadata
 .colcon/
+audit_report.md
