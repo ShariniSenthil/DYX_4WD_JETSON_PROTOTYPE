@@ -50,3 +50,9 @@ config/bag_autorecord.token
 # Colcon metadata
 .colcon/
 audit_report.md
+/Users/dyx_a1/Vetri/rover_ws/Source_Firmware
+px4-params/27-08-2026 PX4 PARAM (VETRI).params
+Upgrade_path/Final Point Mission CM Tracking Upgrade.md
+Upgrade_path/Full RPP Audit Control Architecture.md
+Upgrade_path/Localization Upgrade.md
+Upgrade_path/Trajectory Upgrade.md

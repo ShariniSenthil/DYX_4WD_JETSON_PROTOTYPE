@@ -126,6 +126,13 @@ def generate_launch_description() -> LaunchDescription:
                         ("global_position_topic"): (
                             "/mavros/" "global_position/" "raw/fix"
                         ),
+                        "gp_origin_topic": (
+                            "/mavros/" "global_position/" "gp_origin"
+                        ),
+                        ("fused_global_position_" "topic"): (
+                            "/mavros/" "global_position/" "global"
+                        ),
+                        "localization_mode": "shadow",
                         "local_odom_topic": ("/mavros/" "local_position/odom"),
                         "gps_status_topic": ("/mavros/" "gpsstatus/gps1/raw"),
                         "rtk_health_topic": ("/rtk_correction_bridge/" "healthy"),

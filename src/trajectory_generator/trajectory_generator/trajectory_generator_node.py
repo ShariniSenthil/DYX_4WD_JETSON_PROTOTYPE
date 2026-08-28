@@ -62,6 +62,7 @@ from typing import Any
 
 import rclpy
 
+from geographic_msgs.msg import GeoPointStamped
 from geometry_msgs.msg import PoseStamped
 from mavros_msgs.msg import GPSRAW
 from nav_msgs.msg import Odometry
@@ -78,6 +79,9 @@ from std_msgs.msg import Int32MultiArray
 from std_msgs.msg import String
 from std_msgs.msg import UInt8MultiArray
 from std_srvs.srv import Trigger
+
+from trajectory_generator.localization_frame import GeographicOrigin
+from trajectory_generator.localization_frame import project_geodetic_to_px4_enu
 
 
 class TrajectoryGenerator(Node):
@@ -113,6 +117,12 @@ class TrajectoryGenerator(Node):
         "DISABLE",
     }
 
+    VALID_LOCALIZATION_MODES = {
+        "legacy",
+        "px4_origin",
+        "shadow",
+    }
+
     def __init__(self) -> None:
         super().__init__("trajectory_generator")
 
@@ -138,6 +148,21 @@ class TrajectoryGenerator(Node):
         self.declare_parameter(
             "global_position_topic",
             "/mavros/global_position/raw/fix",
+        )
+
+        self.declare_parameter(
+            "gp_origin_topic",
+            "/mavros/global_position/gp_origin",
+        )
+
+        self.declare_parameter(
+            "fused_global_position_topic",
+            "/mavros/global_position/global",
+        )
+
+        self.declare_parameter(
+            "localization_mode",
+            "shadow",
         )
 
         self.declare_parameter(
@@ -239,6 +264,18 @@ class TrajectoryGenerator(Node):
         self.global_position_topic = str(
             self.get_parameter("global_position_topic").value
         ).strip()
+
+        self.gp_origin_topic = str(
+            self.get_parameter("gp_origin_topic").value
+        ).strip()
+
+        self.fused_global_position_topic = str(
+            self.get_parameter("fused_global_position_topic").value
+        ).strip()
+
+        self.localization_mode = str(
+            self.get_parameter("localization_mode").value
+        ).strip().lower()
 
         self.local_odom_topic = str(
             self.get_parameter("local_odom_topic").value
@@ -380,6 +417,20 @@ class TrajectoryGenerator(Node):
         )
 
         self.create_subscription(
+            GeoPointStamped,
+            self.gp_origin_topic,
+            self._gp_origin_callback,
+            retained_qos,
+        )
+
+        self.create_subscription(
+            NavSatFix,
+            self.fused_global_position_topic,
+            self._fused_global_position_callback,
+            sensor_qos,
+        )
+
+        self.create_subscription(
             Odometry,
             self.local_odom_topic,
             self._local_odom_callback,
@@ -433,6 +484,12 @@ class TrajectoryGenerator(Node):
 
         self.latest_global_time = None
 
+        self.latest_gp_origin: GeoPointStamped | None = None
+
+        self.latest_fused_global_fix: NavSatFix | None = None
+
+        self.latest_fused_global_time = None
+
         self.latest_local_odom: Odometry | None = None
 
         self.latest_local_time = None
@@ -440,6 +497,12 @@ class TrajectoryGenerator(Node):
         self.latest_gps_status: GPSRAW | None = None
 
         self.latest_gps_status_time = None
+
+        self.localization_shadow_summary: dict[str, Any] = {
+            "mode": self.localization_mode,
+            "candidate_available": False,
+            "reason": "not evaluated",
+        }
 
         self.rtk_healthy = False
         self.correction_age_sec = math.inf
@@ -494,6 +557,8 @@ class TrajectoryGenerator(Node):
 
         self.get_logger().warn(f"Metadata file : {self.metadata_file}")
 
+        self.get_logger().warn(f"Localization  : {self.localization_mode}")
+
         self.get_logger().warn("Prepare       : " "/trajectory_generator/prepare")
 
         self.get_logger().warn("Clear         : " "/trajectory_generator/clear")
@@ -507,6 +572,26 @@ class TrajectoryGenerator(Node):
     ) -> None:
         if not self.frame_id:
             raise ValueError("frame_id must not be empty")
+
+        topics = {
+            "global_position_topic": self.global_position_topic,
+            "gp_origin_topic": self.gp_origin_topic,
+            "fused_global_position_topic": self.fused_global_position_topic,
+            "local_odom_topic": self.local_odom_topic,
+            "gps_status_topic": self.gps_status_topic,
+            "rtk_health_topic": self.rtk_health_topic,
+            "rtk_correction_age_topic": self.rtk_correction_age_topic,
+        }
+
+        for name, value in topics.items():
+            if not value:
+                raise ValueError(f"{name} must not be empty")
+
+        if self.localization_mode not in self.VALID_LOCALIZATION_MODES:
+            allowed = ", ".join(sorted(self.VALID_LOCALIZATION_MODES))
+            raise ValueError(
+                f"localization_mode must be one of: {allowed}"
+            )
 
         if self.required_gps_fix_type < 0:
             raise ValueError("required_gps_fix_type must be >= 0")
@@ -546,6 +631,55 @@ class TrajectoryGenerator(Node):
         with self._lock:
             self.latest_global_fix = message
             self.latest_global_time = self.get_clock().now()
+
+    def _gp_origin_callback(
+        self,
+        message: GeoPointStamped,
+    ) -> None:
+        latitude = float(message.position.latitude)
+        longitude = float(message.position.longitude)
+
+        if (
+            not math.isfinite(latitude)
+            or not math.isfinite(longitude)
+            or abs(latitude) > 90.0
+            or abs(longitude) > 180.0
+            or (latitude == 0.0 and longitude == 0.0)
+        ):
+            self.get_logger().error(
+                "Ignoring invalid PX4 global origin: "
+                f"lat={latitude}, lon={longitude}"
+            )
+
+            return
+
+        with self._lock:
+            previous = self.latest_gp_origin
+            self.latest_gp_origin = message
+
+        if previous is None:
+            self.get_logger().warn(
+                "PX4 global origin received for shadow diagnostics: "
+                f"lat={latitude:.7f}, lon={longitude:.7f}"
+            )
+
+        elif (
+            float(previous.position.latitude) != latitude
+            or float(previous.position.longitude) != longitude
+        ):
+            self.get_logger().error(
+                "PX4 global origin changed during shadow observation: "
+                f"lat={latitude:.7f}, lon={longitude:.7f}; "
+                "legacy coordinates remain authoritative"
+            )
+
+    def _fused_global_position_callback(
+        self,
+        message: NavSatFix,
+    ) -> None:
+        with self._lock:
+            self.latest_fused_global_fix = message
+            self.latest_fused_global_time = self.get_clock().now()
 
     def _local_odom_callback(
         self,
@@ -1223,7 +1357,7 @@ class TrajectoryGenerator(Node):
             north,
         )
 
-    def _convert_markings_to_local(
+    def _convert_markings_legacy(
         self,
     ) -> list[tuple[float, float]]:
         if self.raw_coordinate_mode == "local":
@@ -1294,6 +1428,257 @@ class TrajectoryGenerator(Node):
             )
 
         return local_points
+
+    def _convert_markings_px4_origin(
+        self,
+    ) -> list[tuple[float, float]]:
+        if self.latest_gp_origin is None:
+            raise ValueError("PX4 global origin unavailable")
+
+        origin_position = self.latest_gp_origin.position
+
+        origin = GeographicOrigin(
+            latitude_deg=float(origin_position.latitude),
+            longitude_deg=float(origin_position.longitude),
+            altitude_m=float(origin_position.altitude),
+        )
+
+        candidate_points: list[tuple[float, float]] = []
+
+        for index, (
+            latitude,
+            longitude,
+        ) in enumerate(
+            self.raw_marking_points,
+            start=1,
+        ):
+            projected = project_geodetic_to_px4_enu(
+                origin,
+                latitude,
+                longitude,
+            )
+
+            target_distance = math.hypot(
+                projected.east_m,
+                projected.north_m,
+            )
+
+            if target_distance > self.max_target_distance_m:
+                raise ValueError(
+                    f"PX4 candidate marking {index} is "
+                    f"{target_distance:.1f} m from the estimator origin"
+                )
+
+            candidate_points.append(
+                (
+                    projected.east_m,
+                    projected.north_m,
+                )
+            )
+
+        return candidate_points
+
+    def _log_localization_shadow(
+        self,
+        legacy_points: list[tuple[float, float]],
+        candidate_points: list[tuple[float, float]],
+    ) -> None:
+        assert self.latest_gp_origin is not None
+
+        origin = self.latest_gp_origin.position
+
+        radial_deltas = [
+            math.hypot(
+                candidate[0] - legacy[0],
+                candidate[1] - legacy[1],
+            )
+            for legacy, candidate in zip(
+                legacy_points,
+                candidate_points,
+            )
+        ]
+
+        self.localization_shadow_summary = {
+            "mode": self.localization_mode,
+            "candidate_available": True,
+            "reason": None,
+            "origin_latitude_deg": float(origin.latitude),
+            "origin_longitude_deg": float(origin.longitude),
+            "point_count": len(candidate_points),
+            "maximum_legacy_candidate_delta_m": max(radial_deltas),
+            "mean_legacy_candidate_delta_m": (
+                sum(radial_deltas) / len(radial_deltas)
+            ),
+            "frame_residual_m": None,
+            "frame_receive_skew_sec": None,
+        }
+
+        self.get_logger().warn(
+            "LOCALIZATION SHADOW: legacy remains authoritative; "
+            f"gp_origin=({origin.latitude:.7f}, {origin.longitude:.7f})"
+        )
+
+        for index, (legacy, candidate) in enumerate(
+            zip(legacy_points, candidate_points),
+            start=1,
+        ):
+            delta_east = candidate[0] - legacy[0]
+            delta_north = candidate[1] - legacy[1]
+            radial_delta = math.hypot(delta_east, delta_north)
+
+            self.get_logger().warn(
+                f"LOCALIZATION SHADOW P{index}: "
+                f"legacy=({legacy[0]:.6f}, {legacy[1]:.6f}) m, "
+                f"candidate=({candidate[0]:.6f}, "
+                f"{candidate[1]:.6f}) m, "
+                f"delta=({delta_east:+.6f}, "
+                f"{delta_north:+.6f}) m, "
+                f"radial={radial_delta:.6f} m"
+            )
+
+        self._log_frame_consistency_shadow()
+
+    def _log_frame_consistency_shadow(
+        self,
+    ) -> None:
+        if (
+            self.latest_gp_origin is None
+            or self.latest_fused_global_fix is None
+            or self.latest_local_odom is None
+            or self.latest_fused_global_time is None
+            or self.latest_local_time is None
+        ):
+            self.localization_shadow_summary["frame_reason"] = (
+                "fused-global/local sample unavailable"
+            )
+
+            self.get_logger().warn(
+                "LOCALIZATION SHADOW: fused-global/local residual unavailable"
+            )
+
+            return
+
+        origin_position = self.latest_gp_origin.position
+        fused_position = self.latest_fused_global_fix
+
+        try:
+            projected = project_geodetic_to_px4_enu(
+                GeographicOrigin(
+                    latitude_deg=float(origin_position.latitude),
+                    longitude_deg=float(origin_position.longitude),
+                    altitude_m=float(origin_position.altitude),
+                ),
+                float(fused_position.latitude),
+                float(fused_position.longitude),
+            )
+        except ValueError as error:
+            self.localization_shadow_summary["frame_reason"] = str(error)
+
+            self.get_logger().warn(
+                "LOCALIZATION SHADOW: fused-global projection rejected: "
+                f"{error}"
+            )
+
+            return
+
+        local_east = float(self.latest_local_odom.pose.pose.position.x)
+        local_north = float(self.latest_local_odom.pose.pose.position.y)
+        delta_east = local_east - projected.east_m
+        delta_north = local_north - projected.north_m
+        radial_delta = math.hypot(delta_east, delta_north)
+        receive_skew = abs(
+            (
+                self.latest_fused_global_time
+                - self.latest_local_time
+            ).nanoseconds
+        ) / 1e9
+
+        self.localization_shadow_summary.update(
+            {
+                "frame_reason": None,
+                "frame_delta_east_m": delta_east,
+                "frame_delta_north_m": delta_north,
+                "frame_residual_m": radial_delta,
+                "frame_receive_skew_sec": receive_skew,
+            }
+        )
+
+        self.get_logger().warn(
+            "LOCALIZATION SHADOW FRAME: "
+            f"projected=({projected.east_m:.6f}, "
+            f"{projected.north_m:.6f}) m, "
+            f"odom=({local_east:.6f}, {local_north:.6f}) m, "
+            f"delta=({delta_east:+.6f}, "
+            f"{delta_north:+.6f}) m, "
+            f"radial={radial_delta:.6f} m, "
+            f"receive_skew={receive_skew:.3f} s"
+        )
+
+    def _convert_markings_to_local(
+        self,
+    ) -> list[tuple[float, float]]:
+        if self.raw_coordinate_mode == "local":
+            self.localization_shadow_summary = {
+                "mode": self.localization_mode,
+                "candidate_available": False,
+                "reason": "mission already uses local coordinates",
+            }
+
+            return list(self.raw_marking_points)
+
+        legacy_points = self._convert_markings_legacy()
+
+        if self.localization_mode == "legacy":
+            self.localization_shadow_summary = {
+                "mode": self.localization_mode,
+                "candidate_available": False,
+                "reason": "shadow calculation disabled",
+            }
+
+            return legacy_points
+
+        if self.latest_gp_origin is None:
+            self.localization_shadow_summary = {
+                "mode": self.localization_mode,
+                "candidate_available": False,
+                "reason": "PX4 global origin unavailable",
+            }
+
+            self.get_logger().warn(
+                "LOCALIZATION SHADOW SKIPPED: PX4 global origin unavailable; "
+                "legacy coordinates remain authoritative"
+            )
+
+            return legacy_points
+
+        try:
+            candidate_points = self._convert_markings_px4_origin()
+        except ValueError as error:
+            self.localization_shadow_summary = {
+                "mode": self.localization_mode,
+                "candidate_available": False,
+                "reason": str(error),
+            }
+
+            self.get_logger().warn(
+                "LOCALIZATION SHADOW SKIPPED: PX4 candidate rejected: "
+                f"{error}; legacy coordinates remain authoritative"
+            )
+
+            return legacy_points
+
+        try:
+            self._log_localization_shadow(
+                legacy_points,
+                candidate_points,
+            )
+        except Exception as error:  # noqa: BLE001 - diagnostics must never veto legacy authority
+            self.get_logger().error(
+                "LOCALIZATION SHADOW DIAGNOSTICS FAILED: "
+                f"{error}; legacy coordinates remain authoritative"
+            )
+
+        return legacy_points
 
     # ==========================================================
     # Path generation
@@ -1743,6 +2128,7 @@ class TrajectoryGenerator(Node):
             "navigation_point_count": len(self.prepared_navigation_points),
             "dummy_point_count": int(dummy_count),
             "interpolation_spacing_m": (self.interpolation_spacing_m),
+            "localization": dict(self.localization_shadow_summary),
             "error": self.last_error,
         }
 
@@ -1821,6 +2207,12 @@ class TrajectoryGenerator(Node):
         self.prepared_path_types = []
         self.prepared_marking_indices = []
         self.prepared_path_signature = None
+
+        self.localization_shadow_summary = {
+            "mode": self.localization_mode,
+            "candidate_available": False,
+            "reason": "not evaluated",
+        }
 
         self._publish_ready(False)
 
