@@ -65,6 +65,7 @@ MAX_S = float(os.environ.get("BAG_MAX_S", "7200"))
 CSV_LOGGER = os.environ.get("BAG_ENABLE_CSV_LOGGER", "1") == "1"
 _FIELD_LOGGER = os.path.join(_REPO_ROOT, "scripts", "field_test_logger.py")
 API_GRACE_S = float(os.environ.get("BAG_API_GRACE_S", "8"))
+FINAL_CAPTURE_GRACE_S = float(os.environ.get("BAG_FINAL_CAPTURE_GRACE_S", "1.0"))
 
 IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 CAPTURE_FCU_PARAMS = os.environ.get("BAG_FCU_PARAMS", "1") == "1"
@@ -179,6 +180,7 @@ TOPICS = [
     "/rpp/speed_debug",
     "/rpp/tracking_debug",
     "/rpp/pivot_debug",
+    "/rpp/debug",
     "/rpp/terminal_certificate",
     "/rpp/terminal_result",
     "/spray/status",
@@ -716,8 +718,6 @@ class Recorder:
                 self._last_refuse_log = now
             return
 
-        _enforce_retention(BAGS_DIR)
-
         started = _now_utc()
         stamp = started.astimezone(IST).strftime("%Y%m%d_%H%M%S")
         label = mission.get("filename") or mission.get("mission_id") or "mission"
@@ -790,6 +790,15 @@ class Recorder:
             "outcome": {"status": "RECORDING", "recorder_end": None},
         }
         _write_manifest(self.bundle_dir, self.manifest)
+
+        # Enforce retention asynchronously to avoid blocking recorder start
+        threading.Thread(
+            target=_enforce_retention,
+            args=(BAGS_DIR, {self.bundle_dir}),
+            name=f"retention-{name}",
+            daemon=True,
+        ).start()
+
         thread = threading.Thread(
             target=self._capture_ros_params,
             args=(self.bundle_dir,),
@@ -878,15 +887,22 @@ class Recorder:
 
     def _finalise_inner(self, proc, bundle, manifest, reason: str) -> None:
         try:
+            if FINAL_CAPTURE_GRACE_S > 0:
+                log(f"  terminal grace {FINAL_CAPTURE_GRACE_S}s before SIGINT...")
+                time.sleep(FINAL_CAPTURE_GRACE_S)
             os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            log("  SIGINT sent")
             proc.wait(timeout=15)
+            log("  rosbag normal exit")
         except subprocess.TimeoutExpired:
             log("  finalise slow — SIGTERM")
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 proc.wait(timeout=10)
+                log("  SIGTERM fallback exit")
             except Exception:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                log("  SIGKILL fallback exit")
         except Exception as error:
             log(f"  stop error: {error}")
 

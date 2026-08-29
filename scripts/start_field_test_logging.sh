@@ -102,6 +102,7 @@ TOPICS=(
   /rpp/speed_debug
   /rpp/tracking_debug
   /rpp/pivot_debug
+  /rpp/debug
   /rpp/terminal_certificate
   /rpp/terminal_result
   /cmd_vel_bridge/backend_heartbeat_healthy

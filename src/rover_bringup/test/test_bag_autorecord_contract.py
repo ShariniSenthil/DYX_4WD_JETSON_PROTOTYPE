@@ -20,6 +20,7 @@ PRECISION_TOPICS = {
     "/rpp/pivot_debug",
     "/rpp/terminal_certificate",
     "/rpp/terminal_result",
+    "/rpp/debug",
 }
 
 
@@ -69,8 +70,8 @@ def test_path_signature_uses_latched_publisher_qos():
 def test_volatile_precision_topics_have_no_transient_local_override():
     """Avoid incompatible retained subscriptions to volatile publishers."""
     source = QOS_OVERRIDES.read_text(encoding="utf-8")
-    retained_topic = "/trajectory_generator/path_signature"
-    volatile_topics = PRECISION_TOPICS - {retained_topic}
+    retained_topics = {"/trajectory_generator/path_signature", "/rpp/debug"}
+    volatile_topics = PRECISION_TOPICS - retained_topics
     for topic in volatile_topics:
         assert f"\n{topic}:" not in source
 

@@ -132,6 +132,11 @@
   depth: 1
   reliability: reliable
   durability: transient_local
+/rpp/debug:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
 /cmd_vel_bridge/backend_heartbeat_healthy:
   history: keep_last
   depth: 1
