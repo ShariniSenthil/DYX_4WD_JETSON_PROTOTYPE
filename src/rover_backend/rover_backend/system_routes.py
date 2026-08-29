@@ -515,6 +515,37 @@ def build_telemetry_payload() -> dict[str, Any]:
                 False,
             )
         ),
+
+        # Exact RPP controller-view telemetry.
+        "rpp_debug_available": bool(
+            accuracy.get("rpp_debug_available", False)
+        ),
+        "rpp_control_mode": accuracy.get("rpp_control_mode"),
+        "rpp_goal_number": accuracy.get("rpp_goal_number"),
+
+        "rpp_actual_speed_mps": accuracy.get("rpp_actual_speed_mps"),
+        "rpp_command_speed_mps": accuracy.get("rpp_command_speed_mps"),
+
+        "rpp_current_yaw_deg": accuracy.get("rpp_current_yaw_deg"),
+        "rpp_path_bearing_deg": accuracy.get("rpp_path_bearing_deg"),
+        "rpp_guidance_bearing_deg": accuracy.get(
+            "rpp_guidance_bearing_deg"
+        ),
+        "rpp_heading_error_deg": accuracy.get("rpp_heading_error_deg"),
+
+        "rpp_distance_to_goal_m": accuracy.get(
+            "rpp_distance_to_goal_m"
+        ),
+
+        "rpp_cross_track_error_mm": accuracy.get(
+            "rpp_cross_track_error_mm"
+        ),
+        "rpp_cross_track_side": accuracy.get("rpp_cross_track_side"),
+
+        "rpp_along_remaining_mm": accuracy.get(
+            "rpp_along_remaining_mm"
+        ),
+        "rpp_along_position": accuracy.get("rpp_along_position"),
     }
 
 

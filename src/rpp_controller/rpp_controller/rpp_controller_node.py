@@ -1522,6 +1522,16 @@ class RPPController(Node):
             "/rpp/accuracy",
             retained_qos,
         )
+
+        # Exact runtime control telemetry.
+        # Monitoring only: values are copied from the same RPP control cycle
+        # that produces the velocity command. No downstream reconstruction.
+        self.rpp_debug_pub = self.create_publisher(
+            String,
+            "/rpp/debug",
+            retained_qos,
+        )
+
         self.geometry_debug_pub = self.create_publisher(
             String,
             "/rpp/geometry_debug",
@@ -6553,6 +6563,154 @@ class RPPController(Node):
                 f"{accuracy_status}"
             )
 
+    def publish_rpp_debug(
+        self,
+        *,
+        control_mode,
+        command_speed_mps,
+        path_bearing_rad,
+        guidance_bearing_rad,
+        heading_error_rad,
+        distance_to_goal_m,
+        signed_cross_track_m,
+        along_remaining_m,
+    ):
+        """Publish exact values from the active RPP control cycle.
+
+        This is monitoring only. Heading, cross-track, goal distance and
+        command speed are passed from the exact variables used by RPP.
+        Backend/frontend consumers must not reconstruct control geometry.
+        """
+        values = (
+            self.current_speed_mps,
+            self.current_yaw,
+            command_speed_mps,
+            path_bearing_rad,
+            guidance_bearing_rad,
+            heading_error_rad,
+            distance_to_goal_m,
+            signed_cross_track_m,
+            along_remaining_m,
+        )
+        available = all(
+            value is not None and math.isfinite(float(value))
+            for value in values
+        )
+
+        if available:
+            actual_speed_mps = float(self.current_speed_mps)
+            current_yaw_rad = float(self.current_yaw)
+            command_speed_mps = float(command_speed_mps)
+            path_bearing_rad = float(path_bearing_rad)
+            guidance_bearing_rad = float(guidance_bearing_rad)
+            heading_error_rad = float(heading_error_rad)
+            distance_to_goal_m = float(distance_to_goal_m)
+            signed_cross_track_m = float(signed_cross_track_m)
+            along_remaining_m = float(along_remaining_m)
+
+            # Only RPP's existing reporting-sign conversion is applied here.
+            # No path geometry is recomputed.
+            ground_xtrack_m = float(
+                self.ground_xtrack(signed_cross_track_m)
+            )
+
+            if signed_cross_track_m > 0.0005:
+                cross_track_side = "LEFT"
+            elif signed_cross_track_m < -0.0005:
+                cross_track_side = "RIGHT"
+            else:
+                cross_track_side = "CENTER"
+
+            if along_remaining_m > 0.0005:
+                along_position = "BEFORE_POINT"
+            elif along_remaining_m < -0.0005:
+                along_position = "AFTER_POINT"
+            else:
+                along_position = "AT_POINT"
+        else:
+            actual_speed_mps = None
+            current_yaw_rad = None
+            command_speed_mps = None
+            path_bearing_rad = None
+            guidance_bearing_rad = None
+            heading_error_rad = None
+            distance_to_goal_m = None
+            ground_xtrack_m = None
+            along_remaining_m = None
+            cross_track_side = "UNKNOWN"
+            along_position = "UNKNOWN"
+
+        try:
+            goal_number = max(0, int(self.segment_goal_number))
+        except (TypeError, ValueError):
+            goal_number = 0
+
+        payload = {
+            "available": available,
+            "source": "/rpp/debug",
+            "control_mode": str(control_mode),
+            "goal_number": goal_number,
+
+            "actual_speed_mps": actual_speed_mps,
+            "command_speed_mps": command_speed_mps,
+
+            "current_yaw_rad": current_yaw_rad,
+            "current_yaw_deg": (
+                math.degrees(current_yaw_rad)
+                if current_yaw_rad is not None
+                else None
+            ),
+
+            "path_bearing_rad": path_bearing_rad,
+            "path_bearing_deg": (
+                math.degrees(path_bearing_rad)
+                if path_bearing_rad is not None
+                else None
+            ),
+
+            "guidance_bearing_rad": guidance_bearing_rad,
+            "guidance_bearing_deg": (
+                math.degrees(guidance_bearing_rad)
+                if guidance_bearing_rad is not None
+                else None
+            ),
+
+            # IMPORTANT: this is the final existing RPP heading_error.
+            "heading_error_rad": heading_error_rad,
+            "heading_error_deg": (
+                math.degrees(heading_error_rad)
+                if heading_error_rad is not None
+                else None
+            ),
+
+            "distance_to_goal_m": distance_to_goal_m,
+            "distance_to_goal_mm": (
+                distance_to_goal_m * 1000.0
+                if distance_to_goal_m is not None
+                else None
+            ),
+
+            "cross_track_error_m": ground_xtrack_m,
+            "cross_track_error_mm": (
+                ground_xtrack_m * 1000.0
+                if ground_xtrack_m is not None
+                else None
+            ),
+            "cross_track_side": cross_track_side,
+
+            "along_remaining_m": along_remaining_m,
+            "along_remaining_mm": (
+                along_remaining_m * 1000.0
+                if along_remaining_m is not None
+                else None
+            ),
+            "along_position": along_position,
+        }
+
+        message = String()
+        message.data = json.dumps(payload, separators=(",", ":"))
+        self.rpp_debug_pub.publish(message)
+
     def log_waiting(self, reason):
         now = self.get_clock().now()
         if (now - self.last_wait_log_time).nanoseconds < 1_000_000_000:
@@ -8422,6 +8580,17 @@ class RPPController(Node):
             )
             self._record_published_translational_speed(speed)
 
+            self.publish_rpp_debug(
+                control_mode="TERMINAL",
+                command_speed_mps=speed,
+                path_bearing_rad=path_bearing,
+                guidance_bearing_rad=guidance_bearing,
+                heading_error_rad=heading_error,
+                distance_to_goal_m=goal_distance,
+                signed_cross_track_m=global_signed_cross_track,
+                along_remaining_m=along_remaining,
+            )
+
             if xtrack_speed_cap_active:
                 speed_owner = (
                     "MIN(DISTANCE_PROFILE,"
@@ -8514,6 +8683,18 @@ class RPPController(Node):
                 east,
             )
             self._record_published_translational_speed(speed)
+
+        self.publish_rpp_debug(
+            control_mode="FIRST_APPROACH" if first_approach else "TRACKING",
+            command_speed_mps=speed,
+            path_bearing_rad=path_bearing,
+            guidance_bearing_rad=guidance_bearing,
+            heading_error_rad=heading_error,
+            distance_to_goal_m=goal_distance,
+            signed_cross_track_m=signed_cross_track,
+            along_remaining_m=goal_along_remaining,
+        )
+
         self.log_control(
             status,
             target_distance,

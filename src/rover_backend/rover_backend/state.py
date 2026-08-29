@@ -277,6 +277,29 @@ class RoverState:
                 "accuracy_status": "UNAVAILABLE",
                 "accuracy_pass": False,
                 "within_test_tolerance": False,
+
+                # Exact /rpp/debug pass-through.
+                "rpp_debug_available": False,
+                "rpp_debug_source": "/rpp/debug",
+                "rpp_control_mode": "UNKNOWN",
+                "rpp_goal_number": 0,
+
+                "rpp_actual_speed_mps": None,
+                "rpp_command_speed_mps": None,
+
+                "rpp_current_yaw_deg": None,
+                "rpp_path_bearing_deg": None,
+                "rpp_guidance_bearing_deg": None,
+                "rpp_heading_error_deg": None,
+
+                "rpp_distance_to_goal_m": None,
+
+                "rpp_cross_track_error_mm": None,
+                "rpp_cross_track_side": "UNKNOWN",
+
+                "rpp_along_remaining_mm": None,
+                "rpp_along_position": "UNKNOWN",
+
                 "updated_at": now,
             },
             "network": {

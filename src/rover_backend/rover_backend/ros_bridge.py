@@ -513,6 +513,12 @@ class RoverBackendRosNode(Node):
         )
         self.create_subscription(
             String,
+            "/rpp/debug",
+            self._rpp_debug_callback,
+            retained_qos,
+        )
+        self.create_subscription(
+            String,
             "/spray/status",
             self._spray_status_callback,
             retained_qos,
@@ -1011,6 +1017,63 @@ class RoverBackendRosNode(Node):
             ground_speed_mps=ground_speed,
             linear_speed_mps=ground_speed,
             angular_speed_rps=angular_z,
+        )
+
+    def _rpp_debug_callback(
+        self,
+        message: String,
+    ) -> None:
+        """Mirror exact RPP control telemetry without reconstruction."""
+
+        self._mark_ros_message()
+        payload = _json_object(message.data)
+        if payload is None:
+            return
+
+        rover_state.update(
+            "accuracy",
+            rpp_debug_available=bool(payload.get("available", False)),
+            rpp_debug_source="/rpp/debug",
+            rpp_control_mode=str(payload.get("control_mode") or "UNKNOWN"),
+            rpp_goal_number=_safe_int(payload.get("goal_number"), 0),
+
+            rpp_actual_speed_mps=_finite_float(
+                payload.get("actual_speed_mps")
+            ),
+            rpp_command_speed_mps=_finite_float(
+                payload.get("command_speed_mps")
+            ),
+
+            rpp_current_yaw_deg=_finite_float(
+                payload.get("current_yaw_deg")
+            ),
+            rpp_path_bearing_deg=_finite_float(
+                payload.get("path_bearing_deg")
+            ),
+            rpp_guidance_bearing_deg=_finite_float(
+                payload.get("guidance_bearing_deg")
+            ),
+            rpp_heading_error_deg=_finite_float(
+                payload.get("heading_error_deg")
+            ),
+
+            rpp_distance_to_goal_m=_finite_float(
+                payload.get("distance_to_goal_m")
+            ),
+
+            rpp_cross_track_error_mm=_finite_float(
+                payload.get("cross_track_error_mm")
+            ),
+            rpp_cross_track_side=str(
+                payload.get("cross_track_side") or "UNKNOWN"
+            ),
+
+            rpp_along_remaining_mm=_finite_float(
+                payload.get("along_remaining_mm")
+            ),
+            rpp_along_position=str(
+                payload.get("along_position") or "UNKNOWN"
+            ),
         )
 
     def _accuracy_callback(
