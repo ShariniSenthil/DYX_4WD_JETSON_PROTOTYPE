@@ -1721,6 +1721,11 @@ class RPPController(Node):
         self.precision_terminal_last_reset_reason = "INITIALIZE"
         self.precision_terminal_reset_count = 0
         self.precision_terminal_historical_certificate = None
+        # Latched once per terminal identity by
+        # _resolve_precision_terminal_measurement_bearing(); frozen until the
+        # next _reset_precision_terminal() semantic boundary.
+        self.precision_terminal_measurement_bearing = None
+        self.precision_terminal_measurement_bearing_source = None
 
         # First marking state. C is captured when the mission is enabled.
         self.first_marking_completed = False
@@ -7227,6 +7232,20 @@ class RPPController(Node):
             math.cos(path_bearing) * delta_east + math.sin(path_bearing) * delta_north
         )
 
+    def _terminal_cross_internal(self, path_bearing, target_x, target_y):
+        """Return the internal terminal Cross measurement.
+
+        Internal convention: LEFT = positive, RIGHT = negative. Shared by the
+        live precision-terminal cycle and its hold/refresh path so both use
+        the identical formula against the same latched bearing.
+        """
+        goal_delta_east = self.current_x - target_x
+        goal_delta_north = self.current_y - target_y
+        return (
+            -math.sin(path_bearing) * goal_delta_east
+            + math.cos(path_bearing) * goal_delta_north
+        )
+
     def apply_alignment_release_ramp(self, requested_speed):
         """Compatibility helper; preserve the configured acceleration slew."""
         return self.command_speed_slew_limit(requested_speed)
@@ -7259,6 +7278,8 @@ class RPPController(Node):
         self.precision_terminal_last_sample = None
         self.precision_terminal_speed_override_mps = None
         self.precision_terminal_historical_certificate = None
+        self.precision_terminal_measurement_bearing = None
+        self.precision_terminal_measurement_bearing_source = None
         self.precision_terminal_last_reset_reason = str(reason)
         self.precision_terminal_reset_count += 1
 
@@ -7302,12 +7323,106 @@ class RPPController(Node):
         )
         return identity, components
 
+    def _resolve_precision_terminal_measurement_bearing(
+        self,
+        *,
+        first_approach,
+        path_bearing,
+    ):
+        """Resolve and latch the terminal Along/Cross measurement tangent.
+
+        Latched at most once per terminal identity; frozen thereafter until
+        the next _reset_precision_terminal() semantic boundary. Never derives
+        a bearing from self.current_yaw, a literal 0.0, or a custom segment
+        scan -- only runtime-entry authority, the resolved semantic anchor,
+        or the already-resolved active-nav path_bearing fallback.
+        """
+
+        if self.precision_terminal_measurement_bearing is not None:
+            return (
+                self.precision_terminal_measurement_bearing,
+                self.precision_terminal_measurement_bearing_source,
+            )
+
+        if first_approach:
+            bearing = self.c_line_bearing
+            source = "RUNTIME_ENTRY_C_TO_P1"
+            if bearing is None or not math.isfinite(bearing):
+                return None, None
+        else:
+            bearing = None
+            source = None
+            binding = self.geometry_goal_binding
+            if self.path_geometry is not None and binding is not None:
+                anchor = self.path_geometry.semantic_anchor_at(
+                    binding.raw_path_index
+                )
+                if (
+                    anchor is not None
+                    and anchor.incoming_heading_rad is not None
+                    and math.isfinite(anchor.incoming_heading_rad)
+                ):
+                    bearing = anchor.incoming_heading_rad
+                    source = "SEMANTIC_INCOMING"
+            if bearing is None:
+                if path_bearing is not None and math.isfinite(path_bearing):
+                    bearing = path_bearing
+                    source = "ACTIVE_NAV_FALLBACK"
+                    self.get_logger().warn(
+                        "PRECISION TERMINAL MEASUREMENT TANGENT / "
+                        "SEMANTIC INCOMING HEADING UNAVAILABLE / "
+                        "ACTIVE_NAV_FALLBACK | "
+                        f"path_bearing={math.degrees(path_bearing):.1f}deg"
+                    )
+                else:
+                    return None, None
+
+        self.precision_terminal_measurement_bearing = bearing
+        self.precision_terminal_measurement_bearing_source = source
+        self.get_logger().warn(
+            "PRECISION TERMINAL MEASUREMENT TANGENT LATCHED | "
+            f"bearing={math.degrees(bearing):.1f}deg | source={source}"
+        )
+        return bearing, source
+
+    def _check_precision_terminal_measurement_consistency(
+        self,
+        *,
+        radial_error_m,
+        along_error_m,
+        cross_error_m,
+    ):
+        """Diagnostic-only radial**2 ~= along**2 + cross**2 sanity check.
+
+        Never raises and never influences FSM state, speed, or control.
+        """
+
+        if not all(
+            math.isfinite(value)
+            for value in (radial_error_m, along_error_m, cross_error_m)
+        ):
+            return
+        residual_m2 = (radial_error_m ** 2) - (
+            along_error_m ** 2 + cross_error_m ** 2
+        )
+        if abs(residual_m2) > 1.0e-6:
+            self.get_logger().warn(
+                "PRECISION TERMINAL MEASUREMENT CONSISTENCY WARNING | "
+                f"radial_m={radial_error_m:.6f} | "
+                f"along_m={along_error_m:.6f} | "
+                f"cross_m={cross_error_m:.6f} | "
+                f"residual_m2={residual_m2:.9f}"
+            )
+
     def _step_precision_terminal_for_cycle(
         self,
         *,
         goal_distance,
-        goal_along_remaining,
         path_heading_error,
+        first_approach,
+        path_bearing,
+        goal_x,
+        goal_y,
     ):
         """Step the terminal FSM exactly once using current-cycle geometry."""
 
@@ -7319,29 +7434,60 @@ class RPPController(Node):
         if projection is None or guidance is None or identity is None:
             return None
 
+        (
+            latched_terminal_bearing,
+            _latched_terminal_bearing_source,
+        ) = self._resolve_precision_terminal_measurement_bearing(
+            first_approach=first_approach,
+            path_bearing=path_bearing,
+        )
+        if latched_terminal_bearing is None:
+            return None
+
         now_sec = self._precision_now_sec()
         telemetry_fresh = self.is_fresh(
             self.last_odom_time,
             self.precision_terminal_telemetry_timeout_sec,
         )
-        along_error = max(
+        # Control remaining distance: unchanged clamped span projection.
+        # This alone continues to feed distance_to_terminal_m / brake gating.
+        control_remaining_m = max(
             0.0,
             float(self.geometry_active_span.stop_s - projection.projected_s),
+        )
+        # Signed measurement Along: latched-tangent projection of the exact
+        # semantic goal. + = before waypoint, - = past/overshoot.
+        terminal_along_error_m = self.along_track_remaining(
+            latched_terminal_bearing,
+            goal_x,
+            goal_y,
+        )
+        # Internal measurement Cross: LEFT = positive, RIGHT = negative.
+        terminal_cross_internal_m = self._terminal_cross_internal(
+            latched_terminal_bearing,
+            goal_x,
+            goal_y,
+        )
+        self._check_precision_terminal_measurement_consistency(
+            radial_error_m=float(goal_distance),
+            along_error_m=terminal_along_error_m,
+            cross_error_m=terminal_cross_internal_m,
         )
         sample = TerminalInput(
             monotonic_time_sec=now_sec,
             dt_sec=self.precision_cycle_dt_sec,
             terminal_requested=True,
             terminal_identity=identity,
-            distance_to_terminal_m=along_error,
+            distance_to_terminal_m=control_remaining_m,
             radial_error_m=float(goal_distance),
-            cross_track_error_m=float(guidance.signed_cross_track_m),
-            along_track_error_m=along_error,
+            cross_track_error_m=terminal_cross_internal_m,
+            along_track_error_m=terminal_along_error_m,
             measured_linear_speed_mps=float(self.current_speed_mps),
             measured_yaw_rate_radps=float(self.current_yaw_rate_radps),
             telemetry_fresh=telemetry_fresh,
             braking_required=(
-                along_error <= self.precision_terminal_config.brake_distance_m
+                control_remaining_m
+                <= self.precision_terminal_config.brake_distance_m
             ),
             heading_error_deg=math.degrees(path_heading_error),
             current_pose=ControllerPose(
@@ -7428,13 +7574,36 @@ class RPPController(Node):
             value is not None and math.isfinite(float(value))
             for value in (self.segment_goal_x, self.segment_goal_y)
         )
-        radial_error = (
-            math.hypot(
+        # A refreshed radial must never be combined with a stale Along/Cross
+        # (or vice versa): either all three come from the current pose/goal,
+        # or the entire prior geometric measurement is preserved together.
+        latched_terminal_bearing = self.precision_terminal_measurement_bearing
+        geometry_refreshable = (
+            pose_valid and goal_valid and latched_terminal_bearing is not None
+        )
+        if geometry_refreshable:
+            radial_error = math.hypot(
                 self.segment_goal_x - self.current_x,
                 self.segment_goal_y - self.current_y,
             )
-            if pose_valid and goal_valid
-            else prior.radial_error_m
+            along_error = self.along_track_remaining(
+                latched_terminal_bearing,
+                self.segment_goal_x,
+                self.segment_goal_y,
+            )
+            cross_error = self._terminal_cross_internal(
+                latched_terminal_bearing,
+                self.segment_goal_x,
+                self.segment_goal_y,
+            )
+        else:
+            radial_error = prior.radial_error_m
+            along_error = prior.along_track_error_m
+            cross_error = prior.cross_track_error_m
+        self._check_precision_terminal_measurement_consistency(
+            radial_error_m=radial_error,
+            along_error_m=along_error,
+            cross_error_m=cross_error,
         )
         sample = TerminalInput(
             monotonic_time_sec=self._precision_now_sec(),
@@ -7443,8 +7612,8 @@ class RPPController(Node):
             terminal_identity=self.precision_terminal_identity,
             distance_to_terminal_m=prior.distance_to_terminal_m,
             radial_error_m=radial_error,
-            cross_track_error_m=prior.cross_track_error_m,
-            along_track_error_m=prior.along_track_error_m,
+            cross_track_error_m=cross_error,
+            along_track_error_m=along_error,
             measured_linear_speed_mps=float(self.current_speed_mps),
             measured_yaw_rate_radps=float(self.current_yaw_rate_radps),
             telemetry_fresh=telemetry_fresh,
@@ -7564,6 +7733,9 @@ class RPPController(Node):
                 signed_cross_track=sample.cross_track_error_m,
                 along_remaining=sample.along_track_error_m,
                 precision_certificate=certificate,
+                tolerance_override_m=(
+                    self.precision_terminal_config.terminal_radial_tolerance_m
+                ),
             )
         elif (
             result.state is TerminalState.HOLD_FAIL
@@ -7576,6 +7748,9 @@ class RPPController(Node):
                 signed_cross_track=sample.cross_track_error_m,
                 along_remaining=sample.along_track_error_m,
                 precision_certificate=None,
+                tolerance_override_m=(
+                    self.precision_terminal_config.terminal_radial_tolerance_m
+                ),
             )
 
     def publish_terminal_result(
@@ -7587,6 +7762,7 @@ class RPPController(Node):
         signed_cross_track,
         along_remaining,
         precision_certificate=None,
+        tolerance_override_m=None,
     ):
         """Publish the authoritative terminal result for the active semantic goal.
 
@@ -7595,6 +7771,11 @@ class RPPController(Node):
         Downstream nodes may store/display these values but must never reconstruct
         the final marking accuracy from odometry, GPS, target coordinates or live
         telemetry.
+
+        ``tolerance_override_m`` reports the tolerance this specific result was
+        actually certified against: None keeps the existing
+        ``self.waypoint_tolerance`` (legacy) behavior; an explicit value is used
+        for this call only and does not alter ``self.waypoint_tolerance``.
         """
         outcome = str(outcome).strip().upper()
 
@@ -7617,7 +7798,11 @@ class RPPController(Node):
         cross_track_m = self.ground_xtrack(signed_cross_track)
 
         along_track_m = float(along_remaining)
-        tolerance_m = float(self.waypoint_tolerance)
+        tolerance_m = (
+            float(self.waypoint_tolerance)
+            if tolerance_override_m is None
+            else float(tolerance_override_m)
+        )
 
         radial_mm = radial_m * 1000.0
         cross_track_mm = cross_track_m * 1000.0
@@ -8101,8 +8286,11 @@ class RPPController(Node):
         ):
             terminal_result = self._step_precision_terminal_for_cycle(
                 goal_distance=goal_distance,
-                goal_along_remaining=goal_along_remaining,
                 path_heading_error=path_heading_error,
+                first_approach=first_approach,
+                path_bearing=path_bearing,
+                goal_x=goal_x,
+                goal_y=goal_y,
             )
             if terminal_result is None:
                 self.publish_stop()
