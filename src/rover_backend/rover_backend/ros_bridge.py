@@ -3353,7 +3353,7 @@ class RosBridgeRuntime:
         with self._safety_command_lock:
             requested_generation = self._safety_generation
             expected_manager_generation = _safe_int(
-                rover_state.section("safety").get("safety_generation"),
+                rover_state.section("mission").get("safety_generation"),
                 -1,
             )
 
