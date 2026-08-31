@@ -697,39 +697,6 @@ async def network_status(
     return await run_in_threadpool(collect_network_status)
 
 
-@system_router.get("/api/rtk/status")
-async def rtk_status(
-    _session: AuthenticatedSession = Depends(require_auth),
-) -> dict[str, Any]:
-    """Return GPS fix and RTK correction-bridge health."""
-
-    gps = rover_state.section("gps")
-    rtk = rover_state.section("rtk")
-
-    correction_age = _finite_float(rtk.get("correction_age_sec"))
-
-    return {
-        "healthy": bool(rtk.get("healthy", False)),
-        "status": str(rtk.get("status") or "UNAVAILABLE"),
-        "correction_age_sec": correction_age,
-        "correction_fresh": bool(correction_age is not None and correction_age <= 2.0),
-        "fix_type": _safe_int(
-            gps.get("fix_type"),
-            0,
-        ),
-        "fix_name": str(gps.get("fix_name") or "NO_FIX"),
-        "rtk_fixed": bool(gps.get("rtk_fixed", False)),
-        "satellites_visible": _safe_int(
-            gps.get("satellites_visible"),
-            0,
-        ),
-        "hdop": gps.get("hdop"),
-        "vdop": gps.get("vdop"),
-        "gps_updated_at": gps.get("updated_at"),
-        "rtk_updated_at": rtk.get("updated_at"),
-    }
-
-
 @system_router.get("/api/safety/status")
 async def safety_status(
     _session: AuthenticatedSession = Depends(require_auth),
