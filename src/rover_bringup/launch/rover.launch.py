@@ -47,7 +47,7 @@ def generate_launch_description() -> LaunchDescription:
             "fcu_url:="
             "/dev/ttyACM0:921600 "
             "gcs_url:="
-            "udp://:14550@192.168.3.102:14550 "
+            "udp://:14550@192.168.3.105:14550 "
             "pluginlists_yaml:="
             "/opt/ros/humble/share/mavros/"
             "launch/px4_pluginlists.yaml "
