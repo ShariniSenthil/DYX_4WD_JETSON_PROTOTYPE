@@ -6,10 +6,8 @@ import threading
 import time
 
 import rclpy
-from geographic_msgs.msg import GeoPointStamped
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from nav_msgs.msg import Odometry, Path
-from sensor_msgs.msg import NavSatFix
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -32,10 +30,6 @@ from rpp_controller.point_event_policy import (
 from rpp_controller.runtime_entry import (
     build_runtime_entry_path,
     track_runtime_entry_path,
-)
-from trajectory_generator.localization_frame import (
-    GeographicOrigin,
-    project_geodetic_to_px4_enu,
 )
 from rpp_controller.path_geometry import (
     GeometryProgressTracker,
@@ -121,7 +115,6 @@ class RPPController(Node):
     MAX_MOVING_HEADING_ERROR_RAD = math.radians(30.0)
     WAYPOINT_CHANGE_EPSILON_M = 0.001
     RUNTIME_ENTRY_SPACING_M = 0.05
-    RUNTIME_ENTRY_GLOBAL_TIMEOUT_SEC = 1.0
 
     def __init__(self):
         super().__init__("rpp_controller")
@@ -1374,18 +1367,6 @@ class RPPController(Node):
             odom_qos,
         )
         self.create_subscription(
-            GeoPointStamped,
-            "/mavros/global_position/gp_origin",
-            self.gp_origin_callback,
-            retained_qos,
-        )
-        self.create_subscription(
-            NavSatFix,
-            "/mavros/global_position/global",
-            self.fused_global_callback,
-            odom_qos,
-        )
-        self.create_subscription(
             PoseStamped,
             "/active_waypoint",
             self.waypoint_callback,
@@ -1612,12 +1593,6 @@ class RPPController(Node):
         self.current_speed_mps = math.inf
         self.current_yaw_rate_radps = math.inf
         self.last_odom_time = None
-
-        # START-time C uses same gp_origin frame as surveyed P1.
-        self.latest_gp_origin = None
-        self.prepared_path_gp_origin = None
-        self.latest_fused_global_fix = None
-        self.last_fused_global_monotonic = None
 
         self.target_x = None
         self.target_y = None
@@ -2189,9 +2164,7 @@ class RPPController(Node):
             math.isfinite(self.legacy_pivot_post_settle_hold_sec)
             and self.legacy_pivot_post_settle_hold_sec > 0.0
         ):
-            raise ValueError(
-                "legacy_pivot_post_settle_hold_sec must be finite and > 0"
-            )
+            raise ValueError("legacy_pivot_post_settle_hold_sec must be finite and > 0")
         if not (
             math.isfinite(self.precision_pivot_recapture_xtrack)
             and 0.0
@@ -3337,34 +3310,6 @@ class RPPController(Node):
         self.geometry_last_goal_raw_index = binding.raw_path_index
         return True
 
-    def gp_origin_callback(self, msg):
-        """Retain PX4 gp_origin; snapshot it for the loaded survey frame."""
-        self.latest_gp_origin = msg
-        if (
-            self.marking_metadata_received
-            and not self.mission_enabled
-            and self.prepared_path_gp_origin is None
-        ):
-            try:
-                self.prepared_path_gp_origin = GeographicOrigin(
-                    latitude_deg=float(msg.position.latitude),
-                    longitude_deg=float(msg.position.longitude),
-                    altitude_m=float(msg.position.altitude),
-                )
-            except (TypeError, ValueError):
-                self.prepared_path_gp_origin = None
-
-    def fused_global_callback(self, msg):
-        """Retain current PX4 fused-global position for START/reanchor."""
-        latitude = float(msg.latitude)
-        longitude = float(msg.longitude)
-        if not math.isfinite(latitude) or not math.isfinite(longitude):
-            return
-        if abs(latitude) > 90.0 or abs(longitude) > 180.0:
-            return
-        self.latest_fused_global_fix = msg
-        self.last_fused_global_monotonic = time.monotonic()
-
     def odom_callback(self, msg):
         x = float(msg.pose.pose.position.x)
         y = float(msg.pose.pose.position.y)
@@ -3992,19 +3937,8 @@ class RPPController(Node):
         previous_p1 = self.marking_waypoints[0] if self.marking_waypoints else None
         self.marking_waypoints = points
         self.marking_metadata_received = True
-        # Snapshot the exact gp_origin frame used by this loaded survey.
-        # START and post-pivot C/C' are projected into this same frame.
-        if not self.mission_enabled:
-            self.prepared_path_gp_origin = None
-            if self.latest_gp_origin is not None:
-                try:
-                    self.prepared_path_gp_origin = GeographicOrigin(
-                        latitude_deg=float(self.latest_gp_origin.position.latitude),
-                        longitude_deg=float(self.latest_gp_origin.position.longitude),
-                        altitude_m=float(self.latest_gp_origin.position.altitude),
-                    )
-                except (TypeError, ValueError):
-                    self.prepared_path_gp_origin = None
+        # Surveyed P1..Pn are already in the configured local map frame.
+        # Runtime C/C' authority comes directly from MAVROS local odometry.
         self._try_install_path_geometry()
 
         # Reclassify an already-received semantic goal if retained marking
@@ -5141,11 +5075,9 @@ class RPPController(Node):
             self._reset_precision_regulator("ALIGNED_START_CAPTURE_ARMED")
 
         if self.precision_guidance_enabled and not first_approach:
-            alignment_guidance_bearing = (
-                precision_guidance.limited_command_bearing_rad
-            )
-        command_bearing, command_heading_error = (
-            self.limit_moving_guidance_bearing(alignment_guidance_bearing)
+            alignment_guidance_bearing = precision_guidance.limited_command_bearing_rad
+        command_bearing, command_heading_error = self.limit_moving_guidance_bearing(
+            alignment_guidance_bearing
         )
         speed = self.segment_alignment_recovery_speed
         if self.precision_speed_control_enabled:
@@ -5274,34 +5206,6 @@ class RPPController(Node):
 
         return True, request_bearing, true_error
 
-    def _runtime_current_c_from_gp_origin(self):
-        """Project live fused-global C through the gp_origin frame used for P1."""
-        if self.prepared_path_gp_origin is None or self.latest_fused_global_fix is None:
-            return None
-        if self.last_fused_global_monotonic is None:
-            return None
-
-        age_sec = time.monotonic() - self.last_fused_global_monotonic
-        if (
-            not math.isfinite(age_sec)
-            or age_sec < 0.0
-            or age_sec > self.RUNTIME_ENTRY_GLOBAL_TIMEOUT_SEC
-        ):
-            return None
-
-        try:
-            point = project_geodetic_to_px4_enu(
-                self.prepared_path_gp_origin,
-                float(self.latest_fused_global_fix.latitude),
-                float(self.latest_fused_global_fix.longitude),
-            )
-        except (TypeError, ValueError):
-            return None
-
-        if not math.isfinite(point.east_m) or not math.isfinite(point.north_m):
-            return None
-        return point.east_m, point.north_m
-
     def _install_runtime_entry_path(self, start_x, start_y, p1_x, p1_y, reason):
         """Generate same-frame C->P1 at <=50 mm spacing."""
         try:
@@ -5314,8 +5218,7 @@ class RPPController(Node):
             )
         except (TypeError, ValueError) as error:
             self.get_logger().error(
-                "C->P1 RUNTIME PATH BUILD FAILED | "
-                f"reason={reason} | error={error}"
+                "C->P1 RUNTIME PATH BUILD FAILED | " f"reason={reason} | error={error}"
             )
             return False
 
@@ -5374,7 +5277,7 @@ class RPPController(Node):
         return solution
 
     def lock_c_to_p1_line(self, reason):
-        """On START, create C->P1 in the exact gp_origin frame used by loaded P1."""
+        """On START, create C->P1 from current PX4/MAVROS local odometry."""
         if (
             self.first_marking_completed
             or not self.marking_waypoints
@@ -5388,11 +5291,9 @@ class RPPController(Node):
         if self.c_line_locked and self.runtime_entry_points:
             return True
 
-        runtime_c = self._runtime_current_c_from_gp_origin()
-        if runtime_c is None:
-            return False
+        start_x = float(self.current_x)
+        start_y = float(self.current_y)
 
-        start_x, start_y = runtime_c
         p1_x, p1_y = self.marking_waypoints[0]
         delta_east = p1_x - start_x
         delta_north = p1_y - start_y
@@ -5401,9 +5302,7 @@ class RPPController(Node):
             return False
 
         bearing = math.atan2(delta_north, delta_east)
-        if not self._install_runtime_entry_path(
-            start_x, start_y, p1_x, p1_y, reason
-        ):
+        if not self._install_runtime_entry_path(start_x, start_y, p1_x, p1_y, reason):
             return False
 
         self.c_line_start_x = start_x
@@ -5415,7 +5314,7 @@ class RPPController(Node):
         self._reset_legacy_alignment_lifecycle("C_LINE_LOCKED")
 
         self.get_logger().warn(
-            "C->P1 GP_ORIGIN RUNTIME PATH LOCKED | "
+            "C->P1 LOCAL ODOM RUNTIME PATH LOCKED | "
             f"reason={reason} | "
             f"C_E={start_x:.3f} | C_N={start_y:.3f} | "
             f"P1_E={p1_x:.3f} | P1_N={p1_y:.3f} | "
@@ -5426,7 +5325,7 @@ class RPPController(Node):
         return True
 
     def reanchor_c_to_p1_after_pivot(self):
-        """After pivot settle, regenerate C'->P1 in the SAME prepared gp_origin frame."""
+        """After pivot settle, regenerate C'->P1 from current local odometry."""
         if (
             self.first_marking_completed
             or self.c_line_reanchored_after_pivot
@@ -5436,11 +5335,8 @@ class RPPController(Node):
         ):
             return False
 
-        runtime_c = self._runtime_current_c_from_gp_origin()
-        if runtime_c is None:
-            return False
-
-        start_x, start_y = runtime_c
+        start_x = float(self.current_x)
+        start_y = float(self.current_y)
         p1_x, p1_y = self.marking_waypoints[0]
         old_bearing = self.c_line_bearing
         old_start_x = self.c_line_start_x
@@ -5460,9 +5356,7 @@ class RPPController(Node):
         ):
             old_xtrack = -math.sin(old_bearing) * (
                 self.current_x - old_start_x
-            ) + math.cos(old_bearing) * (
-                self.current_y - old_start_y
-            )
+            ) + math.cos(old_bearing) * (self.current_y - old_start_y)
 
         bearing = math.atan2(delta_north, delta_east)
         if not self._install_runtime_entry_path(
@@ -5483,7 +5377,7 @@ class RPPController(Node):
         self.xtrack_priority_inside_since = None
 
         self.get_logger().warn(
-            "C->P1 POST-PIVOT GP_ORIGIN REANCHOR + PATH REGENERATED | "
+            "C->P1 POST-PIVOT LOCAL ODOM REANCHOR + PATH REGENERATED | "
             f"old_xtrack={self.ground_xtrack(old_xtrack) * 1000.0:+.1f}mm | "
             f"C_E={start_x:.3f} | C_N={start_y:.3f} | "
             f"distance={distance:.3f}m | "
@@ -6954,18 +6848,14 @@ class RPPController(Node):
                 "cross_track_side": (
                     "LEFT"
                     if signed_cross_track_m > 0.0005
-                    else "RIGHT"
-                    if signed_cross_track_m < -0.0005
-                    else "CENTER"
+                    else "RIGHT" if signed_cross_track_m < -0.0005 else "CENTER"
                 ),
                 "along_remaining_m": along_remaining_m,
                 "along_remaining_mm": along_remaining_m * 1000.0,
                 "along_position": (
                     "BEFORE_POINT"
                     if along_remaining_m > 0.0005
-                    else "AFTER_POINT"
-                    if along_remaining_m < -0.0005
-                    else "AT_POINT"
+                    else "AFTER_POINT" if along_remaining_m < -0.0005 else "AT_POINT"
                 ),
             }
         )
@@ -7066,8 +6956,7 @@ class RPPController(Node):
             along_remaining_m,
         )
         available = all(
-            value is not None and math.isfinite(float(value))
-            for value in values
+            value is not None and math.isfinite(float(value)) for value in values
         )
 
         if available:
@@ -7083,9 +6972,7 @@ class RPPController(Node):
 
             # Only RPP's existing reporting-sign conversion is applied here.
             # No path geometry is recomputed.
-            ground_xtrack_m = float(
-                self.ground_xtrack(signed_cross_track_m)
-            )
+            ground_xtrack_m = float(self.ground_xtrack(signed_cross_track_m))
 
             if signed_cross_track_m > 0.0005:
                 cross_track_side = "LEFT"
@@ -7123,31 +7010,22 @@ class RPPController(Node):
             "source": "/rpp/debug",
             "control_mode": str(control_mode),
             "goal_number": goal_number,
-
             "actual_speed_mps": actual_speed_mps,
             "command_speed_mps": command_speed_mps,
-
             "current_yaw_rad": current_yaw_rad,
             "current_yaw_deg": (
-                math.degrees(current_yaw_rad)
-                if current_yaw_rad is not None
-                else None
+                math.degrees(current_yaw_rad) if current_yaw_rad is not None else None
             ),
-
             "path_bearing_rad": path_bearing_rad,
             "path_bearing_deg": (
-                math.degrees(path_bearing_rad)
-                if path_bearing_rad is not None
-                else None
+                math.degrees(path_bearing_rad) if path_bearing_rad is not None else None
             ),
-
             "guidance_bearing_rad": guidance_bearing_rad,
             "guidance_bearing_deg": (
                 math.degrees(guidance_bearing_rad)
                 if guidance_bearing_rad is not None
                 else None
             ),
-
             # IMPORTANT: this is the final existing RPP heading_error.
             "heading_error_rad": heading_error_rad,
             "heading_error_deg": (
@@ -7155,27 +7033,18 @@ class RPPController(Node):
                 if heading_error_rad is not None
                 else None
             ),
-
             "distance_to_goal_m": distance_to_goal_m,
             "distance_to_goal_mm": (
-                distance_to_goal_m * 1000.0
-                if distance_to_goal_m is not None
-                else None
+                distance_to_goal_m * 1000.0 if distance_to_goal_m is not None else None
             ),
-
             "cross_track_error_m": ground_xtrack_m,
             "cross_track_error_mm": (
-                ground_xtrack_m * 1000.0
-                if ground_xtrack_m is not None
-                else None
+                ground_xtrack_m * 1000.0 if ground_xtrack_m is not None else None
             ),
             "cross_track_side": cross_track_side,
-
             "along_remaining_m": along_remaining_m,
             "along_remaining_mm": (
-                along_remaining_m * 1000.0
-                if along_remaining_m is not None
-                else None
+                along_remaining_m * 1000.0 if along_remaining_m is not None else None
             ),
             "along_position": along_position,
         }
@@ -7824,9 +7693,7 @@ class RPPController(Node):
             source = None
             binding = self.geometry_goal_binding
             if self.path_geometry is not None and binding is not None:
-                anchor = self.path_geometry.semantic_anchor_at(
-                    binding.raw_path_index
-                )
+                anchor = self.path_geometry.semantic_anchor_at(binding.raw_path_index)
                 if (
                     anchor is not None
                     and anchor.incoming_heading_rad is not None
@@ -7872,9 +7739,7 @@ class RPPController(Node):
             for value in (radial_error_m, along_error_m, cross_error_m)
         ):
             return
-        residual_m2 = (radial_error_m ** 2) - (
-            along_error_m ** 2 + cross_error_m ** 2
-        )
+        residual_m2 = (radial_error_m**2) - (along_error_m**2 + cross_error_m**2)
         if abs(residual_m2) > 1.0e-6:
             self.get_logger().warn(
                 "PRECISION TERMINAL MEASUREMENT CONSISTENCY WARNING | "
@@ -7956,8 +7821,7 @@ class RPPController(Node):
             measured_yaw_rate_radps=float(self.current_yaw_rate_radps),
             telemetry_fresh=telemetry_fresh,
             braking_required=(
-                control_remaining_m
-                <= self.precision_terminal_config.brake_distance_m
+                control_remaining_m <= self.precision_terminal_config.brake_distance_m
             ),
             heading_error_deg=math.degrees(path_heading_error),
             current_pose=ControllerPose(
@@ -8546,9 +8410,10 @@ class RPPController(Node):
             self.odom_timeout_sec,
         ):
             self.publish_stop()
-            if self.segment_alignment_active and getattr(
-                self, "legacy_alignment", None
-            ) is not None:
+            if (
+                self.segment_alignment_active
+                and getattr(self, "legacy_alignment", None) is not None
+            ):
                 self.legacy_alignment.reset_dwell_timers()
             if self.precision_terminal_enabled:
                 stale_result = self._step_precision_terminal_stale_cycle()
@@ -8584,9 +8449,7 @@ class RPPController(Node):
                 first_approach = True
             else:
                 self.publish_stop()
-                self.log_waiting(
-                    "waiting for gp_origin-projected current C->P1 trajectory"
-                )
+                self.log_waiting("waiting for current local C->P1 trajectory")
                 return
 
         if first_approach:
@@ -8626,7 +8489,7 @@ class RPPController(Node):
                 target_is_marking = True
                 target_label = "P1 FALLBACK TARGET"
 
-            mode_prefix = "C->P1 GP_ORIGIN 50MM / " + target_label + " / "
+            mode_prefix = "C->P1 LOCAL ODOM 50MM / " + target_label + " / "
         else:
             if self.target_x is None or self.target_y is None:
                 self.publish_stop()
@@ -8678,13 +8541,13 @@ class RPPController(Node):
             mode_prefix = ""
 
         # Same map frame, two path lifetimes:
-        #   START->P1 : gp_origin-projected current C -> P1 runtime path.
+        #   START->P1 : current local-odom C -> P1 runtime path.
         #   P1->Pn    : fixed surveyed /nav_path prepared during LOAD.
         if first_approach:
             nav_solution = self.runtime_entry_tracking_solution(goal_x, goal_y)
             if nav_solution is None:
                 self.publish_stop()
-                self.log_waiting("runtime gp_origin C->P1 trajectory unavailable")
+                self.log_waiting("runtime local-odom C->P1 trajectory unavailable")
                 return
         else:
             nav_solution = self.nav_path_tracking_solution(goal_x, goal_y)
