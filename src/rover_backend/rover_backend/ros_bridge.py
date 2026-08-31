@@ -53,6 +53,7 @@ from std_msgs.msg import Float32
 from std_msgs.msg import Float64
 from std_msgs.msg import String
 from std_msgs.msg import UInt64
+from mission_manager_interfaces.srv import ReleaseEmergencyStop
 from std_srvs.srv import Trigger
 
 from rover_backend.config import settings
@@ -70,6 +71,25 @@ LOGGER = logging.getLogger(__name__)
 
 
 RTCM_INJECTION_TOPIC = "/mavros/gps_rtk/send_rtcm"
+
+
+class RosServiceOutcomeUnknownError(RuntimeError):
+    """The client timed out after dispatch, so server completion is unknown."""
+
+    outcome = "UNKNOWN"
+    retry_safe = False
+
+
+def _notify_authoritative_state_changed() -> None:
+    """Notify realtime lazily to avoid a ros_bridge/realtime import cycle."""
+
+    try:
+        from rover_backend.realtime import notify_authoritative_state_changed
+
+        notify_authoritative_state_changed()
+    except ImportError:
+        # Realtime may not be imported during isolated ROS-node tests.
+        return
 
 
 GPS_FIX_NAMES: dict[int, str] = {
@@ -240,6 +260,23 @@ class RoverBackendRosNode(Node):
 
     SERVICE_DISCOVERY_TIMEOUT_SEC = 3.0
     SERVICE_RESPONSE_TIMEOUT_SEC = 5.0
+    MANAGER_RESPONSE_TIMEOUT_SEC = {
+        # START/RESUME/NEXT can each include OFFBOARD and ARM service
+        # discovery/response waits plus state confirmations. These contracts
+        # intentionally exceed Mission Manager's legitimate worst case.
+        "start": 30.0,
+        "resume": 30.0,
+        "next_point": 30.0,
+        # STOP can include DISARM service discovery/response and confirmation.
+        "stop": 20.0,
+        "pause": 8.0,
+        "skip_point": 8.0,
+        "clear": 8.0,
+        # Keep hard-stop acknowledgement latency bounded independently of
+        # ordinary long-running commands.
+        "emergency_stop": 3.0,
+        "release_emergency_stop": 5.0,
+    }
 
     OFFBOARD_STREAM_SETTLE_SEC = 0.60
     COMMAND_SETTLE_SEC = 0.10
@@ -259,6 +296,35 @@ class RoverBackendRosNode(Node):
 
         self._command_lock = threading.RLock()
         self._runtime_lock = threading.RLock()
+        # Mission Manager status arrives on a ROS executor thread. Durable
+        # runtime persistence performs flush/fsync and must never block that
+        # callback. Keep only the newest pending status while the worker is
+        # writing an older snapshot.
+        self._runtime_persist_condition = threading.Condition()
+        self._runtime_persist_pending: tuple[str, dict[str, Any]] | None = None
+        self._runtime_persist_stopping = False
+        self._runtime_persist_thread = threading.Thread(
+            target=self._runtime_persist_worker,
+            name="mission-runtime-persist",
+            daemon=True,
+        )
+        self._runtime_persist_thread.start()
+
+        # Point events update the in-memory result map synchronously, but the
+        # durable live-report checkpoint performs fsync and must not run in a
+        # ROS subscription callback. A one-slot latest-state queue is enough:
+        # each checkpoint reads the accumulated point_results map, so
+        # coalescing cannot lose an already-recorded terminal point result.
+        self._report_checkpoint_condition = threading.Condition()
+        self._report_checkpoint_pending_mission_id: str | None = None
+        self._report_checkpoint_stopping = False
+        self._report_checkpoint_thread = threading.Thread(
+            target=self._report_checkpoint_worker,
+            name="mission-report-checkpoint",
+            daemon=True,
+        )
+        self._report_checkpoint_thread.start()
+
         self._terminal_cleanup_lock = threading.Lock()
         self._terminal_cleanup_keys: set[str] = set()
 
@@ -553,7 +619,13 @@ class RoverBackendRosNode(Node):
                 f"/mission_manager/{command}",
             )
             for command in sorted(MISSION_MANAGER_COMMANDS)
+            if command != "release_emergency_stop"
         }
+
+        self._release_emergency_stop_client = self.create_client(
+            ReleaseEmergencyStop,
+            "/mission_manager/release_emergency_stop",
+        )
 
         # ======================================================
         # Timers and safe initialization
@@ -2014,6 +2086,10 @@ class RoverBackendRosNode(Node):
             ),
             "mission_enable": bool(payload.get("mission_enable", False)),
             "emergency_stop": bool(payload.get("emergency_stop", True)),
+            "safety_generation": _safe_int(
+                payload.get("safety_generation"),
+                -1,
+            ),
             "px4_connected": bool(payload.get("px4_connected", False)),
             "px4_mode": payload.get("px4_mode"),
             "px4_armed": bool(payload.get("px4_armed", False)),
@@ -2151,7 +2227,9 @@ class RoverBackendRosNode(Node):
         )
 
         # mission_manager is the sole owner of the motion safety gate.
-        self._persist_mission_runtime(payload)
+        # Never perform durable file I/O from this ROS subscription callback.
+        self._schedule_mission_runtime_persist(payload)
+        _notify_authoritative_state_changed()
 
 
 
@@ -2361,24 +2439,12 @@ class RoverBackendRosNode(Node):
             last_point_event=payload,
             point_results=point_results,
         )
-
-        # Existing durable checkpoint behavior.
-        try:
-            mission_report_store.checkpoint_live_report()
-
-        except MissionReportError as error:
-            reason = "Mission report checkpoint failed: " f"{error}"
-
-            rover_state.update(
-                "report",
-                status="CHECKPOINT_FAILED",
-                error=reason,
-            )
-
-            self.get_logger().error(reason)
+        _notify_authoritative_state_changed()
 
         if event_name == "MISSION_TERMINATED":
             self._schedule_terminal_mission_cleanup(payload)
+        else:
+            self._schedule_live_report_checkpoint()
 
     def _schedule_terminal_mission_cleanup(
         self,
@@ -2404,6 +2470,78 @@ class RoverBackendRosNode(Node):
             daemon=True,
         )
         cleanup_thread.start()
+
+    def _schedule_live_report_checkpoint(self) -> None:
+        """Queue a coalesced live-report checkpoint outside ROS callbacks."""
+
+        mission_id = str(rover_state.section("mission").get("mission_id") or "")
+        if not mission_id:
+            return
+
+        with self._report_checkpoint_condition:
+            if self._report_checkpoint_stopping:
+                return
+            self._report_checkpoint_pending_mission_id = mission_id
+            self._report_checkpoint_condition.notify()
+
+    def _report_checkpoint_worker(self) -> None:
+        """Persist accumulated point results without blocking the executor."""
+
+        while True:
+            with self._report_checkpoint_condition:
+                while (
+                    self._report_checkpoint_pending_mission_id is None
+                    and not self._report_checkpoint_stopping
+                ):
+                    self._report_checkpoint_condition.wait()
+
+                if (
+                    self._report_checkpoint_pending_mission_id is None
+                    and self._report_checkpoint_stopping
+                ):
+                    return
+
+                mission_id = self._report_checkpoint_pending_mission_id
+                self._report_checkpoint_pending_mission_id = None
+
+            # Serialize with upload replacement and terminal report cleanup.
+            # Re-check identity and active artifacts after acquiring the
+            # lifecycle lock so a delayed worker cannot recreate stale files.
+            with mission_report_store.lifecycle_transaction():
+                active_mission_id = str(
+                    rover_state.section("mission").get("mission_id") or ""
+                )
+                if (
+                    not mission_id
+                    or active_mission_id != mission_id
+                    or not settings.mission_file.is_file()
+                    or not settings.mission_metadata_file.is_file()
+                ):
+                    continue
+
+                try:
+                    mission_report_store.checkpoint_live_report()
+                except MissionReportError as error:
+                    reason = f"Mission report checkpoint failed: {error}"
+                    rover_state.update(
+                        "report",
+                        status="CHECKPOINT_FAILED",
+                        error=reason,
+                    )
+                    self.get_logger().error(reason)
+
+    def _shutdown_report_checkpoint_worker(self) -> None:
+        """Flush the newest pending point checkpoint and stop its worker."""
+
+        with self._report_checkpoint_condition:
+            self._report_checkpoint_stopping = True
+            self._report_checkpoint_condition.notify_all()
+
+        self._report_checkpoint_thread.join(timeout=2.0)
+        if self._report_checkpoint_thread.is_alive():
+            LOGGER.warning(
+                "Mission report checkpoint worker did not stop within 2 seconds"
+            )
 
     def _finalize_terminal_mission(
         self,
@@ -2545,40 +2683,111 @@ class RoverBackendRosNode(Node):
             },
         )
 
-    def _persist_mission_runtime(
+    def _schedule_mission_runtime_persist(
         self,
         manager_payload: dict[str, Any],
     ) -> None:
-        mission_id = rover_state.section("mission").get("mission_id")
+        """Queue the newest runtime snapshot together with its mission identity."""
 
-        # mission_manager continues to publish EMPTY status after terminal
-        # cleanup.  Never let those periodic messages recreate a deleted
-        # mission_runtime.json.
-        if (
-            not mission_id
-            or not settings.mission_file.is_file()
-            or not settings.mission_metadata_file.is_file()
-        ):
-            try:
-                settings.mission_runtime_file.unlink(missing_ok=True)
-            except OSError:
-                LOGGER.exception("Unable to remove stale mission runtime state")
-            return
+        mission_id = str(
+            rover_state.section("mission").get("mission_id") or ""
+        )
+        snapshot = copy.deepcopy(manager_payload)
 
-        runtime_payload = {
-            "schema_version": 1,
-            "saved_at": utc_now_iso(),
-            "mission_id": mission_id,
-            "runtime": manager_payload,
-        }
+        with self._runtime_persist_condition:
+            if self._runtime_persist_stopping:
+                return
 
-        try:
-            _atomic_write_json(
-                settings.mission_runtime_file,
-                runtime_payload,
+            # Mission identity is captured at enqueue time. A delayed Mission A
+            # snapshot must never be persisted as Mission B after replacement.
+            self._runtime_persist_pending = (mission_id, snapshot)
+            self._runtime_persist_condition.notify()
+
+    def _runtime_persist_worker(self) -> None:
+        """Persist Mission Manager runtime snapshots outside ROS callbacks."""
+
+        while True:
+            with self._runtime_persist_condition:
+                while (
+                    self._runtime_persist_pending is None
+                    and not self._runtime_persist_stopping
+                ):
+                    self._runtime_persist_condition.wait()
+
+                if (
+                    self._runtime_persist_pending is None
+                    and self._runtime_persist_stopping
+                ):
+                    return
+
+                pending = self._runtime_persist_pending
+                self._runtime_persist_pending = None
+
+            if pending is not None:
+                mission_id, payload = pending
+                self._persist_mission_runtime(mission_id, payload)
+
+    def _shutdown_runtime_persist_worker(self) -> None:
+        """Flush the newest pending runtime snapshot and stop the worker."""
+
+        with self._runtime_persist_condition:
+            self._runtime_persist_stopping = True
+            self._runtime_persist_condition.notify_all()
+
+        self._runtime_persist_thread.join(timeout=2.0)
+
+        if self._runtime_persist_thread.is_alive():
+            LOGGER.warning(
+                "Mission runtime persistence worker did not stop within 2 seconds"
             )
-        except OSError:
-            LOGGER.exception("Unable to persist mission runtime state")
+
+    def _persist_mission_runtime(
+        self,
+        captured_mission_id: str,
+        manager_payload: dict[str, Any],
+    ) -> None:
+        # Serialize runtime persistence against terminal cleanup and new-mission
+        # lifecycle operations.
+        with mission_report_store.lifecycle_transaction():
+            current_mission_id = str(
+                rover_state.section("mission").get("mission_id") or ""
+            )
+
+            # Never associate an old queued runtime snapshot with a mission that
+            # replaced it while this worker was delayed.
+            if captured_mission_id != current_mission_id:
+                return
+
+            # EMPTY status may remove stale runtime only when the captured
+            # identity is also still EMPTY. It must never delete a newer
+            # mission's runtime file.
+            if (
+                not captured_mission_id
+                or not settings.mission_file.is_file()
+                or not settings.mission_metadata_file.is_file()
+            ):
+                try:
+                    settings.mission_runtime_file.unlink(missing_ok=True)
+                except OSError:
+                    LOGGER.exception(
+                        "Unable to remove stale mission runtime state"
+                    )
+                return
+
+            runtime_payload = {
+                "schema_version": 1,
+                "saved_at": utc_now_iso(),
+                "mission_id": captured_mission_id,
+                "runtime": manager_payload,
+            }
+
+            try:
+                _atomic_write_json(
+                    settings.mission_runtime_file,
+                    runtime_payload,
+                )
+            except OSError:
+                LOGGER.exception("Unable to persist mission runtime state")
 
     # ==========================================================
     # Safety mirroring and backend heartbeat
@@ -2602,6 +2811,7 @@ class RoverBackendRosNode(Node):
             ),
             heartbeat_healthy=heartbeat_healthy,
         )
+        _notify_authoritative_state_changed()
 
     def _mission_enable_state_callback(self, message: Bool) -> None:
         self._mission_enable = bool(message.data)
@@ -2634,6 +2844,7 @@ class RoverBackendRosNode(Node):
         success_attribute: str = "success",
         discovery_timeout_sec: float | None = None,
         response_timeout_sec: float | None = None,
+        timeout_outcome_unknown: bool = False,
     ) -> tuple[bool, str]:
         discovery_timeout = (
             self.SERVICE_DISCOVERY_TIMEOUT_SEC
@@ -2676,6 +2887,19 @@ class RoverBackendRosNode(Node):
         future.add_done_callback(_done_callback)
 
         if not completion.wait(response_timeout):
+            # Cancelling the local future cannot prove that the server did not
+            # execute the request. It only prevents an obsolete client result
+            # from being consumed if cancellation is supported.
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            if timeout_outcome_unknown:
+                raise RosServiceOutcomeUnknownError(
+                    f"Timed out waiting for {service_name} after dispatch; "
+                    "execution outcome is unknown. Do not retry blindly; "
+                    "verify authoritative mission/safety state first."
+                )
             return (
                 False,
                 f"Timed out waiting for {service_name}",
@@ -2719,18 +2943,26 @@ class RoverBackendRosNode(Node):
         client: Any,
         service_name: str,
         response_timeout_sec: float | None = None,
+        timeout_outcome_unknown: bool = False,
     ) -> tuple[bool, str]:
         return self._call_service(
             client=client,
             request=Trigger.Request(),
             service_name=service_name,
             response_timeout_sec=(response_timeout_sec),
+            timeout_outcome_unknown=timeout_outcome_unknown,
         )
 
     def _manager_command(
         self,
         command: str,
     ) -> tuple[bool, str]:
+        if command == "release_emergency_stop":
+            return (
+                False,
+                "release_emergency_stop requires a generation-aware request",
+            )
+
         if command not in MISSION_MANAGER_COMMANDS:
             return (
                 False,
@@ -2740,6 +2972,8 @@ class RoverBackendRosNode(Node):
         return self._call_trigger(
             client=(self._mission_manager_clients[command]),
             service_name=(f"/mission_manager/{command}"),
+            response_timeout_sec=self.MANAGER_RESPONSE_TIMEOUT_SEC[command],
+            timeout_outcome_unknown=True,
         )
 
     def _publish_execution_mode(
@@ -2866,6 +3100,7 @@ class RoverBackendRosNode(Node):
             message=service_message,
             error=None,
         )
+        _notify_authoritative_state_changed()
         return rover_state.section("mission")
 
     def start_mission(self) -> dict[str, Any]:
@@ -2915,13 +3150,40 @@ class RoverBackendRosNode(Node):
         if not accepted:
             raise RuntimeError(service_message)
         rover_state.update("safety", reason="OPERATOR_EMERGENCY_STOP")
+        _notify_authoritative_state_changed()
         return rover_state.section("safety")
 
-    def release_emergency_stop(self) -> dict[str, Any]:
-        accepted, service_message = self._manager_command("release_emergency_stop")
+    def release_emergency_stop(
+        self,
+        expected_generation: int,
+    ) -> dict[str, Any]:
+        if expected_generation < 0:
+            raise RuntimeError(
+                "Mission Manager safety generation is unavailable; "
+                "refusing emergency-stop release"
+            )
+
+        request = ReleaseEmergencyStop.Request()
+        request.expected_generation = int(expected_generation)
+
+        accepted, service_message = self._call_service(
+            client=self._release_emergency_stop_client,
+            request=request,
+            service_name="/mission_manager/release_emergency_stop",
+            response_timeout_sec=self.MANAGER_RESPONSE_TIMEOUT_SEC[
+                "release_emergency_stop"
+            ],
+            timeout_outcome_unknown=True,
+        )
+
         if not accepted:
             raise RuntimeError(service_message)
-        rover_state.update("safety", reason="EMERGENCY_STOP_RELEASED")
+
+        rover_state.update(
+            "safety",
+            reason="EMERGENCY_STOP_RELEASED",
+        )
+        _notify_authoritative_state_changed()
         return rover_state.section("safety")
 
 
@@ -2931,6 +3193,11 @@ class RosBridgeRuntime:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._operation_lock = threading.RLock()
+        # Ordinary commands remain serialized by _operation_lock. Safety
+        # requests use their own ordering lock so E-stop can bypass a long
+        # ordinary operation while a queued, older RELEASE is rejected.
+        self._safety_command_lock = threading.RLock()
+        self._safety_generation = 0
         self._node: RoverBackendRosNode | None = None
         self._executor: MultiThreadedExecutor | None = None
         self._thread: threading.Thread | None = None
@@ -3005,6 +3272,22 @@ class RosBridgeRuntime:
 
         if node is not None:
             try:
+                node._shutdown_runtime_persist_worker()
+            except Exception:
+                LOGGER.exception(
+                    "Mission runtime persistence worker shutdown failed"
+                )
+
+        if node is not None:
+            try:
+                node._shutdown_report_checkpoint_worker()
+            except Exception:
+                LOGGER.exception(
+                    "Mission report checkpoint worker shutdown failed"
+                )
+
+        if node is not None:
+            try:
                 node.destroy_node()
             except Exception:
                 LOGGER.exception("ROS node destruction failed")
@@ -3032,12 +3315,62 @@ class RosBridgeRuntime:
         return node.rtk_mavros_ready()
 
     def force_emergency_stop(self) -> dict[str, Any]:
-        with self._operation_lock:
-            return self.node.emergency_stop()
+        # Only protect the ordering token with the safety lock. Never hold a
+        # mutex required by E-stop while waiting for a ROS service response.
+        with self._safety_command_lock:
+            self._safety_generation += 1
+
+        return self.node.emergency_stop()
 
     def release_emergency_stop(self) -> dict[str, Any]:
+        # Capture request ordering and the exact MissionManager safety epoch
+        # observed when the operator issued RELEASE.
+        with self._safety_command_lock:
+            requested_generation = self._safety_generation
+            expected_manager_generation = _safe_int(
+                rover_state.section("safety").get("safety_generation"),
+                -1,
+            )
+
+        if expected_manager_generation < 0:
+            raise RuntimeError(
+                "Mission Manager safety generation is unavailable; "
+                "refusing emergency-stop release"
+            )
+
         with self._operation_lock:
-            return self.node.release_emergency_stop()
+            # Reject a RELEASE superseded before ROS dispatch.
+            with self._safety_command_lock:
+                if requested_generation != self._safety_generation:
+                    raise RuntimeError(
+                        "Emergency-stop release rejected because a newer "
+                        "E-stop assertion occurred while RELEASE was queued"
+                    )
+
+            # Do not hold the local safety lock across this blocking call.
+            # MissionManager independently validates expected_generation under
+            # its own safety/state lock before clearing the hard-stop latch.
+            release_result = self.node.release_emergency_stop(
+                expected_manager_generation
+            )
+
+            with self._safety_command_lock:
+                superseded = (
+                    requested_generation
+                    != self._safety_generation
+                )
+
+            if superseded:
+                # No compensation service call is required. If the newer E-stop
+                # reached MissionManager first, the stale RELEASE was rejected
+                # by generation. If RELEASE executed first, the newer E-stop
+                # becomes the later authority.
+                raise RuntimeError(
+                    "Emergency-stop release was superseded by a newer "
+                    "E-stop assertion"
+                )
+
+            return release_result
 
     def prepare_trajectory(self) -> dict[str, Any]:
         with self._operation_lock:

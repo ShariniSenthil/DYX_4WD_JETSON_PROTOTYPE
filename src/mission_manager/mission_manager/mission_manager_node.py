@@ -33,6 +33,7 @@ import uuid
 from typing import Any, Optional
 
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from geometry_msgs.msg import PoseStamped
 from mavros_msgs.msg import GPSRAW, State
 from mavros_msgs.srv import CommandBool, SetMode
@@ -43,6 +44,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, Float32, Int32MultiArray, String, UInt8MultiArray
+from mission_manager_interfaces.srv import ReleaseEmergencyStop
 from std_srvs.srv import Trigger
 
 from mission_manager.marking_arrival_policy import after_fail_mode_action
@@ -96,6 +98,13 @@ class MissionManager(Node):
     def __init__(self) -> None:
         super().__init__("mission_manager")
         self._io_group = ReentrantCallbackGroup()
+
+        # Long-running mission services must remain serialized with each
+        # other, but they must not occupy the default callback group used by
+        # the 20 Hz control loop. START/RESUME/NEXT can legitimately wait on
+        # PX4 state transitions; control supervision must continue meanwhile.
+        self._mission_service_group = MutuallyExclusiveCallbackGroup()
+
         self._lock = threading.RLock()
 
         # ----------------------------------------------------------
@@ -361,17 +370,48 @@ class MissionManager(Node):
         # ----------------------------------------------------------
         # Services
         # ----------------------------------------------------------
-        self.create_service(Trigger, "/mission_manager/start", self._start_service)
-        self.create_service(Trigger, "/mission_manager/pause", self._pause_service)
-        self.create_service(Trigger, "/mission_manager/resume", self._resume_service)
         self.create_service(
-            Trigger, "/mission_manager/next_point", self._next_point_service
+            Trigger,
+            "/mission_manager/start",
+            self._start_service,
+            callback_group=self._mission_service_group,
         )
         self.create_service(
-            Trigger, "/mission_manager/skip_point", self._skip_point_service
+            Trigger,
+            "/mission_manager/pause",
+            self._pause_service,
+            callback_group=self._mission_service_group,
         )
-        self.create_service(Trigger, "/mission_manager/stop", self._stop_service)
-        self.create_service(Trigger, "/mission_manager/clear", self._clear_service)
+        self.create_service(
+            Trigger,
+            "/mission_manager/resume",
+            self._resume_service,
+            callback_group=self._mission_service_group,
+        )
+        self.create_service(
+            Trigger,
+            "/mission_manager/next_point",
+            self._next_point_service,
+            callback_group=self._mission_service_group,
+        )
+        self.create_service(
+            Trigger,
+            "/mission_manager/skip_point",
+            self._skip_point_service,
+            callback_group=self._mission_service_group,
+        )
+        self.create_service(
+            Trigger,
+            "/mission_manager/stop",
+            self._stop_service,
+            callback_group=self._mission_service_group,
+        )
+        self.create_service(
+            Trigger,
+            "/mission_manager/clear",
+            self._clear_service,
+            callback_group=self._mission_service_group,
+        )
         self.create_service(
             Trigger,
             "/mission_manager/emergency_stop",
@@ -379,7 +419,7 @@ class MissionManager(Node):
             callback_group=self._io_group,
         )
         self.create_service(
-            Trigger,
+            ReleaseEmergencyStop,
             "/mission_manager/release_emergency_stop",
             self._release_emergency_stop_service,
             callback_group=self._io_group,
@@ -485,6 +525,9 @@ class MissionManager(Node):
 
         self._mission_enable = False
         self._emergency_stop = True
+        # Monotonic invalidation token for operations that may eventually
+        # enable motion after waiting on PX4 services/state confirmation.
+        self._safety_generation = 0
         self._fcu_connected = False
         self._px4_armed = False
         self._px4_mode = "UNKNOWN"
@@ -1358,13 +1401,11 @@ class MissionManager(Node):
         """
         ok, reason = self._rtk_motion_ok()
         if self._state == "RUNNING" and not ok:
-            self._mission_enable = False
             self._pause_reason = "RTK_LOST"
             self._resume_available = False
             self._state = "PAUSED"
             self._reset_arrival_state()
-            self._publish_marking_active(False)
-            self._publish_safety()
+            self._disable_motion_preserve_estop()
             self._last_message = f"{reason}; rover stopped and mission paused"
             self._emit_system_event("RTK_PAUSED", reason)
             self._publish_status(force=True)
@@ -1393,13 +1434,11 @@ class MissionManager(Node):
         if reason is None:
             return
 
-        self._mission_enable = False
         self._pause_reason = "PX4_CONTROL_LOST"
         self._resume_available = False
         self._state = "PAUSED"
         self._reset_arrival_state()
-        self._publish_marking_active(False)
-        self._publish_safety()
+        self._disable_motion_preserve_estop()
         self._last_message = (
             f"{reason}; mission paused. Mission Manager did not change PX4 mode"
         )
@@ -1512,18 +1551,44 @@ class MissionManager(Node):
         self._publish_status(force=True)
 
     def _publish_safety(self) -> None:
+        # Snapshot both gates under the same lock used by every safety
+        # transition so subscribers never observe a mixed intermediate pair.
+        with self._lock:
+            mission_enable = bool(self._mission_enable)
+            emergency_stop = bool(self._emergency_stop)
         m = Bool()
-        m.data = bool(self._mission_enable)
+        m.data = mission_enable
         self.mission_enable_pub.publish(m)
         e = Bool()
-        e.data = bool(self._emergency_stop)
+        e.data = emergency_stop
         self.emergency_stop_pub.publish(e)
 
-    def _set_safety(self, *, emergency_stop: bool, mission_enable: bool) -> None:
-        self._emergency_stop = bool(emergency_stop)
-        self._mission_enable = bool(mission_enable) and not self._emergency_stop
-        if not self._mission_enable:
-            self._publish_marking_active(False)
+    def _disable_motion_preserve_estop(self) -> None:
+        """Remove all motion/spray authority without changing the E-stop latch."""
+        self._mission_enable = False
+        self._publish_marking_active(False)
+        self._publish_safety()
+
+    def _assert_emergency_stop(self) -> None:
+        """Assert the hard-stop latch and invalidate pending motion operations."""
+        self._safety_generation += 1
+        self._emergency_stop = True
+        self._mission_enable = False
+        self._publish_marking_active(False)
+        self._publish_safety()
+
+    def _release_emergency_stop_latch(self) -> None:
+        """Release only the hard-stop latch; never grant movement authority."""
+        self._emergency_stop = False
+        self._mission_enable = False
+        self._publish_marking_active(False)
+        self._publish_safety()
+
+    def _enable_motion(self) -> None:
+        """Enable motion only after the caller's locked safety checks pass."""
+        if self._emergency_stop:
+            raise RuntimeError("Emergency stop is active; motion remains disabled")
+        self._mission_enable = True
         self._publish_safety()
 
     def _require_motion_health(
@@ -1676,9 +1741,12 @@ class MissionManager(Node):
           PX4 MODE UNCHANGED BY MISSION MANAGER
           clear Mission Manager runtime -> EMPTY only after DISARM confirmation
         """
-        self._reset_point_timers()
-        self._set_safety(emergency_stop=True, mission_enable=False)
-        self._publish_marking_active(False)
+        # Serialize the immediate hard-stop transition with the control-loop
+        # state machine. PX4 DISARM remains outside this lock because MAVROS
+        # service/state waits must not block the 20 Hz control loop.
+        with self._lock:
+            self._reset_point_timers()
+            self._assert_emergency_stop()
 
         if completed:
             self._emit_system_event(
@@ -1752,6 +1820,7 @@ class MissionManager(Node):
     ) -> Trigger.Response:
         self._start_stage = "PRECHECK"
         self._start_failed_stage = None
+        safety_generation: int | None = None
         try:
             with self._lock:
                 if self._state == "RUNNING":
@@ -1764,14 +1833,23 @@ class MissionManager(Node):
                     raise RuntimeError("Manual mission waiting for NEXT")
                 if self._state == "ERROR":
                     raise RuntimeError("Mission in ERROR; clear/prepare again")
+                if self._emergency_stop:
+                    raise RuntimeError(
+                        "Emergency stop is active; release E-stop before START"
+                    )
                 if self._px4_armed:
                     raise RuntimeError(
                         "START requires PX4 disarmed so sequence is OFFBOARD then ARM"
                     )
-            self._require_motion_health(require_ready_state=True)
+                safety_generation = self._safety_generation
+            self._require_motion_health(
+                require_ready_state=True,
+                require_estop_released=True,
+            )
 
             self._start_stage = "ZERO_SETPOINT_SETTLE"
-            self._set_safety(emergency_stop=False, mission_enable=False)
+            with self._lock:
+                self._disable_motion_preserve_estop()
             time.sleep(self.OFFBOARD_STREAM_SETTLE_SEC)
 
             self._start_stage = "SWITCHING_OFFBOARD"
@@ -1803,9 +1881,23 @@ class MissionManager(Node):
             )
 
             self._start_stage = "FINAL_CHECK"
-            self._require_motion_health(require_ready_state=True)
-
             with self._lock:
+                if self._emergency_stop:
+                    raise RuntimeError(
+                        "START invalidated because emergency stop is active"
+                    )
+                if self._safety_generation != safety_generation:
+                    raise RuntimeError(
+                        "START invalidated by a newer hard-stop assertion"
+                    )
+                if self._state != "READY":
+                    raise RuntimeError(
+                        f"Mission state changed during START (state={self._state})"
+                    )
+                self._require_motion_health(
+                    require_ready_state=True,
+                    require_estop_released=True,
+                )
                 self._point_status = ["PENDING"] * len(self._mission_waypoints)
                 self._point_accuracy_snapshots = [None] * len(self._mission_waypoints)
                 self._point_results = [None] * len(self._mission_waypoints)
@@ -1825,14 +1917,30 @@ class MissionManager(Node):
                 self._publish_mission_complete(False)
                 self._publish_runtime_path()
                 self._publish_goal()
-            self._set_safety(emergency_stop=False, mission_enable=True)
-            self._publish_status(force=True)
+                self._enable_motion()
+                self._publish_status(force=True)
             response.success = True
             response.message = self._last_message
             return response
         except Exception as exc:
             failed_stage = self._start_stage
-            self._set_safety(emergency_stop=True, mission_enable=False)
+
+            with self._lock:
+                safety_invalidated = (
+                    safety_generation is not None
+                    and self._safety_generation != safety_generation
+                )
+
+                if safety_invalidated:
+                    # A newer safety operation already decided the latch state.
+                    # Never let this stale START override a later operator
+                    # RELEASE; motion still remains disabled.
+                    self._disable_motion_preserve_estop()
+                else:
+                    # Genuine START failure keeps the existing fail-safe hard
+                    # stop behavior.
+                    self._assert_emergency_stop()
+
             cleanup_disarm_confirmed, cleanup = self._best_effort_px4_disarm_only()
             with self._lock:
                 if (
@@ -1866,7 +1974,7 @@ class MissionManager(Node):
             self._resume_available = True
             self._state = "PAUSED"
             self._reset_point_timers()
-            self._set_safety(emergency_stop=False, mission_enable=False)
+            self._disable_motion_preserve_estop()
             self._last_message = "Mission paused by operator; progress preserved"
             self._publish_goal()
             self._publish_status(force=True)
@@ -1883,10 +1991,12 @@ class MissionManager(Node):
                     response.success = False
                     response.message = "Mission is not paused"
                     return response
+                safety_generation = self._safety_generation
             self._require_motion_health(
                 require_ready_state=False, require_estop_released=True
             )
-            self._set_safety(emergency_stop=False, mission_enable=False)
+            with self._lock:
+                self._disable_motion_preserve_estop()
             time.sleep(self.OFFBOARD_STREAM_SETTLE_SEC)
             if self._px4_mode != "OFFBOARD":
                 self._request_px4_mode("OFFBOARD")
@@ -1894,10 +2004,23 @@ class MissionManager(Node):
             if not self._px4_armed:
                 self._request_arm(True)
             self._wait_for_vehicle_state(expected_mode="OFFBOARD", expected_armed=True)
-            self._require_motion_health(
-                require_ready_state=False, require_estop_released=True
-            )
             with self._lock:
+                if self._emergency_stop:
+                    raise RuntimeError(
+                        "RESUME invalidated because emergency stop is active"
+                    )
+                if self._safety_generation != safety_generation:
+                    raise RuntimeError(
+                        "RESUME invalidated by a newer hard-stop assertion"
+                    )
+                if self._state != "PAUSED":
+                    raise RuntimeError(
+                        f"Mission state changed during RESUME (state={self._state})"
+                    )
+                self._require_motion_health(
+                    require_ready_state=False,
+                    require_estop_released=True,
+                )
                 self._pause_reason = None
                 self._resume_available = False
                 self._state = "RUNNING"
@@ -1905,17 +2028,16 @@ class MissionManager(Node):
                 self._last_message = "Mission resumed"
                 self._reset_arrival_state()
                 self._publish_goal()
-            self._set_safety(emergency_stop=False, mission_enable=True)
-            self._publish_status(force=True)
+                self._enable_motion()
+                self._publish_status(force=True)
             response.success = True
             response.message = "Mission resumed"
             return response
         except Exception as exc:
             with self._lock:
-                self._mission_enable = False
+                self._disable_motion_preserve_estop()
                 self._resume_available = False
                 self._last_message = f"Resume blocked: {exc}"
-                self._publish_safety()
                 self._publish_status(force=True)
             response.success = False
             response.message = self._last_message
@@ -1940,13 +2062,15 @@ class MissionManager(Node):
                     response.success = True
                     response.message = "Mission completed"
                     return response
+                safety_generation = self._safety_generation
 
             # NEXT can re-enable movement, so it must pass the same simple
             # prepared-path + RTK FIXED gate used by RESUME.
             self._require_motion_health(
                 require_ready_state=False, require_estop_released=True
             )
-            self._set_safety(emergency_stop=False, mission_enable=False)
+            with self._lock:
+                self._disable_motion_preserve_estop()
             time.sleep(self.OFFBOARD_STREAM_SETTLE_SEC)
 
             if self._px4_mode != "OFFBOARD":
@@ -1957,17 +2081,23 @@ class MissionManager(Node):
                 self._request_arm(True)
             self._wait_for_vehicle_state(expected_mode="OFFBOARD", expected_armed=True)
 
-            # Re-check RTK FIXED immediately before enabling motion.
-            self._require_motion_health(
-                require_ready_state=False, require_estop_released=True
-            )
-
             with self._lock:
-                # State may have changed while service calls were in progress.
+                if self._emergency_stop:
+                    raise RuntimeError(
+                        "NEXT invalidated because emergency stop is active"
+                    )
+                if self._safety_generation != safety_generation:
+                    raise RuntimeError(
+                        "NEXT invalidated by a newer hard-stop assertion"
+                    )
                 if self._state != "WAITING_FOR_NEXT":
                     raise RuntimeError(
                         f"Mission state changed during NEXT (state={self._state})"
                     )
+                self._require_motion_health(
+                    require_ready_state=False,
+                    require_estop_released=True,
+                )
                 self._state = "RUNNING"
                 self._pause_reason = None
                 self._resume_available = False
@@ -1975,9 +2105,8 @@ class MissionManager(Node):
                 self._last_message = "Manual NEXT accepted; proceeding to next point"
                 self._reset_arrival_state()
                 self._publish_goal()
-
-            self._set_safety(emergency_stop=False, mission_enable=True)
-            self._publish_status(force=True)
+                self._enable_motion()
+                self._publish_status(force=True)
             response.success = True
             response.message = "Next point enabled"
             return response
@@ -1987,11 +2116,10 @@ class MissionManager(Node):
                 # NEXT failure is a soft block: preserve WAITING_FOR_NEXT and
                 # never turn motion on. Operator can fix health and press NEXT
                 # again; no CLEAR or mission restart is required.
-                self._mission_enable = False
+                self._disable_motion_preserve_estop()
                 self._resume_available = False
                 self._last_error = None
                 self._last_message = f"NEXT blocked: {exc}"
-                self._publish_safety()
                 self._publish_status(force=True)
             response.success = False
             response.message = self._last_message
@@ -2097,10 +2225,7 @@ class MissionManager(Node):
                 self._resume_available = False
                 # SKIP selects the next point; it must never release an
                 # independently asserted emergency-stop latch.
-                self._set_safety(
-                    emergency_stop=self._emergency_stop,
-                    mission_enable=False,
-                )
+                self._disable_motion_preserve_estop()
                 self._last_message = (
                     f"{point_id} skipped; next point selected with motion "
                     "disabled; waiting for NEXT"
@@ -2110,14 +2235,11 @@ class MissionManager(Node):
                 self._state = "PAUSED"
                 self._pause_reason = previous_pause_reason
                 self._resume_available = previous_resume_available
-                self._set_safety(
-                    emergency_stop=self._emergency_stop,
-                    mission_enable=False,
-                )
+                self._disable_motion_preserve_estop()
                 self._last_message = f"{point_id} skipped; mission remains paused"
             elif previous_state == "WAITING_FOR_NEXT":
                 self._state = "WAITING_FOR_NEXT"
-                self._set_safety(emergency_stop=False, mission_enable=False)
+                self._disable_motion_preserve_estop()
                 self._last_message = f"{point_id} skipped; waiting for NEXT"
             else:
                 # AUTO SKIP resumes the next point immediately when the control
@@ -2128,23 +2250,18 @@ class MissionManager(Node):
                     and self._fcu_connected
                     and self._px4_mode == "OFFBOARD"
                     and self._px4_armed
+                    and not self._emergency_stop
                 ):
                     self._state = "RUNNING"
                     self._pause_reason = None
                     self._resume_available = False
-                    self._set_safety(
-                        emergency_stop=False,
-                        mission_enable=True,
-                    )
+                    self._enable_motion()
                     self._last_message = f"{point_id} skipped; continuing automatically"
                 else:
                     self._state = "PAUSED"
                     self._pause_reason = "SKIP_HEALTH_BLOCK"
                     self._resume_available = False
-                    self._set_safety(
-                        emergency_stop=False,
-                        mission_enable=False,
-                    )
+                    self._disable_motion_preserve_estop()
                     self._last_message = (
                         f"P{marking_number+1:04d} skipped, but next-point motion "
                         f"is paused: RTK={rtk_reason}, mode={self._px4_mode}, "
@@ -2207,7 +2324,7 @@ class MissionManager(Node):
     ) -> Trigger.Response:
         with self._lock:
             self._reset_point_timers()
-            self._set_safety(emergency_stop=True, mission_enable=False)
+            self._assert_emergency_stop()
             if self._state == "RUNNING":
                 self._state = "PAUSED"
                 self._pause_reason = "ESTOP"
@@ -2220,22 +2337,45 @@ class MissionManager(Node):
         return response
 
     def _release_emergency_stop_service(
-        self, _request: Trigger.Request, response: Trigger.Response
-    ) -> Trigger.Response:
+        self,
+        request: ReleaseEmergencyStop.Request,
+        response: ReleaseEmergencyStop.Response,
+    ) -> ReleaseEmergencyStop.Response:
         with self._lock:
-            # Never resume automatically. Release only the hard stop latch;
-            # _monitor_pause_recovery() will advertise Resume only after the
-            # complete motion-health bundle is healthy again.
-            self._set_safety(emergency_stop=False, mission_enable=False)
+            expected_generation = int(request.expected_generation)
+            current_generation = int(self._safety_generation)
+
+            # RELEASE is valid only for the exact safety epoch the caller saw.
+            # If a newer hard-stop occurred after the RELEASE was issued, the
+            # stale request is rejected here at the motion-authority boundary.
+            if expected_generation != current_generation:
+                response.success = False
+                response.message = (
+                    "Emergency-stop release rejected as stale: "
+                    f"expected safety generation {expected_generation}, "
+                    f"current generation is {current_generation}"
+                )
+                response.current_generation = current_generation
+                return response
+
+            # Never resume automatically. Release only the hard-stop latch;
+            # _monitor_pause_recovery() advertises Resume only after the full
+            # motion-health bundle becomes healthy again.
+            self._release_emergency_stop_latch()
+
             if self._pause_reason == "ESTOP":
                 self._resume_available = False
+
             self._last_message = (
                 "Emergency stop released; mission remains paused/disabled"
             )
             self._emit_system_event("ESTOP_RELEASED", self._last_message)
             self._publish_status(force=True)
-        response.success = True
-        response.message = self._last_message
+
+            response.success = True
+            response.message = self._last_message
+            response.current_generation = int(self._safety_generation)
+
         return response
 
     # ==============================================================
@@ -2998,6 +3138,7 @@ class MissionManager(Node):
             "last_termination_report": copy.deepcopy(self._last_termination_report),
             "mission_enable": self._mission_enable,
             "emergency_stop": self._emergency_stop,
+            "safety_generation": self._safety_generation,
             "px4_connected": self._fcu_connected,
             "px4_mode": self._px4_mode,
             "px4_armed": self._px4_armed,
@@ -3181,10 +3322,7 @@ class MissionManager(Node):
             self._pause_reason = None
             self._resume_available = False
 
-            self._set_safety(
-                emergency_stop=False,
-                mission_enable=False,
-            )
+            self._disable_motion_preserve_estop()
 
             self._last_message = (
                 f"{point_id} FAILED from RPP MISSED "
@@ -3216,7 +3354,7 @@ class MissionManager(Node):
         # Completion is a terminal hard stop immediately; disarm is then
         # attempted outside this lock on the next timer tick.
         self._reset_point_timers()
-        self._set_safety(emergency_stop=True, mission_enable=False)
+        self._assert_emergency_stop()
         self._state = "COMPLETED"
         self._pause_reason = None
         self._resume_available = False
@@ -3236,11 +3374,13 @@ class MissionManager(Node):
         self._auto_stop_pending = True
 
     def _run_auto_stop_if_pending(self) -> bool:
-        if not self._auto_stop_pending:
-            return False
+        # Atomically claim the pending automatic STOP before leaving the
+        # control-state synchronization boundary.
+        with self._lock:
+            if not self._auto_stop_pending:
+                return False
+            self._auto_stop_pending = False
 
-        # Clear the pending flag before doing service calls so this is one-shot.
-        self._auto_stop_pending = False
         terminated, warnings = self._execute_stop_cleanup(
             completed=True,
             source="AUTO_COMPLETE",
@@ -3257,15 +3397,13 @@ class MissionManager(Node):
         return True
 
     def _enter_error(self, reason: str) -> None:
-        self._mission_enable = False
         self._state = "ERROR"
         self._last_error = reason
         self._last_message = reason
         self._pause_reason = None
         self._resume_available = False
         self._reset_arrival_state()
-        self._publish_marking_active(False)
-        self._publish_safety()
+        self._disable_motion_preserve_estop()
         self._publish_status(force=True)
         self.get_logger().error(reason)
 
@@ -3319,7 +3457,7 @@ class MissionManager(Node):
                 self._state = "PAUSED"
                 self._pause_reason = "ODOM_STALE"
                 self._resume_available = False
-                self._set_safety(emergency_stop=False, mission_enable=False)
+                self._disable_motion_preserve_estop()
                 self._last_message = "Local odometry stale; mission paused"
                 self._emit_system_event("ODOM_PAUSED", self._last_message)
                 self._publish_status(force=True)
@@ -3736,10 +3874,7 @@ class MissionManager(Node):
 
             if self._execution_mode == "MANUAL":
                 self._state = "WAITING_FOR_NEXT"
-                self._set_safety(
-                    emergency_stop=False,
-                    mission_enable=False,
-                )
+                self._disable_motion_preserve_estop()
                 self._last_message = (
                     f"{point_id} COMPLETED at {final_text}; waiting for NEXT"
                 )
@@ -3770,7 +3905,8 @@ def main(args: Optional[list[str]] = None) -> None:
         pass
     finally:
         try:
-            node._set_safety(emergency_stop=True, mission_enable=False)
+            with node._lock:
+                node._assert_emergency_stop()
             node._publish_marking_active(False)
             node._publish_mission_complete(False)
         finally:

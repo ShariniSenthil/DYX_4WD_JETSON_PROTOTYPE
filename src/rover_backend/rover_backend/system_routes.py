@@ -27,6 +27,7 @@ from starlette.concurrency import run_in_threadpool
 from rover_backend.auth import AuthenticatedSession
 from rover_backend.auth import require_auth
 from rover_backend.config import settings
+from rover_backend.ros_bridge import RosServiceOutcomeUnknownError
 from rover_backend.ros_bridge import ros_bridge
 from rover_backend.state import rover_state
 from rover_backend.state import utc_now_iso
@@ -751,6 +752,17 @@ async def emergency_stop(
 
     try:
         safety = await run_in_threadpool(ros_bridge.force_emergency_stop)
+    except RosServiceOutcomeUnknownError as error:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail={
+                "success": False,
+                "outcome": "UNKNOWN",
+                "retry_safe": False,
+                "message": str(error),
+                "safety": rover_state.section("safety"),
+            },
+        ) from error
     except RuntimeError as error:
         raise HTTPException(
             status_code=(status.HTTP_503_SERVICE_UNAVAILABLE),
@@ -774,9 +786,20 @@ async def release_emergency_stop(
 
     try:
         safety = await run_in_threadpool(ros_bridge.release_emergency_stop)
+    except RosServiceOutcomeUnknownError as error:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail={
+                "success": False,
+                "outcome": "UNKNOWN",
+                "retry_safe": False,
+                "message": str(error),
+                "safety": rover_state.section("safety"),
+            },
+        ) from error
     except RuntimeError as error:
         raise HTTPException(
-            status_code=(status.HTTP_503_SERVICE_UNAVAILABLE),
+            status_code=status.HTTP_409_CONFLICT,
             detail=str(error),
         ) from error
 

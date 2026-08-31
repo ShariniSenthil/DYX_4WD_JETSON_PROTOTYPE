@@ -95,10 +95,25 @@ _socket_lock = asyncio.Lock()
 
 _broadcast_task: asyncio.Task[None] | None = None
 _stop_event: asyncio.Event | None = None
+_state_change_event: asyncio.Event | None = None
 _event_loop: asyncio.AbstractEventLoop | None = None
 
 _lifecycle_lock = asyncio.Lock()
 _revocation_callback_registered = False
+
+
+def notify_authoritative_state_changed() -> None:
+    """Wake realtime delivery from ROS/REST threads after state transitions."""
+
+    loop = _event_loop
+    state_change_event = _state_change_event
+    if loop is None or loop.is_closed() or state_change_event is None:
+        return
+    try:
+        loop.call_soon_threadsafe(state_change_event.set)
+    except RuntimeError:
+        # The ASGI loop is shutting down.
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -604,8 +619,9 @@ async def _revalidate_socket_sessions() -> None:
 
 async def _broadcast_loop() -> None:
     stop_event = _stop_event
+    state_change_event = _state_change_event
 
-    if stop_event is None:
+    if stop_event is None or state_change_event is None:
         return
 
     frequency_hz = max(
@@ -627,6 +643,7 @@ async def _broadcast_loop() -> None:
     previous_point_event_signature: str | None = None
     previous_mission_state: str | None = None
     next_deadline = asyncio.get_running_loop().time()
+    periodic_iteration = True
 
     while not stop_event.is_set():
         try:
@@ -724,17 +741,21 @@ async def _broadcast_loop() -> None:
         except Exception:
             LOGGER.exception("Realtime broadcast iteration failed")
 
-        next_deadline += interval_seconds
+        if periodic_iteration:
+            next_deadline += interval_seconds
         now = asyncio.get_running_loop().time()
         if next_deadline <= now:
             missed_intervals = int((now - next_deadline) / interval_seconds) + 1
             next_deadline += missed_intervals * interval_seconds
         try:
             await asyncio.wait_for(
-                stop_event.wait(),
+                state_change_event.wait(),
                 timeout=max(0.0, next_deadline - now),
             )
+            state_change_event.clear()
+            periodic_iteration = False
         except asyncio.TimeoutError:
+            periodic_iteration = True
             continue
 
 
@@ -749,6 +770,7 @@ async def start_realtime() -> None:
     global _broadcast_task
     global _event_loop
     global _revocation_callback_registered
+    global _state_change_event
     global _stop_event
 
     async with _lifecycle_lock:
@@ -758,6 +780,7 @@ async def start_realtime() -> None:
         _event_loop = asyncio.get_running_loop()
 
         _stop_event = asyncio.Event()
+        _state_change_event = asyncio.Event()
 
         if not _revocation_callback_registered:
             authentication_store.register_revocation_callback(
@@ -782,6 +805,7 @@ async def stop_realtime() -> None:
 
     global _broadcast_task
     global _event_loop
+    global _state_change_event
     global _stop_event
 
     async with _lifecycle_lock:
@@ -790,6 +814,8 @@ async def stop_realtime() -> None:
 
         if stop_event is not None:
             stop_event.set()
+        if _state_change_event is not None:
+            _state_change_event.set()
 
         if task is not None:
             try:
@@ -824,6 +850,7 @@ async def stop_realtime() -> None:
 
         _broadcast_task = None
         _stop_event = None
+        _state_change_event = None
         _event_loop = None
 
         LOGGER.info("Realtime broadcaster stopped")

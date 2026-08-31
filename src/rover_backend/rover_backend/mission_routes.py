@@ -44,6 +44,7 @@ from rover_backend.mission_report import MissionReportError
 from rover_backend.mission_report import mission_report_store
 from rover_backend.mission_store import MissionValidationError
 from rover_backend.mission_store import mission_store
+from rover_backend.ros_bridge import RosServiceOutcomeUnknownError
 from rover_backend.ros_bridge import ros_bridge
 from rover_backend.state import rover_state
 
@@ -132,12 +133,15 @@ def _control_error(
     operation: str,
     error: Exception,
 ) -> HTTPException:
+    outcome_unknown = isinstance(error, RosServiceOutcomeUnknownError)
     return HTTPException(
-        status_code=409,
+        status_code=504 if outcome_unknown else 409,
         detail={
             "success": False,
             "operation": operation,
             "message": str(error),
+            "outcome": "UNKNOWN" if outcome_unknown else "FAILED",
+            "retry_safe": not outcome_unknown,
             "mission": _mission_state(),
         },
     )
@@ -532,29 +536,20 @@ async def stop_mission(
         ros_bridge.stop_mission,
     )
 
-    report = None
-    if mission_id:
-        report = await run_in_threadpool(
-            mission_report_store.wait_for_report,
-            mission_id,
-            10.0,
-        )
-
+    # STOP authority is Mission Manager. Once its STOP service returns
+    # successfully, motion has already been disabled and the PX4 disarm
+    # contract has completed. Terminal report/file cleanup runs independently
+    # from the control response and must never hold the STOP HTTP request.
     report_status = mission_report_store.status()
     report_ready = bool(
-        report is not None and report_status.get("cleanup_complete", False)
+        mission_id
+        and mission_id == report_status.get("mission_id")
+        and report_status.get("cleanup_complete", False)
     )
 
     response["manager_stop_success"] = True
     response["report_ready"] = report_ready
     response["report"] = report_status
-
-    if mission_id and not report_ready:
-        response["success"] = False
-        response["message"] = str(
-            report_status.get("error")
-            or "Mission Manager stopped the mission, but terminal report cleanup did not complete."
-        )
 
     return response
 

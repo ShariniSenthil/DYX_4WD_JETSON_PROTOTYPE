@@ -1,0 +1,5 @@
+uint64 expected_generation
+---
+bool success
+string message
+uint64 current_generation

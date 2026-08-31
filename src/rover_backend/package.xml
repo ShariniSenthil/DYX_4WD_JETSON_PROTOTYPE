@@ -32,4 +32,5 @@
   <export>
     <build_type>ament_python</build_type>
   </export>
+  <exec_depend>mission_manager_interfaces</exec_depend>
 </package>
