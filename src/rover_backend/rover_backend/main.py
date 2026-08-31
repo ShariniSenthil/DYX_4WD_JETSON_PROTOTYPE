@@ -153,6 +153,23 @@ def _request_client_ip(
     return client_ip or None
 
 
+def _is_public_docs_request(request: Request) -> bool:
+    """Return True for read-only Swagger/OpenAPI documentation requests.
+
+    The PX4_DXP reference backend serves its API documentation without the
+    network gate. Documentation endpoints expose no rover control, so they
+    stay reachable for every client that can reach the rover.
+    """
+
+    if request.method not in {"GET", "HEAD"}:
+        return False
+
+    return request.url.path in {
+        "/api/docs",
+        "/api/openapi.json",
+    }
+
+
 @fastapi_app.middleware("http")
 async def local_network_and_security_headers(
     request: Request,
@@ -162,7 +179,9 @@ async def local_network_and_security_headers(
 
     client_ip = _request_client_ip(request)
 
-    if not client_ip_is_allowed(client_ip):
+    if not _is_public_docs_request(request) and not client_ip_is_allowed(
+        client_ip,
+    ):
         LOGGER.warning(
             "Rejected HTTP client outside allowed network: ip=%s path=%s",
             client_ip,
