@@ -347,6 +347,28 @@ class RPPController(Node):
             "line_tracking_lookahead_m",
             0.55,
         )
+        # Speed- and cross-track-adaptive lookahead for line_guidance().
+        # A fixed lookahead means the correction reacts far ahead in TIME at
+        # low speed (e.g. mid-accel-ramp) and close in time at cruise --
+        # inconsistent dynamic response across the speed range. Scaling with
+        # commanded speed keeps look-ahead TIME roughly constant instead
+        # (line_tracking_lookahead_m / cruise_speed_mps is used as that time
+        # gain, so behaviour at cruise is unchanged from today's tuning).
+        # The xtrack term widens the lookahead on large deviations so
+        # re-acquisition is a softer curve instead of saturating straight
+        # into the atan2 correction-limit clamp.
+        self.declare_parameter(
+            "line_tracking_lookahead_min_m",
+            0.35,
+        )
+        self.declare_parameter(
+            "line_tracking_lookahead_max_m",
+            0.80,
+        )
+        self.declare_parameter(
+            "line_tracking_lookahead_xtrack_gain",
+            1.0,
+        )
         # /nav_path is generated at 50 mm spacing. The cursor advances through
         # those points without stopping; a farther point is selected only as
         # the RPP lookahead reference. Semantic /segment_goal still owns the
@@ -847,6 +869,20 @@ class RPPController(Node):
         )
         self.line_tracking_lookahead = float(
             self.get_parameter("line_tracking_lookahead_m").value
+        )
+        self.line_tracking_lookahead_min = float(
+            self.get_parameter("line_tracking_lookahead_min_m").value
+        )
+        self.line_tracking_lookahead_max = float(
+            self.get_parameter("line_tracking_lookahead_max_m").value
+        )
+        self.line_tracking_lookahead_xtrack_gain = float(
+            self.get_parameter("line_tracking_lookahead_xtrack_gain").value
+        )
+        # Derived time gain: reproduces line_tracking_lookahead_m exactly at
+        # cruise_speed_mps (xtrack=0), so cruise-speed behaviour is unchanged.
+        self.line_tracking_lookahead_speed_gain = (
+            self.line_tracking_lookahead / self.cruise_speed
         )
         self.nav_path_lookahead = float(
             self.get_parameter("nav_path_lookahead_m").value
@@ -2400,6 +2436,11 @@ class RPPController(Node):
                 self.terminal_line_alignment_distance
             ),
             "line_tracking_lookahead_m": (self.line_tracking_lookahead),
+            "line_tracking_lookahead_min_m": (self.line_tracking_lookahead_min),
+            "line_tracking_lookahead_max_m": (self.line_tracking_lookahead_max),
+            "line_tracking_lookahead_xtrack_gain": (
+                self.line_tracking_lookahead_xtrack_gain
+            ),
             "nav_path_lookahead_m": self.nav_path_lookahead,
             "nav_path_point_reach_m": self.nav_path_point_reach,
             "alignment_release_accel_distance_m": (
@@ -2896,6 +2937,20 @@ class RPPController(Node):
             raise ValueError(
                 "terminal_recovery_lookahead_min_m must be <= "
                 "line_tracking_lookahead_m"
+            )
+        if not (
+            0.0
+            < self.line_tracking_lookahead_min
+            <= self.line_tracking_lookahead
+            <= self.line_tracking_lookahead_max
+        ):
+            raise ValueError(
+                "line_tracking_lookahead_min_m must be > 0 and <= "
+                "line_tracking_lookahead_m <= line_tracking_lookahead_max_m"
+            )
+        if self.line_tracking_lookahead_xtrack_gain < 0.0:
+            raise ValueError(
+                "line_tracking_lookahead_xtrack_gain must be >= 0"
             )
         if (
             self.terminal_goal_intercept_distance
@@ -7465,6 +7520,19 @@ class RPPController(Node):
         Follow the local tangent line through the active /nav_path cursor.
         The cursor advances through the trajectory generator's 50 mm points;
         interpolation points shape guidance but never become stop goals.
+
+        The lookahead is speed- and cross-track-adaptive. A fixed lookahead
+        reacts far ahead in TIME at low speed and close in time at cruise --
+        inconsistent dynamic response across the accel/decel speed range.
+        Scaling with the last commanded translational speed keeps look-ahead
+        time roughly constant instead (line_tracking_lookahead_speed_gain is
+        line_tracking_lookahead_m / cruise_speed_mps, so behaviour at cruise
+        is unchanged from the previous fixed-lookahead tuning). The xtrack
+        term widens the lookahead on large deviations for a softer
+        re-acquisition curve instead of saturating straight into the
+        correction-limit clamp below. Drivetrain-agnostic: this only shapes
+        the commanded bearing/velocity vector, the same output contract used
+        by every caller regardless of how PX4 turns it into wheel commands.
         """
         delta_east = self.current_x - line_point_x
         delta_north = self.current_y - line_point_y
@@ -7473,9 +7541,18 @@ class RPPController(Node):
             -math.sin(line_bearing) * delta_east + math.cos(line_bearing) * delta_north
         )
 
+        lookahead = (
+            self.line_tracking_lookahead_speed_gain * abs(self.command_slew_speed)
+            + self.line_tracking_lookahead_xtrack_gain * abs(signed_cross_track)
+        )
+        lookahead = max(
+            self.line_tracking_lookahead_min,
+            min(self.line_tracking_lookahead_max, lookahead),
+        )
+
         correction = -math.atan2(
             signed_cross_track,
-            self.line_tracking_lookahead,
+            lookahead,
         )
         correction = max(
             -correction_limit,

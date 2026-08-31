@@ -78,6 +78,11 @@ class _Controller:
         self.segment_pivot_keeper_started_at = None
         self.alignment_inside_since = None
         self.line_tracking_lookahead = 0.55
+        self.command_slew_speed = 1.0
+        self.line_tracking_lookahead_speed_gain = 0.55
+        self.line_tracking_lookahead_min = 0.35
+        self.line_tracking_lookahead_max = 0.80
+        self.line_tracking_lookahead_xtrack_gain = 1.0
 
     def _reset_legacy_alignment_lifecycle(self, _reason):
         self.segment_alignment_pivot_complete = False

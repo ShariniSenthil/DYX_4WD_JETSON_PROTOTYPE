@@ -411,6 +411,14 @@ def generate_launch_description() -> LaunchDescription:
                         "path_correction_limit_deg": 18.0,
                         "terminal_line_correction_limit_deg": 18.0,
                         "line_tracking_lookahead_m": 0.55,
+                        # Speed-adaptive lookahead: reproduces the 0.55 m
+                        # value above exactly at cruise_speed_mps (1.00),
+                        # scales down toward the min during the accel/decel
+                        # ramps, and widens toward the max on large
+                        # cross-track deviations for a softer re-acquisition.
+                        "line_tracking_lookahead_min_m": 0.35,
+                        "line_tracking_lookahead_max_m": 0.80,
+                        "line_tracking_lookahead_xtrack_gain": 1.0,
                         "nav_path_lookahead_m": 0.55,
                         # Gate-1 accepted in four forward/reverse field runs.
                         # Geometry is installed by default but cannot change
