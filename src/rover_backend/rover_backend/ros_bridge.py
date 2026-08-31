@@ -677,6 +677,19 @@ class RoverBackendRosNode(Node):
         rover_state.mark_ros_message_received()
 
     def _stale_monitor(self) -> None:
+        # This timer runs on the single rover-backend-ros-spin thread that
+        # dispatches ALL of this node's ROS work (subscriptions, timers,
+        # services). An uncaught exception here doesn't just skip one tick
+        # -- it kills that thread permanently for the life of the process,
+        # silently taking every ROS callback (including the E-stop/mission
+        # command services) down with it while the HTTP/FastAPI side keeps
+        # running and looks healthy. Fail closed and log instead of raising.
+        try:
+            self._stale_monitor_impl()
+        except Exception:
+            LOGGER.exception("_stale_monitor tick failed; continuing")
+
+    def _stale_monitor_impl(self) -> None:
         ros_age = self._monotonic_age(self._last_ros_message_monotonic)
         fcu_age = self._monotonic_age(self._last_fcu_message_monotonic)
         position_age = self._monotonic_age(self._last_position_message_monotonic)
@@ -767,6 +780,18 @@ class RoverBackendRosNode(Node):
             fcu_age_sec = self._monotonic_age(
                 self._last_fcu_message_monotonic
             )
+
+        # No /mavros/state message has arrived yet -- _monotonic_age(None)
+        # returns +inf. evaluate_mavros_rtcm_readiness() correctly rejects
+        # a non-finite age; on a cold start _stale_monitor's first tick can
+        # fire before MAVROS finishes connecting, so this is the normal
+        # startup case, not an error. Treat it as "not ready yet" directly
+        # instead of forwarding inf into the strict validator.
+        if not math.isfinite(fcu_age_sec):
+            with self._runtime_lock:
+                self._mavros_rtcm_ready = False
+                self._mavros_rtcm_subscriber_count = 0
+            return
 
         try:
             subscriber_count = int(
