@@ -1,15 +1,17 @@
-"""PX4 geographic-to-local horizontal frame conversion.
+"""PX4 geographic projection and MAVROS NED/ENU conversion.
 
-This module is deliberately ROS-free so its frame mathematics can be tested
-without a running graph. PX4 local NED uses ``MapProjection`` with a spherical
-Earth radius of 6,371,000 metres. ROS local coordinates use ENU axis order.
+The stages are deliberately explicit:
+  geodetic + PX4 gp_origin -> PX4 local NED
+  PX4 local NED -> ROS/MAVROS ENU
+
+PX4 MapProjection uses CONSTANTS_RADIUS_OF_EARTH = 6,371,000 m.
+MAVROS FTF vector conversion is (N, E, D) -> (E, N, -D).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-
 
 PX4_EARTH_RADIUS_M = 6_371_000.0
 
@@ -24,49 +26,46 @@ class GeographicOrigin:
 
 
 @dataclass(frozen=True)
+class LocalPointNED:
+    """PX4 local NED point."""
+
+    north_m: float
+    east_m: float
+    down_m: float = 0.0
+
+
+@dataclass(frozen=True)
 class LocalPointENU:
-    """Horizontal ROS ENU point relative to the PX4 estimator origin."""
+    """ROS/MAVROS local ENU point."""
 
     east_m: float
     north_m: float
+    up_m: float = 0.0
 
 
-def _validate_coordinate(
-    *,
-    latitude_deg: float,
-    longitude_deg: float,
-    label: str,
-) -> None:
-    """Reject coordinates that cannot define a geographic position."""
+def _validate_coordinate(*, latitude_deg: float, longitude_deg: float, label: str) -> None:
+    """Reject invalid geographic coordinates."""
 
     if not math.isfinite(latitude_deg) or not math.isfinite(longitude_deg):
         raise ValueError(f"{label} latitude/longitude must be finite")
-
     if abs(latitude_deg) > 90.0:
         raise ValueError(f"{label} latitude must be within [-90, 90]")
-
     if abs(longitude_deg) > 180.0:
         raise ValueError(f"{label} longitude must be within [-180, 180]")
 
 
-def project_geodetic_to_px4_enu(
+def project_geodetic_to_px4_ned(
     origin: GeographicOrigin,
     latitude_deg: float,
     longitude_deg: float,
-) -> LocalPointENU:
-    """Project one geodetic coordinate into the PX4 local frame in ROS ENU.
-
-    The calculation is an exact Python port of PX4
-    ``MapProjection::project()``. PX4 returns North then East; this function
-    returns East then North to match MAVROS/ROS ENU.
-    """
+) -> LocalPointNED:
+    """Exact horizontal Python port of PX4 MapProjection::project()."""
 
     _validate_coordinate(
         latitude_deg=origin.latitude_deg,
         longitude_deg=origin.longitude_deg,
         label="Origin",
     )
-
     _validate_coordinate(
         latitude_deg=latitude_deg,
         longitude_deg=longitude_deg,
@@ -89,11 +88,9 @@ def project_geodetic_to_px4_enu(
         sin_reference * sin_latitude
         + cos_reference * cos_latitude * cos_delta_longitude
     )
-
     central_angle = math.acos(max(-1.0, min(1.0, argument)))
 
     scale = 1.0
-
     if abs(central_angle) > 0.0:
         scale = central_angle / math.sin(central_angle)
 
@@ -105,7 +102,6 @@ def project_geodetic_to_px4_enu(
         )
         * PX4_EARTH_RADIUS_M
     )
-
     east = (
         scale
         * cos_latitude
@@ -113,7 +109,30 @@ def project_geodetic_to_px4_enu(
         * PX4_EARTH_RADIUS_M
     )
 
+    return LocalPointNED(north_m=north, east_m=east, down_m=0.0)
+
+
+def transform_ned_to_enu(point: LocalPointNED) -> LocalPointENU:
+    """Apply MAVROS FTF static vector rule: (N,E,D) -> (E,N,-D)."""
+
+    values = (point.north_m, point.east_m, point.down_m)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("NED point must contain finite values")
+
     return LocalPointENU(
-        east_m=east,
-        north_m=north,
+        east_m=point.east_m,
+        north_m=point.north_m,
+        up_m=-point.down_m,
+    )
+
+
+def project_geodetic_to_px4_enu(
+    origin: GeographicOrigin,
+    latitude_deg: float,
+    longitude_deg: float,
+) -> LocalPointENU:
+    """Compatibility helper: geodetic -> PX4 NED -> MAVROS/ROS ENU."""
+
+    return transform_ned_to_enu(
+        project_geodetic_to_px4_ned(origin, latitude_deg, longitude_deg)
     )

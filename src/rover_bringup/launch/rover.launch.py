@@ -123,16 +123,14 @@ def generate_launch_description() -> LaunchDescription:
                         "mission_file": (MISSION_FILE),
                         ("mission_metadata_file"): (MISSION_METADATA_FILE),
                         "frame_id": "map",
-                        ("global_position_topic"): (
-                            "/mavros/" "global_position/" "raw/fix"
-                        ),
                         "gp_origin_topic": (
                             "/mavros/" "global_position/" "gp_origin"
                         ),
                         ("fused_global_position_" "topic"): (
                             "/mavros/" "global_position/" "global"
                         ),
-                        "localization_mode": "shadow",
+                        # Survey GPS -> gp_origin -> NED -> MAVROS ENU.
+                        "localization_mode": "px4_origin",
                         "local_odom_topic": ("/mavros/" "local_position/odom"),
                         "gps_status_topic": ("/mavros/" "gpsstatus/gps1/raw"),
                         "rtk_health_topic": ("/rtk_correction_bridge/" "healthy"),
@@ -144,6 +142,8 @@ def generate_launch_description() -> LaunchDescription:
                         ("max_correction_age_sec"): 2.0,
                         ("reference_timeout_sec"): 1.0,
                         ("max_reference_skew_sec"): 0.25,
+                        # Origin health only; not marking tolerance.
+                        "origin_consistency_max_m": 0.30,
                         ("max_target_distance_m"): 1000.0,
                         ("max_abs_coordinate_m"): 10000.0,
                         ("maximum_marking_points"): 10000,

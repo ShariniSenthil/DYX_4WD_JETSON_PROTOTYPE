@@ -14,7 +14,10 @@ Responsibilities:
 
 - Read the single active mission.csv.
 - Preserve the exact uploaded marking-point order.
-- Convert GPS coordinates into MAVROS local ENU coordinates.
+- Convert surveyed GPS through PX4 gp_origin into local NED.
+- Convert NED to ROS ENU using the MAVROS FTF axis rule.
+- Generate ONE fixed mission trajectory beginning at surveyed P1.
+- Leave fresh current-rover C -> P1 entry to RPP after START/ARM.
 - Generate navigation interpolation at the configured spacing.
 - Generate dummy alignment points for short row transitions.
 - Publish original marking points separately from navigation points.
@@ -81,14 +84,12 @@ from std_msgs.msg import UInt8MultiArray
 from std_srvs.srv import Trigger
 
 from trajectory_generator.localization_frame import GeographicOrigin
-from trajectory_generator.localization_frame import project_geodetic_to_px4_enu
+from trajectory_generator.localization_frame import project_geodetic_to_px4_ned
+from trajectory_generator.localization_frame import transform_ned_to_enu
 
 
 class TrajectoryGenerator(Node):
     """Prepare and publish one active rover mission."""
-
-    WGS84_A_M = 6_378_137.0
-    WGS84_F = 1.0 / 298.257223563
 
     CONTROL_HZ = 5.0
 
@@ -118,9 +119,7 @@ class TrajectoryGenerator(Node):
     }
 
     VALID_LOCALIZATION_MODES = {
-        "legacy",
         "px4_origin",
-        "shadow",
     }
 
     def __init__(self) -> None:
@@ -146,11 +145,6 @@ class TrajectoryGenerator(Node):
         )
 
         self.declare_parameter(
-            "global_position_topic",
-            "/mavros/global_position/raw/fix",
-        )
-
-        self.declare_parameter(
             "gp_origin_topic",
             "/mavros/global_position/gp_origin",
         )
@@ -162,7 +156,7 @@ class TrajectoryGenerator(Node):
 
         self.declare_parameter(
             "localization_mode",
-            "shadow",
+            "px4_origin",
         )
 
         self.declare_parameter(
@@ -208,6 +202,11 @@ class TrajectoryGenerator(Node):
         self.declare_parameter(
             "max_reference_skew_sec",
             0.25,
+        )
+
+        self.declare_parameter(
+            "origin_consistency_max_m",
+            0.30,
         )
 
         self.declare_parameter(
@@ -261,10 +260,6 @@ class TrajectoryGenerator(Node):
 
         self.frame_id = str(self.get_parameter("frame_id").value).strip()
 
-        self.global_position_topic = str(
-            self.get_parameter("global_position_topic").value
-        ).strip()
-
         self.gp_origin_topic = str(
             self.get_parameter("gp_origin_topic").value
         ).strip()
@@ -309,6 +304,10 @@ class TrajectoryGenerator(Node):
 
         self.max_reference_skew_sec = float(
             self.get_parameter("max_reference_skew_sec").value
+        )
+
+        self.origin_consistency_max_m = float(
+            self.get_parameter("origin_consistency_max_m").value
         )
 
         self.max_target_distance_m = float(
@@ -410,13 +409,6 @@ class TrajectoryGenerator(Node):
         # ======================================================
 
         self.create_subscription(
-            NavSatFix,
-            self.global_position_topic,
-            self._global_position_callback,
-            sensor_qos,
-        )
-
-        self.create_subscription(
             GeoPointStamped,
             self.gp_origin_topic,
             self._gp_origin_callback,
@@ -480,10 +472,6 @@ class TrajectoryGenerator(Node):
 
         self._lock = threading.RLock()
 
-        self.latest_global_fix: NavSatFix | None = None
-
-        self.latest_global_time = None
-
         self.latest_gp_origin: GeoPointStamped | None = None
 
         self.latest_fused_global_fix: NavSatFix | None = None
@@ -498,9 +486,10 @@ class TrajectoryGenerator(Node):
 
         self.latest_gps_status_time = None
 
-        self.localization_shadow_summary: dict[str, Any] = {
+        self.localization_summary: dict[str, Any] = {
             "mode": self.localization_mode,
-            "candidate_available": False,
+            "authority": "PX4_GP_ORIGIN",
+            "projection": "PX4_NED_THEN_MAVROS_ENU",
             "reason": "not evaluated",
         }
 
@@ -574,7 +563,6 @@ class TrajectoryGenerator(Node):
             raise ValueError("frame_id must not be empty")
 
         topics = {
-            "global_position_topic": self.global_position_topic,
             "gp_origin_topic": self.gp_origin_topic,
             "fused_global_position_topic": self.fused_global_position_topic,
             "local_odom_topic": self.local_odom_topic,
@@ -609,6 +597,7 @@ class TrajectoryGenerator(Node):
             "max_correction_age_sec": (self.max_correction_age_sec),
             "reference_timeout_sec": (self.reference_timeout_sec),
             "max_reference_skew_sec": (self.max_reference_skew_sec),
+            "origin_consistency_max_m": (self.origin_consistency_max_m),
             "max_target_distance_m": (self.max_target_distance_m),
             "max_abs_coordinate_m": (self.max_abs_coordinate_m),
             "interpolation_spacing_m": (self.interpolation_spacing_m),
@@ -623,14 +612,6 @@ class TrajectoryGenerator(Node):
     # ==========================================================
     # ROS input callbacks
     # ==========================================================
-
-    def _global_position_callback(
-        self,
-        message: NavSatFix,
-    ) -> None:
-        with self._lock:
-            self.latest_global_fix = message
-            self.latest_global_time = self.get_clock().now()
 
     def _gp_origin_callback(
         self,
@@ -647,30 +628,42 @@ class TrajectoryGenerator(Node):
             or (latitude == 0.0 and longitude == 0.0)
         ):
             self.get_logger().error(
-                "Ignoring invalid PX4 global origin: "
+                "Ignoring invalid PX4 gp_origin: "
                 f"lat={latitude}, lon={longitude}"
             )
-
             return
 
         with self._lock:
             previous = self.latest_gp_origin
+            origin_changed = (
+                previous is not None
+                and (
+                    float(previous.position.latitude) != latitude
+                    or float(previous.position.longitude) != longitude
+                )
+            )
             self.latest_gp_origin = message
+
+            if origin_changed and (
+                self.ready or self.preparing or self.prepare_requested
+            ):
+                self._set_error(
+                    "PX4 gp_origin changed; prepared trajectory invalid. "
+                    "Re-prepare the surveyed mission."
+                )
 
         if previous is None:
             self.get_logger().warn(
-                "PX4 global origin received for shadow diagnostics: "
-                f"lat={latitude:.7f}, lon={longitude:.7f}"
+                "PX4 gp_origin received: "
+                f"lat={latitude:.9f}, lon={longitude:.9f}"
             )
-
-        elif (
-            float(previous.position.latitude) != latitude
-            or float(previous.position.longitude) != longitude
-        ):
+        elif origin_changed:
             self.get_logger().error(
-                "PX4 global origin changed during shadow observation: "
-                f"lat={latitude:.7f}, lon={longitude:.7f}; "
-                "legacy coordinates remain authoritative"
+                "PX4 GP_ORIGIN CHANGED: "
+                f"old=({float(previous.position.latitude):.9f}, "
+                f"{float(previous.position.longitude):.9f}) "
+                f"new=({latitude:.9f}, {longitude:.9f}); "
+                "prepared trajectory invalidated"
             )
 
     def _fused_global_position_callback(
@@ -1109,576 +1102,185 @@ class TrajectoryGenerator(Node):
 
         return (self.get_clock().now() - timestamp).nanoseconds / 1e9
 
-    def _rover_start_is_ready(
-        self,
-    ) -> tuple[bool, str]:
-        """Check that current local odometry can be used as path start."""
-
-        if self.latest_local_odom is None:
-            return (
-                False,
-                "No local odometry for rover start",
-            )
-
-        if self._age_seconds(self.latest_local_time) > self.reference_timeout_sec:
-            return (
-                False,
-                "Local odometry for rover start is stale",
-            )
-
-        start_east = float(self.latest_local_odom.pose.pose.position.x)
-
-        start_north = float(self.latest_local_odom.pose.pose.position.y)
-
-        if not all(
-            math.isfinite(value)
-            for value in (
-                start_east,
-                start_north,
-            )
-        ):
-            return (
-                False,
-                "Rover start position is non-finite",
-            )
-
-        return (
-            True,
-            "Rover start position ready",
-        )
-
-    def _current_rover_start_point(
-        self,
-    ) -> tuple[float, float]:
-        ready, reason = self._rover_start_is_ready()
-
-        if not ready:
-            raise ValueError(reason)
-
-        assert self.latest_local_odom is not None
-
-        return (
-            float(self.latest_local_odom.pose.pose.position.x),
-            float(self.latest_local_odom.pose.pose.position.y),
-        )
-
     def _reference_is_ready(
         self,
     ) -> tuple[bool, str]:
-        if self.latest_global_fix is None:
-            return (
-                False,
-                "No global GPS fix",
-            )
+        """Validate gp_origin against PX4's live fused-global/local pair."""
 
+        if self.latest_gp_origin is None:
+            return False, "PX4 gp_origin unavailable"
+        if self.latest_fused_global_fix is None:
+            return False, "PX4 fused global position unavailable"
         if self.latest_local_odom is None:
-            return (
-                False,
-                "No local odometry",
-            )
-
+            return False, "PX4 local odometry unavailable for origin validation"
         if self.latest_gps_status is None:
-            return (
-                False,
-                "No GPS status",
-            )
+            return False, "No GPS status"
 
-        if self._age_seconds(self.latest_global_time) > self.reference_timeout_sec:
-            return (
-                False,
-                "Global GPS fix is stale",
-            )
-
+        if self._age_seconds(self.latest_fused_global_time) > self.reference_timeout_sec:
+            return False, "PX4 fused global position is stale"
         if self._age_seconds(self.latest_local_time) > self.reference_timeout_sec:
-            return (
-                False,
-                "Local odometry is stale",
-            )
-
+            return False, "PX4 local odometry is stale"
         if self._age_seconds(self.latest_gps_status_time) > self.reference_timeout_sec:
-            return (
-                False,
-                "GPS status is stale",
-            )
+            return False, "GPS status is stale"
 
         if int(self.latest_gps_status.fix_type) < self.required_gps_fix_type:
             return (
                 False,
-                (
-                    "RTK FIXED required; "
-                    f"fix_type="
-                    f"{self.latest_gps_status.fix_type}"
-                ),
+                "RTK FIXED required; "
+                f"fix_type={self.latest_gps_status.fix_type}",
             )
 
         if not self.rtk_healthy:
-            return (
-                False,
-                "RTK correction bridge unhealthy",
-            )
+            return False, "RTK correction bridge unhealthy"
 
         if (
             not math.isfinite(self.correction_age_sec)
             or self.correction_age_sec > self.max_correction_age_sec
         ):
+            return False, f"RTK correction age {self.correction_age_sec:.2f}s"
+
+        receive_skew = abs(
+            (self.latest_fused_global_time - self.latest_local_time).nanoseconds
+        ) / 1e9
+        if receive_skew > self.max_reference_skew_sec:
             return (
                 False,
-                ("RTK correction age " f"{self.correction_age_sec:.2f}s"),
+                "Fused-global/local sample skew "
+                f"{receive_skew:.3f}s > {self.max_reference_skew_sec:.3f}s",
             )
 
-        reference_skew = (
-            abs((self.latest_global_time - self.latest_local_time).nanoseconds) / 1e9
-        )
-
-        if reference_skew > self.max_reference_skew_sec:
-            return (
-                False,
-                ("GPS/local timestamp skew " f"{reference_skew:.3f}s"),
-            )
+        origin_position = self.latest_gp_origin.position
+        fused = self.latest_fused_global_fix
 
         values = (
-            float(self.latest_global_fix.latitude),
-            float(self.latest_global_fix.longitude),
-            float(self.latest_global_fix.altitude),
+            float(origin_position.latitude),
+            float(origin_position.longitude),
+            float(origin_position.altitude),
+            float(fused.latitude),
+            float(fused.longitude),
             float(self.latest_local_odom.pose.pose.position.x),
             float(self.latest_local_odom.pose.pose.position.y),
         )
-
         if not all(math.isfinite(value) for value in values):
+            return False, "PX4 origin/global/local sample is non-finite"
+
+        ned = project_geodetic_to_px4_ned(
+            GeographicOrigin(
+                latitude_deg=float(origin_position.latitude),
+                longitude_deg=float(origin_position.longitude),
+                altitude_m=float(origin_position.altitude),
+            ),
+            float(fused.latitude),
+            float(fused.longitude),
+        )
+        enu = transform_ned_to_enu(ned)
+
+        local_east = float(self.latest_local_odom.pose.pose.position.x)
+        local_north = float(self.latest_local_odom.pose.pose.position.y)
+        delta_east = local_east - enu.east_m
+        delta_north = local_north - enu.north_m
+        residual = math.hypot(delta_east, delta_north)
+
+        self.localization_summary = {
+            "mode": "px4_origin",
+            "authority": "PX4_GP_ORIGIN",
+            "projection": "PX4_NED_THEN_MAVROS_ENU",
+            "origin_latitude_deg": float(origin_position.latitude),
+            "origin_longitude_deg": float(origin_position.longitude),
+            "frame_delta_east_m": delta_east,
+            "frame_delta_north_m": delta_north,
+            "frame_residual_m": residual,
+            "frame_receive_skew_sec": receive_skew,
+            "origin_consistency_limit_m": self.origin_consistency_max_m,
+            "raw_global_waypoint_anchor_used": False,
+            "prepare_time_rover_start_used": False,
+        }
+
+        if residual > self.origin_consistency_max_m:
             return (
                 False,
-                "GPS/local reference is non-finite",
+                "PX4 gp_origin inconsistent with live local frame: "
+                f"residual={residual:.3f}m "
+                f"(dE={delta_east:+.3f}, dN={delta_north:+.3f}), "
+                f"limit={self.origin_consistency_max_m:.3f}m",
             )
 
         return (
             True,
-            "Reference ready",
+            "PX4 gp_origin verified: "
+            f"frame residual={residual:.3f}m",
         )
 
     # ==========================================================
     # GPS conversion
     # ==========================================================
 
-    @classmethod
-    def _geodetic_to_ecef(
-        cls,
-        latitude_deg: float,
-        longitude_deg: float,
-        altitude_m: float,
-    ) -> tuple[float, float, float]:
-        latitude = math.radians(latitude_deg)
-
-        longitude = math.radians(longitude_deg)
-
-        eccentricity_sq = cls.WGS84_F * (2.0 - cls.WGS84_F)
-
-        sin_latitude = math.sin(latitude)
-
-        cos_latitude = math.cos(latitude)
-
-        sin_longitude = math.sin(longitude)
-
-        cos_longitude = math.cos(longitude)
-
-        prime_vertical = cls.WGS84_A_M / math.sqrt(
-            1.0 - eccentricity_sq * sin_latitude * sin_latitude
-        )
-
-        x = (prime_vertical + altitude_m) * cos_latitude * cos_longitude
-
-        y = (prime_vertical + altitude_m) * cos_latitude * sin_longitude
-
-        z = (prime_vertical * (1.0 - eccentricity_sq) + altitude_m) * sin_latitude
-
-        return (
-            x,
-            y,
-            z,
-        )
-
-    @classmethod
-    def _geodetic_delta_to_enu(
-        cls,
-        *,
-        target_latitude: float,
-        target_longitude: float,
-        reference_latitude: float,
-        reference_longitude: float,
-        reference_altitude: float,
-    ) -> tuple[float, float]:
-        (
-            reference_x,
-            reference_y,
-            reference_z,
-        ) = cls._geodetic_to_ecef(
-            reference_latitude,
-            reference_longitude,
-            reference_altitude,
-        )
-
-        (
-            target_x,
-            target_y,
-            target_z,
-        ) = cls._geodetic_to_ecef(
-            target_latitude,
-            target_longitude,
-            reference_altitude,
-        )
-
-        delta_x = target_x - reference_x
-
-        delta_y = target_y - reference_y
-
-        delta_z = target_z - reference_z
-
-        latitude = math.radians(reference_latitude)
-
-        longitude = math.radians(reference_longitude)
-
-        sin_latitude = math.sin(latitude)
-
-        cos_latitude = math.cos(latitude)
-
-        sin_longitude = math.sin(longitude)
-
-        cos_longitude = math.cos(longitude)
-
-        east = -sin_longitude * delta_x + cos_longitude * delta_y
-
-        north = (
-            -sin_latitude * cos_longitude * delta_x
-            - sin_latitude * sin_longitude * delta_y
-            + cos_latitude * delta_z
-        )
-
-        return (
-            east,
-            north,
-        )
-
-    def _convert_markings_legacy(
-        self,
-    ) -> list[tuple[float, float]]:
-        if self.raw_coordinate_mode == "local":
-            return list(self.raw_marking_points)
-
-        if self.latest_global_fix is None or self.latest_local_odom is None:
-            raise ValueError("GPS/local reference unavailable")
-
-        reference_latitude = float(self.latest_global_fix.latitude)
-
-        reference_longitude = float(self.latest_global_fix.longitude)
-
-        reference_altitude = float(self.latest_global_fix.altitude)
-
-        reference_east = float(self.latest_local_odom.pose.pose.position.x)
-
-        reference_north = float(self.latest_local_odom.pose.pose.position.y)
-
-        local_points: list[tuple[float, float]] = []
-
-        self.get_logger().warn(
-            "GPS/local reference locked: "
-            f"lat={reference_latitude:.9f}, "
-            f"lon={reference_longitude:.9f}, "
-            f"E={reference_east:.3f}, "
-            f"N={reference_north:.3f}"
-        )
-
-        for index, (
-            latitude,
-            longitude,
-        ) in enumerate(
-            self.raw_marking_points,
-            start=1,
-        ):
-            (
-                east_offset,
-                north_offset,
-            ) = self._geodetic_delta_to_enu(
-                target_latitude=latitude,
-                target_longitude=longitude,
-                reference_latitude=(reference_latitude),
-                reference_longitude=(reference_longitude),
-                reference_altitude=(reference_altitude),
-            )
-
-            target_distance = math.hypot(
-                east_offset,
-                north_offset,
-            )
-
-            if target_distance > self.max_target_distance_m:
-                raise ValueError(
-                    f"Marking point {index} is "
-                    f"{target_distance:.1f} m from "
-                    "the local reference"
-                )
-
-            point = (
-                reference_east + east_offset,
-                reference_north + north_offset,
-            )
-
-            local_points.append(point)
-
-            self.get_logger().warn(
-                f"MARKING {index}: " f"E={point[0]:.3f}, " f"N={point[1]:.3f}"
-            )
-
-        return local_points
-
     def _convert_markings_px4_origin(
         self,
     ) -> list[tuple[float, float]]:
+        """Surveyed GPS -> PX4 NED -> MAVROS/ROS ENU."""
+
         if self.latest_gp_origin is None:
-            raise ValueError("PX4 global origin unavailable")
+            raise ValueError("PX4 gp_origin unavailable")
 
         origin_position = self.latest_gp_origin.position
-
         origin = GeographicOrigin(
             latitude_deg=float(origin_position.latitude),
             longitude_deg=float(origin_position.longitude),
             altitude_m=float(origin_position.altitude),
         )
 
-        candidate_points: list[tuple[float, float]] = []
+        local_points: list[tuple[float, float]] = []
 
-        for index, (
-            latitude,
-            longitude,
-        ) in enumerate(
-            self.raw_marking_points,
-            start=1,
+        self.get_logger().warn(
+            "TRAJECTORY AUTHORITY = PX4_GP_ORIGIN | "
+            f"origin=({origin.latitude_deg:.9f}, {origin.longitude_deg:.9f})"
+        )
+
+        for index, (latitude, longitude) in enumerate(
+            self.raw_marking_points, start=1
         ):
-            projected = project_geodetic_to_px4_enu(
-                origin,
-                latitude,
-                longitude,
-            )
+            ned = project_geodetic_to_px4_ned(origin, latitude, longitude)
+            enu = transform_ned_to_enu(ned)
 
-            target_distance = math.hypot(
-                projected.east_m,
-                projected.north_m,
-            )
-
+            target_distance = math.hypot(enu.east_m, enu.north_m)
             if target_distance > self.max_target_distance_m:
                 raise ValueError(
-                    f"PX4 candidate marking {index} is "
-                    f"{target_distance:.1f} m from the estimator origin"
+                    f"Marking point {index} is {target_distance:.1f} m "
+                    "from the PX4 estimator origin"
                 )
 
-            candidate_points.append(
-                (
-                    projected.east_m,
-                    projected.north_m,
-                )
-            )
-
-        return candidate_points
-
-    def _log_localization_shadow(
-        self,
-        legacy_points: list[tuple[float, float]],
-        candidate_points: list[tuple[float, float]],
-    ) -> None:
-        assert self.latest_gp_origin is not None
-
-        origin = self.latest_gp_origin.position
-
-        radial_deltas = [
-            math.hypot(
-                candidate[0] - legacy[0],
-                candidate[1] - legacy[1],
-            )
-            for legacy, candidate in zip(
-                legacy_points,
-                candidate_points,
-            )
-        ]
-
-        self.localization_shadow_summary = {
-            "mode": self.localization_mode,
-            "candidate_available": True,
-            "reason": None,
-            "origin_latitude_deg": float(origin.latitude),
-            "origin_longitude_deg": float(origin.longitude),
-            "point_count": len(candidate_points),
-            "maximum_legacy_candidate_delta_m": max(radial_deltas),
-            "mean_legacy_candidate_delta_m": (
-                sum(radial_deltas) / len(radial_deltas)
-            ),
-            "frame_residual_m": None,
-            "frame_receive_skew_sec": None,
-        }
-
-        self.get_logger().warn(
-            "LOCALIZATION SHADOW: legacy remains authoritative; "
-            f"gp_origin=({origin.latitude:.7f}, {origin.longitude:.7f})"
-        )
-
-        for index, (legacy, candidate) in enumerate(
-            zip(legacy_points, candidate_points),
-            start=1,
-        ):
-            delta_east = candidate[0] - legacy[0]
-            delta_north = candidate[1] - legacy[1]
-            radial_delta = math.hypot(delta_east, delta_north)
-
+            local_points.append((enu.east_m, enu.north_m))
             self.get_logger().warn(
-                f"LOCALIZATION SHADOW P{index}: "
-                f"legacy=({legacy[0]:.6f}, {legacy[1]:.6f}) m, "
-                f"candidate=({candidate[0]:.6f}, "
-                f"{candidate[1]:.6f}) m, "
-                f"delta=({delta_east:+.6f}, "
-                f"{delta_north:+.6f}) m, "
-                f"radial={radial_delta:.6f} m"
+                f"MARKING {index}: "
+                f"NED(N={ned.north_m:.6f}, E={ned.east_m:.6f}) -> "
+                f"ENU(E={enu.east_m:.6f}, N={enu.north_m:.6f})"
             )
 
-        self._log_frame_consistency_shadow()
-
-    def _log_frame_consistency_shadow(
-        self,
-    ) -> None:
-        if (
-            self.latest_gp_origin is None
-            or self.latest_fused_global_fix is None
-            or self.latest_local_odom is None
-            or self.latest_fused_global_time is None
-            or self.latest_local_time is None
-        ):
-            self.localization_shadow_summary["frame_reason"] = (
-                "fused-global/local sample unavailable"
-            )
-
-            self.get_logger().warn(
-                "LOCALIZATION SHADOW: fused-global/local residual unavailable"
-            )
-
-            return
-
-        origin_position = self.latest_gp_origin.position
-        fused_position = self.latest_fused_global_fix
-
-        try:
-            projected = project_geodetic_to_px4_enu(
-                GeographicOrigin(
-                    latitude_deg=float(origin_position.latitude),
-                    longitude_deg=float(origin_position.longitude),
-                    altitude_m=float(origin_position.altitude),
-                ),
-                float(fused_position.latitude),
-                float(fused_position.longitude),
-            )
-        except ValueError as error:
-            self.localization_shadow_summary["frame_reason"] = str(error)
-
-            self.get_logger().warn(
-                "LOCALIZATION SHADOW: fused-global projection rejected: "
-                f"{error}"
-            )
-
-            return
-
-        local_east = float(self.latest_local_odom.pose.pose.position.x)
-        local_north = float(self.latest_local_odom.pose.pose.position.y)
-        delta_east = local_east - projected.east_m
-        delta_north = local_north - projected.north_m
-        radial_delta = math.hypot(delta_east, delta_north)
-        receive_skew = abs(
-            (
-                self.latest_fused_global_time
-                - self.latest_local_time
-            ).nanoseconds
-        ) / 1e9
-
-        self.localization_shadow_summary.update(
+        self.localization_summary.update(
             {
-                "frame_reason": None,
-                "frame_delta_east_m": delta_east,
-                "frame_delta_north_m": delta_north,
-                "frame_residual_m": radial_delta,
-                "frame_receive_skew_sec": receive_skew,
+                "point_count": len(local_points),
+                "raw_global_waypoint_anchor_used": False,
+                "prepare_time_rover_start_used": False,
             }
         )
-
-        self.get_logger().warn(
-            "LOCALIZATION SHADOW FRAME: "
-            f"projected=({projected.east_m:.6f}, "
-            f"{projected.north_m:.6f}) m, "
-            f"odom=({local_east:.6f}, {local_north:.6f}) m, "
-            f"delta=({delta_east:+.6f}, "
-            f"{delta_north:+.6f}) m, "
-            f"radial={radial_delta:.6f} m, "
-            f"receive_skew={receive_skew:.3f} s"
-        )
+        return local_points
 
     def _convert_markings_to_local(
         self,
     ) -> list[tuple[float, float]]:
         if self.raw_coordinate_mode == "local":
-            self.localization_shadow_summary = {
-                "mode": self.localization_mode,
-                "candidate_available": False,
-                "reason": "mission already uses local coordinates",
+            self.localization_summary = {
+                "mode": "local_input",
+                "authority": "LOCAL_INPUT",
+                "projection": "NONE",
+                "reason": "mission already uses local ENU coordinates",
+                "raw_global_waypoint_anchor_used": False,
+                "prepare_time_rover_start_used": False,
             }
-
             return list(self.raw_marking_points)
 
-        legacy_points = self._convert_markings_legacy()
-
-        if self.localization_mode == "legacy":
-            self.localization_shadow_summary = {
-                "mode": self.localization_mode,
-                "candidate_available": False,
-                "reason": "shadow calculation disabled",
-            }
-
-            return legacy_points
-
-        if self.latest_gp_origin is None:
-            self.localization_shadow_summary = {
-                "mode": self.localization_mode,
-                "candidate_available": False,
-                "reason": "PX4 global origin unavailable",
-            }
-
-            self.get_logger().warn(
-                "LOCALIZATION SHADOW SKIPPED: PX4 global origin unavailable; "
-                "legacy coordinates remain authoritative"
-            )
-
-            return legacy_points
-
-        try:
-            candidate_points = self._convert_markings_px4_origin()
-        except ValueError as error:
-            self.localization_shadow_summary = {
-                "mode": self.localization_mode,
-                "candidate_available": False,
-                "reason": str(error),
-            }
-
-            self.get_logger().warn(
-                "LOCALIZATION SHADOW SKIPPED: PX4 candidate rejected: "
-                f"{error}; legacy coordinates remain authoritative"
-            )
-
-            return legacy_points
-
-        try:
-            self._log_localization_shadow(
-                legacy_points,
-                candidate_points,
-            )
-        except Exception as error:  # noqa: BLE001 - diagnostics must never veto legacy authority
-            self.get_logger().error(
-                "LOCALIZATION SHADOW DIAGNOSTICS FAILED: "
-                f"{error}; legacy coordinates remain authoritative"
-            )
-
-        return legacy_points
+        return self._convert_markings_px4_origin()
 
     # ==========================================================
     # Path generation
@@ -1814,80 +1416,32 @@ class TrajectoryGenerator(Node):
     def _generate_navigation_path(
         self,
         marking_points: list[tuple[float, float]],
-        rover_start: tuple[
-            float,
-            float,
-        ],
     ) -> tuple[
         list[tuple[float, float]],
         list[int],
         list[int],
         int,
     ]:
-        navigation_points: list[tuple[float, float]] = []
+        """Build the fixed surveyed mission path beginning at P1."""
 
+        navigation_points: list[tuple[float, float]] = []
         point_types: list[int] = []
         marking_indices: list[int] = []
-
         dummy_count = 0
 
-        # The rover's latest local-odometry position becomes the
-        # first navigation-only point.
-        #
-        # It is not a marking point, so it does not affect:
-        # - total marking-point count
-        # - completed-point count
-        # - skipped-point count
-        # - mission report
         first_marking = marking_points[0]
-
-        approach_distance = self._distance(
-            rover_start,
-            first_marking,
+        self._append_point(
+            points=navigation_points,
+            point_types=point_types,
+            marking_indices=marking_indices,
+            point=first_marking,
+            point_type=self.POINT_TYPE_MARKING,
+            marking_index=0,
         )
 
-        if approach_distance >= self.minimum_segment_length_m:
-            # First point is the rover's current position.
-            self._append_point(
-                points=navigation_points,
-                point_types=point_types,
-                marking_indices=marking_indices,
-                point=rover_start,
-                point_type=(self.POINT_TYPE_PASS_THROUGH),
-                marking_index=-1,
-            )
-
-            # Generate interpolation from rover start to P1.
-            # The final point remains the real marking point P1.
-            self._append_interpolated_segment(
-                points=navigation_points,
-                point_types=point_types,
-                marking_indices=marking_indices,
-                start=rover_start,
-                end=first_marking,
-                final_type=(self.POINT_TYPE_MARKING),
-                final_marking_index=0,
-            )
-
-        else:
-            # Rover is already effectively at P1.
-            # Avoid creating duplicate points.
-            self._append_point(
-                points=navigation_points,
-                point_types=point_types,
-                marking_indices=marking_indices,
-                point=first_marking,
-                point_type=(self.POINT_TYPE_MARKING),
-                marking_index=0,
-            )
-
         self.get_logger().warn(
-            "ROVER START -> P1: "
-            f"start=({rover_start[0]:.3f}, "
-            f"{rover_start[1]:.3f}) | "
-            f"P1=({first_marking[0]:.3f}, "
-            f"{first_marking[1]:.3f}) | "
-            f"distance={approach_distance:.3f} m"
+            "FIXED SURVEY TRAJECTORY: /nav_path begins at P1; "
+            "fresh current C->P1 is owned by RPP after START/ARM"
         )
 
         for index in range(len(marking_points) - 1):
@@ -2128,7 +1682,7 @@ class TrajectoryGenerator(Node):
             "navigation_point_count": len(self.prepared_navigation_points),
             "dummy_point_count": int(dummy_count),
             "interpolation_spacing_m": (self.interpolation_spacing_m),
-            "localization": dict(self.localization_shadow_summary),
+            "localization": dict(self.localization_summary),
             "error": self.last_error,
         }
 
@@ -2208,9 +1762,10 @@ class TrajectoryGenerator(Node):
         self.prepared_marking_indices = []
         self.prepared_path_signature = None
 
-        self.localization_shadow_summary = {
+        self.localization_summary = {
             "mode": self.localization_mode,
-            "candidate_available": False,
+            "authority": "PX4_GP_ORIGIN",
+            "projection": "PX4_NED_THEN_MAVROS_ENU",
             "reason": "not evaluated",
         }
 
@@ -2319,22 +1874,9 @@ class TrajectoryGenerator(Node):
 
                     return
 
-            (
-                rover_start_ready,
-                rover_start_reason,
-            ) = self._rover_start_is_ready()
-
-            if not rover_start_ready:
-                self._publish_ready(False)
-
-                self._log_waiting(rover_start_reason)
-
-                return
-
             try:
-                # This is the rover position at trajectory preparation.
-                rover_start = self._current_rover_start_point()
-
+                # PREPARE creates only fixed surveyed mission geometry.
+                # Existing RPP captures fresh current C at START after ARM.
                 marking_points = self._convert_markings_to_local()
 
                 (
@@ -2344,7 +1886,6 @@ class TrajectoryGenerator(Node):
                     dummy_count,
                 ) = self._generate_navigation_path(
                     marking_points,
-                    rover_start,
                 )
 
                 stamp = self.get_clock().now().to_msg()
