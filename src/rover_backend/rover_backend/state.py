@@ -281,6 +281,18 @@ class RoverState:
                 # Exact /rpp/debug pass-through.
                 "rpp_debug_available": False,
                 "rpp_debug_source": "/rpp/debug",
+                "rpp_debug_schema_version": 2,
+                "rpp_debug_telemetry_sequence": None,
+                "rpp_debug_control_sequence": None,
+                "rpp_debug_control_sample_age_ms": None,
+                "rpp_debug_receive_age_ms": None,
+                "rpp_debug_odom_age_ms": None,
+                "rpp_debug_control_dt_ms": None,
+                "rpp_debug_control_compute_ms": None,
+                "rpp_debug_control_deadline_missed": False,
+                "rpp_debug_stream_fresh": False,
+                "rpp_debug_dropped_frames": 0,
+                "rpp_debug_reason": "UNKNOWN",
                 "rpp_control_mode": "UNKNOWN",
                 "rpp_goal_number": 0,
 

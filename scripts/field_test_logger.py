@@ -58,7 +58,7 @@ def _yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
 
 
 class FieldTestLogger(Node):
-    SAMPLE_HZ = 20.0
+    SAMPLE_HZ = 50.0
 
     def __init__(self, out_dir: Path) -> None:
         super().__init__("field_test_logger")
@@ -110,6 +110,7 @@ class FieldTestLogger(Node):
         self.rpp_xtrack_speed_cap_active = None
         self.rpp_xtrack_speed_cap_mps = None
         self.rpp_accuracy: dict[str, Any] = {}
+        self.rpp_debug: dict[str, Any] = {}
 
         self.setpoint_vx = None
         self.setpoint_vy = None
@@ -165,6 +166,7 @@ class FieldTestLogger(Node):
         self.create_subscription(Bool, "/rpp/xtrack_speed_cap_active", lambda m: self._set("rpp_xtrack_speed_cap_active", m.data), reliable_qos)
         self.create_subscription(Float64, "/rpp/xtrack_speed_cap_mps", lambda m: self._set("rpp_xtrack_speed_cap_mps", m.data), reliable_qos)
         self.create_subscription(String, "/rpp/accuracy", self._rpp_accuracy_cb, retained_qos)
+        self.create_subscription(String, "/rpp/debug", self._rpp_debug_cb, sensor_qos)
 
         self.create_subscription(Bool, "/mission_enable", lambda m: self._set("mission_enable", m.data), reliable_qos)
         self.create_subscription(Bool, "/emergency_stop", lambda m: self._set("emergency_stop", m.data), reliable_qos)
@@ -192,6 +194,8 @@ class FieldTestLogger(Node):
             "arrival_settle_elapsed_sec", "arrival_settle_required_sec",
             "marking_active", "marking_radial_error_m", "marking_xtrack_m", "marking_along_error_m", "marking_combined_error_m",
             "rpp_goal_number", "rpp_cross_track_error_mm", "rpp_front_back_error_mm", "rpp_radial_error_mm", "rpp_closest_radial_error_mm", "rpp_accuracy_status",
+            "rpp_debug_telemetry_sequence", "rpp_debug_control_sequence", "rpp_debug_control_sample_age_ms", "rpp_debug_odom_age_ms", "rpp_debug_control_dt_ms", "rpp_debug_control_compute_ms", "rpp_debug_deadline_missed", "rpp_debug_mode", "rpp_debug_reason",
+            "rpp_debug_actual_speed_mps", "rpp_debug_command_speed_mps", "rpp_debug_heading_error_deg", "rpp_debug_cross_track_error_mm", "rpp_debug_along_remaining_mm", "rpp_debug_distance_to_goal_m",
             "rpp_command_speed_mps", "rpp_velocity_north_mps", "rpp_velocity_east_mps", "rpp_velocity_down_mps",
             "rpp_accel_active", "rpp_accel_progress_m", "rpp_decel_active", "rpp_decel_progress_m", "rpp_decel_remaining_m",
             "rpp_xtrack_mm_topic", "rpp_goal_distance_mm_topic", "rpp_along_remaining_mm_topic", "rpp_closest_goal_distance_mm_topic",
@@ -252,6 +256,9 @@ class FieldTestLogger(Node):
     def _rpp_accuracy_cb(self, msg: String) -> None:
         self.rpp_accuracy = _json_dict(msg.data)
 
+    def _rpp_debug_cb(self, msg: String) -> None:
+        self.rpp_debug = _json_dict(msg.data)
+
     def _mission_status_cb(self, msg: String) -> None:
         self.mission_status = _json_dict(msg.data)
         self._event("mission_manager/status", msg.data)
@@ -269,6 +276,7 @@ class FieldTestLogger(Node):
     def _sample(self) -> None:
         m = self.mission_status
         a = self.rpp_accuracy
+        d = self.rpp_debug
         s = self.spray_status
         row = {
             "timestamp_unix_ns": time.time_ns(),
@@ -317,6 +325,21 @@ class FieldTestLogger(Node):
             "rpp_radial_error_mm": self._g(a, "radial_error_mm"),
             "rpp_closest_radial_error_mm": self._g(a, "closest_radial_error_mm"),
             "rpp_accuracy_status": self._g(a, "accuracy_status"),
+            "rpp_debug_telemetry_sequence": self._g(d, "telemetry_sequence"),
+            "rpp_debug_control_sequence": self._g(d, "control_sequence"),
+            "rpp_debug_control_sample_age_ms": self._g(d, "control_sample_age_ms"),
+            "rpp_debug_odom_age_ms": self._g(d, "odom_age_ms"),
+            "rpp_debug_control_dt_ms": self._g(d, "control_dt_ms"),
+            "rpp_debug_control_compute_ms": self._g(d, "control_compute_ms"),
+            "rpp_debug_deadline_missed": self._g(d, "control_deadline_missed"),
+            "rpp_debug_mode": self._g(d, "control_mode"),
+            "rpp_debug_reason": self._g(d, "reason"),
+            "rpp_debug_actual_speed_mps": self._g(d, "actual_speed_mps"),
+            "rpp_debug_command_speed_mps": self._g(d, "command_speed_mps"),
+            "rpp_debug_heading_error_deg": self._g(d, "heading_error_deg"),
+            "rpp_debug_cross_track_error_mm": self._g(d, "cross_track_error_mm"),
+            "rpp_debug_along_remaining_mm": self._g(d, "along_remaining_mm"),
+            "rpp_debug_distance_to_goal_m": self._g(d, "distance_to_goal_m"),
             "rpp_command_speed_mps": self.rpp_command_speed,
             "rpp_velocity_north_mps": self.rpp_vx,
             "rpp_velocity_east_mps": self.rpp_vy,

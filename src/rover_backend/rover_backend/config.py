@@ -444,7 +444,7 @@ def load_settings() -> Settings:
         ),
         telemetry_broadcast_hz=_read_float(
             "DYX_TELEMETRY_BROADCAST_HZ",
-            5.0,
+            50.0,
             minimum=0.5,
         ),
         socket_path=socket_path,

@@ -2,6 +2,8 @@
 
 import json
 import math
+import threading
+import time
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
@@ -9,6 +11,8 @@ from nav_msgs.msg import Odometry, Path
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import (
     DurabilityPolicy,
     HistoryPolicy,
@@ -103,6 +107,7 @@ class RPPController(Node):
     """
 
     CONTROL_HZ = 20.0
+    TELEMETRY_HZ = 50.0
     MAXIMUM_MOVING_SPEED_MPS = 1.00
     MAX_MOVING_HEADING_ERROR_RAD = math.radians(30.0)
     WAYPOINT_CHANGE_EPSILON_M = 0.001
@@ -1344,6 +1349,12 @@ class RPPController(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
+        debug_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
 
         self.create_subscription(
             Odometry,
@@ -1529,7 +1540,7 @@ class RPPController(Node):
         self.rpp_debug_pub = self.create_publisher(
             String,
             "/rpp/debug",
-            retained_qos,
+            debug_qos,
         )
 
         self.geometry_debug_pub = self.create_publisher(
@@ -1784,6 +1795,20 @@ class RPPController(Node):
         self.last_wait_log_time = now
         self.last_mm_monitor_log_time = now
 
+        # /rpp/debug is a 50 Hz latest-sample transport. The controller remains
+        # 20 Hz so telemetry cannot change motion dynamics. Each transport
+        # frame carries both a telemetry sequence and the source control-cycle
+        # sequence/age, making repeated samples explicit and measurable.
+        self._rpp_debug_lock = threading.Lock()
+        self._rpp_debug_control_sequence = 0
+        self._rpp_debug_telemetry_sequence = 0
+        self._rpp_debug_last_control_start_ns = None
+        self._rpp_debug_cycle_start_ns = None
+        self._rpp_debug_pending = None
+        self._rpp_debug_snapshot = None
+        self._rpp_debug_last_error_log_ns = 0
+        self._rpp_debug_callback_group = MutuallyExclusiveCallbackGroup()
+
         # Feature gates are runtime mutable only while the vehicle is in the
         # same safe state required for stationary configuration.  Register
         # after all adapter state exists so an accepted transition can install
@@ -1794,7 +1819,12 @@ class RPPController(Node):
 
         self.timer = self.create_timer(
             1.0 / self.CONTROL_HZ,
-            self.control_loop,
+            self._control_timer_callback,
+        )
+        self.rpp_debug_timer = self.create_timer(
+            1.0 / self.TELEMETRY_HZ,
+            self._publish_rpp_debug_telemetry,
+            callback_group=self._rpp_debug_callback_group,
         )
         self.publish_motion_profile_monitor(0.0)
 
@@ -5319,6 +5349,11 @@ class RPPController(Node):
         return age <= timeout
 
     def publish_motion_profile_monitor(self, command_speed):
+        if self._rpp_debug_pending is not None:
+            command_speed_value = self._finite_or_none(command_speed)
+            self._rpp_debug_pending["command_speed_mps"] = command_speed_value
+            self._rpp_debug_pending["command_valid"] = command_speed_value is not None
+
         acceleration_message = Bool()
         acceleration_message.data = bool(
             self.acceleration_active and not self.acceleration_complete
@@ -6400,6 +6435,7 @@ class RPPController(Node):
     def publish_stop(self):
         self._reset_precision_regulator("LITERAL_STOP")
         self.publish_velocity_ned(0.0, 0.0)
+        self._record_rpp_debug_command(0.0, 0.0, 0.0)
 
     @staticmethod
     def _publish_float64(publisher, value):
@@ -6568,6 +6604,235 @@ class RPPController(Node):
                 f"{accuracy_status}"
             )
 
+    @staticmethod
+    def _finite_or_none(value):
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    def _begin_rpp_debug_cycle(self):
+        now = self.get_clock().now()
+        now_mono_ns = time.monotonic_ns()
+        previous_start_ns = self._rpp_debug_last_control_start_ns
+        self._rpp_debug_last_control_start_ns = now_mono_ns
+        self._rpp_debug_cycle_start_ns = now_mono_ns
+        self._rpp_debug_control_sequence += 1
+
+        control_dt_ms = (
+            (now_mono_ns - previous_start_ns) / 1_000_000.0
+            if previous_start_ns is not None
+            else 1000.0 / self.CONTROL_HZ
+        )
+        odom_age_ms = None
+        if self.last_odom_time is not None:
+            odom_age_ms = max(
+                0.0,
+                (now - self.last_odom_time).nanoseconds / 1_000_000.0,
+            )
+
+        self._rpp_debug_pending = {
+            "schema_version": 2,
+            "source": "/rpp/debug",
+            "publisher_alive": True,
+            "available": False,
+            "geometry_valid": False,
+            "command_valid": False,
+            "odom_fresh": bool(
+                odom_age_ms is not None
+                and odom_age_ms <= self.odom_timeout_sec * 1000.0
+            ),
+            "control_sequence": self._rpp_debug_control_sequence,
+            "control_stamp_ros_ns": int(now.nanoseconds),
+            "control_dt_ms": float(control_dt_ms),
+            "control_compute_ms": None,
+            "control_deadline_missed": False,
+            "control_hz": float(self.CONTROL_HZ),
+            "telemetry_hz": float(self.TELEMETRY_HZ),
+            "odom_age_ms": odom_age_ms,
+            "control_mode": "CONTROL_CYCLE",
+            "reason": "NO_ACTIVE_CONTROL_OUTPUT",
+            "goal_number": max(0, int(self.segment_goal_number or 0)),
+            "actual_speed_mps": self._finite_or_none(self.current_speed_mps),
+            "command_speed_mps": None,
+            "command_north_mps": None,
+            "command_east_mps": None,
+            "current_yaw_rad": self._finite_or_none(self.current_yaw),
+            "current_yaw_deg": (
+                math.degrees(self.current_yaw)
+                if self._finite_or_none(self.current_yaw) is not None
+                else None
+            ),
+            "path_bearing_rad": None,
+            "path_bearing_deg": None,
+            "guidance_bearing_rad": None,
+            "guidance_bearing_deg": None,
+            "heading_error_rad": None,
+            "heading_error_deg": None,
+            "distance_to_goal_m": None,
+            "distance_to_goal_mm": None,
+            "cross_track_error_m": None,
+            "cross_track_error_mm": None,
+            "cross_track_side": "UNKNOWN",
+            "along_remaining_m": None,
+            "along_remaining_mm": None,
+            "along_position": "UNKNOWN",
+        }
+
+    def _set_rpp_debug_status(self, control_mode, reason):
+        if self._rpp_debug_pending is None:
+            return
+        self._rpp_debug_pending["control_mode"] = str(control_mode)
+        self._rpp_debug_pending["reason"] = str(reason)
+
+    def _record_rpp_debug_command(self, north, east, speed):
+        if self._rpp_debug_pending is None:
+            return
+        north = self._finite_or_none(north)
+        east = self._finite_or_none(east)
+        speed = self._finite_or_none(speed)
+        self._rpp_debug_pending.update(
+            {
+                "command_valid": all(
+                    value is not None for value in (north, east, speed)
+                ),
+                "command_north_mps": north,
+                "command_east_mps": east,
+                "command_speed_mps": speed,
+            }
+        )
+
+    def _record_rpp_debug_geometry(
+        self,
+        *,
+        path_bearing_rad,
+        heading_error_rad,
+        distance_to_goal_m,
+        signed_cross_track_m,
+        along_remaining_m,
+    ):
+        if self._rpp_debug_pending is None:
+            return
+        values = tuple(
+            self._finite_or_none(value)
+            for value in (
+                path_bearing_rad,
+                heading_error_rad,
+                distance_to_goal_m,
+                signed_cross_track_m,
+                along_remaining_m,
+            )
+        )
+        if any(value is None for value in values):
+            return
+        (
+            path_bearing_rad,
+            heading_error_rad,
+            distance_to_goal_m,
+            signed_cross_track_m,
+            along_remaining_m,
+        ) = values
+        ground_xtrack_m = self.ground_xtrack(signed_cross_track_m)
+        self._rpp_debug_pending.update(
+            {
+                "available": True,
+                "geometry_valid": True,
+                "path_bearing_rad": path_bearing_rad,
+                "path_bearing_deg": math.degrees(path_bearing_rad),
+                "heading_error_rad": heading_error_rad,
+                "heading_error_deg": math.degrees(heading_error_rad),
+                "distance_to_goal_m": distance_to_goal_m,
+                "distance_to_goal_mm": distance_to_goal_m * 1000.0,
+                "cross_track_error_m": ground_xtrack_m,
+                "cross_track_error_mm": ground_xtrack_m * 1000.0,
+                "cross_track_side": (
+                    "LEFT"
+                    if signed_cross_track_m > 0.0005
+                    else "RIGHT"
+                    if signed_cross_track_m < -0.0005
+                    else "CENTER"
+                ),
+                "along_remaining_m": along_remaining_m,
+                "along_remaining_mm": along_remaining_m * 1000.0,
+                "along_position": (
+                    "BEFORE_POINT"
+                    if along_remaining_m > 0.0005
+                    else "AFTER_POINT"
+                    if along_remaining_m < -0.0005
+                    else "AT_POINT"
+                ),
+            }
+        )
+
+    def _finish_rpp_debug_cycle(self):
+        pending = self._rpp_debug_pending
+        if pending is None:
+            return
+        finish_ns = time.monotonic_ns()
+        start_ns = self._rpp_debug_cycle_start_ns or finish_ns
+        compute_ms = max(0.0, (finish_ns - start_ns) / 1_000_000.0)
+        pending["control_compute_ms"] = compute_ms
+        pending["control_deadline_missed"] = compute_ms > 1000.0 / self.CONTROL_HZ
+
+        if pending["control_mode"] == "CONTROL_CYCLE":
+            if self.segment_alignment_active:
+                pending["control_mode"] = "ALIGNMENT"
+                pending["reason"] = "SEGMENT_ALIGNMENT_ACTIVE"
+            elif pending["command_valid"]:
+                command_speed = pending["command_speed_mps"] or 0.0
+                pending["control_mode"] = (
+                    "STOP" if command_speed <= 1.0e-9 else "CONTROL_OUTPUT"
+                )
+                pending["reason"] = "FINAL_COMMAND_RECORDED"
+            else:
+                pending["control_mode"] = "WAITING"
+
+        pending["actual_speed_mps"] = self._finite_or_none(self.current_speed_mps)
+        pending["sample_complete_monotonic_ns"] = finish_ns
+        with self._rpp_debug_lock:
+            self._rpp_debug_snapshot = dict(pending)
+        self._rpp_debug_pending = None
+        self._rpp_debug_cycle_start_ns = None
+
+    def _publish_rpp_debug_telemetry(self):
+        now_mono_ns = time.monotonic_ns()
+        now_ros = self.get_clock().now()
+        with self._rpp_debug_lock:
+            if self._rpp_debug_snapshot is None:
+                return
+            payload = dict(self._rpp_debug_snapshot)
+            self._rpp_debug_telemetry_sequence += 1
+            telemetry_sequence = self._rpp_debug_telemetry_sequence
+
+        sample_complete_ns = payload.pop("sample_complete_monotonic_ns", now_mono_ns)
+        payload.update(
+            {
+                "telemetry_sequence": telemetry_sequence,
+                "telemetry_stamp_ros_ns": int(now_ros.nanoseconds),
+                "control_sample_age_ms": max(
+                    0.0,
+                    (now_mono_ns - sample_complete_ns) / 1_000_000.0,
+                ),
+            }
+        )
+        try:
+            message = String()
+            message.data = json.dumps(
+                payload,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            self.rpp_debug_pub.publish(message)
+        except Exception as exc:
+            if now_mono_ns - self._rpp_debug_last_error_log_ns >= 1_000_000_000:
+                self._rpp_debug_last_error_log_ns = now_mono_ns
+                self.get_logger().error(
+                    f"RPP DEBUG PUBLISH FAILED: {type(exc).__name__}: {exc}"
+                )
+
     def publish_rpp_debug(
         self,
         *,
@@ -6711,12 +6976,14 @@ class RPPController(Node):
             ),
             "along_position": along_position,
         }
-
-        message = String()
-        message.data = json.dumps(payload, separators=(",", ":"))
-        self.rpp_debug_pub.publish(message)
+        if self._rpp_debug_pending is not None:
+            self._rpp_debug_pending.update(payload)
+            self._rpp_debug_pending["geometry_valid"] = available
+            self._rpp_debug_pending["command_valid"] = command_speed_mps is not None
+            self._rpp_debug_pending["reason"] = "ACTIVE_CONTROL_OUTPUT"
 
     def log_waiting(self, reason):
+        self._set_rpp_debug_status("WAITING", reason)
         now = self.get_clock().now()
         if (now - self.last_wait_log_time).nanoseconds < 1_000_000_000:
             return
@@ -8030,6 +8297,19 @@ class RPPController(Node):
                 along_remaining=along_remaining,
             )
 
+    def _control_timer_callback(self):
+        """Run one motion cycle and always commit one coherent debug sample."""
+        self._begin_rpp_debug_cycle()
+        try:
+            self.control_loop()
+        finally:
+            try:
+                self._finish_rpp_debug_cycle()
+            except Exception as exc:
+                self.get_logger().error(
+                    f"RPP DEBUG FINALIZE FAILED: {type(exc).__name__}: {exc}"
+                )
+
     def control_loop(self):
         self._begin_precision_cycle()
         if self.emergency_stop:
@@ -8270,6 +8550,13 @@ class RPPController(Node):
         goal_signed_cross_track = (
             -math.sin(path_bearing) * goal_delta_east
             + math.cos(path_bearing) * goal_delta_north
+        )
+        self._record_rpp_debug_geometry(
+            path_bearing_rad=path_bearing,
+            heading_error_rad=path_heading_error,
+            distance_to_goal_m=goal_distance,
+            signed_cross_track_m=goal_signed_cross_track,
+            along_remaining_m=goal_along_remaining,
         )
 
         # Phase-5 terminal authority is evaluated after current projection,
@@ -8897,12 +9184,15 @@ class RPPController(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = RPPController()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
 
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node._reset_legacy_alignment_lifecycle("SHUTDOWN")
         node.publish_stop()
         node.destroy_node()

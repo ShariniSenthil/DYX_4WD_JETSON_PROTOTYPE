@@ -626,6 +626,7 @@ async def _broadcast_loop() -> None:
     previous_safety_signature: str | None = None
     previous_point_event_signature: str | None = None
     previous_mission_state: str | None = None
+    next_deadline = asyncio.get_running_loop().time()
 
     while not stop_event.is_set():
         try:
@@ -723,10 +724,15 @@ async def _broadcast_loop() -> None:
         except Exception:
             LOGGER.exception("Realtime broadcast iteration failed")
 
+        next_deadline += interval_seconds
+        now = asyncio.get_running_loop().time()
+        if next_deadline <= now:
+            missed_intervals = int((now - next_deadline) / interval_seconds) + 1
+            next_deadline += missed_intervals * interval_seconds
         try:
             await asyncio.wait_for(
                 stop_event.wait(),
-                timeout=interval_seconds,
+                timeout=max(0.0, next_deadline - now),
             )
         except asyncio.TimeoutError:
             continue

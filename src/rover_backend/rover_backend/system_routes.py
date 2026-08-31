@@ -520,6 +520,32 @@ def build_telemetry_payload() -> dict[str, Any]:
         "rpp_debug_available": bool(
             accuracy.get("rpp_debug_available", False)
         ),
+        "rpp_debug_schema_version": accuracy.get("rpp_debug_schema_version"),
+        "rpp_debug_telemetry_sequence": accuracy.get(
+            "rpp_debug_telemetry_sequence"
+        ),
+        "rpp_debug_control_sequence": accuracy.get(
+            "rpp_debug_control_sequence"
+        ),
+        "rpp_debug_control_sample_age_ms": accuracy.get(
+            "rpp_debug_control_sample_age_ms"
+        ),
+        "rpp_debug_receive_age_ms": accuracy.get(
+            "rpp_debug_receive_age_ms"
+        ),
+        "rpp_debug_odom_age_ms": accuracy.get("rpp_debug_odom_age_ms"),
+        "rpp_debug_control_dt_ms": accuracy.get("rpp_debug_control_dt_ms"),
+        "rpp_debug_control_compute_ms": accuracy.get(
+            "rpp_debug_control_compute_ms"
+        ),
+        "rpp_debug_control_deadline_missed": bool(
+            accuracy.get("rpp_debug_control_deadline_missed", False)
+        ),
+        "rpp_debug_stream_fresh": bool(
+            accuracy.get("rpp_debug_stream_fresh", False)
+        ),
+        "rpp_debug_dropped_frames": accuracy.get("rpp_debug_dropped_frames", 0),
+        "rpp_debug_reason": accuracy.get("rpp_debug_reason"),
         "rpp_control_mode": accuracy.get("rpp_control_mode"),
         "rpp_goal_number": accuracy.get("rpp_goal_number"),
 

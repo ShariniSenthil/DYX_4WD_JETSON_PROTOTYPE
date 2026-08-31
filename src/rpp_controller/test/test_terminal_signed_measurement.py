@@ -41,6 +41,8 @@ _ROS_STUB_MODULE_NAMES = (
     "rclpy",
     "rclpy.node",
     "rclpy.parameter",
+    "rclpy.callback_groups",
+    "rclpy.executors",
     "rclpy.qos",
     "geometry_msgs",
     "geometry_msgs.msg",
@@ -63,6 +65,8 @@ def _real_ros_is_available():
         import rclpy  # noqa: F401
         import rclpy.node  # noqa: F401
         import rclpy.parameter  # noqa: F401
+        import rclpy.callback_groups  # noqa: F401
+        import rclpy.executors  # noqa: F401
         import rclpy.qos  # noqa: F401
         import geometry_msgs.msg  # noqa: F401
         import nav_msgs.msg  # noqa: F401
@@ -110,6 +114,16 @@ def _build_ros_stub_modules():
         Type = _StubParameterType
 
     parameter_module.Parameter = _StubParameter
+
+    callback_groups_module = types.ModuleType("rclpy.callback_groups")
+    callback_groups_module.MutuallyExclusiveCallbackGroup = type(
+        "MutuallyExclusiveCallbackGroup", (), {}
+    )
+
+    executors_module = types.ModuleType("rclpy.executors")
+    executors_module.MultiThreadedExecutor = type(
+        "MultiThreadedExecutor", (), {}
+    )
 
     qos_module = types.ModuleType("rclpy.qos")
     qos_module.DurabilityPolicy = types.SimpleNamespace(
@@ -164,6 +178,8 @@ def _build_ros_stub_modules():
         "rclpy": rclpy_module,
         "rclpy.node": node_module,
         "rclpy.parameter": parameter_module,
+        "rclpy.callback_groups": callback_groups_module,
+        "rclpy.executors": executors_module,
         "rclpy.qos": qos_module,
         "geometry_msgs": geometry_msgs_module,
         "geometry_msgs.msg": geometry_msgs_msg_module,

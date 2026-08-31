@@ -39,6 +39,7 @@ from mavros_msgs.msg import Mavlink
 from mavros_msgs.msg import State
 from nav_msgs.msg import Odometry
 from nav_msgs.msg import Path as NavPath
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy
@@ -300,6 +301,10 @@ class RoverBackendRosNode(Node):
         self._last_fcu_message_monotonic: float | None = None
         self._last_position_message_monotonic: float | None = None
         self._last_rtk_message_monotonic: float | None = None
+        self._last_rpp_debug_monotonic: float | None = None
+        self._last_rpp_debug_sequence: int | None = None
+        self._rpp_debug_dropped_frames = 0
+        self._rpp_debug_callback_group = MutuallyExclusiveCallbackGroup()
 
         retained_qos = _reliable_qos(
             depth=1,
@@ -318,6 +323,9 @@ class RoverBackendRosNode(Node):
 
         sensor_qos = _sensor_qos(
             depth=10,
+        )
+        debug_qos = _sensor_qos(
+            depth=1,
         )
 
         # ======================================================
@@ -515,7 +523,8 @@ class RoverBackendRosNode(Node):
             String,
             "/rpp/debug",
             self._rpp_debug_callback,
-            retained_qos,
+            debug_qos,
+            callback_group=self._rpp_debug_callback_group,
         )
         self.create_subscription(
             String,
@@ -558,6 +567,11 @@ class RoverBackendRosNode(Node):
         self.create_timer(
             1.0,
             self._stale_monitor,
+        )
+        self.create_timer(
+            0.1,
+            self._rpp_debug_stale_monitor,
+            callback_group=self._rpp_debug_callback_group,
         )
 
         rover_state.mark_ros_node_started()
@@ -631,6 +645,17 @@ class RoverBackendRosNode(Node):
                 stream_state="STALE",
                 status="STALE",
             )
+
+    def _rpp_debug_stale_monitor(self) -> None:
+        rpp_debug_age = self._monotonic_age(self._last_rpp_debug_monotonic)
+        rover_state.update(
+            "accuracy",
+            rpp_debug_receive_age_ms=(
+                rpp_debug_age * 1000.0 if math.isfinite(rpp_debug_age) else None
+            ),
+            rpp_debug_stream_fresh=(rpp_debug_age <= 0.25),
+            rpp_debug_dropped_frames=self._rpp_debug_dropped_frames,
+        )
 
     # ==========================================================
     # MAVROS and RTK callbacks
@@ -1030,10 +1055,44 @@ class RoverBackendRosNode(Node):
         if payload is None:
             return
 
+        self._last_rpp_debug_monotonic = time.monotonic()
+        telemetry_sequence = _safe_int(payload.get("telemetry_sequence"), -1)
+        control_sequence = _safe_int(payload.get("control_sequence"), -1)
+        if telemetry_sequence >= 0:
+            previous_sequence = self._last_rpp_debug_sequence
+            if (
+                previous_sequence is not None
+                and telemetry_sequence > previous_sequence + 1
+            ):
+                self._rpp_debug_dropped_frames += (
+                    telemetry_sequence - previous_sequence - 1
+                )
+            if previous_sequence is None or telemetry_sequence != previous_sequence:
+                self._last_rpp_debug_sequence = telemetry_sequence
+
         rover_state.update(
             "accuracy",
             rpp_debug_available=bool(payload.get("available", False)),
             rpp_debug_source="/rpp/debug",
+            rpp_debug_schema_version=_safe_int(payload.get("schema_version"), 1),
+            rpp_debug_telemetry_sequence=(
+                telemetry_sequence if telemetry_sequence >= 0 else None
+            ),
+            rpp_debug_control_sequence=(
+                control_sequence if control_sequence >= 0 else None
+            ),
+            rpp_debug_control_sample_age_ms=_finite_float(
+                payload.get("control_sample_age_ms")
+            ),
+            rpp_debug_odom_age_ms=_finite_float(payload.get("odom_age_ms")),
+            rpp_debug_control_dt_ms=_finite_float(payload.get("control_dt_ms")),
+            rpp_debug_control_compute_ms=_finite_float(
+                payload.get("control_compute_ms")
+            ),
+            rpp_debug_control_deadline_missed=bool(
+                payload.get("control_deadline_missed", False)
+            ),
+            rpp_debug_reason=str(payload.get("reason") or "UNKNOWN"),
             rpp_control_mode=str(payload.get("control_mode") or "UNKNOWN"),
             rpp_goal_number=_safe_int(payload.get("goal_number"), 0),
 
