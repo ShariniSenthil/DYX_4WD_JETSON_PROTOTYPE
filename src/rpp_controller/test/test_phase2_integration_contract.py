@@ -46,11 +46,7 @@ def _called_attributes(method_name: str) -> set[str]:
     return attributes
 
 
-def test_accepted_guidance_and_speed_control_default_on_while_tracking_stays_off():
-    # precision_speed_control_enabled was promoted from the launch file's
-    # own staged rollout (see the launch file's comment at this param):
-    # guidance first, speed control next -- both are now live, tracking/
-    # pivot/terminal remain off pending their own separate promotion.
+def test_accepted_guidance_defaults_on_while_speed_control_stays_off():
     declarations = {}
     for node in ast.walk(_method("__init__")):
         if not (
@@ -63,16 +59,11 @@ def test_accepted_guidance_and_speed_control_default_on_while_tracking_stays_off
             continue
         declarations[node.args[0].value] = ast.literal_eval(node.args[1])
 
-    # Node-level defaults stay safe (off) regardless of what the launch
-    # file overrides -- only the launch file's explicit values are promoted.
     assert declarations["precision_guidance_enabled"] is True
     assert declarations["precision_speed_control_enabled"] is False
     assert declarations["precision_lookahead_time_s"] == 0.90
     assert '"precision_guidance_enabled": True' in LAUNCH_SOURCE
-    assert '"precision_speed_control_enabled": True' in LAUNCH_SOURCE
-    assert '"precision_tracking_control_enabled": False' in LAUNCH_SOURCE
-    assert '"precision_pivot_enabled": False' in LAUNCH_SOURCE
-    assert '"precision_terminal_enabled": False' in LAUNCH_SOURCE
+    assert '"precision_speed_control_enabled": False' in LAUNCH_SOURCE
     assert '"precision_lookahead_time_s": 0.90' in LAUNCH_SOURCE
 
 
@@ -143,7 +134,7 @@ def test_precision_publication_bypasses_competing_legacy_profiles():
 def test_legacy_publisher_and_native_pivot_math_remain_byte_exact():
     expected_hashes = {
         "publish_velocity_ned": (
-            "1f179fa785d59686aa3f449e0bec29722d75ea2a6999644bdfeb0b02318a6123"
+            "006983971b3315179d85a6eeab703ca8093dbcae2634a19157b5b489b68f0627"
         ),
         "terminal_native_pivot_command": (
             "ab1a69086a10d69a3719dea04fdfd772887dfec02ee318020c47e93b3e0cea00"

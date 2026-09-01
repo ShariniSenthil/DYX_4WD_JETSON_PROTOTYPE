@@ -332,19 +332,6 @@ class RPPController(Node):
         self.declare_parameter("alignment_hold_sec", 0.20)
         self.declare_parameter("maximum_yaw_rate_radps", 0.20)
         self.declare_parameter("minimum_yaw_rate_radps", 0.06)
-        # Master gate for the pure-pursuit yaw-rate feedforward (kappa * v).
-        # Disabled by default: computing/publishing it for observability is
-        # inert on its own -- it is not wired into any published setpoint
-        # until cmd_vel_bridge is separately extended to consume it.
-        self.declare_parameter("yaw_rate_feedforward_enabled", False)
-        self.declare_parameter("yaw_rate_feedforward_heading_gain", 0.0)
-        # Forward-cone safety clamp (PX4_DXP's proven guard against PX4
-        # flipping a large bearing error into a reverse-then-spin-turn --
-        # confirmed live in PX4_DXP's own bag data as `flip=True`,
-        # min-fwd -0.08 on pivots, still occurring despite this same clamp
-        # on that side). Applied unconditionally to every published
-        # velocity command, pivot or not.
-        self.declare_parameter("velocity_forward_cone_limit_deg", 75.0)
         self.declare_parameter("pivot_yaw_kp", 1.00)
         self.declare_parameter(
             "alignment_reentry_goal_distance_m",
@@ -869,15 +856,6 @@ class RPPController(Node):
         )
         self.minimum_yaw_rate = float(
             self.get_parameter("minimum_yaw_rate_radps").value
-        )
-        self.yaw_rate_feedforward_enabled = bool(
-            self.get_parameter("yaw_rate_feedforward_enabled").value
-        )
-        self.yaw_rate_feedforward_heading_gain = float(
-            self.get_parameter("yaw_rate_feedforward_heading_gain").value
-        )
-        self.velocity_forward_cone_limit = math.radians(
-            float(self.get_parameter("velocity_forward_cone_limit_deg").value)
         )
         self.pivot_yaw_kp = float(self.get_parameter("pivot_yaw_kp").value)
         self.alignment_reentry_goal_distance = float(
@@ -1571,11 +1549,6 @@ class RPPController(Node):
             "/rpp/xtrack_mm",
             retained_qos,
         )
-        self.yaw_rate_feedforward_pub = self.create_publisher(
-            Float64,
-            "/rpp/yaw_rate_feedforward_radps",
-            retained_qos,
-        )
         self.goal_distance_mm_pub = self.create_publisher(
             Float64,
             "/rpp/goal_distance_mm",
@@ -1835,11 +1808,6 @@ class RPPController(Node):
         self.terminal_native_pivot_true_bearing = None
         self.terminal_native_pivot_request_bearing = None  # legacy, unused
         self.terminal_native_pivot_reason = ""
-
-        # Monitoring only -- see line_guidance(). Not read by any publisher
-        # until yaw_rate_feedforward_enabled is turned on and cmd_vel_bridge
-        # is separately extended to carry it.
-        self.last_yaw_rate_feedforward_radps = 0.0
 
         # Straight-segment acceleration state. It is reset by every literal
         # zero, every new segment goal, mission disable and native pivot.
@@ -2895,10 +2863,6 @@ class RPPController(Node):
             )
         if not math.isfinite(self.pivot_yaw_kp) or self.pivot_yaw_kp <= 0.0:
             raise ValueError("pivot_yaw_kp must be finite and > 0")
-        if not (0.0 < self.velocity_forward_cone_limit <= math.pi):
-            raise ValueError(
-                "velocity_forward_cone_limit_deg must be in (0, 180]"
-            )
         if self.heading_full_speed >= self.heading_min_speed:
             raise ValueError(
                 "heading_full_speed_deg must be less than " "heading_min_speed_deg"
@@ -6570,21 +6534,6 @@ class RPPController(Node):
             direction_north = north / raw_speed
             direction_east = east / raw_speed
 
-            # Forward-cone safety clamp: never publish a bearing more than
-            # velocity_forward_cone_limit off the current yaw. Guards against
-            # PX4 interpreting a large bearing error as a reverse-then-spin
-            # turn instead of a forward pivot (see param declaration).
-            if self.current_yaw is not None:
-                bearing = math.atan2(direction_north, direction_east)
-                heading_error = self.normalize_angle(bearing - self.current_yaw)
-                if abs(heading_error) > self.velocity_forward_cone_limit:
-                    clamped_error = math.copysign(
-                        self.velocity_forward_cone_limit, heading_error
-                    )
-                    bearing = self.normalize_angle(self.current_yaw + clamped_error)
-                    direction_north = math.sin(bearing)
-                    direction_east = math.cos(bearing)
-
             if apply_acceleration:
                 output_speed = self.acceleration_speed_limit(requested_speed)
             else:
@@ -6707,10 +6656,6 @@ class RPPController(Node):
         self._publish_float64(
             self.xtrack_mm_pub,
             xtrack_mm,
-        )
-        self._publish_float64(
-            self.yaw_rate_feedforward_pub,
-            self.last_yaw_rate_feedforward_radps,
         )
         self._publish_float64(
             self.goal_distance_mm_pub,
@@ -7713,30 +7658,6 @@ class RPPController(Node):
         )
 
         guidance_bearing = self.normalize_angle(line_bearing + correction)
-
-        # Monitoring only while yaw_rate_feedforward_enabled is False (the
-        # default): kappa = 2*y/L^2 (PX4_DXP's validated pure-pursuit
-        # curvature formula) times the last commanded speed, plus a small
-        # correction-angle feedback term. Forced to zero during an active
-        # native pivot -- PX4_DXP's own pivot keeper does the same, since a
-        # yaw-rate value is meaningless while the carrier-bearing trick is
-        # driving PX4's spot-turn state machine instead of line tracking.
-        # Not read by cmd_vel_bridge or published to mavros; see
-        # /rpp/yaw_rate_feedforward_radps.
-        if self.yaw_rate_feedforward_enabled and not self.terminal_native_pivot_active:
-            curvature = (2.0 * signed_cross_track) / (lookahead * lookahead)
-            yaw_rate_feedforward = (
-                curvature * self.command_slew_speed
-                + self.yaw_rate_feedforward_heading_gain * correction
-            )
-            yaw_rate_feedforward = max(
-                -self.maximum_yaw_rate,
-                min(self.maximum_yaw_rate, yaw_rate_feedforward),
-            )
-        else:
-            yaw_rate_feedforward = 0.0
-        self.last_yaw_rate_feedforward_radps = yaw_rate_feedforward
-
         return guidance_bearing, signed_cross_track
 
     def along_track_remaining(
