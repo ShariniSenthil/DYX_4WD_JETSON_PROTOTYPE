@@ -33,6 +33,7 @@ from typing import Optional
 
 import rclpy
 
+from geographic_msgs.msg import GeoPointStamped
 from geometry_msgs.msg import PoseStamped
 from mavros_msgs.msg import GPSRAW
 from mavros_msgs.msg import Mavlink
@@ -71,6 +72,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 RTCM_INJECTION_TOPIC = "/mavros/gps_rtk/send_rtcm"
+PX4_EARTH_RADIUS_M = 6_371_000.0
 
 
 class RosServiceOutcomeUnknownError(RuntimeError):
@@ -141,6 +143,77 @@ def _safe_int(
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _px4_enu_to_geodetic(
+    *,
+    origin_latitude_deg: float,
+    origin_longitude_deg: float,
+    east_m: float,
+    north_m: float,
+) -> tuple[float, float]:
+    """Inverse PX4 MapProjection for one ROS/MAVROS ENU point.
+
+    PX4 MapProjection::reproject() uses local NED horizontal coordinates:
+        x = north
+        y = east
+
+    The rover /nav_path uses ROS/MAVROS ENU:
+        x = east
+        y = north
+
+    Therefore north_m is PX4 x and east_m is PX4 y.
+    """
+
+    values = (
+        origin_latitude_deg,
+        origin_longitude_deg,
+        east_m,
+        north_m,
+    )
+
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("PX4 projection values must be finite")
+
+    if not -90.0 <= origin_latitude_deg <= 90.0:
+        raise ValueError("PX4 origin latitude must be within [-90, 90]")
+
+    if not -180.0 <= origin_longitude_deg <= 180.0:
+        raise ValueError("PX4 origin longitude must be within [-180, 180]")
+
+    reference_latitude = math.radians(origin_latitude_deg)
+    reference_longitude = math.radians(origin_longitude_deg)
+
+    x_rad = north_m / PX4_EARTH_RADIUS_M
+    y_rad = east_m / PX4_EARTH_RADIUS_M
+    central_angle = math.hypot(x_rad, y_rad)
+
+    if central_angle <= 1.0e-15:
+        return (
+            origin_latitude_deg,
+            origin_longitude_deg,
+        )
+
+    sin_c = math.sin(central_angle)
+    cos_c = math.cos(central_angle)
+    sin_reference = math.sin(reference_latitude)
+    cos_reference = math.cos(reference_latitude)
+
+    latitude = math.asin(
+        cos_c * sin_reference
+        + (x_rad * sin_c * cos_reference) / central_angle
+    )
+
+    longitude = reference_longitude + math.atan2(
+        y_rad * sin_c,
+        central_angle * cos_reference * cos_c
+        - x_rad * sin_reference * sin_c,
+    )
+
+    return (
+        math.degrees(latitude),
+        math.degrees(longitude),
+    )
 
 
 def _reliable_qos(
@@ -340,6 +413,9 @@ class RoverBackendRosNode(Node):
         self._rtk_healthy = False
         self._rtk_correction_age_sec: float | None = None
 
+        self._px4_origin_latitude_deg: float | None = None
+        self._px4_origin_longitude_deg: float | None = None
+
         # Cached MAVROS RTCM endpoint readiness. ROS graph inspection happens
         # only inside this ROS node; non-ROS supervisor code reads this cache.
         self._mavros_rtcm_ready = False
@@ -432,6 +508,20 @@ class RoverBackendRosNode(Node):
             NavSatFix,
             "/mavros/global_position/raw/fix",
             self._global_position_callback,
+            sensor_qos,
+        )
+
+        self.create_subscription(
+            GeoPointStamped,
+            "/mavros/global_position/gp_origin",
+            self._gp_origin_callback,
+            retained_qos,
+        )
+
+        self.create_subscription(
+            NavSatFix,
+            "/mavros/global_position/global",
+            self._fused_global_position_callback,
             sensor_qos,
         )
 
@@ -845,6 +935,102 @@ class RoverBackendRosNode(Node):
         message: NavSatFix,
     ) -> None:
         self._mark_ros_message()
+        latitude = _finite_float(message.latitude)
+        longitude = _finite_float(message.longitude)
+        altitude = _finite_float(message.altitude)
+
+        if latitude is not None and not -90.0 <= latitude <= 90.0:
+            latitude = None
+
+        if longitude is not None and not -180.0 <= longitude <= 180.0:
+            longitude = None
+
+        rover_state.update(
+            "gps",
+            raw_latitude=latitude,
+            raw_longitude=longitude,
+            raw_altitude_m=altitude,
+        )
+
+    def _gp_origin_callback(
+        self,
+        message: GeoPointStamped,
+    ) -> None:
+        """Cache the exact PX4 EKF local-map geographic origin."""
+
+        self._mark_ros_message()
+
+        latitude = _finite_float(message.position.latitude)
+        longitude = _finite_float(message.position.longitude)
+
+        if (
+            latitude is None
+            or longitude is None
+            or not -90.0 <= latitude <= 90.0
+            or not -180.0 <= longitude <= 180.0
+            or (latitude == 0.0 and longitude == 0.0)
+        ):
+            LOGGER.warning(
+                "Ignoring invalid PX4 gp_origin: lat=%s lon=%s",
+                latitude,
+                longitude,
+            )
+            return
+
+        with self._runtime_lock:
+            self._px4_origin_latitude_deg = latitude
+            self._px4_origin_longitude_deg = longitude
+
+        rover_state.update(
+            "mission",
+            projection_origin_latitude_deg=latitude,
+            projection_origin_longitude_deg=longitude,
+            path_projection="PX4_MAP_PROJECTION_REPROJECT",
+        )
+
+        # /nav_path can arrive before gp_origin on process startup.
+        # If a local preview is already cached, decorate it immediately.
+        cached_preview = rover_state.section("mission").get(
+            "navigation_path_preview",
+            [],
+        )
+
+        if isinstance(cached_preview, list) and cached_preview:
+            projected_preview: list[dict[str, Any]] = []
+
+            for fallback_index, cached_point in enumerate(cached_preview):
+                if not isinstance(cached_point, dict):
+                    continue
+
+                east_m = _finite_float(cached_point.get("x"))
+                north_m = _finite_float(cached_point.get("y"))
+
+                if east_m is None or north_m is None:
+                    continue
+
+                projected_preview.append(
+                    self._navigation_preview_point(
+                        index=_safe_int(
+                            cached_point.get("index"),
+                            fallback_index,
+                        ),
+                        east_m=east_m,
+                        north_m=north_m,
+                    )
+                )
+
+            rover_state.update(
+                "mission",
+                navigation_path_preview=projected_preview,
+            )
+
+    def _fused_global_position_callback(
+        self,
+        message: NavSatFix,
+    ) -> None:
+        """Use PX4 EKF fused global as the live map-position authority."""
+
+        self._mark_ros_message()
         self._last_position_message_monotonic = time.monotonic()
 
         latitude = _finite_float(message.latitude)
@@ -862,6 +1048,7 @@ class RoverBackendRosNode(Node):
             latitude=latitude,
             longitude=longitude,
             altitude_m=altitude,
+            global_position_source="PX4_FUSED_GLOBAL",
         )
 
     def _gps_status_callback(
@@ -1794,6 +1981,53 @@ class RoverBackendRosNode(Node):
             backend_heartbeat_healthy=bool(message.data),
         )
 
+    def _navigation_preview_point(
+        self,
+        *,
+        index: int,
+        east_m: float,
+        north_m: float,
+    ) -> dict[str, Any]:
+        """Return local ENU plus authoritative GPS for API/map preview."""
+
+        point: dict[str, Any] = {
+            "index": int(index),
+            "x": float(east_m),
+            "y": float(north_m),
+        }
+
+        with self._runtime_lock:
+            origin_latitude = self._px4_origin_latitude_deg
+            origin_longitude = self._px4_origin_longitude_deg
+
+        if origin_latitude is None or origin_longitude is None:
+            return point
+
+        try:
+            latitude, longitude = _px4_enu_to_geodetic(
+                origin_latitude_deg=origin_latitude,
+                origin_longitude_deg=origin_longitude,
+                east_m=float(east_m),
+                north_m=float(north_m),
+            )
+        except ValueError as error:
+            LOGGER.warning(
+                "Unable to project nav preview point %s: %s",
+                index,
+                error,
+            )
+            return point
+
+        point.update(
+            {
+                "latitude": latitude,
+                "longitude": longitude,
+                "projection": "PX4_MAP_PROJECTION_REPROJECT",
+            }
+        )
+
+        return point
+
     # ==========================================================
     # Trajectory and mission callbacks
     # ==========================================================
@@ -1905,18 +2139,22 @@ class RoverBackendRosNode(Node):
 
         # The full path stays in ROS. API state stores only a bounded preview.
         preview_limit = 2000
-        preview = [
-            {
-                "index": index,
-                "x": float(pose.pose.position.x),
-                "y": float(pose.pose.position.y),
-            }
-            for index, pose in enumerate(message.poses[:preview_limit])
-            if (
-                math.isfinite(float(pose.pose.position.x))
-                and math.isfinite(float(pose.pose.position.y))
+        preview: list[dict[str, Any]] = []
+
+        for index, pose in enumerate(message.poses[:preview_limit]):
+            east_m = float(pose.pose.position.x)
+            north_m = float(pose.pose.position.y)
+
+            if not math.isfinite(east_m) or not math.isfinite(north_m):
+                continue
+
+            preview.append(
+                self._navigation_preview_point(
+                    index=index,
+                    east_m=east_m,
+                    north_m=north_m,
+                )
             )
-        ]
 
         rover_state.update(
             "mission",
