@@ -68,6 +68,8 @@ import rclpy
 from geographic_msgs.msg import GeoPointStamped
 from geometry_msgs.msg import PoseStamped
 from mavros_msgs.msg import GPSRAW
+from mavros_msgs.msg import State as MavrosState
+from mavros_msgs.srv import CommandLong
 from nav_msgs.msg import Odometry
 from nav_msgs.msg import Path as NavPath
 from rclpy.node import Node
@@ -95,6 +97,19 @@ class TrajectoryGenerator(Node):
     WGS84_F = 1.0 / 298.257223563
 
     CONTROL_HZ = 5.0
+
+    # PX4 broadcasts GPS_GLOBAL_ORIGIN once, on change -- not as a stream.
+    # If nothing is listening at that instant (e.g. this node's MAVROS
+    # session connects after PX4 already set its origin), it's gone until
+    # explicitly re-requested. Actively request it on every MAVROS connect
+    # (including reconnects) instead of passively waiting for a broadcast
+    # that may already have been missed.
+    MAVROS_STATE_TOPIC = "/mavros/state"
+    MAVROS_COMMAND_SERVICE = "/mavros/cmd/command"
+    MAV_CMD_REQUEST_MESSAGE = 512
+    GPS_GLOBAL_ORIGIN_MSG_ID = 49.0
+    GP_ORIGIN_REQUEST_RETRY_SEC = 2.0
+    GP_ORIGIN_REQUEST_MAX_ATTEMPTS = 10
 
     POINT_TYPE_PASS_THROUGH = 0
     POINT_TYPE_DUMMY_ALIGNMENT = 1
@@ -435,6 +450,13 @@ class TrajectoryGenerator(Node):
         )
 
         self.create_subscription(
+            MavrosState,
+            self.MAVROS_STATE_TOPIC,
+            self._mavros_state_callback,
+            sensor_qos,
+        )
+
+        self.create_subscription(
             NavSatFix,
             self.fused_global_position_topic,
             self._fused_global_position_callback,
@@ -486,6 +508,15 @@ class TrajectoryGenerator(Node):
         )
 
         # ======================================================
+        # Clients
+        # ======================================================
+
+        self._mavros_command_client = self.create_client(
+            CommandLong,
+            self.MAVROS_COMMAND_SERVICE,
+        )
+
+        # ======================================================
         # Runtime state
         # ======================================================
 
@@ -496,6 +527,12 @@ class TrajectoryGenerator(Node):
         self.latest_global_time = None
 
         self.latest_gp_origin: GeoPointStamped | None = None
+
+        self.mavros_connected = False
+
+        self.gp_origin_request_attempts = 0
+
+        self.gp_origin_last_request_time = None
 
         self.latest_fused_global_fix: NavSatFix | None = None
 
@@ -696,6 +733,83 @@ class TrajectoryGenerator(Node):
                 f"new=({latitude:.9f}, {longitude:.9f}); "
                 "prepared trajectory invalidated"
             )
+
+    def _mavros_state_callback(
+        self,
+        message: MavrosState,
+    ) -> None:
+        connected = bool(message.connected)
+        with self._lock:
+            just_connected = connected and not self.mavros_connected
+            self.mavros_connected = connected
+            if just_connected:
+                # A fresh (or reconnected) MAVROS session may have missed
+                # PX4's one-shot GPS_GLOBAL_ORIGIN broadcast entirely --
+                # give it a full retry budget rather than assuming the
+                # previous session's attempts still apply.
+                self.gp_origin_request_attempts = 0
+                self.gp_origin_last_request_time = None
+
+    def _maybe_request_gp_origin(self) -> None:
+        """Actively (re-)request PX4's origin instead of waiting on a
+        broadcast that may already have been missed. See MAVROS_STATE_TOPIC
+        comment above CONTROL_HZ for why this is needed."""
+
+        if self.localization_mode != "px4_origin":
+            return
+        if not self.mavros_connected:
+            return
+        if not self._mavros_command_client.service_is_ready():
+            return
+
+        with self._lock:
+            if self.latest_gp_origin is not None:
+                return
+            if self.gp_origin_request_attempts >= self.GP_ORIGIN_REQUEST_MAX_ATTEMPTS:
+                return
+
+            now = self.get_clock().now()
+            if self.gp_origin_last_request_time is not None:
+                elapsed = (
+                    now - self.gp_origin_last_request_time
+                ).nanoseconds / 1e9
+                if elapsed < self.GP_ORIGIN_REQUEST_RETRY_SEC:
+                    return
+
+            self.gp_origin_last_request_time = now
+            self.gp_origin_request_attempts += 1
+            attempt = self.gp_origin_request_attempts
+
+        request = CommandLong.Request()
+        request.command = self.MAV_CMD_REQUEST_MESSAGE
+        request.param1 = self.GPS_GLOBAL_ORIGIN_MSG_ID
+        request.confirmation = 0
+
+        future = self._mavros_command_client.call_async(request)
+
+        def _on_response(done_future, attempt=attempt) -> None:
+            try:
+                response = done_future.result()
+            except Exception as error:
+                self.get_logger().warn(
+                    "GPS_GLOBAL_ORIGIN request "
+                    f"{attempt}/{self.GP_ORIGIN_REQUEST_MAX_ATTEMPTS} "
+                    f"failed: {error}"
+                )
+                return
+            if not response.success:
+                self.get_logger().warn(
+                    "GPS_GLOBAL_ORIGIN request "
+                    f"{attempt}/{self.GP_ORIGIN_REQUEST_MAX_ATTEMPTS} "
+                    f"rejected by PX4 (result={response.result})"
+                )
+
+        future.add_done_callback(_on_response)
+
+        self.get_logger().warn(
+            "Requesting PX4 GPS_GLOBAL_ORIGIN "
+            f"(attempt {attempt}/{self.GP_ORIGIN_REQUEST_MAX_ATTEMPTS})"
+        )
 
     def _fused_global_position_callback(
         self,
@@ -1192,6 +1306,12 @@ class TrajectoryGenerator(Node):
         """Validate gp_origin against PX4's live fused-global/local pair."""
 
         if self.latest_gp_origin is None:
+            if self.localization_mode == "px4_origin":
+                return False, (
+                    "PX4 gp_origin unavailable (requested "
+                    f"{self.gp_origin_request_attempts}/"
+                    f"{self.GP_ORIGIN_REQUEST_MAX_ATTEMPTS} times)"
+                )
             return False, "PX4 gp_origin unavailable"
         if self.latest_fused_global_fix is None:
             return False, "PX4 fused global position unavailable"
@@ -2207,6 +2327,11 @@ class TrajectoryGenerator(Node):
     def _control_loop(
         self,
     ) -> None:
+        # Runs regardless of prepare_requested so the origin is already
+        # available by the time an operator actually prepares a mission,
+        # instead of only starting the retry once PREPARE stalls on it.
+        self._maybe_request_gp_origin()
+
         with self._lock:
             if not self.prepare_requested:
                 return
