@@ -14,7 +14,7 @@ Responsibilities:
 
 - Read the single active mission.csv.
 - Preserve the exact uploaded marking-point order.
-- Convert GPS coordinates into MAVROS local ENU coordinates.
+- Convert PX4-origin GPS candidates through explicit NED, then MAVROS ENU.
 - Generate navigation interpolation at the configured spacing.
 - Generate dummy alignment points for short row transitions.
 - Publish original marking points separately from navigation points.
@@ -81,7 +81,8 @@ from std_msgs.msg import UInt8MultiArray
 from std_srvs.srv import Trigger
 
 from trajectory_generator.localization_frame import GeographicOrigin
-from trajectory_generator.localization_frame import project_geodetic_to_px4_enu
+from trajectory_generator.localization_frame import project_geodetic_to_px4_ned
+from trajectory_generator.localization_frame import transform_ned_to_enu
 
 
 class TrajectoryGenerator(Node):
@@ -1452,15 +1453,16 @@ class TrajectoryGenerator(Node):
             self.raw_marking_points,
             start=1,
         ):
-            projected = project_geodetic_to_px4_enu(
+            ned = project_geodetic_to_px4_ned(
                 origin,
                 latitude,
                 longitude,
             )
+            enu = transform_ned_to_enu(ned)
 
             target_distance = math.hypot(
-                projected.east_m,
-                projected.north_m,
+                enu.east_m,
+                enu.north_m,
             )
 
             if target_distance > self.max_target_distance_m:
@@ -1471,9 +1473,15 @@ class TrajectoryGenerator(Node):
 
             candidate_points.append(
                 (
-                    projected.east_m,
-                    projected.north_m,
+                    enu.east_m,
+                    enu.north_m,
                 )
+            )
+
+            self.get_logger().warn(
+                f"PX4 NED CANDIDATE P{index}: "
+                f"NED(N={ned.north_m:.6f}, E={ned.east_m:.6f}) -> "
+                f"ENU(E={enu.east_m:.6f}, N={enu.north_m:.6f})"
             )
 
         return candidate_points
@@ -1562,7 +1570,7 @@ class TrajectoryGenerator(Node):
         fused_position = self.latest_fused_global_fix
 
         try:
-            projected = project_geodetic_to_px4_enu(
+            ned = project_geodetic_to_px4_ned(
                 GeographicOrigin(
                     latitude_deg=float(origin_position.latitude),
                     longitude_deg=float(origin_position.longitude),
@@ -1571,6 +1579,7 @@ class TrajectoryGenerator(Node):
                 float(fused_position.latitude),
                 float(fused_position.longitude),
             )
+            enu = transform_ned_to_enu(ned)
         except ValueError as error:
             self.localization_shadow_summary["frame_reason"] = str(error)
 
@@ -1583,8 +1592,8 @@ class TrajectoryGenerator(Node):
 
         local_east = float(self.latest_local_odom.pose.pose.position.x)
         local_north = float(self.latest_local_odom.pose.pose.position.y)
-        delta_east = local_east - projected.east_m
-        delta_north = local_north - projected.north_m
+        delta_east = local_east - enu.east_m
+        delta_north = local_north - enu.north_m
         radial_delta = math.hypot(delta_east, delta_north)
         receive_skew = abs(
             (
@@ -1605,8 +1614,8 @@ class TrajectoryGenerator(Node):
 
         self.get_logger().warn(
             "LOCALIZATION SHADOW FRAME: "
-            f"projected=({projected.east_m:.6f}, "
-            f"{projected.north_m:.6f}) m, "
+            f"NED=({ned.north_m:.6f}, {ned.east_m:.6f}) m -> "
+            f"ENU=({enu.east_m:.6f}, {enu.north_m:.6f}) m, "
             f"odom=({local_east:.6f}, {local_north:.6f}) m, "
             f"delta=({delta_east:+.6f}, "
             f"{delta_north:+.6f}) m, "
