@@ -29,10 +29,14 @@ MISSION_METADATA_FILE = (
     "/home/flash/.local/share/" "dyx_rover/runtime/mission_metadata.json"
 )
 
-# Temporarily lowered from 1.00 for the first supervised field test of
-# precision_speed_control_enabled (newly turned on below). Revert to 1.00
-# once that test validates cleanly at low speed.
-CRUISE_SPEED_MPS = 0.40
+# rpp_controller_node.py's own validate_parameters() hard-fails startup
+# unless cruise_speed_mps is exactly 1.00 -- many other derived params in
+# that file (lookahead speed gain, decel profile speeds, etc.) are tuned
+# assuming exactly this value. Lowering it is not a safe standalone change;
+# the low-speed behavior for the first precision_speed_control test comes
+# from precision_terminal_target_speed_mps (0.15) inside the ~1.2m terminal
+# approach zone instead, not from a global cruise-speed reduction.
+CRUISE_SPEED_MPS = 1.00
 TERMINAL_FLOOR_SPEED_MPS = 0.15
 
 
