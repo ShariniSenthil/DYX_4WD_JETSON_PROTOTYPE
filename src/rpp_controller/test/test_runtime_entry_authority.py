@@ -83,6 +83,11 @@ class _Controller:
         self.line_tracking_lookahead_min = 0.35
         self.line_tracking_lookahead_max = 0.80
         self.line_tracking_lookahead_xtrack_gain = 1.0
+        self.yaw_rate_feedforward_enabled = False
+        self.yaw_rate_feedforward_heading_gain = 0.0
+        self.terminal_native_pivot_active = False
+        self.maximum_yaw_rate = 0.20
+        self.last_yaw_rate_feedforward_radps = 0.0
 
     def _reset_legacy_alignment_lifecycle(self, _reason):
         self.segment_alignment_pivot_complete = False

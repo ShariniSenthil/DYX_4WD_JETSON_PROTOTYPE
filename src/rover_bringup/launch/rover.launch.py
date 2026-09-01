@@ -29,10 +29,10 @@ MISSION_METADATA_FILE = (
     "/home/flash/.local/share/" "dyx_rover/runtime/mission_metadata.json"
 )
 
-# Fixed production field-test cruise speed. Forward line capture and normal
-# xtrack recovery target 1.00 m/s. The only planned reductions are the normal
-# start ramp and the final 500 mm semantic-goal deceleration needed to stop.
-CRUISE_SPEED_MPS = 1.00
+# Temporarily lowered from 1.00 for the first supervised field test of
+# precision_speed_control_enabled (newly turned on below). Revert to 1.00
+# once that test validates cleanly at low speed.
+CRUISE_SPEED_MPS = 0.40
 TERMINAL_FLOOR_SPEED_MPS = 0.15
 
 
@@ -437,9 +437,14 @@ def generate_launch_description() -> LaunchDescription:
                         "geometry_max_forward_jump_m": 1.00,
                         # Projection guidance is field-accepted and enabled
                         # with the tested 0.90 s horizon. Longitudinal speed
-                        # regulation remains independently default-OFF.
+                        # regulation is the next staged increment: enabled on
+                        # its own (no dependency on tracking/pivot/terminal --
+                        # see the requires-checks in __init__). Shapes only
+                        # approach SPEED; the 30 mm radial latch remains the
+                        # sole stop authority (precision_terminal_enabled is
+                        # still False).
                         "precision_guidance_enabled": True,
-                        "precision_speed_control_enabled": False,
+                        "precision_speed_control_enabled": True,
                         "precision_lookahead_min_m": 0.20,
                         "precision_lookahead_max_m": 1.00,
                         "precision_lookahead_time_s": 0.90,
@@ -447,7 +452,12 @@ def generate_launch_description() -> LaunchDescription:
                         "precision_moving_bearing_cone_deg": 30.0,
                         "precision_hardware_speed_ceiling_mps": 1.00,
                         "precision_acceleration_mps2": 0.75,
-                        "precision_deceleration_mps2": 0.75,
+                        # Lowered from 0.75: braking_distance(v=1.0 cruise,
+                        # target=0.15, latency=0.10, margin=0.05) works out to
+                        # ~0.80m at 0.75 and ~1.24m at 0.45 -- widens the
+                        # terminal approach zone into the requested 1.0-1.5m
+                        # band instead of the tighter ~0.8m the old value gave.
+                        "precision_deceleration_mps2": 0.45,
                         "precision_launch_speed_mps": 0.10,
                         "precision_control_dt_max_sec": 0.10,
                         "precision_heading_accel_full_error_deg": 2.0,
