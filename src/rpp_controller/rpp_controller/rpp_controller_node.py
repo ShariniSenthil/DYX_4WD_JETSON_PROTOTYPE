@@ -2744,8 +2744,18 @@ class RPPController(Node):
             )
         if self.cruise_speed > self.MAXIMUM_MOVING_SPEED_MPS + 1.0e-9:
             raise ValueError("cruise_speed_mps must not exceed 1.00 m/s")
-        if not math.isclose(self.cruise_speed, 1.00, abs_tol=1.0e-6):
-            raise ValueError("production cruise_speed_mps must be exactly 1.00 m/s")
+        # Previously pinned to exactly 1.00. Relaxed to a bounded range on
+        # 2026-09-01 for staged speed bring-up: the FCU's RO_SPEED_LIM was
+        # 0.40, so every mission so far was clamped there and the stack has
+        # never actually been driven at its own configured cruise speed. The
+        # 1.00 ceiling above is unchanged and still enforced; this only allows
+        # deliberately commanding LESS. Every derived quantity -- acceleration
+        # rate, deceleration rate, and the alignment/xtrack/terminal speeds
+        # that rover.launch.py computes from CRUISE_SPEED_MPS -- is recomputed
+        # from this value at init, which is why cruise speed remains a
+        # restart-time setting and is not runtime-settable.
+        if self.cruise_speed < self.minimum_speed:
+            raise ValueError("cruise_speed_mps must be >= minimum_speed_mps")
         if self.acceleration_startup_ceiling >= self.cruise_speed:
             raise ValueError(
                 "acceleration_startup_ceiling_mps must be below cruise speed"

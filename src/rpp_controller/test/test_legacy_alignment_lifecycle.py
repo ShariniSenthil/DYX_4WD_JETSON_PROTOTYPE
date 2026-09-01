@@ -931,3 +931,54 @@ def test_runtime_line_legs_deny_navpath_guidance_bearing_authority():
     guards = control.count("not self.following_runtime_line")
     assert substitutions >= 3
     assert guards >= substitutions
+
+
+def test_cruise_speed_is_a_bounded_range_not_a_pinned_value():
+    """Cruise speed must be tunable downward for staged bring-up.
+
+    It was pinned to exactly 1.00 m/s, which made staged speed testing
+    impossible: the node refused to start at any other value. The 1.00
+    ceiling (MAXIMUM_MOVING_SPEED_MPS) must survive -- only the equality
+    check is gone.
+    """
+    validate = _method_source("validate_parameters")
+    assert "must not exceed 1.00 m/s" in validate
+    assert "must be exactly 1.00 m/s" not in validate
+    assert "cruise_speed_mps must be >= minimum_speed_mps" in validate
+
+
+def test_launch_cruise_speed_stays_within_the_controller_ceiling():
+    """Whatever CRUISE_SPEED_MPS is set to, it must satisfy the guards.
+
+    Guards against a staged-bring-up edit that would fail validation only
+    at node startup, in the field.
+    """
+    import re
+
+    def const(name):
+        m = re.search(rf"^{name}\s*=\s*([0-9.]+)", LAUNCH_SOURCE, re.M)
+        assert m, f"{name} not found in rover.launch.py"
+        return float(m.group(1))
+
+    cruise = const("CRUISE_SPEED_MPS")
+    floor = const("TERMINAL_FLOOR_SPEED_MPS")
+    declared = _declared_defaults()
+    minimum = float(declared["minimum_speed_mps"])
+
+    assert minimum <= cruise <= 1.00, cruise
+    assert 0.0 < floor <= cruise, (floor, cruise)
+
+    # Values the launch file sets independently of CRUISE_SPEED_MPS still
+    # have to fit inside it, or the node raises at startup.
+    for name in (
+        "acceleration_startup_ceiling_mps",
+        "post_pivot_capture_speed_mps",
+        "precision_pivot_recenter_speed_mps",
+    ):
+        m = re.search(rf'"{name}":\s*([0-9.]+)', LAUNCH_SOURCE)
+        assert m, name
+        value = float(m.group(1))
+        if name == "acceleration_startup_ceiling_mps":
+            assert value < cruise, f"{name}={value} must be < cruise {cruise}"
+        else:
+            assert minimum <= value <= cruise, f"{name}={value} vs cruise {cruise}"

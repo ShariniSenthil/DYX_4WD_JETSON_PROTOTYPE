@@ -29,10 +29,28 @@ MISSION_METADATA_FILE = (
     "/home/flash/.local/share/" "dyx_rover/runtime/mission_metadata.json"
 )
 
-# Fixed production field-test cruise speed. Forward line capture and normal
-# xtrack recovery target 1.00 m/s. The only planned reductions are the normal
-# start ramp and the final 500 mm semantic-goal deceleration needed to stop.
-CRUISE_SPEED_MPS = 1.00
+# Field-test cruise speed. Forward line capture and normal xtrack recovery
+# target this value; the only planned reductions are the start ramp and the
+# final semantic-goal deceleration needed to stop. Every other speed below
+# (segment alignment, alignment recovery, xtrack priority, the decel profile
+# points, and the terminal caps) is derived from it, and the controller
+# recomputes its acceleration/deceleration rates from it at init -- so this is
+# a restart-time setting, never a live `ros2 param set`.
+#
+# STAGED BRING-UP, 2026-09-01. Set to 0.40 as step 1 of 0.40 -> 0.60 -> 0.80
+# -> 1.00. The FCU's RO_SPEED_LIM was 0.40, so every mission ever run on this
+# rover was clamped there regardless of what this said: 1.00 commanded
+# produced 0.22-0.30 m/s actual across all 12 legs of three runs. 0.40 is
+# therefore the known-good baseline, not a blind first step -- it is where the
+# rover has been operating all along, now stated honestly.
+#
+# Raising this past 0.40 does nothing until RO_SPEED_LIM is raised on the FCU
+# (1.2 recommended, a ceiling not a target). Note the feedforward interaction:
+# PX4 throttle is roughly setpoint/RO_MAX_THR_SPEED, so a 0.40 setpoint asks
+# for 0.21 throttle -- inside the measured 0.143-0.219 breakaway deadband,
+# which is why tracking is poor down here. A 1.00 setpoint asks for 0.53 and
+# should sit well clear of it.
+CRUISE_SPEED_MPS = 0.40
 TERMINAL_FLOOR_SPEED_MPS = 0.15
 
 
