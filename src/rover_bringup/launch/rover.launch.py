@@ -305,14 +305,38 @@ def generate_launch_description() -> LaunchDescription:
                         # offset is still being corrected. See P4 bag
                         # forensic analysis (2026-08-27).
                         "acceleration_distance_m": 0.50,
-                        # Small bootstrap ceiling only prevents drivetrain deadlock;
-                        # the profile itself starts from literal zero. Lowered
-                        # from 0.15 -- field bags show this jump (0->0.15 m/s
-                        # within ~0.1s) combined with residual heading/
-                        # lookahead correction produces a visible left/right
-                        # swing at launch. See P3 bag forensic analysis
-                        # (2026-08-27).
-                        "acceleration_startup_ceiling_mps": 0.08,
+                        # Bootstrap ceiling exists only to prevent drivetrain
+                        # deadlock; the profile itself starts from literal zero.
+                        #
+                        # History: raised 0.08 -> 0.25 on 2026-09-01. It had
+                        # been lowered 0.15 -> 0.08 on 2026-08-27 because that
+                        # jump "combined with residual heading/lookahead
+                        # correction produces a visible left/right swing at
+                        # launch". That residual was legs starting 185-460 mm
+                        # off-line, which the post-pivot reanchor (commit
+                        # 4b8fe1b) removed: measured start-of-leg cross-track
+                        # is now -2 to -28 mm on all four legs of runs
+                        # 165849/170044. With nothing large left to correct at
+                        # launch, the reason for the low ceiling is gone.
+                        #
+                        # 0.08 could never start this rover anyway. Measured
+                        # breakaway command is 0.143-0.219 m/s across 12 legs,
+                        # so the bootstrap term alone never moves it: the ramp
+                        # escaped only once distance_limited_speed grew, and
+                        # that needs odometry progress the rover was not making.
+                        # /rpp/acceleration_progress_m shows it ratcheting on
+                        # ~8 mm of GPS position noise, frozen at 0.0076 m for a
+                        # full second on leg 1, costing 2.0-2.9 s of dead time
+                        # from a true dead stop (0.4-0.6 s on legs that kept a
+                        # little residual creep). 0.25 clears the 0.219 worst
+                        # case with margin.
+                        #
+                        # Still gentle: with the ~4:1 command-to-actual loss on
+                        # this drivetrain (1.00 m/s commanded gives 0.22-0.30
+                        # m/s actual, all 12 legs), 0.25 commanded is roughly
+                        # 0.10 m/s of real motion, and the bootstrap ramps at
+                        # acceleration_rate so it takes ~0.25 s to get there.
+                        "acceleration_startup_ceiling_mps": 0.25,
                         "acceleration_max_progress_jump_m": 0.10,
                         "acceleration_max_dt_sec": 0.10,
                         # 1.00 m/s over 0.20 m requires 2.50 m/s^2, so this
