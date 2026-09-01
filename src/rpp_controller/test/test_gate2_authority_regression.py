@@ -130,6 +130,12 @@ def test_gate2_off_retains_legacy_guidance_and_terminal_publisher():
     )
 
     assert "self.line_guidance(" in normal
-    assert "if self.precision_guidance_enabled and not first_approach:" in normal
+    # Precision guidance still holds bearing authority in the normal branch,
+    # but the gate is now the path actually being tracked rather than the leg
+    # index: following_runtime_line is true for the C->P1 entry leg AND for a
+    # post-pivot reanchored leg, both of which steer on a locally generated
+    # line that the /nav_path-derived guidance correction must not override.
+    assert "self.precision_guidance_enabled" in normal
+    assert "not self.following_runtime_line" in normal
     assert "if self.precision_speed_control_enabled:" in normal
     assert "self.publish_velocity_ned(" in terminal

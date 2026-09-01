@@ -782,3 +782,152 @@ def test_failed_reanchor_later_semantic_geometry_remains_unchanged():
     assert driver.life.phase is LegacyAlignmentPhase.ENTRY
     assert driver.life.native_carrier_issued is False
     assert driver.life.reanchor_complete is False
+
+
+def _pivot_to_settle_certificate(*, first_approach, **cfg):
+    """Drive a full pivot to the settle certificate on a chosen leg."""
+    driver = Driver(heading_deg=90.0, **cfg)
+    driver.first_approach = first_approach
+    result = driver.tick()
+    assert result.phase is LegacyAlignmentPhase.PRE_PIVOT_STOP
+    complete_pre_zero_transition(driver)
+    publish_native(driver)
+    release_to_settle(driver, heading_deg=1.0)
+    return driver, reach_settle_certificate(driver, heading_deg=1.0)
+
+
+def test_later_leg_requests_its_own_post_pivot_reanchor():
+    """A pivot on P1->P2 must be offered the same reanchor the entry leg gets.
+
+    A native pivot walks the rover 300-600 mm off the line it is about to
+    drive (Sep-1 P1 bags, 12 pivots). The entry leg has always rebuilt its
+    line from the post-pivot position and is the only leg that lands inside
+    the 30 mm marking latch; later legs stayed bound to the surveyed
+    /nav_path segment and finished 125-191 mm off the point.
+    """
+    driver, settled = _pivot_to_settle_certificate(first_approach=False)
+    assert settled.reanchor_requested is True
+    assert settled.directive is LegacyAlignmentDirective.REANCHOR_ZERO
+    assert driver.life.reanchor_complete is False
+
+    driver.life.ack_reanchor_completed()
+    done = finish_settle_and_hold_after_reanchor(driver, heading_deg=1.0)
+    assert done.directive is LegacyAlignmentDirective.COMPLETE_ZERO
+    assert done.pivot_complete is True
+
+
+def test_reanchor_all_legs_false_restores_entry_leg_only_behaviour():
+    """The field must be able to fall back without a code rollback."""
+    driver, settled = _pivot_to_settle_certificate(
+        first_approach=False,
+        reanchor_all_legs=False,
+    )
+    assert settled.reanchor_requested is False
+    assert settled.directive is LegacyAlignmentDirective.HOLD_ZERO
+    assert settled.transition_reason == "POST_SETTLE_HOLD"
+
+    done = driver.tick(elapsed=1.01, heading_deg=1.0, speed=0.0, yaw_rate=0.0)
+    assert done.directive is LegacyAlignmentDirective.COMPLETE_ZERO
+
+
+def test_entry_leg_reanchor_is_unaffected_by_the_all_legs_flag():
+    for flag in (True, False):
+        driver, settled = _pivot_to_settle_certificate(
+            first_approach=True,
+            reanchor_all_legs=flag,
+        )
+        assert settled.reanchor_requested is True, flag
+        assert settled.directive is LegacyAlignmentDirective.REANCHOR_ZERO
+
+
+def test_later_leg_reanchor_is_offered_once_per_leg():
+    """already_reanchored is the node's per-leg latch; honour it."""
+    driver, settled = _pivot_to_settle_certificate(first_approach=False)
+    assert settled.reanchor_requested is True
+    driver.life.ack_reanchor_completed()
+    again = driver.tick(heading_deg=1.0, speed=0.0, yaw_rate=0.0)
+    assert again.reanchor_requested is False
+
+    # And a leg whose node-side latch is already set never asks at all.
+    fresh, settled_again = _pivot_to_settle_certificate(first_approach=False)
+    fresh.already_reanchored = True
+    nxt = fresh.tick(heading_deg=1.0, speed=0.0, yaw_rate=0.0)
+    assert nxt.reanchor_requested is False
+
+
+def test_declined_later_leg_reanchor_never_stops_the_mission():
+    """A later-leg reanchor that declines must fall back to /nav_path.
+
+    The entry leg keeps its strict REANCHOR_FAILED -> SAFETY_HOLD contract,
+    but this feature may only ever improve on the previous path -- it must
+    never halt a leg that used to drive. Guarded at the source level because
+    the branch lives in the ROS adapter, not the ROS-free lifecycle.
+    """
+    adapter = _method_source("_run_legacy_segment_alignment")
+    block = adapter.split("REANCHOR_ZERO", 1)[1].split("COMPLETE_ZERO", 1)[0]
+    assert "reanchor_runtime_path_after_pivot" in block
+    assert "reanchor_c_to_p1_after_pivot" in block
+
+    fallback_at = block.index("if not first_approach:")
+    safety_at = block.index("enter_safety_hold")
+    # The non-entry fallback must be reached before the safety hold, so a
+    # declined later-leg reanchor can never fall through to it.
+    assert fallback_at < safety_at
+
+    fallback = block[fallback_at:safety_at]
+    assert "ack_reanchor_completed" in fallback
+    assert "segment_runtime_reanchored = True" in fallback
+    assert "enter_safety_hold" not in fallback
+
+
+def test_later_leg_path_selection_prefers_the_reanchored_line():
+    """The reanchored line is followed only when it belongs to THIS goal."""
+    control = _method_source("control_loop")
+    assert "if self.segment_runtime_reanchored:" in control
+    assert "LEG_PATH" in control
+    # The surveyed path must remain the fallback, never replaced.
+    assert "nav_path_tracking_solution(goal_x, goal_y)" in control
+
+    guarded = control.split("if self.segment_runtime_reanchored:", 1)[1]
+    assert "runtime_entry_tracking_solution(goal_x, goal_y)" in guarded.split(
+        "nav_path_tracking_solution"
+    )[0]
+
+
+def test_post_pivot_reanchor_all_legs_is_declared_and_launched():
+    assert _declared_defaults()["post_pivot_reanchor_all_legs"] is True
+    assert "post_pivot_reanchor_all_legs" in LAUNCH_SOURCE
+
+
+def test_runtime_line_legs_deny_navpath_guidance_bearing_authority():
+    """Precision guidance must not steer a leg back onto the surveyed line.
+
+    compute_precision_guidance() derives its correction from the /nav_path
+    geometry projection, not from the path being tracked. A post-pivot
+    reanchored leg deliberately replaces that surveyed line with one drawn
+    from where the pivot actually left the rover; letting guidance keep
+    bearing authority there would pull the rover back onto the line the
+    reanchor just discarded, silently undoing it. The C->P1 entry leg has
+    always been excluded for exactly this reason -- reanchored legs join it.
+    """
+    control = _method_source("control_loop")
+    alignment = _method_source("_run_legacy_segment_alignment")
+
+    # The authority flag is derived from the tracked path, once per cycle.
+    assert 'self.following_runtime_line = path_label in ("ENTRY_PATH", "LEG_PATH")' in (
+        control
+    )
+
+    # No guidance-authority site may still key off the leg index.
+    for source, name in ((control, "control_loop"), (alignment, "adapter")):
+        for line in source.splitlines():
+            if "precision_guidance_enabled" in line or (
+                "precision_tracking_control_enabled" in line
+            ):
+                assert "first_approach" not in line, f"{name}: {line.strip()}"
+
+    # Every substitution of the guidance bearing is gated on the flag.
+    substitutions = control.count("precision_guidance.limited_command_bearing_rad")
+    guards = control.count("not self.following_runtime_line")
+    assert substitutions >= 3
+    assert guards >= substitutions

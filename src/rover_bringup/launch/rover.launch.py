@@ -572,6 +572,27 @@ def generate_launch_description() -> LaunchDescription:
                         # (above) did not fully resolve repeated-reset
                         # dwell stalls.
                         "legacy_pivot_stationary_violation_debounce_sec": 0.10,
+                        # A native pivot walks the rover 300-600 mm off the
+                        # line it is about to drive (measured net displacement
+                        # across 12 pivots in the Sep-1 P1 bags), most of it
+                        # the GPS antenna swinging through its lever-arm arc.
+                        # Only the C->P1 entry leg used to rebuild its line
+                        # from where the rover actually ended up, and it is
+                        # the only leg that lands inside the 30 mm marking
+                        # latch: with the entry reanchor, P1 finished at +4.4
+                        # and +17.5 mm on runs 162110/161911; without it, P2-P4
+                        # started 185-460 mm off-line and finished 125-191 mm
+                        # off the surveyed point in every run measured.
+                        #
+                        # Safe because nothing is painted between marking
+                        # points -- marking_indices fire only at the surveyed
+                        # nav_path indices (0/44/92/133 on this mission), so
+                        # the inter-point line decides how the rover ARRIVES,
+                        # not what it marks. The goal is never moved.
+                        #
+                        # Set False to restore entry-leg-only reanchoring
+                        # without a code rollback.
+                        "post_pivot_reanchor_all_legs": True,
                         "precision_pivot_recapture_xtrack_m": 0.020,
                         "precision_pivot_recapture_heading_deg": 2.0,
                         "precision_pivot_recapture_settle_sec": 0.20,

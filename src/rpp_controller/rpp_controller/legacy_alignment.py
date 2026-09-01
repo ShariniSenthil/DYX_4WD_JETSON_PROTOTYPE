@@ -65,6 +65,16 @@ class LegacyAlignmentConfig:
     pivot_keeper_timeout_sec: float
     pre_pivot_timeout_sec: float
     stationary_violation_debounce_sec: float
+    # A native pivot displaces the rover 300-600 mm off the line it was
+    # about to drive (measured across 12 pivots in the Sep-1 P1 bags), most
+    # of it the GPS antenna swinging through its lever-arm arc. Reanchoring
+    # rebuilds the line from where the rover actually ended up. Historically
+    # only the C->P1 entry leg did this, and it is the only leg that lands
+    # inside the 30 mm marking latch; later legs start ~180-460 mm off-line
+    # and finish 125-191 mm off the surveyed point. When True the same
+    # reanchor is offered on every leg. Kept configurable so the field can
+    # fall back to entry-leg-only without a rollback.
+    reanchor_all_legs: bool = True
 
     def __post_init__(self) -> None:
         finite_fields = (
@@ -385,7 +395,7 @@ class LegacyAlignmentLifecycle:
                 reason="SETTLE_CERTIFICATE_DWELL",
             )
         reanchor = (
-            sample.first_approach
+            (sample.first_approach or self.config.reanchor_all_legs)
             and not self.reanchor_complete
             and not sample.already_reanchored
             and self.native_carrier_issued

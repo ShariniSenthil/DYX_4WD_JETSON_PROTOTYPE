@@ -618,6 +618,12 @@ class RPPController(Node):
         self.declare_parameter(
             "legacy_pivot_stationary_violation_debounce_sec", 0.10
         )
+        # Offer the post-pivot runtime reanchor on every leg, not just the
+        # C->P1 entry leg. A pivot walks the rover 300-600 mm off the line it
+        # is about to drive; only the entry leg used to rebuild its line from
+        # the post-pivot position, and it is the only leg that lands inside
+        # the 30 mm marking latch. Set False to restore entry-leg-only.
+        self.declare_parameter("post_pivot_reanchor_all_legs", True)
 
         self.local_frame = str(self.get_parameter("local_frame").value).strip()
         self.cruise_speed = float(self.get_parameter("cruise_speed_mps").value)
@@ -1293,6 +1299,9 @@ class RPPController(Node):
                 "legacy_pivot_stationary_violation_debounce_sec"
             ).value
         )
+        self.post_pivot_reanchor_all_legs = bool(
+            self.get_parameter("post_pivot_reanchor_all_legs").value
+        )
         self.precision_pivot_config = PivotMotionConfig(
             pivot_anchor_tolerance_m=float(
                 self.get_parameter("precision_pivot_anchor_tolerance_m").value
@@ -1371,6 +1380,7 @@ class RPPController(Node):
                 stationary_violation_debounce_sec=(
                     self.legacy_pivot_stationary_violation_debounce_sec
                 ),
+                reanchor_all_legs=self.post_pivot_reanchor_all_legs,
             )
         )
         self.get_logger().warn(
@@ -1806,6 +1816,18 @@ class RPPController(Node):
         self.c_line_start_y = None
         self.c_line_bearing = None
         self.c_line_reanchored_after_pivot = False
+        # Per-leg twin of c_line_reanchored_after_pivot for legs after the
+        # C->P1 entry leg. Cleared on every semantic segment change so each
+        # leg gets exactly one post-pivot reanchor.
+        self.segment_runtime_reanchored = False
+        # True for any cycle whose steering follows a locally generated
+        # runtime line rather than the surveyed /nav_path. Precision guidance
+        # derives its correction from the /nav_path geometry projection, so it
+        # must not hold bearing authority on those cycles -- it would steer
+        # back to the surveyed line the runtime path deliberately replaced.
+        # The C->P1 entry leg has always run this way; a post-pivot reanchored
+        # leg now does too. Recomputed every control cycle at path selection.
+        self.following_runtime_line = False
 
         # Continuous final-corridor gate and latched precision state.
         self.terminal_gate_inside_since = None
@@ -4236,6 +4258,7 @@ class RPPController(Node):
         # Every semantic segment (marking OR extension/dummy) must complete
         # heading/cross-track alignment before translational drive is released.
         self.segment_alignment_active = True
+        self.segment_runtime_reanchored = False
         self._reset_legacy_alignment_lifecycle("SEGMENT_GOAL_CHANGED")
         self.alignment_forward_heading_recovery_active = False
         self.alignment_deadband_recovery_active = False
@@ -4501,6 +4524,7 @@ class RPPController(Node):
         self.terminal_gate_ready = False
         self.reset_terminal_precision_state()
         self.c_line_reanchored_after_pivot = False
+        self.segment_runtime_reanchored = False
         self.reset_terminal_native_pivot()
 
     def _precision_now_sec(self):
@@ -4985,7 +5009,11 @@ class RPPController(Node):
                 alignment_cross_track_m=alignment_cross_track,
                 native_pivot_active=bool(native_active),
                 first_approach=bool(first_approach),
-                already_reanchored=bool(self.c_line_reanchored_after_pivot),
+                already_reanchored=bool(
+                    self.c_line_reanchored_after_pivot
+                    if first_approach
+                    else self.segment_runtime_reanchored
+                ),
                 current_x=self.current_x,
                 current_y=self.current_y,
             )
@@ -5053,14 +5081,34 @@ class RPPController(Node):
             return True
 
         if result.directive is LegacyAlignmentDirective.REANCHOR_ZERO:
-            success = False
             if first_approach:
                 success = bool(self.reanchor_c_to_p1_after_pivot())
+            else:
+                success = bool(
+                    self.reanchor_runtime_path_after_pivot(goal_x, goal_y)
+                )
             if success:
                 self.legacy_alignment.ack_reanchor_completed()
                 self.reset_terminal_native_pivot()
                 self._reset_precision_regulator("PIVOT_COMPLETE_RECAPTURE_ARMED")
                 self.publish_stop()
+                return True
+            if not first_approach:
+                # Nothing to reanchor to (goal already inside
+                # waypoint_tolerance, or the path build declined). Fall back
+                # to the pre-existing /nav_path behaviour for this leg
+                # instead of stopping the mission: this feature may only ever
+                # improve on the old path, never halt where it used to drive.
+                self.legacy_alignment.ack_reanchor_completed()
+                self.segment_runtime_reanchored = True
+                self.publish_stop()
+                self.get_logger().warn(
+                    "POST-PIVOT LEG REANCHOR DECLINED / "
+                    "CONTINUING ON /nav_path | "
+                    f"goal=P{self.segment_goal_number} | "
+                    f"xtrack="
+                    f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
+                )
                 return True
             self.legacy_alignment.enter_safety_hold("REANCHOR_FAILED")
             self.publish_stop()
@@ -5151,7 +5199,7 @@ class RPPController(Node):
             self.xtrack_priority_inside_since = None
             self._reset_precision_regulator("ALIGNED_START_CAPTURE_ARMED")
 
-        if self.precision_guidance_enabled and not first_approach:
+        if self.precision_guidance_enabled and not self.following_runtime_line:
             alignment_guidance_bearing = (
                 precision_guidance.limited_command_bearing_rad
             )
@@ -5458,6 +5506,64 @@ class RPPController(Node):
             "C->P1 POST-PIVOT LOCAL ODOM REANCHOR + PATH REGENERATED | "
             f"old_xtrack={self.ground_xtrack(old_xtrack) * 1000.0:+.1f}mm | "
             f"C_E={start_x:.3f} | C_N={start_y:.3f} | "
+            f"distance={distance:.3f}m | "
+            f"points={len(self.runtime_entry_points)} | "
+            f"bearing={math.degrees(bearing):.1f}deg"
+        )
+        return True
+
+    def reanchor_runtime_path_after_pivot(self, goal_x, goal_y):
+        """After pivot settle on a non-entry leg, rebuild the line to the goal.
+
+        The entry leg has always done this via reanchor_c_to_p1_after_pivot();
+        this is the same idea for P1->P2 and beyond, which previously stayed
+        bound to the surveyed /nav_path segment they were already 180-460 mm
+        off after the pivot walked them off it.
+
+        Safe because nothing is painted between marking points: the mission's
+        marking_indices fire only at the surveyed nav_path indices, so the
+        inter-point path determines how the rover ARRIVES, not what it marks.
+        The goal itself is never moved -- only the line taken to reach it.
+
+        Does not touch c_line_* (entry-leg-only state) and does not modify
+        /nav_path. The installed runtime path is self-invalidating:
+        runtime_entry_tracking_solution() declines any path whose endpoint no
+        longer matches the requested goal, so a stale one cannot be followed.
+        """
+        if (
+            self.segment_runtime_reanchored
+            or self.current_x is None
+            or self.current_y is None
+            or goal_x is None
+            or goal_y is None
+        ):
+            return False
+
+        start_x = float(self.current_x)
+        start_y = float(self.current_y)
+        distance = math.hypot(goal_x - start_x, goal_y - start_y)
+        if distance <= self.waypoint_tolerance:
+            return False
+
+        if not self._install_runtime_entry_path(
+            start_x,
+            start_y,
+            float(goal_x),
+            float(goal_y),
+            "post-pivot leg reanchor",
+        ):
+            return False
+
+        self.segment_runtime_reanchored = True
+        self.reset_xtrack_damping_state()
+        self.xtrack_priority_active = False
+        self.xtrack_priority_inside_since = None
+
+        bearing = math.atan2(goal_y - start_y, goal_x - start_x)
+        self.get_logger().warn(
+            "POST-PIVOT LEG REANCHOR + PATH REGENERATED | "
+            f"goal=P{self.segment_goal_number} | "
+            f"E={start_x:.3f} | N={start_y:.3f} | "
             f"distance={distance:.3f}m | "
             f"points={len(self.runtime_entry_points)} | "
             f"bearing={math.degrees(bearing):.1f}deg"
@@ -8665,21 +8771,41 @@ class RPPController(Node):
                 path_bearing = goal_bearing
             mode_prefix = ""
 
-        # Same map frame, two path lifetimes:
+        # Same map frame, three path lifetimes:
         #   START->P1 : current local-odom C -> P1 runtime path.
-        #   P1->Pn    : fixed surveyed /nav_path prepared during LOAD.
+        #   Pn->Pn+1  : post-pivot reanchored runtime line, when one was
+        #               installed for this goal (post_pivot_reanchor_all_legs).
+        #   otherwise : fixed surveyed /nav_path prepared during LOAD.
+        # Only the line taken to the goal differs; the goal is never moved,
+        # and nothing is painted between marking points.
         if first_approach:
             nav_solution = self.runtime_entry_tracking_solution(goal_x, goal_y)
             if nav_solution is None:
                 self.publish_stop()
                 self.log_waiting("runtime local-odom C->P1 trajectory unavailable")
                 return
+            path_label = "ENTRY_PATH"
         else:
-            nav_solution = self.nav_path_tracking_solution(goal_x, goal_y)
+            # A later leg follows its post-pivot reanchored line when one was
+            # installed for THIS goal, otherwise the surveyed /nav_path exactly
+            # as before. runtime_entry_tracking_solution() returns None unless
+            # the installed path's endpoint matches goal_x/goal_y within
+            # waypoint_match_tolerance, so a path left over from a previous leg
+            # can never be followed -- the fallback below is what runs then.
+            nav_solution = None
+            if self.segment_runtime_reanchored:
+                nav_solution = self.runtime_entry_tracking_solution(goal_x, goal_y)
+            path_label = "LEG_PATH"
+            if nav_solution is None:
+                path_label = "NAV_PATH"
+                nav_solution = self.nav_path_tracking_solution(goal_x, goal_y)
             if nav_solution is None:
                 self.publish_stop()
                 self.log_waiting("semantic goal not bound to /nav_path")
                 return
+
+        # Bearing authority follows whichever path is actually being tracked.
+        self.following_runtime_line = path_label in ("ENTRY_PATH", "LEG_PATH")
 
         (
             target_x,
@@ -8689,7 +8815,6 @@ class RPPController(Node):
             nav_lookahead_index,
             nav_goal_index,
         ) = nav_solution
-        path_label = "ENTRY_PATH" if first_approach else "NAV_PATH"
         mode_prefix += (
             f"{path_label} {nav_cursor_index}->{nav_lookahead_index}/"
             f"{nav_goal_index} / "
@@ -8715,12 +8840,13 @@ class RPPController(Node):
         precision_guidance = None
         if self.precision_guidance_enabled or self.precision_speed_control_enabled:
             precision_guidance = self._compute_precision_guidance_for_cycle()
-            if precision_guidance is None and not first_approach:
+            if precision_guidance is None and not self.following_runtime_line:
                 self.publish_stop()
                 self.log_waiting("precision guidance lacks current-cycle projection")
                 return
         precision_tracking_authority = (
-            self.precision_tracking_control_enabled and not first_approach
+            self.precision_tracking_control_enabled
+            and not self.following_runtime_line
         )
         if precision_tracking_authority:
             tracking_output = self._compute_precision_tracking_for_cycle()
@@ -8946,7 +9072,10 @@ class RPPController(Node):
                 target_y,
                 self.segment_alignment_correction_limit,
             )
-            if self.precision_guidance_enabled and not first_approach:
+            if (
+                self.precision_guidance_enabled
+                and not self.following_runtime_line
+            ):
                 alignment_guidance_bearing = (
                     precision_guidance.limited_command_bearing_rad
                 )
@@ -9083,7 +9212,10 @@ class RPPController(Node):
             and not terminal_active
             and xtrack_speed_cap_active
         ):
-            if self.precision_guidance_enabled and not first_approach:
+            if (
+                self.precision_guidance_enabled
+                and not self.following_runtime_line
+            ):
                 xtrack_guidance_bearing = precision_guidance.limited_command_bearing_rad
             (
                 xtrack_guidance_bearing,
@@ -9302,7 +9434,10 @@ class RPPController(Node):
                 target_y,
                 self.path_correction_limit,
             )
-            if self.precision_guidance_enabled and not first_approach:
+            if (
+                self.precision_guidance_enabled
+                and not self.following_runtime_line
+            ):
                 guidance_bearing = precision_guidance.limited_command_bearing_rad
                 signed_cross_track = precision_guidance.signed_cross_track_m
         heading_error = self.normalize_angle(guidance_bearing - self.current_yaw)
