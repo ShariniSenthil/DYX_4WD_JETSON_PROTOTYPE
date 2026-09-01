@@ -511,14 +511,42 @@ def generate_launch_description() -> LaunchDescription:
                         # Shared with the legacy pivot lifecycle's stationary
                         # certificate (LegacyAlignmentConfig.stop_speed_mps)
                         # even though precision_pivot_enabled is False -- this
-                        # value gates the legacy settle/hold dwell too. Raised
-                        # from 0.010 because measured/estimated speed while
-                        # genuinely stationary (yaw_rate<0.01) sits at a
-                        # median of 0.016-0.033 m/s in field bags, causing the
-                        # dwell certificate to repeatedly reset and stall for
-                        # 15-20+ seconds. See P3 bag forensic analysis
-                        # (2026-08-27).
-                        "precision_pivot_stop_speed_tolerance_mps": 0.030,
+                        # value gates the legacy settle/hold dwell too.
+                        #
+                        # The gate input is current_speed_mps =
+                        # hypot(twist.linear.x, twist.linear.y) off
+                        # /mavros/local_position/odom (rpp_controller_node.py
+                        # :3465). That EKF velocity has a large stationary
+                        # noise floor and rings through zero for seconds after
+                        # a pivot, so the gate must clear the floor's TAIL,
+                        # not its median.
+                        #
+                        # Measured over 1221 samples from the Sep-1 P1 bags
+                        # (mission.csv_20260901_{144040,150119,154640}) where
+                        # the rover genuinely moved <10 mm/s and |yaw_rate| was
+                        # <0.01 rad/s:
+                        #   median 0.0233 | p75 0.0348 | p90 0.0444
+                        #   p99    0.0535 | max 0.0770 m/s
+                        # Fraction of those STATIONARY samples that read as
+                        # MOVING, by threshold:
+                        #   0.030 -> 33.4%   0.040 -> 18.6%   0.050 -> 6.1%
+                        #   0.060 ->  0.2%   0.080 ->  0.0%
+                        # The previous 0.030 sat below the p75 of its own
+                        # input's noise, so release waited on the estimator,
+                        # not the chassis: in all 12 pivots across those three
+                        # bags release landed at exactly (first sustained
+                        # crossing of the gate) + 1.20 s -- the settle_sec +
+                        # post_settle_hold_sec budget was always correct, but
+                        # the crossing arrived 1.4-6.6 s after the chassis had
+                        # physically stopped (peak |yaw_rate| after rotation
+                        # ceased was <=0.0085 rad/s, position box <=78 mm,
+                        # /rpp/velocity_ned exactly 0.000, GPS fix_type 6 with
+                        # 25-28 sats throughout -- so this is estimator
+                        # ringdown, not motion, RTK loss or multipath).
+                        # 0.060 clears the p99 while still rejecting any real
+                        # motion an order of magnitude below the 0.20 m/s
+                        # post-pivot capture speed.
+                        "precision_pivot_stop_speed_tolerance_mps": 0.060,
                         "precision_pivot_stop_yaw_rate_tolerance_radps": 0.050,
                         "precision_pivot_telemetry_timeout_sec": 0.25,
                         "precision_pivot_stop_settle_sec": 0.20,
