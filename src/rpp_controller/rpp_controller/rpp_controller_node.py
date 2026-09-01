@@ -27,7 +27,10 @@ from rpp_controller.point_event_policy import (
     latched_stop_terminal_outcome,
     should_release_first_marking,
 )
-from rpp_controller.runtime_entry import select_runtime_entry_authority
+from rpp_controller.runtime_entry import (
+    build_runtime_entry_path,
+    track_runtime_entry_path,
+)
 from rpp_controller.path_geometry import (
     GeometryProgressTracker,
     GeometryResetReason,
@@ -111,6 +114,7 @@ class RPPController(Node):
     MAXIMUM_MOVING_SPEED_MPS = 1.00
     MAX_MOVING_HEADING_ERROR_RAD = math.radians(30.0)
     WAYPOINT_CHANGE_EPSILON_M = 0.001
+    RUNTIME_ENTRY_SPACING_M = 0.05
 
     def __init__(self):
         super().__init__("rpp_controller")
@@ -1680,6 +1684,12 @@ class RPPController(Node):
         self.nav_path_cursor_index = 0
         self.nav_path_goal_index = None
         self.nav_path_lookahead_index = None
+
+        # Temporary START->P1 sidecar; fixed /nav_path remains P1->Pn.
+        self.runtime_entry_points = []
+        self.runtime_entry_cursor_index = 0
+        self.runtime_entry_lookahead_index = 0
+        self.runtime_entry_goal_index = None
 
         self.marking_waypoints = []
         self.marking_metadata_received = False
@@ -5289,7 +5299,79 @@ class RPPController(Node):
 
         return True, request_bearing, true_error
 
+    def _install_runtime_entry_path(self, start_x, start_y, p1_x, p1_y, reason):
+        """Generate same-frame C->P1 at <=50 mm spacing."""
+        try:
+            points = build_runtime_entry_path(
+                start_x,
+                start_y,
+                p1_x,
+                p1_y,
+                spacing_m=self.RUNTIME_ENTRY_SPACING_M,
+            )
+        except (TypeError, ValueError) as error:
+            self.get_logger().error(
+                "C->P1 RUNTIME PATH BUILD FAILED | "
+                f"reason={reason} | error={error}"
+            )
+            return False
+
+        if len(points) < 2:
+            return False
+
+        self.runtime_entry_points = list(points)
+        self.runtime_entry_cursor_index = 1
+        self.runtime_entry_lookahead_index = 1
+        self.runtime_entry_goal_index = len(points) - 1
+        return True
+
+    def runtime_entry_tracking_solution(self, goal_x, goal_y):
+        """Follow temporary START->P1; fixed /nav_path remains P1->Pn."""
+        if (
+            not self.runtime_entry_points
+            or self.current_x is None
+            or self.current_y is None
+        ):
+            return None
+
+        runtime_goal_x, runtime_goal_y = self.runtime_entry_points[-1]
+        if math.hypot(
+            runtime_goal_x - goal_x,
+            runtime_goal_y - goal_y,
+        ) > max(self.waypoint_match_tolerance, 0.002):
+            return None
+
+        try:
+            solution = track_runtime_entry_path(
+                self.runtime_entry_points,
+                current_x=self.current_x,
+                current_y=self.current_y,
+                cursor_index=self.runtime_entry_cursor_index,
+                lookahead_m=self.nav_path_lookahead,
+                point_reach_m=self.nav_path_point_reach,
+                waypoint_epsilon_m=self.WAYPOINT_CHANGE_EPSILON_M,
+            )
+        except (TypeError, ValueError):
+            return None
+
+        if solution is None:
+            return None
+
+        (
+            _target_x,
+            _target_y,
+            _path_bearing,
+            cursor,
+            lookahead,
+            goal_index,
+        ) = solution
+        self.runtime_entry_cursor_index = cursor
+        self.runtime_entry_lookahead_index = lookahead
+        self.runtime_entry_goal_index = goal_index
+        return solution
+
     def lock_c_to_p1_line(self, reason):
+        """On START, create C->P1 from current PX4/MAVROS local odometry."""
         if (
             self.first_marking_completed
             or not self.marking_waypoints
@@ -5298,37 +5380,44 @@ class RPPController(Node):
         ):
             return False
 
-        p1_x, p1_y = self.marking_waypoints[0]
-        delta_east = p1_x - self.current_x
-        delta_north = p1_y - self.current_y
-        distance = math.hypot(delta_east, delta_north)
+        if self.c_line_locked and self.runtime_entry_points:
+            return True
 
+        start_x = float(self.current_x)
+        start_y = float(self.current_y)
+
+        p1_x, p1_y = self.marking_waypoints[0]
+        delta_east = p1_x - start_x
+        delta_north = p1_y - start_y
+        distance = math.hypot(delta_east, delta_north)
         if distance <= 1.0e-6:
             return False
 
-        self.c_line_start_x = self.current_x
-        self.c_line_start_y = self.current_y
-        self.c_line_bearing = math.atan2(
-            delta_north,
-            delta_east,
-        )
+        bearing = math.atan2(delta_north, delta_east)
+        if not self._install_runtime_entry_path(start_x, start_y, p1_x, p1_y, reason):
+            return False
+
+        self.c_line_start_x = start_x
+        self.c_line_start_y = start_y
+        self.c_line_bearing = bearing
         self.c_line_locked = True
         self.c_line_reanchored_after_pivot = False
         self.segment_alignment_active = True
         self._reset_legacy_alignment_lifecycle("C_LINE_LOCKED")
 
         self.get_logger().warn(
-            "C->P1 FIXED LINE LOCKED | "
+            "C->P1 LOCAL ODOM RUNTIME PATH LOCKED | "
             f"reason={reason} | "
-            f"C_E={self.c_line_start_x:.3f} | "
-            f"C_N={self.c_line_start_y:.3f} | "
+            f"C_E={start_x:.3f} | C_N={start_y:.3f} | "
+            f"P1_E={p1_x:.3f} | P1_N={p1_y:.3f} | "
             f"distance={distance:.3f}m | "
-            f"bearing={math.degrees(self.c_line_bearing):.1f}deg"
+            f"points={len(self.runtime_entry_points)} | "
+            f"bearing={math.degrees(bearing):.1f}deg"
         )
         return True
 
     def reanchor_c_to_p1_after_pivot(self):
-        """Lock the final travel line from the post-pivot position to P1."""
+        """After pivot settle, regenerate C'->P1 from current local odometry."""
         if (
             self.first_marking_completed
             or self.c_line_reanchored_after_pivot
@@ -5338,13 +5427,15 @@ class RPPController(Node):
         ):
             return False
 
+        start_x = float(self.current_x)
+        start_y = float(self.current_y)
         p1_x, p1_y = self.marking_waypoints[0]
         old_bearing = self.c_line_bearing
         old_start_x = self.c_line_start_x
         old_start_y = self.c_line_start_y
 
-        delta_east = p1_x - self.current_x
-        delta_north = p1_y - self.current_y
+        delta_east = p1_x - start_x
+        delta_north = p1_y - start_y
         distance = math.hypot(delta_east, delta_north)
         if distance <= self.waypoint_tolerance:
             return False
@@ -5359,24 +5450,31 @@ class RPPController(Node):
                 self.current_x - old_start_x
             ) + math.cos(old_bearing) * (self.current_y - old_start_y)
 
-        self.c_line_start_x = self.current_x
-        self.c_line_start_y = self.current_y
-        self.c_line_bearing = math.atan2(
-            delta_north,
-            delta_east,
-        )
+        bearing = math.atan2(delta_north, delta_east)
+        if not self._install_runtime_entry_path(
+            start_x,
+            start_y,
+            p1_x,
+            p1_y,
+            "post-pivot reanchor",
+        ):
+            return False
+
+        self.c_line_start_x = start_x
+        self.c_line_start_y = start_y
+        self.c_line_bearing = bearing
         self.c_line_reanchored_after_pivot = True
         self.reset_xtrack_damping_state()
         self.xtrack_priority_active = False
         self.xtrack_priority_inside_since = None
 
         self.get_logger().warn(
-            "C->P1 POST-PIVOT TRAVEL LINE RE-ANCHORED | "
+            "C->P1 POST-PIVOT LOCAL ODOM REANCHOR + PATH REGENERATED | "
             f"old_xtrack={self.ground_xtrack(old_xtrack) * 1000.0:+.1f}mm | "
-            f"C_E={self.c_line_start_x:.3f} | "
-            f"C_N={self.c_line_start_y:.3f} | "
+            f"C_E={start_x:.3f} | C_N={start_y:.3f} | "
             f"distance={distance:.3f}m | "
-            f"bearing={math.degrees(self.c_line_bearing):.1f}deg"
+            f"points={len(self.runtime_entry_points)} | "
+            f"bearing={math.degrees(bearing):.1f}deg"
         )
         return True
 
@@ -8573,7 +8671,7 @@ class RPPController(Node):
                 target_is_marking = True
                 target_label = "P1 FALLBACK TARGET"
 
-            mode_prefix = "C->P1 FIXED C-LINE / " + target_label + " / "
+            mode_prefix = "C->P1 LOCAL ODOM 50MM / " + target_label + " / "
         else:
             if self.target_x is None or self.target_y is None:
                 self.publish_stop()
@@ -8624,27 +8722,21 @@ class RPPController(Node):
                 path_bearing = goal_bearing
             mode_prefix = ""
 
-        # /nav_path is the PRIMARY movement geometry. /segment_goal remains
-        # the semantic stop endpoint used for 500 mm deceleration and 30 mm
-        # final zero capture.
-        nav_solution = self.nav_path_tracking_solution(goal_x, goal_y)
-        if nav_solution is None:
-            self.publish_stop()
-            self.log_waiting("semantic goal not bound to /nav_path")
-            return
-
+        # Same map frame, two path lifetimes:
+        #   START->P1 : current local-odom C -> P1 runtime path.
+        #   P1->Pn    : fixed surveyed /nav_path prepared during LOAD.
         if first_approach:
-            # The prepared /nav_path C->P1 span remains installed and is still
-            # evaluated above for contract/diagnostics. Motion authority is
-            # the fresh C captured by lock_c_to_p1_line() and exact semantic
-            # P1. Only diagnostic indices survive from the prepared solution.
-            nav_solution = select_runtime_entry_authority(
-                nav_solution,
-                first_approach=True,
-                p1_x=goal_x,
-                p1_y=goal_y,
-                c_to_p1_bearing=self.c_line_bearing,
-            )
+            nav_solution = self.runtime_entry_tracking_solution(goal_x, goal_y)
+            if nav_solution is None:
+                self.publish_stop()
+                self.log_waiting("runtime local-odom C->P1 trajectory unavailable")
+                return
+        else:
+            nav_solution = self.nav_path_tracking_solution(goal_x, goal_y)
+            if nav_solution is None:
+                self.publish_stop()
+                self.log_waiting("semantic goal not bound to /nav_path")
+                return
 
         (
             target_x,
@@ -8654,8 +8746,9 @@ class RPPController(Node):
             nav_lookahead_index,
             nav_goal_index,
         ) = nav_solution
+        path_label = "ENTRY_PATH" if first_approach else "NAV_PATH"
         mode_prefix += (
-            f"NAV_PATH {nav_cursor_index}->{nav_lookahead_index}/"
+            f"{path_label} {nav_cursor_index}->{nav_lookahead_index}/"
             f"{nav_goal_index} / "
         )
 

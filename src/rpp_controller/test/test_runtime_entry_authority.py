@@ -1,9 +1,8 @@
-"""Focused guards for the fresh runtime C-to-P1 movement authority."""
+"""Regression tests for local-odom START->P1 runtime-entry authority."""
 
 from __future__ import annotations
 
 import ast
-import inspect
 import math
 from pathlib import Path
 import sys
@@ -13,22 +12,27 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 NODE_PATH = PACKAGE_ROOT / "rpp_controller" / "rpp_controller_node.py"
 NODE_SOURCE = NODE_PATH.read_text(encoding="utf-8")
 NODE_TREE = ast.parse(NODE_SOURCE)
+
 sys.path.insert(0, str(PACKAGE_ROOT))
 
 from rpp_controller.runtime_entry import (  # noqa: E402
-    select_runtime_entry_authority,
+    build_runtime_entry_path,
+    track_runtime_entry_path,
 )
 
 
-def _controller_method(name: str) -> ast.FunctionDef:
-    controller = next(
+def _controller_class() -> ast.ClassDef:
+    return next(
         item
         for item in NODE_TREE.body
         if isinstance(item, ast.ClassDef) and item.name == "RPPController"
     )
+
+
+def _controller_method(name: str) -> ast.FunctionDef:
     return next(
         item
-        for item in controller.body
+        for item in _controller_class().body
         if isinstance(item, ast.FunctionDef) and item.name == name
     )
 
@@ -42,15 +46,18 @@ def _method_source(name: str) -> str:
 def _load_methods(*names: str):
     namespace = {"math": math}
     module = ast.fix_missing_locations(
-        ast.Module(body=[_controller_method(name) for name in names], type_ignores=[])
+        ast.Module(
+            body=[_controller_method(name) for name in names],
+            type_ignores=[],
+        )
     )
     exec(compile(module, str(NODE_PATH), "exec"), namespace)
     return tuple(namespace[name] for name in names)
 
 
-_lock_c_to_p1_line, _line_guidance = _load_methods(
+_lock_c_to_p1_line, _reanchor_c_to_p1_after_pivot = _load_methods(
     "lock_c_to_p1_line",
-    "line_guidance",
+    "reanchor_c_to_p1_after_pivot",
 )
 
 
@@ -58,10 +65,15 @@ class _Logger:
     def warn(self, _message):
         pass
 
+    def error(self, _message):
+        pass
+
 
 class _Controller:
     lock_c_to_p1_line = _lock_c_to_p1_line
-    line_guidance = _line_guidance
+    reanchor_c_to_p1_after_pivot = _reanchor_c_to_p1_after_pivot
+
+    RUNTIME_ENTRY_SPACING_M = 0.05
 
     def __init__(self):
         self.first_marking_completed = False
@@ -73,165 +85,201 @@ class _Controller:
         self.c_line_bearing = None
         self.c_line_locked = False
         self.c_line_reanchored_after_pivot = False
+        self.runtime_entry_points = []
+        self.runtime_entry_cursor_index = 0
+        self.runtime_entry_lookahead_index = 0
+        self.runtime_entry_goal_index = None
         self.segment_alignment_active = False
-        self.segment_alignment_pivot_complete = False
-        self.segment_pivot_keeper_started_at = None
-        self.alignment_inside_since = None
-        self.line_tracking_lookahead = 0.55
-        self.command_slew_speed = 1.0
-        self.line_tracking_lookahead_speed_gain = 0.55
-        self.line_tracking_lookahead_min = 0.35
-        self.line_tracking_lookahead_max = 0.80
-        self.line_tracking_lookahead_xtrack_gain = 1.0
-        self.yaw_rate_feedforward_enabled = False
-        self.yaw_rate_feedforward_heading_gain = 0.0
-        self.terminal_native_pivot_active = False
-        self.maximum_yaw_rate = 0.20
-        self.last_yaw_rate_feedforward_radps = 0.0
+        self.xtrack_priority_active = False
+        self.xtrack_priority_inside_since = None
+        self.waypoint_tolerance = 0.03
+        self.legacy_reset_reasons = []
+        self.xtrack_reset_count = 0
 
-    def _reset_legacy_alignment_lifecycle(self, _reason):
-        self.segment_alignment_pivot_complete = False
-        self.segment_pivot_keeper_started_at = None
-        self.alignment_inside_since = None
+    def _install_runtime_entry_path(self, start_x, start_y, p1_x, p1_y, _reason):
+        points = build_runtime_entry_path(
+            start_x,
+            start_y,
+            p1_x,
+            p1_y,
+            spacing_m=self.RUNTIME_ENTRY_SPACING_M,
+        )
+        if len(points) < 2:
+            return False
+        self.runtime_entry_points = list(points)
+        self.runtime_entry_cursor_index = 1
+        self.runtime_entry_lookahead_index = 1
+        self.runtime_entry_goal_index = len(points) - 1
+        return True
+
+    def _reset_legacy_alignment_lifecycle(self, reason):
+        self.legacy_reset_reasons.append(reason)
+
+    def reset_xtrack_damping_state(self):
+        self.xtrack_reset_count += 1
+
+    @staticmethod
+    def ground_xtrack(value):
+        return -float(value)
 
     def get_logger(self):
         return _Logger()
 
-    @staticmethod
-    def normalize_angle(angle):
-        return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
-
-def test_start_after_lateral_ready_motion_uses_fresh_c_to_p1_line():
-    controller = _Controller()
-    stale_prepared_bearing = 0.0
-
-    assert controller.lock_c_to_p1_line("test start")
-    expected = math.atan2(-0.5, 10.0)
-    assert math.isclose(controller.c_line_bearing, expected, abs_tol=1.0e-12)
-    assert not math.isclose(controller.c_line_bearing, stale_prepared_bearing)
-
-    stale_nav_solution = (0.55, 0.0, stale_prepared_bearing, 1, 11, 41)
-    selected = select_runtime_entry_authority(
-        stale_nav_solution,
-        first_approach=True,
-        p1_x=10.0,
-        p1_y=0.0,
-        c_to_p1_bearing=controller.c_line_bearing,
-    )
-    guidance, xtrack = controller.line_guidance(
-        selected[2], selected[0], selected[1], math.radians(22.0)
-    )
-
-    assert selected[:3] == (10.0, 0.0, expected)
-    assert math.isclose(xtrack, 0.0, abs_tol=1.0e-12)
-    assert math.isclose(guidance, expected, abs_tol=1.0e-12)
-
-
-def test_runtime_entry_selection_does_not_mutate_prepared_nav_path():
-    controller = _Controller()
-    prepared_nav_path = ((0.0, 0.0), (0.05, 0.0), (10.0, 0.0))
-    nav_snapshot = tuple(prepared_nav_path)
-
-    assert controller.lock_c_to_p1_line("test start")
-    select_runtime_entry_authority(
-        (0.55, 0.0, 0.0, 1, 2, 2),
-        first_approach=True,
-        p1_x=10.0,
-        p1_y=0.0,
-        c_to_p1_bearing=controller.c_line_bearing,
-    )
-
-    assert prepared_nav_path == nav_snapshot
-    assert "nav_path_points" not in inspect.getsource(
-        select_runtime_entry_authority
-    )
-
-
-def test_runtime_entry_selection_does_not_mutate_path_signature():
-    controller = _Controller()
-    path_signature = "sha256:prepared-static-path"
-
-    assert controller.lock_c_to_p1_line("test start")
-    select_runtime_entry_authority(
-        (0.55, 0.0, 0.0, 1, 2, 2),
-        first_approach=True,
-        p1_x=10.0,
-        p1_y=0.0,
-        c_to_p1_bearing=controller.c_line_bearing,
-    )
-
-    assert path_signature == "sha256:prepared-static-path"
-    selector = inspect.getsource(select_runtime_entry_authority)
-    assert "path_signature" not in selector
-    assert "geometry_installed_signature" not in selector
-
-
-def test_nav_tangent_cannot_overwrite_first_approach_path_heading():
-    control = _method_source("control_loop")
-    selection = control.index("nav_solution = select_runtime_entry_authority(")
-    unpack = control.index(") = nav_solution", selection)
-    heading = control.index("path_heading_error =", unpack)
-    pivot = control.index("abs(path_heading_error) >= self.pivot_enter_angle", heading)
-
-    assert selection < unpack < heading < pivot
-
-
-def test_precision_guidance_cannot_overwrite_first_approach_steering():
-    control = _method_source("control_loop")
-
-    assert (
-        NODE_SOURCE.count("self.precision_guidance_enabled and not first_approach")
-        >= 4
-    )
-    assert "self.precision_tracking_control_enabled and not first_approach" in control
-
-
-def test_45_degree_pivot_decision_uses_fresh_runtime_heading():
-    stale_nav_solution = (0.5, 0.0, 0.0, 1, 2, 2)
-    fresh_bearing = math.atan2(-1.01, 1.0)
-    selected = select_runtime_entry_authority(
-        stale_nav_solution,
-        first_approach=True,
-        p1_x=1.0,
-        p1_y=0.0,
-        c_to_p1_bearing=fresh_bearing,
-    )
-    rover_yaw = 0.0
-    pivot_enter = math.radians(45.0)
-
-    assert abs(selected[2] - rover_yaw) >= pivot_enter
-    assert abs(stale_nav_solution[2] - rover_yaw) < pivot_enter
-
-
-def test_post_p1_nav_solution_is_returned_byte_for_byte_unchanged():
-    p1_to_p2 = (1.55, 2.25, 0.375, 42, 52, 75)
-
-    selected = select_runtime_entry_authority(
-        p1_to_p2,
-        first_approach=False,
-        p1_x=999.0,
-        p1_y=999.0,
-        c_to_p1_bearing=-2.0,
-    )
-
-    assert selected is p1_to_p2
-
-
-def test_runtime_entry_guidance_remains_forward_without_backtracking():
-    controller = _Controller()
-    assert controller.lock_c_to_p1_line("test start")
-    path_bearing = controller.c_line_bearing
-
-    for lateral_offset in (-2.0, -0.5, 0.0, 0.5, 2.0):
-        controller.current_x = 2.0
-        controller.current_y = lateral_offset
-        guidance, _xtrack = controller.line_guidance(
-            path_bearing,
-            10.0,
-            0.0,
-            math.radians(22.0),
+def _maximum_segment_length(points):
+    return max(
+        math.hypot(
+            points[index + 1][0] - points[index][0],
+            points[index + 1][1] - points[index][1],
         )
-        correction = controller.normalize_angle(guidance - path_bearing)
-        assert abs(correction) <= math.radians(22.0) + 1.0e-12
-        assert math.cos(correction) > 0.0
+        for index in range(len(points) - 1)
+    )
+
+
+def test_runtime_entry_builder_has_exact_endpoints_and_max_50mm_spacing():
+    start = (1.234, -2.345)
+    p1 = (4.876, 3.210)
+    points = build_runtime_entry_path(
+        start[0], start[1], p1[0], p1[1], spacing_m=0.05
+    )
+    assert points[0] == start
+    assert math.isclose(points[-1][0], p1[0], rel_tol=0.0, abs_tol=1.0e-12)
+    assert math.isclose(points[-1][1], p1[1], rel_tol=0.0, abs_tol=1.0e-12)
+    assert len(points) >= 2
+    assert _maximum_segment_length(points) <= 0.05 + 1.0e-12
+
+
+def test_start_lock_uses_current_local_odom_c_and_builds_runtime_path():
+    controller = _Controller()
+    controller.current_x = 2.25
+    controller.current_y = -1.75
+    controller.marking_waypoints = [(8.0, 4.0)]
+
+    assert controller.lock_c_to_p1_line("test mission enable")
+    assert controller.c_line_start_x == 2.25
+    assert controller.c_line_start_y == -1.75
+    assert controller.runtime_entry_points[0] == (2.25, -1.75)
+    assert controller.runtime_entry_points[-1] == (8.0, 4.0)
+    assert _maximum_segment_length(controller.runtime_entry_points) <= 0.05 + 1.0e-12
+    expected_bearing = math.atan2(4.0 - (-1.75), 8.0 - 2.25)
+    assert math.isclose(
+        controller.c_line_bearing,
+        expected_bearing,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    )
+    assert controller.runtime_entry_cursor_index == 1
+    assert controller.runtime_entry_goal_index == len(controller.runtime_entry_points) - 1
+
+
+def test_retained_callbacks_cannot_move_locked_start_c_before_real_pivot_reanchor():
+    controller = _Controller()
+    controller.current_x = 1.0
+    controller.current_y = 2.0
+    assert controller.lock_c_to_p1_line("initial")
+    original_start = (controller.c_line_start_x, controller.c_line_start_y)
+    original_path = tuple(controller.runtime_entry_points)
+
+    controller.current_x = 1.4
+    controller.current_y = 2.3
+    assert controller.lock_c_to_p1_line("retained callback")
+    assert (controller.c_line_start_x, controller.c_line_start_y) == original_start
+    assert tuple(controller.runtime_entry_points) == original_path
+
+
+def test_post_pivot_reanchor_uses_fresh_local_odom_c_prime_and_resets_cursor():
+    controller = _Controller()
+    controller.current_x = 0.0
+    controller.current_y = 0.0
+    controller.marking_waypoints = [(6.0, 0.0)]
+    assert controller.lock_c_to_p1_line("initial")
+    initial_path = tuple(controller.runtime_entry_points)
+
+    controller.current_x = 0.08
+    controller.current_y = -0.06
+    controller.runtime_entry_cursor_index = 25
+    controller.runtime_entry_lookahead_index = 30
+    assert controller.reanchor_c_to_p1_after_pivot()
+
+    assert controller.c_line_reanchored_after_pivot is True
+    assert controller.c_line_start_x == 0.08
+    assert controller.c_line_start_y == -0.06
+    assert controller.runtime_entry_points[0] == (0.08, -0.06)
+    assert controller.runtime_entry_points[-1] == (6.0, 0.0)
+    assert tuple(controller.runtime_entry_points) != initial_path
+    assert controller.runtime_entry_cursor_index == 1
+    assert controller.runtime_entry_lookahead_index == 1
+    assert controller.runtime_entry_goal_index == len(controller.runtime_entry_points) - 1
+    assert _maximum_segment_length(controller.runtime_entry_points) <= 0.05 + 1.0e-12
+
+
+def test_runtime_tracker_advances_without_intermediate_stops_or_backtracking():
+    points = build_runtime_entry_path(0.0, 0.0, 1.0, 0.0, spacing_m=0.05)
+    solution = track_runtime_entry_path(
+        points,
+        current_x=0.31,
+        current_y=0.01,
+        cursor_index=1,
+        lookahead_m=0.20,
+        point_reach_m=0.075,
+        waypoint_epsilon_m=0.001,
+    )
+    assert solution is not None
+    target_x, target_y, bearing, cursor, lookahead, goal = solution
+    assert cursor >= 6
+    assert lookahead >= cursor
+    assert goal == len(points) - 1
+    assert target_x >= points[cursor][0]
+    assert math.isclose(target_y, 0.0, abs_tol=1.0e-12)
+    assert math.isclose(bearing, 0.0, abs_tol=1.0e-12)
+
+
+def test_rpp_no_longer_owns_gp_origin_or_fused_global_c_conversion():
+    forbidden = (
+        "GeoPointStamped",
+        "NavSatFix",
+        "prepared_path_gp_origin",
+        "latest_gp_origin",
+        "latest_fused_global_fix",
+        "last_fused_global_monotonic",
+        "_runtime_current_c_from_gp_origin",
+        "project_geodetic_to_px4_enu",
+        "/mavros/global_position/gp_origin",
+        "/mavros/global_position/global",
+    )
+    for marker in forbidden:
+        assert marker not in NODE_SOURCE
+
+    assert '"/mavros/local_position/odom"' in NODE_SOURCE
+    assert NODE_SOURCE.count("start_x = float(self.current_x)") >= 2
+
+
+def test_first_approach_uses_runtime_sidecar_then_returns_to_fixed_nav_path():
+    control = _method_source("control_loop")
+    first_if = control.index("if first_approach:")
+    runtime_call = control.index(
+        "nav_solution = self.runtime_entry_tracking_solution(goal_x, goal_y)",
+        first_if,
+    )
+    else_index = control.index("else:", runtime_call)
+    fixed_nav_call = control.index(
+        "nav_solution = self.nav_path_tracking_solution(goal_x, goal_y)",
+        else_index,
+    )
+    assert first_if < runtime_call < else_index < fixed_nav_call
+
+
+def test_runtime_entry_methods_do_not_mutate_fixed_nav_path_or_signature():
+    lock_source = _method_source("lock_c_to_p1_line")
+    reanchor_source = _method_source("reanchor_c_to_p1_after_pivot")
+    for source in (lock_source, reanchor_source):
+        assert "nav_path_points" not in source
+        assert "geometry_installed_signature" not in source
+        assert "prepared_path_signature" not in source
+        assert "path_signature" not in source
+
+
+def test_obsolete_selector_is_not_control_authority_anymore():
+    control = _method_source("control_loop")
+    assert "select_runtime_entry_authority" not in control
+    assert "runtime_entry_tracking_solution" in control
