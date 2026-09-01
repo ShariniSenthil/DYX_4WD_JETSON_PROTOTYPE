@@ -295,9 +295,16 @@ def generate_launch_description() -> LaunchDescription:
                         # showed the two catastrophic later-leg swings
                         # (163805 t=127s, 164150 t=68s) peaked at 92-268mm
                         # of travel, i.e. inside the launch ramp's own
-                        # distance window. Matches deceleration_distance_m
-                        # for a symmetric envelope. Derived accel rate drops
-                        # from 2.5 m/s^2 to 1.0 m/s^2. Does not fix leg1
+                        # distance window. Derived accel rate drops from
+                        # 2.5 m/s^2 to 1.0 m/s^2.
+                        # NOTE: this used to match deceleration_distance_m for
+                        # a symmetric envelope; that symmetry was broken
+                        # deliberately on 2026-09-01 when decel went to 1.00 m.
+                        # Legs on this mission are 2.2-2.4 m, so 1.0 m of accel
+                        # plus 1.0 m of decel would leave almost no cruise
+                        # segment at all. 0.50 accel + 1.00 decel leaves
+                        # 0.7-0.9 m at speed, which is what makes a 1 m/s
+                        # cruise measurable in the first place. Does not fix leg1
                         # cruise-phase swings (150503/151020 pattern), which
                         # peak past 1m, well outside this window, and does
                         # not fix the later-leg missing-reanchor root cause
@@ -343,9 +350,28 @@ def generate_launch_description() -> LaunchDescription:
                         # secondary slew guard must sit above the derived profile.
                         "command_speed_rise_limit_mps2": 3.00,
                         "command_speed_fall_limit_mps2": 2.00,
-                        # Final 500 mm profile for marking + extension goals.
+                        # Final approach profile for marking + extension goals.
+                        # v = sqrt(floor^2 + 2*a*s) from here down to
+                        # deceleration_floor_speed_mps at the 30 mm boundary.
+                        #
+                        # 0.50 -> 1.00 m on 2026-09-01, ahead of the first run
+                        # that can actually reach cruise speed. Until now
+                        # RO_SPEED_LIM=0.4 on the FCU clamped the 1.00 m/s
+                        # setpoint, so the rover never exceeded ~0.24-0.30 m/s
+                        # and a 0.50 m brake zone was never tested at speed.
+                        # Braking 1.00 -> 0.15 m/s inside 0.47 m needs
+                        # ~1.04 m/s^2; over 0.97 m it needs ~0.50 m/s^2, which
+                        # is a far gentler demand on a skid-steer whose
+                        # RO_DECEL_LIM is disabled (-1).
+                        #
+                        # Keep deceleration_floor_speed_mps well ABOVE the
+                        # FCU's RO_SPEED_TH (0.02). The 3WD sibling pinned its
+                        # approach speed at 0.03, under that threshold, and
+                        # steering authority collapsed: cross-track walked
+                        # ~4 cm over the final 0.6 m and the rover crossed the
+                        # goal plane beside the point rather than on it.
                         "deceleration_enabled": True,
-                        "deceleration_distance_m": 0.50,
+                        "deceleration_distance_m": 1.00,
                         "deceleration_floor_speed_mps": TERMINAL_FLOOR_SPEED_MPS,
                         "deceleration_max_progress_jump_m": 0.10,
                         "deceleration_max_dt_sec": 0.10,
