@@ -83,6 +83,14 @@ from rpp_controller.terminal_certificate import (
     TerminalStopStateMachine,
 )
 
+# Parameters rclpy or the launch system may legitimately set at runtime and
+# from which this node derives nothing. Everything else is restart-only --
+# see _on_set_precision_feature_gates for why refusing beats silently
+# ignoring.
+_RUNTIME_SETTABLE_EXEMPT = frozenset({"use_sim_time"}) | frozenset(
+    PRECISION_FEATURE_GATES
+)
+
 
 class RPPController(Node):
     """Precision waypoint marking controller.
@@ -2063,6 +2071,33 @@ class RPPController(Node):
             if parameter.name in PRECISION_FEATURE_GATES
         }
         if not requested:
+            # Nothing runtime-settable was asked for. Do NOT silently succeed:
+            # every other parameter on this node is read once during __init__
+            # and, in many cases, used to DERIVE further values -- cruise speed
+            # alone sets acceleration_rate, deceleration_rate, and (via
+            # rover.launch.py's CRUISE_SPEED_MPS) the alignment, recovery,
+            # xtrack-priority, decel-profile and terminal-cap speeds. Accepting
+            # a set for one of those changed what `ros2 param get` reported
+            # while the controller kept driving on the original value, which is
+            # worse than refusing: it invites a field operator to believe a
+            # change took effect when it did not.
+            unsupported = sorted(
+                parameter.name
+                for parameter in parameters
+                if parameter.name not in _RUNTIME_SETTABLE_EXEMPT
+            )
+            if unsupported:
+                return SetParametersResult(
+                    successful=False,
+                    reason=(
+                        "restart-only parameter(s) "
+                        + ", ".join(unsupported)
+                        + "; this node accepts runtime changes only to "
+                        "precision feature gates. Edit "
+                        "rover_bringup/launch/rover.launch.py and restart the "
+                        "stack so every derived value is recomputed."
+                    ),
+                )
             return SetParametersResult(successful=True)
 
         current = self._precision_feature_gate_values()

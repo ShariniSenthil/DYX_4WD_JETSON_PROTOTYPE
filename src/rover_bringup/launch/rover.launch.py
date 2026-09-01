@@ -37,20 +37,26 @@ MISSION_METADATA_FILE = (
 # recomputes its acceleration/deceleration rates from it at init -- so this is
 # a restart-time setting, never a live `ros2 param set`.
 #
-# STAGED BRING-UP, 2026-09-01. Set to 0.40 as step 1 of 0.40 -> 0.60 -> 0.80
-# -> 1.00. The FCU's RO_SPEED_LIM was 0.40, so every mission ever run on this
-# rover was clamped there regardless of what this said: 1.00 commanded
-# produced 0.22-0.30 m/s actual across all 12 legs of three runs. 0.40 is
-# therefore the known-good baseline, not a blind first step -- it is where the
-# rover has been operating all along, now stated honestly.
+# STAGED BRING-UP, 2026-09-01: 0.40 -> **0.60** -> 0.80 -> 1.00.
 #
-# Raising this past 0.40 does nothing until RO_SPEED_LIM is raised on the FCU
-# (1.2 recommended, a ceiling not a target). Note the feedforward interaction:
-# PX4 throttle is roughly setpoint/RO_MAX_THR_SPEED, so a 0.40 setpoint asks
-# for 0.21 throttle -- inside the measured 0.143-0.219 breakaway deadband,
-# which is why tracking is poor down here. A 1.00 setpoint asks for 0.53 and
-# should sit well clear of it.
-CRUISE_SPEED_MPS = 0.40
+# Step 1 (0.40) is measured and closed. With RO_SPEED_LIM raised to 1.2 and
+# RO_SPEED_I raised 0 -> 0.2 on the FCU, achieved speed went from 0.235 m/s
+# to 0.37 m/s against the 0.40 command -- 59% -> 92%. The remaining gap is the
+# PX4 speed loop's integrator still converging, not a clamp: PX4's internally
+# used setpoint was proven from ulog to be the full 0.400 m/s.
+#
+# Step 2 raises this to 0.60. Prerequisites are already satisfied on the FCU
+# (RO_SPEED_LIM 1.2 > 0.60, RO_SPEED_I 0.2), so this is a restart-only change.
+# Feedforward interaction to watch: PX4 throttle is roughly
+# setpoint/RO_MAX_THR_SPEED, so 0.60 asks for 0.32 throttle versus 0.21 at
+# 0.40 -- further out of the measured 0.143-0.219 breakaway deadband, so
+# tracking should IMPROVE, not degrade, as speed rises.
+#
+# Before going past ~0.60, settle RO_MAX_THR_SPEED: no log yet contains
+# throttle above 0.277, and the measured local slope there is 1.25 m/s per
+# unit throttle against the 1.9 the feedforward assumes. See CLAUDE.md
+# 2026-09-01 session notes for the bench sweep that would resolve it.
+CRUISE_SPEED_MPS = 0.60
 TERMINAL_FLOOR_SPEED_MPS = 0.15
 
 

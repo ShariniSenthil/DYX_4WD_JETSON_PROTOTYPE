@@ -982,3 +982,32 @@ def test_launch_cruise_speed_stays_within_the_controller_ceiling():
             assert value < cruise, f"{name}={value} must be < cruise {cruise}"
         else:
             assert minimum <= value <= cruise, f"{name}={value} vs cruise {cruise}"
+
+
+def test_restart_only_parameter_sets_are_refused_not_silently_ignored():
+    """A `ros2 param set` for a restart-only value must FAIL, loudly.
+
+    Every parameter except the precision feature gates is read once in
+    __init__, and several derive further values -- cruise speed alone sets
+    acceleration_rate, deceleration_rate and, through rover.launch.py's
+    CRUISE_SPEED_MPS, the alignment / recovery / xtrack-priority /
+    decel-profile / terminal-cap speeds. The callback used to return
+    successful=True for anything it did not recognise, so `ros2 param get`
+    would report the new value while the controller kept driving on the old
+    one. In the field that reads as "the change took effect" when it did not.
+    """
+    callback = _method_source("_on_set_precision_feature_gates")
+    assert "_RUNTIME_SETTABLE_EXEMPT" in callback
+    assert "successful=False" in callback
+    assert "restart-only parameter" in callback
+
+    # The refusal must be reached before any unconditional success return.
+    not_requested = callback.split("if not requested:", 1)[1]
+    first_return = not_requested.index("return SetParametersResult(")
+    assert "successful=False" in not_requested[first_return:first_return + 200]
+
+    # The exemption set must stay narrow: feature gates plus rclpy's own.
+    assert '_RUNTIME_SETTABLE_EXEMPT = frozenset({"use_sim_time"})' in NODE_SOURCE
+    assert "PRECISION_FEATURE_GATES" in NODE_SOURCE.split(
+        "_RUNTIME_SETTABLE_EXEMPT", 1
+    )[1][:200]
