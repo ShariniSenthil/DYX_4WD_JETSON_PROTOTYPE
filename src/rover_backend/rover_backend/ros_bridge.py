@@ -2073,6 +2073,9 @@ class RoverBackendRosNode(Node):
                 self._trajectory_error = None
 
         mission_updates: dict[str, Any] = {
+            # trajectory_ready is the fixed-path/display authority.
+            # mission["ready"] remains the stricter mission-manager START gate.
+            "trajectory_ready": ready,
             "ready": ready,
             "navigation_point_count": max(
                 0,
@@ -2116,7 +2119,6 @@ class RoverBackendRosNode(Node):
             # marking_indices). Keep the public lifecycle PREPARING here.
             mission_updates["state"] = "PREPARING"
             mission_updates["ready"] = False
-            mission_updates["trajectory_ready"] = True
             mission_updates["message"] = (
                 "Trajectory generated; waiting for mission manager READY"
             )
@@ -3291,6 +3293,19 @@ class RoverBackendRosNode(Node):
             "PREPARING",
             message="Trajectory preparation requested; waiting for RTK FIXED",
             error=None,
+        )
+
+        # A new LOAD invalidates the previous fixed trajectory preview
+        # immediately. trajectory_generator will republish /nav_path and
+        # trajectory_ready=True only after the replacement P1->Pn geometry
+        # has been completely generated.
+        rover_state.update(
+            "mission",
+            trajectory_ready=False,
+            navigation_point_count=0,
+            navigation_path_preview=[],
+            navigation_path_preview_truncated=False,
+            path_frame_id=None,
         )
 
         accepted, service_message = self._call_trigger(

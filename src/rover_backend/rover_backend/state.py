@@ -342,6 +342,9 @@ class RoverState:
                 "execution_mode": "AUTO",
                 "state": "EMPTY",
                 "ready": False,
+                # True only after trajectory_generator has committed the
+                # fixed surveyed P1->Pn /nav_path.
+                "trajectory_ready": False,
                 "loaded": False,
                 "total_points": 0,
                 "navigation_point_count": 0,
