@@ -533,6 +533,17 @@ def generate_launch_description() -> LaunchDescription:
                         "precision_pivot_recapture_timeout_sec": 8.0,
                         "post_pivot_capture_speed_mps": 0.20,
                         "legacy_pivot_post_settle_hold_sec": 1.00,
+                        # A lone speed/yaw-rate sample outside tolerance
+                        # (GPS-antenna lever-arm noise during residual yaw
+                        # settling) no longer discards earned dwell
+                        # progress by itself; only a violation that
+                        # persists past this window resets the
+                        # settle/hold certificate timers. See P3/Sep-1
+                        # bag forensics -- raising
+                        # precision_pivot_stop_speed_tolerance_mps alone
+                        # (above) did not fully resolve repeated-reset
+                        # dwell stalls.
+                        "legacy_pivot_stationary_violation_debounce_sec": 0.10,
                         "precision_pivot_recapture_xtrack_m": 0.020,
                         "precision_pivot_recapture_heading_deg": 2.0,
                         "precision_pivot_recapture_settle_sec": 0.20,

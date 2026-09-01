@@ -64,6 +64,7 @@ class LegacyAlignmentConfig:
     pivot_enter_rad: float
     pivot_keeper_timeout_sec: float
     pre_pivot_timeout_sec: float
+    stationary_violation_debounce_sec: float
 
     def __post_init__(self) -> None:
         finite_fields = (
@@ -79,6 +80,7 @@ class LegacyAlignmentConfig:
             "pivot_enter_rad",
             "pivot_keeper_timeout_sec",
             "pre_pivot_timeout_sec",
+            "stationary_violation_debounce_sec",
         )
         for name in finite_fields:
             value = getattr(self, name)
@@ -136,6 +138,7 @@ class LegacyAlignmentLifecycle:
         self.native_carrier_issued = False
         self.native_timeout_warned = False
         self._last_now_sec: Optional[float] = None
+        self.violation_started_at: Optional[float] = None
 
     @property
     def needs_native_command(self) -> bool:
@@ -164,6 +167,7 @@ class LegacyAlignmentLifecycle:
         self.settle_inside_since = None
         self.post_settle_hold_since = None
         self.non_pivot_inside_since = None
+        self.violation_started_at = None
 
     def ack_native_carrier_published(self) -> None:
         """Record that a native carrier was actually published."""
@@ -277,7 +281,7 @@ class LegacyAlignmentLifecycle:
                 "PRE_PIVOT_TIMEOUT",
                 reset_native_carrier=True,
             )
-        if not self._chassis_stationary(sample):
+        if not self._chassis_stationary_debounced(sample):
             self.pre_stop_inside_since = None
             return self._result(
                 previous,
@@ -353,7 +357,7 @@ class LegacyAlignmentLifecycle:
         heading_abs = abs(sample.path_heading_error_rad)
         if heading_abs >= self.config.pivot_enter_rad:
             return self._enter_pre_pivot_stop(previous, sample, "SETTLE_ESCALATE_GE45")
-        if not self._chassis_stationary(sample):
+        if not self._chassis_stationary_debounced(sample):
             self.reset_dwell_timers()
             return self._result(
                 previous,
@@ -520,6 +524,25 @@ class LegacyAlignmentLifecycle:
             and abs(sample.measured_yaw_rate_radps)
             <= self.config.stop_yaw_rate_radps
         )
+
+    def _chassis_stationary_debounced(self, sample: LegacyAlignmentInput) -> bool:
+        """Stationary gate used to decide whether dwell timers survive.
+
+        A lone out-of-tolerance sample (GPS-antenna lever-arm noise during
+        residual yaw settling is the known source here) no longer discards
+        already-earned dwell progress. Only a violation that persists past
+        ``stationary_violation_debounce_sec`` is treated as real motion and
+        allowed to reset the certificate/hold timers.
+        """
+        if self._chassis_stationary(sample):
+            self.violation_started_at = None
+            return True
+        if self.violation_started_at is None:
+            self.violation_started_at = sample.now_sec
+        elapsed = sample.now_sec - self.violation_started_at
+        if elapsed < self.config.stationary_violation_debounce_sec:
+            return True
+        return False
 
     def _safety_hold(
         self,

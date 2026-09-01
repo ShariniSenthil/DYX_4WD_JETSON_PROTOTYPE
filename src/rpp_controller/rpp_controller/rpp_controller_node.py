@@ -612,6 +612,12 @@ class RPPController(Node):
         # Extra literal-zero hold after the measured native-pivot stop
         # certificate.  Independent of the default-off precision pivot FSM.
         self.declare_parameter("legacy_pivot_post_settle_hold_sec", 1.00)
+        # A lone speed/yaw-rate sample outside tolerance (GPS-antenna
+        # lever-arm noise during residual yaw settling) must persist past
+        # this window before the settle/hold dwell timers are discarded.
+        self.declare_parameter(
+            "legacy_pivot_stationary_violation_debounce_sec", 0.10
+        )
 
         self.local_frame = str(self.get_parameter("local_frame").value).strip()
         self.cruise_speed = float(self.get_parameter("cruise_speed_mps").value)
@@ -1282,6 +1288,11 @@ class RPPController(Node):
         self.legacy_pivot_post_settle_hold_sec = float(
             self.get_parameter("legacy_pivot_post_settle_hold_sec").value
         )
+        self.legacy_pivot_stationary_violation_debounce_sec = float(
+            self.get_parameter(
+                "legacy_pivot_stationary_violation_debounce_sec"
+            ).value
+        )
         self.precision_pivot_config = PivotMotionConfig(
             pivot_anchor_tolerance_m=float(
                 self.get_parameter("precision_pivot_anchor_tolerance_m").value
@@ -1357,6 +1368,9 @@ class RPPController(Node):
                 pivot_enter_rad=self.pivot_enter_angle,
                 pivot_keeper_timeout_sec=self.segment_pivot_keeper_timeout_sec,
                 pre_pivot_timeout_sec=self.precision_pivot_config.brake_timeout_sec,
+                stationary_violation_debounce_sec=(
+                    self.legacy_pivot_stationary_violation_debounce_sec
+                ),
             )
         )
         self.get_logger().warn(
@@ -2202,6 +2216,14 @@ class RPPController(Node):
         ):
             raise ValueError(
                 "legacy_pivot_post_settle_hold_sec must be finite and > 0"
+            )
+        if not (
+            math.isfinite(self.legacy_pivot_stationary_violation_debounce_sec)
+            and self.legacy_pivot_stationary_violation_debounce_sec > 0.0
+        ):
+            raise ValueError(
+                "legacy_pivot_stationary_violation_debounce_sec must be "
+                "finite and > 0"
             )
         if not (
             math.isfinite(self.precision_pivot_recapture_xtrack)

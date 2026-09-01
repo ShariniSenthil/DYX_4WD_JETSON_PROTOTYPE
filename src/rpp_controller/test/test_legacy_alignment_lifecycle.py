@@ -77,6 +77,7 @@ def make_config(**overrides) -> LegacyAlignmentConfig:
         "pivot_enter_rad": math.radians(45.0),
         "pivot_keeper_timeout_sec": 10.0,
         "pre_pivot_timeout_sec": 8.0,
+        "stationary_violation_debounce_sec": 0.10,
     }
     values.update(overrides)
     return LegacyAlignmentConfig(**values)
@@ -268,14 +269,42 @@ def test_stationary_entry_still_waits_0_20s():
     assert done.directive is LegacyAlignmentDirective.HOLD_ZERO
 
 
-def test_pre_speed_yaw_freshness_resets():
+def test_pre_speed_yaw_brief_violation_does_not_reset():
+    """A lone speed/yaw-rate blip inside the debounce window (e.g.
+    GPS-antenna lever-arm noise during residual yaw settling) must not
+    discard already-earned pre-stop dwell progress."""
     driver = enter_pre()
     driver.tick(heading_deg=90.0, speed=0.0, yaw_rate=0.0)
-    driver.tick(heading_deg=90.0, speed=0.05, yaw_rate=0.0)
-    assert driver.life.pre_stop_inside_since is None
+    started_at = driver.life.pre_stop_inside_since
+    assert started_at is not None
+    blip = driver.tick(heading_deg=90.0, speed=0.05, yaw_rate=0.0, elapsed=0.05)
+    assert blip.transition_reason == "PRE_PIVOT_CERTIFICATE_DWELL"
+    assert driver.life.pre_stop_inside_since == started_at
+    driver.tick(heading_deg=90.0, speed=0.0, yaw_rate=0.0, elapsed=0.02)
+    assert driver.life.violation_started_at is None
+    assert driver.life.pre_stop_inside_since == started_at
+
+    yaw_blip = driver.tick(heading_deg=90.0, speed=0.0, yaw_rate=0.20, elapsed=0.05)
+    assert yaw_blip.transition_reason == "PRE_PIVOT_CERTIFICATE_DWELL"
+    assert driver.life.pre_stop_inside_since == started_at
+
+
+def test_pre_speed_yaw_sustained_violation_still_resets():
+    """A violation held past the debounce window is real motion, not
+    noise, and must still reset the dwell timer."""
+    driver = enter_pre()
     driver.tick(heading_deg=90.0, speed=0.0, yaw_rate=0.0)
-    driver.tick(heading_deg=90.0, speed=0.0, yaw_rate=0.20)
+    driver.tick(heading_deg=90.0, speed=0.05, yaw_rate=0.0, elapsed=0.05)
+    driver.tick(heading_deg=90.0, speed=0.05, yaw_rate=0.0, elapsed=0.05)
+    late = driver.tick(heading_deg=90.0, speed=0.05, yaw_rate=0.0, elapsed=0.05)
+    assert late.transition_reason == "PRE_PIVOT_GATES_OPEN"
     assert driver.life.pre_stop_inside_since is None
+
+
+def test_pre_stale_telemetry_still_resets_immediately():
+    """Staleness is a separate, non-debounced gate: it resets on the first
+    bad sample regardless of the stationary-violation debounce."""
+    driver = enter_pre()
     driver.tick(heading_deg=90.0, speed=0.0, yaw_rate=0.0)
     stale = driver.tick(heading_deg=90.0, speed=0.0, yaw_rate=0.0, fresh=False)
     assert stale.directive is LegacyAlignmentDirective.HOLD_ZERO
@@ -399,6 +428,35 @@ def test_native_over_10s_warns_once_and_continues():
     )
     assert second.directive is LegacyAlignmentDirective.NATIVE_CARRIER
     assert second.warn_native_timeout is False
+
+
+def test_settle_brief_violation_does_not_reset():
+    """Same debounce protection inside PIVOT_SETTLE, the phase responsible
+    for the field-observed 8s dwell inflation from GPS-antenna lever-arm
+    noise on an otherwise-stationary chassis."""
+    driver = enter_pre()
+    complete_pre_zero_transition(driver)
+    publish_native(driver)
+    release_to_settle(driver, heading_deg=1.0)
+    driver.tick(heading_deg=1.0, speed=0.0, yaw_rate=0.0)
+    started_at = driver.life.settle_inside_since
+    assert started_at is not None
+    blip = driver.tick(heading_deg=1.0, speed=0.05, yaw_rate=0.0, elapsed=0.05)
+    assert blip.transition_reason == "SETTLE_CERTIFICATE_DWELL"
+    assert driver.life.settle_inside_since == started_at
+
+
+def test_settle_sustained_violation_still_resets():
+    driver = enter_pre()
+    complete_pre_zero_transition(driver)
+    publish_native(driver)
+    release_to_settle(driver, heading_deg=1.0)
+    driver.tick(heading_deg=1.0, speed=0.0, yaw_rate=0.0)
+    driver.tick(heading_deg=1.0, speed=0.05, yaw_rate=0.0, elapsed=0.05)
+    driver.tick(heading_deg=1.0, speed=0.05, yaw_rate=0.0, elapsed=0.05)
+    late = driver.tick(heading_deg=1.0, speed=0.05, yaw_rate=0.0, elapsed=0.05)
+    assert late.transition_reason == "SETTLE_GATES_OPEN"
+    assert driver.life.settle_inside_since is None
 
 
 def test_settle_escalates_through_pre_on_ge45_heading():
@@ -540,6 +598,7 @@ def test_legacy_param_and_precision_gate_remain_field_safe():
     defaults = _declared_defaults()
     assert defaults["precision_pivot_enabled"] is False
     assert defaults["legacy_pivot_post_settle_hold_sec"] == 1.00
+    assert defaults["legacy_pivot_stationary_violation_debounce_sec"] == 0.10
     assert defaults["post_pivot_capture_speed_mps"] == 0.20
     assert defaults["acceleration_distance_m"] == 0.20
     assert defaults["deceleration_distance_m"] == 0.50
