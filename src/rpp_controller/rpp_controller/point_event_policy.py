@@ -61,3 +61,4 @@ def latched_stop_terminal_outcome(
     if target_distance <= waypoint_tolerance:
         return "CAPTURED"
     return "MISSED"
+ 
