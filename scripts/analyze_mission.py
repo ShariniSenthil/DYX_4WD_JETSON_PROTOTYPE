@@ -534,7 +534,9 @@ def collect(bag_dir: str) -> Series:
     DEBUG_JSON_TOPICS = {
         "/rpp/geometry_debug", "/rpp/guidance_debug", "/rpp/speed_debug",
         "/rpp/tracking_debug", "/rpp/pivot_debug", "/rpp/accuracy",
-        "/rpp/terminal_result", "/mission_manager/status",
+        "/rpp/terminal_result", "/rpp/terminal_certificate",
+        "/rpp/legacy_alignment_debug",
+        "/mission_manager/status",
         "/mission_manager/segment_goal_metadata", "/mission_manager/point_event",
         "/mission_manager/execution_mode", "/trajectory_generator/status",
         "/trajectory_generator/path_signature",

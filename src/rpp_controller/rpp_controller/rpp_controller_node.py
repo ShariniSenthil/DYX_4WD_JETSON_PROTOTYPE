@@ -1749,6 +1749,18 @@ class RPPController(Node):
             "/rpp/pivot_debug",
             command_qos,
         )
+        # legacy_alignment.py's LegacyAlignmentPhase is the production-active
+        # pivot/align state machine (pivot_debug above belongs to the dormant
+        # Phase-3 precision_pivot_fsm instead, gated off by default and
+        # therefore absent from every field bag). Every prior phase
+        # transition here only ever reached a get_logger().warn() text line,
+        # which isn't bag-recoverable -- this publishes the current phase
+        # structurally, every cycle, so it is.
+        self.legacy_alignment_debug_pub = self.create_publisher(
+            String,
+            "/rpp/legacy_alignment_debug",
+            command_qos,
+        )
         self.terminal_certificate_pub = self.create_publisher(
             String,
             "/rpp/terminal_certificate",
@@ -4867,6 +4879,48 @@ class RPPController(Node):
         except Exception as error:  # diagnostics are never control authority
             self.get_logger().error(f"PIVOT DEBUG PUBLISH FAILED | {error}")
 
+    def _publish_legacy_alignment_debug(
+        self,
+        result,
+        *,
+        heading_error,
+        cross_track,
+        native_pivot_active,
+        telemetry_fresh,
+    ):
+        """Structurally publish the production-active alignment phase.
+
+        Every cycle, not just on transitions -- so any timestamp in a bag
+        can be answered directly from this topic instead of reconstructed
+        from a get_logger() text line or inferred from another topic's
+        gaps (e.g. guidance_debug going silent during a pivot).
+        """
+
+        try:
+            payload = {
+                "schema_version": 1,
+                "source": "RPP_LEGACY_ALIGNMENT",
+                "phase": result.phase.value,
+                "previous_phase": result.previous_phase.value,
+                "directive": result.directive.value,
+                "transition_reason": result.transition_reason,
+                "pivot_complete": bool(result.pivot_complete),
+                "reanchor_requested": bool(result.reanchor_requested),
+                "native_carrier_issued": bool(result.native_carrier_issued),
+                "warn_native_timeout": bool(result.warn_native_timeout),
+                "native_pivot_active": bool(native_pivot_active),
+                "heading_error_deg": math.degrees(heading_error),
+                "cross_track_mm": self.ground_xtrack(cross_track) * 1000.0,
+                "measured_speed_mps": self.current_speed_mps,
+                "measured_yaw_rate_radps": self.current_yaw_rate_radps,
+                "telemetry_fresh": bool(telemetry_fresh),
+            }
+            message = String()
+            message.data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            self.legacy_alignment_debug_pub.publish(message)
+        except Exception as error:  # diagnostics are never control authority
+            self.get_logger().error(f"LEGACY ALIGNMENT DEBUG PUBLISH FAILED | {error}")
+
     def _run_precision_pivot_alignment(
         self,
         *,
@@ -5173,6 +5227,13 @@ class RPPController(Node):
             )
         )
         self._sync_legacy_alignment_shadow()
+        self._publish_legacy_alignment_debug(
+            result,
+            heading_error=path_heading_error,
+            cross_track=alignment_cross_track,
+            native_pivot_active=native_active,
+            telemetry_fresh=telemetry_fresh,
+        )
         if result.reset_native_carrier:
             self.reset_terminal_native_pivot()
         if result.phase is not previous_phase:
