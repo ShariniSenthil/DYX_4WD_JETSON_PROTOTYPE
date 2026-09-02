@@ -56,3 +56,12 @@ Upgrade_path/Final Point Mission CM Tracking Upgrade.md
 Upgrade_path/Full RPP Audit Control Architecture.md
 Upgrade_path/Localization Upgrade.md
 Upgrade_path/Trajectory Upgrade.md
+REFACTOR_TO_CPP_AUDIT.md
+rover_final_audit.txt
+px4-params/31-07-2026 PX4 HOLYBRO 6X Params By Satheesh (DUAL SABERTOOTH 2X32 + PX4 PID TUNED FOR PROTOTYPE ROVER 100PERCENT).params
+AGENTS.md
+CLAUDE.md
+.agents/skills/analyse-missions/SKILL.md
+.agents/skills/rover-ship/SKILL.md
+.claude/skills/analyse-missions/SKILL.md
+.claude/skills/rover-ship/SKILL.md

@@ -775,6 +775,7 @@ def _publish_result_controller(rpp_controller_class, *, precision_terminal_enabl
         current_speed_mps=0.0,
         waypoint_tolerance=0.03,
         precision_terminal_enabled=precision_terminal_enabled,
+        radial20_active=False,
         precision_terminal_identity="RUN:x|PATH:y|RAW:1|GOAL:g|INSTANCE:i",
         precision_terminal_identity_components={
             "mission_run_id": "run-1",

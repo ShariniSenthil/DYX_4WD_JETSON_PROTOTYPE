@@ -94,6 +94,7 @@ class MissionManager(Node):
     POINT_MARKING = 2
     VALID_POINT_TYPES = {POINT_PASS_THROUGH, POINT_DUMMY_ALIGNMENT, POINT_MARKING}
     TERMINAL_POINT_STATES = {"COMPLETED", "SKIPPED", "FAILED"}
+    TERMINAL_STOP_MODES = frozenset({"legacy", "precision_fsm", "radial20"})
 
     def __init__(self) -> None:
         super().__init__("mission_manager")
@@ -127,6 +128,10 @@ class MissionManager(Node):
         # path contract is now the production default; its runtime rollback
         # gate remains available while safely stopped.
         self.declare_parameter("precision_path_contract_enabled", True)
+        self.declare_parameter("terminal_stop_mode", "legacy")
+        # Deprecated compatibility input. Terminal authority is selected only
+        # by terminal_stop_mode; a true value is valid only when the selector
+        # explicitly names the existing precision_fsm authority.
         self.declare_parameter("precision_terminal_enabled", False)
         self.declare_parameter("precision_terminal_heartbeat_timeout_sec", 0.50)
 
@@ -165,21 +170,42 @@ class MissionManager(Node):
         if not isinstance(precision_path_contract_value, bool):
             raise ValueError("precision_path_contract_enabled must be a bool")
         self.precision_path_contract_enabled = precision_path_contract_value
+        terminal_stop_mode_value = self.get_parameter("terminal_stop_mode").value
+        if not isinstance(terminal_stop_mode_value, str):
+            raise ValueError("terminal_stop_mode must be a string")
+        self.terminal_stop_mode = terminal_stop_mode_value.strip().lower()
+        if self.terminal_stop_mode not in self.TERMINAL_STOP_MODES:
+            allowed = ", ".join(sorted(self.TERMINAL_STOP_MODES))
+            raise ValueError(
+                f"terminal_stop_mode must be one of: {allowed}"
+            )
         precision_terminal_value = self.get_parameter(
             "precision_terminal_enabled"
         ).value
         if not isinstance(precision_terminal_value, bool):
             raise ValueError("precision_terminal_enabled must be a bool")
-        self.precision_terminal_enabled = precision_terminal_value
+        if precision_terminal_value and self.terminal_stop_mode != "precision_fsm":
+            raise ValueError(
+                "precision_terminal_enabled is deprecated and may be true only "
+                "when terminal_stop_mode=precision_fsm"
+            )
+        self.precision_fsm_active = self.terminal_stop_mode == "precision_fsm"
+        self.terminal_certificate_required = self.terminal_stop_mode in {
+            "precision_fsm",
+            "radial20",
+        }
+        # Compatibility/status alias: it describes only the old precision FSM,
+        # not every mode that consumes the shared terminal certificate schema.
+        self.precision_terminal_enabled = self.precision_fsm_active
         self.precision_terminal_heartbeat_timeout_sec = float(
             self.get_parameter("precision_terminal_heartbeat_timeout_sec").value
         )
         if (
-            self.precision_terminal_enabled
+            self.terminal_certificate_required
             and not self.precision_path_contract_enabled
         ):
             raise ValueError(
-                "precision_terminal_enabled requires "
+                "certificate-backed terminal_stop_mode requires "
                 "precision_path_contract_enabled"
             )
         self._validate_parameters()
@@ -582,13 +608,25 @@ class MissionManager(Node):
     ) -> SetParametersResult:
         """Atomically synchronize live precision parameters with authority."""
         updates = [(parameter.name, parameter.value) for parameter in parameters]
+        restart_only = {
+            name
+            for name, _value in updates
+            if name in {"terminal_stop_mode", "precision_terminal_enabled"}
+        }
+        if restart_only:
+            names = ", ".join(sorted(restart_only))
+            reason = f"{names} is restart-only; terminal authority cannot change live"
+            self.get_logger().warn(
+                f"Rejected terminal authority update: {reason}"
+            )
+            return SetParametersResult(successful=False, reason=reason)
         with self._lock:
             decision = decide_precision_feature_gate_update(
                 updates,
                 current_path_contract_enabled=(
                     self.precision_path_contract_enabled
                 ),
-                current_terminal_enabled=self.precision_terminal_enabled,
+                current_terminal_enabled=self.precision_fsm_active,
                 mission_state=self._state,
                 mission_enable=self._mission_enable,
                 emergency_stop=self._emergency_stop,
@@ -614,14 +652,13 @@ class MissionManager(Node):
                 self.precision_path_contract_enabled = (
                     decision.path_contract_enabled
                 )
-                self.precision_terminal_enabled = decision.terminal_enabled
                 if decision.republish_ready_goal:
                     self._publish_goal()
                 self._publish_status(force=True)
                 self.get_logger().warn(
                     "Precision feature gates updated: "
                     f"path_contract={self.precision_path_contract_enabled} "
-                    f"terminal={self.precision_terminal_enabled}"
+                    f"terminal_stop_mode={self.terminal_stop_mode}"
                 )
 
             return SetParametersResult(successful=True, reason=decision.reason)
@@ -998,10 +1035,10 @@ class MissionManager(Node):
     def _rpp_terminal_result_callback(self, message: String) -> None:
         """Receive RPP CAPTURED/MISSED for the active goal.
 
-        CAPTURED does not start the 3 s hold. Mission Manager starts that
-        hold only when it measures <=30 mm and stationary.
-        MISSED, while stationary and outside 30 mm, fails the point now
-        with no 3 s hold.
+        RPP owns the terminal geometry and stationary decision. Mission
+        Manager checks active-goal identity here, then either follows the
+        legacy result path or, in a certificate-backed mode, requires the
+        matching fresh v2 certificate before hold/spray/advance.
         """
         try:
             payload = json.loads(message.data)
@@ -1049,7 +1086,7 @@ class MissionManager(Node):
     ) -> Optional[PrecisionTerminalExpectation]:
         """Return the exact current run/path/goal identity without geometry work."""
         if (
-            not self.precision_terminal_enabled
+            not self.terminal_certificate_required
             or not self._mission_run_id
             or self._path_signature is None
             or not (0 <= self._current_path_index < len(self._navigation_path))
@@ -2591,7 +2628,7 @@ class MissionManager(Node):
                     .upper()
                     == "RPP_TERMINAL_RESULT"
                     and (
-                        not self.precision_terminal_enabled
+                        not self.terminal_certificate_required
                         or self._precision_rpp_terminal_result_valid()
                     )
                 )
@@ -2660,7 +2697,7 @@ class MissionManager(Node):
                 "speed_mps": speed_mps,
             }
 
-            if self.precision_terminal_enabled:
+            if self.terminal_certificate_required:
                 decision = self._precision_terminal_decision(time.monotonic())
                 heartbeat = self._rpp_terminal_certificate
                 if decision.valid and isinstance(heartbeat, dict):
@@ -2824,7 +2861,7 @@ class MissionManager(Node):
                 marking_index = self._marking_indices[self._current_path_index]
                 goal_instance_id = None
                 mission_run_id = None
-                if self.precision_terminal_enabled and self._mission_run_id:
+                if self.terminal_certificate_required and self._mission_run_id:
                     mission_run_id = self._mission_run_id
                     goal_instance_id = make_goal_instance_id(
                         mission_run_id=mission_run_id,
@@ -3114,6 +3151,9 @@ class MissionManager(Node):
                 self.precision_path_contract_enabled
             ),
             "precision_terminal_enabled": self.precision_terminal_enabled,
+            "terminal_stop_mode": self.terminal_stop_mode,
+            "terminal_certificate_required": self.terminal_certificate_required,
+            "precision_fsm_active": self.precision_fsm_active,
             "precision_path_contract_fault_latched": (
                 self._precision_path_contract_fault_latched
             ),
@@ -3488,7 +3528,7 @@ class MissionManager(Node):
             # heading or speed logic here. RPP owns how it reaches the dummy.
             if point_type == self.POINT_DUMMY_ALIGNMENT:
                 self._publish_marking_active(False)
-                if self.precision_terminal_enabled:
+                if self.terminal_certificate_required:
                     now = time.monotonic()
                     decision = self._precision_terminal_decision(now)
                     if not decision.valid:
@@ -3578,7 +3618,7 @@ class MissionManager(Node):
             point_id = f"P{marking_number+1:04d}"
             spray_key = (self._mission_run_id, point_id)
 
-            if self.precision_terminal_enabled:
+            if self.terminal_certificate_required:
                 if not self._precision_marking_pre_spray(
                     marking_number=marking_number,
                     point_id=point_id,

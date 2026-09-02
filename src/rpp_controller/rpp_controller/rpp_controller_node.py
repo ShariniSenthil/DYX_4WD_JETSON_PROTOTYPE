@@ -82,6 +82,13 @@ from rpp_controller.terminal_certificate import (
     TerminalState,
     TerminalStopStateMachine,
 )
+from rpp_controller.terminal_stop_regulator import (
+    MotionDirection as RadialStopMotionDirection,
+    RadialStopConfig,
+    RadialStopInput,
+    RadialStopState,
+    TerminalStopRegulator,
+)
 
 # Parameters rclpy or the launch system may legitimately set at runtime and
 # from which this node derives nothing. Everything else is restart-only --
@@ -160,7 +167,13 @@ class RPPController(Node):
         # along-track distance and zero is still controlled only by the exact
         # radial waypoint tolerance.
         self.declare_parameter("terminal_decel_correction_limit_deg", 3.0)
-        self.declare_parameter("terminal_near_correction_limit_deg", 1.0)
+        # 2026-09-01 field bags 184246/184406 showed the old production
+        # 3-degree near-goal cap saturating while cross-track continued to
+        # grow through the goal plane.  4.5 degrees restores modest steering
+        # authority during the final deceleration without approaching PX4's
+        # 45-degree native-pivot boundary; the outer deceleration cap remains
+        # independently limited by terminal_decel_correction_limit_deg.
+        self.declare_parameter("terminal_near_correction_limit_deg", 4.5)
         self.declare_parameter("terminal_near_correction_start_distance_m", 0.15)
         self.declare_parameter("terminal_bearing_freeze_distance_m", 0.06)
         self.declare_parameter("terminal_correction_slew_rate_degps", 8.0)
@@ -592,6 +605,26 @@ class RPPController(Node):
         self.declare_parameter("precision_terminal_timeout_sec", 15.0)
         self.declare_parameter("precision_terminal_settle_timeout_sec", 5.0)
         self.declare_parameter("precision_terminal_min_actuatable_speed_mps", 0.04)
+
+        # Radial-20mm one-shot terminal stop regulator
+        # (terminal_stop_regulator.py). Distinct purpose from the Phase-5 FSM
+        # above -- see the plan review: fixed configured deceleration rate
+        # replaced by a measured-speed stopping lead, no speed floor is
+        # preserved through the goal, and it fails closed on timeout. Exactly
+        # one terminal authority may be selected via terminal_stop_mode; this
+        # module is only reachable when terminal_stop_mode=radial20 below.
+        self.declare_parameter("terminal_stop_mode", "legacy")
+        self.declare_parameter("radial_stop_radial_tolerance_m", 0.020)
+        self.declare_parameter("radial_stop_terminal_guidance_distance_m", 0.75)
+        self.declare_parameter("radial_stop_conservative_decel_mps2", 0.30)
+        self.declare_parameter("radial_stop_brake_margin_m", 0.010)
+        self.declare_parameter("radial_stop_stationary_window_sec", 0.50)
+        self.declare_parameter("radial_stop_stationary_displacement_m", 0.005)
+        self.declare_parameter("radial_stop_stationary_yaw_rate_radps", 0.050)
+        self.declare_parameter("radial_stop_max_position_sample_gap_sec", 0.20)
+        self.declare_parameter("radial_stop_terminal_timeout_sec", 15.0)
+        self.declare_parameter("radial_stop_settle_timeout_sec", 5.0)
+        self.declare_parameter("radial_stop_telemetry_timeout_sec", 0.25)
 
         # Phase-3 measured pivot/recenter controller.  It is independent and
         # default-OFF: the production Phase-A/B keeper below remains byte-for-
@@ -1067,9 +1100,33 @@ class RPPController(Node):
         self.precision_tracking_control_enabled = bool(
             self.get_parameter("precision_tracking_control_enabled").value
         )
-        self.precision_terminal_enabled = bool(
+        _TERMINAL_STOP_MODES = frozenset({"legacy", "precision_fsm", "radial20"})
+        terminal_stop_mode_value = self.get_parameter("terminal_stop_mode").value
+        if not isinstance(terminal_stop_mode_value, str):
+            raise ValueError("terminal_stop_mode must be a string")
+        self.terminal_stop_mode = terminal_stop_mode_value.strip().lower()
+        if self.terminal_stop_mode not in _TERMINAL_STOP_MODES:
+            allowed = ", ".join(sorted(_TERMINAL_STOP_MODES))
+            raise ValueError(f"terminal_stop_mode must be one of: {allowed}")
+        precision_terminal_param_value = bool(
             self.get_parameter("precision_terminal_enabled").value
         )
+        if (
+            precision_terminal_param_value
+            and self.terminal_stop_mode != "precision_fsm"
+        ):
+            raise ValueError(
+                "precision_terminal_enabled is deprecated and may be true "
+                "only when terminal_stop_mode=precision_fsm"
+            )
+        self.precision_fsm_active = self.terminal_stop_mode == "precision_fsm"
+        self.legacy_terminal_stop_active = self.terminal_stop_mode == "legacy"
+        self.radial20_active = self.terminal_stop_mode == "radial20"
+        # Compatibility alias: every existing precision_terminal_enabled call
+        # site in this file continues to mean "the Phase-5 FSM branch is the
+        # authoritative terminal path" -- never radial20, which is gated
+        # separately on self.radial20_active throughout.
+        self.precision_terminal_enabled = self.precision_fsm_active
         # Loaded fully below after Phase-2 configs are constructed.  Read the
         # gate here so geometry subscription/install authority includes the
         # Phase-3 consumer from the first retained DDS sample.
@@ -1083,6 +1140,7 @@ class RPPController(Node):
             or self.precision_speed_control_enabled
             or self.precision_tracking_control_enabled
             or self.precision_terminal_enabled
+            or self.radial20_active
             or precision_pivot_requested
         )
         self.precision_guidance_config = GuidanceConfig(
@@ -1274,6 +1332,49 @@ class RPPController(Node):
         self.precision_terminal_fsm = TerminalStopStateMachine(
             self.precision_terminal_config
         )
+
+        self.radial_stop_telemetry_timeout_sec = float(
+            self.get_parameter("radial_stop_telemetry_timeout_sec").value
+        )
+        self.radial_stop_config = RadialStopConfig(
+            radial_tolerance_m=float(
+                self.get_parameter("radial_stop_radial_tolerance_m").value
+            ),
+            terminal_guidance_distance_m=float(
+                self.get_parameter("radial_stop_terminal_guidance_distance_m").value
+            ),
+            conservative_decel_mps2=float(
+                self.get_parameter("radial_stop_conservative_decel_mps2").value
+            ),
+            brake_margin_m=float(
+                self.get_parameter("radial_stop_brake_margin_m").value
+            ),
+            stationary_window_sec=float(
+                self.get_parameter("radial_stop_stationary_window_sec").value
+            ),
+            stationary_displacement_m=float(
+                self.get_parameter("radial_stop_stationary_displacement_m").value
+            ),
+            stationary_yaw_rate_radps=float(
+                self.get_parameter("radial_stop_stationary_yaw_rate_radps").value
+            ),
+            maximum_position_sample_gap_sec=float(
+                self.get_parameter("radial_stop_max_position_sample_gap_sec").value
+            ),
+            terminal_timeout_sec=float(
+                self.get_parameter("radial_stop_terminal_timeout_sec").value
+            ),
+            settle_timeout_sec=float(
+                self.get_parameter("radial_stop_settle_timeout_sec").value
+            ),
+        )
+        self.radial_stop_regulator = TerminalStopRegulator(self.radial_stop_config)
+        self.radial_stop_request_armed = False
+        self.radial_stop_identity = None
+        self.radial_stop_identity_components = None
+        self.radial_stop_last_result = None
+        self.radial_stop_last_sample = None
+        self._radial_stop_speed_last_sample = None
 
         self.precision_pivot_enabled = bool(
             self.get_parameter("precision_pivot_enabled").value
@@ -7897,6 +7998,26 @@ class RPPController(Node):
         self.precision_terminal_measurement_bearing_source = None
         self.precision_terminal_last_reset_reason = str(reason)
         self.precision_terminal_reset_count += 1
+        self._reset_radial20_terminal(reason)
+
+    def _reset_radial20_terminal(self, reason):
+        """Reset radial20 authority at the same semantic boundaries as Phase-5.
+
+        Called from _reset_precision_terminal() so every one of its existing
+        call sites (goal change, mission enable/disable, e-stop, geometry
+        invalidation, localization jump, point completion, ...) resets
+        radial20 identically without duplicating those call sites.
+        """
+
+        if not hasattr(self, "radial_stop_regulator"):
+            return
+        self.radial_stop_regulator.reset()
+        self.radial_stop_request_armed = False
+        self.radial_stop_identity = None
+        self.radial_stop_identity_components = None
+        self.radial_stop_last_result = None
+        self.radial_stop_last_sample = None
+        self._radial_stop_speed_last_sample = None
 
     def _current_precision_terminal_identity(self):
         """Return a synchronized, run-scoped semantic terminal identity."""
@@ -8368,6 +8489,251 @@ class RPPController(Node):
                 ),
             )
 
+    def _radial_stop_position_sample_time_sec(self):
+        """Return a real sensor-timestamped sample time for the detector.
+
+        Uses the actual odometry timestamp (not the control-loop's own
+        monotonic cycle time) so the stationary detector's duplicate-sample
+        and sample-gap handling see genuine odom cadence, per its own
+        designed-for input contract.
+        """
+
+        if self.last_odom_time is None:
+            return self._precision_now_sec()
+        return max(0.0, self.last_odom_time.nanoseconds / 1.0e9)
+
+    def _radial_stop_position_derived_speed_mps(self, position_sample_time_sec):
+        """Differentiate position over the most recent sample gap.
+
+        Never derived from EKF twist. Returns 0.0 (never a negative or
+        stale value) whenever the gap is invalid/too large/non-finite so the
+        regulator's max(position_derived, commanded) braking-lead formula
+        conservatively falls back to the commanded speed instead of
+        under-estimating danger.
+        """
+
+        last = self._radial_stop_speed_last_sample
+        current_x = float(self.current_x)
+        current_y = float(self.current_y)
+        self._radial_stop_speed_last_sample = (
+            position_sample_time_sec,
+            current_x,
+            current_y,
+        )
+        if last is None:
+            return 0.0
+        last_t, last_x, last_y = last
+        dt = position_sample_time_sec - last_t
+        if (
+            not math.isfinite(dt)
+            or dt <= 1.0e-6
+            or dt > self.radial_stop_config.maximum_position_sample_gap_sec
+            or not all(
+                math.isfinite(value)
+                for value in (current_x, current_y, last_x, last_y)
+            )
+        ):
+            return 0.0
+        distance = math.hypot(current_x - last_x, current_y - last_y)
+        return max(0.0, distance / dt)
+
+    def _step_radial20_terminal_for_cycle(
+        self,
+        *,
+        along_remaining,
+        cross_error,
+    ):
+        """Advance the radial20 regulator for one control cycle.
+
+        Mirrors _step_precision_terminal_for_cycle's identity/telemetry
+        pattern but feeds TerminalStopRegulator instead of the Phase-5 FSM.
+        """
+
+        identity, components = self._current_precision_terminal_identity()
+        if identity is None:
+            return None
+        now_sec = self._precision_now_sec()
+        telemetry_fresh = self.is_fresh(
+            self.last_odom_time,
+            self.radial_stop_telemetry_timeout_sec,
+        )
+        position_sample_time_sec = self._radial_stop_position_sample_time_sec()
+        position_derived_speed = self._radial_stop_position_derived_speed_mps(
+            position_sample_time_sec
+        )
+        tracking_speed_command = max(
+            0.0,
+            float(self.precision_last_published_translational_speed_mps),
+        )
+        yaw_rate = (
+            float(self.current_yaw_rate_radps)
+            if math.isfinite(self.current_yaw_rate_radps)
+            else 0.0
+        )
+        sample = RadialStopInput(
+            monotonic_time_sec=now_sec,
+            position_sample_time_sec=position_sample_time_sec,
+            active=True,
+            terminal_identity=identity,
+            along_remaining_m=float(along_remaining),
+            cross_error_m=float(cross_error),
+            position_x_m=float(self.current_x),
+            position_y_m=float(self.current_y),
+            position_derived_speed_mps=position_derived_speed,
+            measured_yaw_rate_radps=yaw_rate,
+            tracking_speed_command_mps=tracking_speed_command,
+            telemetry_fresh=telemetry_fresh,
+        )
+        try:
+            result = self.radial_stop_regulator.step(sample)
+        except (TypeError, ValueError):
+            return None
+        self.radial_stop_request_armed = True
+        self.radial_stop_identity = identity
+        self.radial_stop_identity_components = components
+        self.radial_stop_last_result = result
+        self.radial_stop_last_sample = sample
+        self._publish_radial20_heartbeat(result, sample)
+        return result
+
+    def _radial_stop_certificate_payload(self, certificate):
+        """Convert a RadialStopCertificate for external reporting.
+
+        Ground/report cross-track convention (LEFT negative, RIGHT positive)
+        matches ground_terminal_certificate_payload's contract for the
+        Phase-5 certificate.
+        """
+
+        if certificate is None:
+            return None
+        return {
+            "version": certificate.version,
+            "terminal_identity": certificate.terminal_identity,
+            "certified_timestamp_sec": certificate.certified_timestamp_sec,
+            "radial_error_m": certificate.radial_error_m,
+            "along_error_m": certificate.along_error_m,
+            "cross_error_m": self.ground_xtrack(certificate.cross_error_m),
+            "final_position_x_m": certificate.final_position_x_m,
+            "final_position_y_m": certificate.final_position_y_m,
+            "stationary_window_sec": certificate.stationary_window_sec,
+            "maximum_stationary_displacement_m": (
+                certificate.maximum_stationary_displacement_m
+            ),
+            "maximum_abs_yaw_rate_radps": (
+                certificate.maximum_abs_yaw_rate_radps
+            ),
+            "speed_source": certificate.speed_source,
+            "truth_frame": certificate.truth_frame,
+            "precision_pass": True,
+        }
+
+    def _publish_radial20_heartbeat(self, result, sample):
+        """Publish the radial20 heartbeat on the shared /rpp/terminal_certificate
+        wire schema mission_manager's existing precision-terminal consumer
+        already validates (schema_version 2 / RPP_PRECISION_TERMINAL_HEARTBEAT).
+        "precision_terminal_enabled": True below is a fixed wire-contract
+        literal meaning "this heartbeat is certificate-backed" -- it is not
+        self.precision_terminal_enabled, which stays scoped to the Phase-5
+        FSM branch for legacy-latch mutual exclusion.
+        """
+
+        components = self.radial_stop_identity_components or {}
+        certificate = result.certificate
+        currently_valid = result.state in (
+            RadialStopState.CERTIFIED,
+            RadialStopState.HOLD_ZERO,
+        )
+        try:
+            payload = {
+                "schema_version": 2,
+                "source": "RPP_PRECISION_TERMINAL_HEARTBEAT",
+                "ros_time_ns": self.get_clock().now().nanoseconds,
+                "precision_terminal_enabled": True,
+                "state": result.state.value,
+                "directive": (
+                    "hold_zero" if result.hold_zero else "approach"
+                ),
+                "zero_latched": bool(result.hold_zero),
+                "motion_evidence_valid": bool(result.stationary),
+                "currently_valid": currently_valid,
+                "transition_reason": (
+                    result.failure.value
+                    if result.failure.value != "none"
+                    else None
+                ),
+                "terminal_identity": self.radial_stop_identity,
+                "terminal_identity_components": components,
+                "mission_run_id": components.get("mission_run_id"),
+                "goal_instance_id": components.get("goal_instance_id"),
+                "path_signature": components.get("path_signature"),
+                "raw_path_index": components.get("raw_path_index"),
+                "active_goal_identity": components.get("active_goal_identity"),
+                "radial_error_mm": result.radial_error_m * 1000.0,
+                "cross_error_mm": (
+                    self.ground_xtrack(sample.cross_error_m) * 1000.0
+                ),
+                "along_error_mm": sample.along_remaining_m * 1000.0,
+                "measured_speed_mps": sample.position_derived_speed_mps,
+                "measured_yaw_rate_radps": sample.measured_yaw_rate_radps,
+                "telemetry_fresh": sample.telemetry_fresh,
+                "settle_held_sec": result.stationary_window_sec,
+                "max_radial_during_settle_mm": (
+                    certificate.radial_error_m * 1000.0
+                    if certificate is not None
+                    else None
+                ),
+                "certificate": self._radial_stop_certificate_payload(certificate),
+                "precision_certificate_version": (
+                    certificate.version if certificate is not None else None
+                ),
+                "precision_pass": bool(certificate is not None),
+                "truth_frame": "controller_estimator_frame_only",
+                "localization_accuracy_certified": False,
+                "physical_accuracy_certified": False,
+                "reset_reason": None,
+                "reset_count": 0,
+            }
+            message = String()
+            message.data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            self.terminal_certificate_pub.publish(message)
+        except Exception as error:  # diagnostics never alter stop authority
+            try:
+                self.get_logger().error(
+                    f"RADIAL20 CERTIFICATE HEARTBEAT PUBLISH FAILED | {error}"
+                )
+            except Exception:
+                pass
+
+    def _publish_radial20_result_if_ready(self, result):
+        """Bridge radial20 completion to the shared terminal-result topic."""
+
+        if result is None or self._terminal_result_sent is not None:
+            return
+        sample = self.radial_stop_last_sample
+        if sample is None:
+            return
+        certificate = result.certificate
+        if result.state is RadialStopState.CERTIFIED and certificate is not None:
+            self.publish_terminal_result(
+                "CAPTURED",
+                reason="RADIAL20_CERTIFIED",
+                target_distance=result.radial_error_m,
+                signed_cross_track=sample.cross_error_m,
+                along_remaining=sample.along_remaining_m,
+                precision_certificate=certificate,
+                tolerance_override_m=self.radial_stop_config.radial_tolerance_m,
+            )
+        elif result.state is RadialStopState.HOLD_FAIL:
+            self.publish_terminal_result(
+                "MISSED",
+                reason=f"RADIAL20_{result.failure.value.upper()}",
+                target_distance=result.radial_error_m,
+                signed_cross_track=sample.cross_error_m,
+                along_remaining=sample.along_remaining_m,
+                precision_certificate=None,
+                tolerance_override_m=self.radial_stop_config.radial_tolerance_m,
+            )
+
     def publish_terminal_result(
         self,
         outcome,
@@ -8462,7 +8828,87 @@ class RPPController(Node):
             "timestamp_unix_ns": self.get_clock().now().nanoseconds,
         }
 
-        if self.precision_terminal_enabled:
+        if self.radial20_active:
+            # radial20 certificates are RadialStopCertificate, a distinct
+            # type from PrecisionTerminalCertificate below -- never pass one
+            # through the Phase-5 branch's attribute access.
+            components = self.radial_stop_identity_components or {}
+            certificate_payload = self._radial_stop_certificate_payload(
+                precision_certificate
+            )
+            payload.update(
+                {
+                    "controller_outcome": outcome,
+                    "precision_certificate_version": (
+                        precision_certificate.version
+                        if precision_certificate is not None
+                        else 2
+                    ),
+                    "terminal_identity": self.radial_stop_identity,
+                    "terminal_identity_components": components,
+                    "mission_run_id": components.get("mission_run_id"),
+                    "goal_instance_id": components.get("goal_instance_id"),
+                    "path_signature": components.get("path_signature"),
+                    "raw_path_index": components.get("raw_path_index"),
+                    "active_goal_identity": components.get("active_goal_identity"),
+                    "precision_pass": bool(precision_certificate is not None),
+                    "cross_error_mm": cross_track_mm,
+                    "along_error_mm": along_track_mm,
+                    "stop_spec_mm": (
+                        self.radial_stop_config.radial_tolerance_m * 1000.0
+                    ),
+                    "precision_stop_spec_mm": (
+                        self.radial_stop_config.radial_tolerance_m * 1000.0
+                    ),
+                    "measured_yaw_rate_radps": (
+                        float(self.current_yaw_rate_radps)
+                        if math.isfinite(self.current_yaw_rate_radps)
+                        else None
+                    ),
+                    "speed_at_release_mps": (
+                        float(self.current_speed_mps)
+                        if math.isfinite(self.current_speed_mps)
+                        else None
+                    ),
+                    "yaw_rate_at_release_radps": (
+                        precision_certificate.maximum_abs_yaw_rate_radps
+                        if precision_certificate is not None
+                        else (
+                            float(self.current_yaw_rate_radps)
+                            if math.isfinite(self.current_yaw_rate_radps)
+                            else None
+                        )
+                    ),
+                    "telemetry_fresh": self.is_fresh(
+                        self.last_odom_time,
+                        self.radial_stop_telemetry_timeout_sec,
+                    ),
+                    "settle_sec": (
+                        precision_certificate.stationary_window_sec
+                        if precision_certificate is not None
+                        else 0.0
+                    ),
+                    "max_radial_during_settle_mm": (
+                        precision_certificate.radial_error_m * 1000.0
+                        if precision_certificate is not None
+                        else None
+                    ),
+                    "first_capture_pose": None,
+                    "final_settled_pose": (
+                        {
+                            "x_m": precision_certificate.final_position_x_m,
+                            "y_m": precision_certificate.final_position_y_m,
+                        }
+                        if precision_certificate is not None
+                        else None
+                    ),
+                    "truth_frame": "controller_estimator_frame_only",
+                    "localization_accuracy_certified": False,
+                    "physical_accuracy_certified": False,
+                    "precision_certificate": certificate_payload,
+                }
+            )
+        elif self.precision_terminal_enabled:
             components = self.precision_terminal_identity_components or {}
             certificate_payload = self.ground_terminal_certificate_payload(
                 precision_certificate
@@ -8968,8 +9414,82 @@ class RPPController(Node):
                 )
                 return
 
+        # radial20 terminal authority: mutually exclusive with both the
+        # Phase-5 branch above and the legacy 30 mm latch below, via
+        # self.terminal_stop_mode. Bearing stays owned by the guidance
+        # pipeline already resolved into path_bearing above (following_runtime_line
+        # authority is already correctly gated by the time path_bearing
+        # reaches this point) -- this branch only overrides speed magnitude.
         if (
-            not self.precision_terminal_enabled
+            self.radial20_active
+            and goal_requires_precision_stop
+            and (
+                self.radial_stop_request_armed
+                or goal_distance
+                <= self.radial_stop_config.terminal_guidance_distance_m
+            )
+        ):
+            radial_result = self._step_radial20_terminal_for_cycle(
+                along_remaining=goal_along_remaining,
+                cross_error=goal_signed_cross_track,
+            )
+            if radial_result is None:
+                self.publish_stop()
+                self.log_waiting(
+                    "radial20 terminal lacks synchronized current goal binding"
+                )
+                return
+            self._publish_radial20_result_if_ready(radial_result)
+            if radial_result.motion_direction is RadialStopMotionDirection.ZERO:
+                self.publish_stop()
+                self.log_control(
+                    mode_prefix
+                    + "RADIAL20 TERMINAL "
+                    + radial_result.state.value.upper()
+                    + " / ZERO OWNED",
+                    goal_distance,
+                    goal_distance,
+                    path_heading_error,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
+                return
+            desired_goal_bearing = math.atan2(
+                goal_y - self.current_y,
+                goal_x - self.current_x,
+            )
+            guidance_bearing = self.terminal_bounded_guidance(
+                path_bearing,
+                desired_goal_bearing,
+                goal_along_remaining,
+            )
+            speed = radial_result.forward_speed_command_mps
+            north = speed * math.sin(guidance_bearing)
+            east = speed * math.cos(guidance_bearing)
+            north, east, published_speed = self.publish_velocity_ned(
+                north,
+                east,
+                apply_acceleration=True,
+                apply_deceleration=False,
+                hard_speed_cap_mps=speed,
+            )
+            self._record_published_translational_speed(published_speed)
+            self.log_control(
+                mode_prefix
+                + "RADIAL20 TERMINAL "
+                + radial_result.state.value.upper(),
+                goal_distance,
+                goal_distance,
+                path_heading_error,
+                published_speed,
+                0.0,
+                0.0,
+            )
+            return
+
+        if (
+            self.legacy_terminal_stop_active
             and goal_requires_precision_stop
             and self.marking_stop_latched
         ):
@@ -8993,7 +9513,7 @@ class RPPController(Node):
         # Exact radial distance is checked independently for every semantic
         # stop goal: marking point or extension/dummy.
         if (
-            not self.precision_terminal_enabled
+            self.legacy_terminal_stop_active
             and goal_requires_precision_stop
             and self.latch_exact_marking_stop(
                 goal_distance,
@@ -9168,9 +9688,21 @@ class RPPController(Node):
         gate2_active = (
             self.precision_guidance_enabled or self.precision_speed_control_enabled
         )
-        terminal_active = goal_requires_precision_stop and (
-            goal_distance <= self.terminal_goal_intercept_distance
-            or (gate2_active and self.terminal_precision_armed)
+        # radial20 owns the entire terminal approach once
+        # goal_requires_precision_stop is true (its own branch above always
+        # returns before this point once armed/in range); this generic decel
+        # zone would otherwise still fire in the gap between
+        # terminal_goal_intercept_distance_m (0.90 m production) and
+        # radial_stop_terminal_guidance_distance_m (0.75 m), running the
+        # legacy speed/guidance profile for a sliver of approach distance in
+        # a mode meant to have exactly one terminal authority.
+        terminal_active = (
+            not self.radial20_active
+            and goal_requires_precision_stop
+            and (
+                goal_distance <= self.terminal_goal_intercept_distance
+                or (gate2_active and self.terminal_precision_armed)
+            )
         )
 
         # Preserve xtrack speed-cap state across the terminal boundary.

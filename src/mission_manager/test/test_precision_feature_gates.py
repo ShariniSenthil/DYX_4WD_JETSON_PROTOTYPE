@@ -33,6 +33,7 @@ def test_accepted_path_contract_is_default_on_but_terminal_stays_off():
         'declare_parameter("precision_path_contract_enabled", True)'
         in source
     )
+    assert 'declare_parameter("terminal_stop_mode", "legacy")' in source
     assert 'declare_parameter("precision_terminal_enabled", False)' in source
 
 
@@ -164,7 +165,7 @@ def test_invalid_batch_cannot_partially_mutate_resulting_authority():
     assert decision.terminal_enabled is False
 
 
-def test_callback_updates_both_caches_then_republishes_goal_and_status():
+def test_callback_keeps_terminal_authority_restart_only_and_updates_path_cache():
     source_path = (
         Path(__file__).parents[1]
         / "mission_manager"
@@ -180,14 +181,14 @@ def test_callback_updates_both_caches_then_republishes_goal_and_status():
     )
     callback_source = ast.get_source_segment(source, callback)
 
-    path_assignment = callback_source.index(
-        "self.precision_path_contract_enabled ="
-    )
-    terminal_assignment = callback_source.index("self.precision_terminal_enabled =")
+    assert 'name in {"terminal_stop_mode", "precision_terminal_enabled"}' in callback_source
+    assert "terminal authority cannot change live" in callback_source
+    assert "self.precision_terminal_enabled =" not in callback_source
+
+    path_assignment = callback_source.index("self.precision_path_contract_enabled =")
     republish = callback_source.index("self._publish_goal()")
     status = callback_source.index("self._publish_status(force=True)")
     assert path_assignment < republish
-    assert terminal_assignment < republish
     assert republish < status
 
     status_function = next(
@@ -198,3 +199,5 @@ def test_callback_updates_both_caches_then_republishes_goal_and_status():
     status_source = ast.get_source_segment(source, status_function)
     assert '"precision_path_contract_enabled"' in status_source
     assert '"precision_terminal_enabled"' in status_source
+    assert '"terminal_stop_mode"' in status_source
+    assert '"terminal_certificate_required"' in status_source

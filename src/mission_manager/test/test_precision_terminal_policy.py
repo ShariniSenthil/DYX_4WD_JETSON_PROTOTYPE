@@ -63,6 +63,17 @@ def test_current_matching_certificate_is_valid():
     assert decision.certificate["radial_error_mm"] == 7.4
 
 
+@pytest.mark.parametrize("terminal_stop_mode", ["precision_fsm", "radial20"])
+def test_shared_v2_certificate_allows_mode_as_additive_top_level_metadata(
+    terminal_stop_mode,
+):
+    payload = valid_heartbeat()
+    payload["terminal_stop_mode"] = terminal_stop_mode
+    decision = decide(payload)
+    assert decision.valid
+    assert decision.reason == "valid"
+
+
 @pytest.mark.parametrize(
     ("field", "value", "reason"),
     [

@@ -87,7 +87,12 @@ def test_10mm_capture_preempts_legacy_latch_and_every_moving_floor():
     assert "TerminalDirective.HOLD_ZERO" in hold_branch
     assert "self.publish_stop()" in hold_branch
     assert "return" in hold_branch
-    assert control.count("not self.precision_terminal_enabled") >= 2
+    # Legacy-latch mutual exclusion is keyed on self.legacy_terminal_stop_active
+    # (terminal_stop_mode == "legacy") rather than the old bare
+    # precision_terminal_enabled negation, since a third authority
+    # (terminal_stop_mode == "radial20") must also be excluded from the
+    # 30 mm latch -- see the plan review's mode-selector requirement (R1).
+    assert control.count("self.legacy_terminal_stop_active") >= 2
     assert "and self.marking_stop_latched" in control
     assert "and self.latch_exact_marking_stop(" in control
 
@@ -99,10 +104,53 @@ def test_precision_mode_20mm_does_not_enter_legacy_30mm_latch():
     assert '"precision_terminal_radial_tolerance_m", 0.010' in NODE
     assert '"waypoint_tolerance_m": 0.03' in LAUNCH
     assert (
-        "not self.precision_terminal_enabled\n"
+        "self.legacy_terminal_stop_active\n"
         "            and goal_requires_precision_stop\n"
         "            and self.latch_exact_marking_stop("
     ) in control
+
+
+def test_radial20_mode_defaults_off_and_is_mutually_exclusive_with_every_other_authority():
+    """terminal_stop_mode=legacy is the default; exactly one authority runs."""
+
+    assert 'declare_parameter("terminal_stop_mode", "legacy")' in NODE
+    assert '"terminal_stop_mode": TERMINAL_STOP_MODE' in LAUNCH
+    assert 'TERMINAL_STOP_MODE = "legacy"' in LAUNCH
+    assert '"radial_stop_radial_tolerance_m", 0.020' in NODE
+
+    control = function_source("control_loop")
+    precision = control.index("_step_precision_terminal_for_cycle")
+    radial20 = control.index("_step_radial20_terminal_for_cycle")
+    legacy = control.index("latch_exact_marking_stop")
+    # radial20 is evaluated after the Phase-5 FSM branch and before the
+    # legacy 30 mm latch, matching the Phase-5 branch's own ordering
+    # guarantee -- see test_10mm_capture_preempts_legacy_latch_and_every_moving_floor.
+    assert precision < radial20 < legacy
+    radial20_branch = control[radial20:legacy]
+    assert "self.radial20_active" in control[:radial20]
+    assert "RadialStopMotionDirection.ZERO" in radial20_branch
+    assert "self.publish_stop()" in radial20_branch
+    assert "return" in radial20_branch
+    assert "self.terminal_bounded_guidance(" in radial20_branch
+    assert "hard_speed_cap_mps=speed" in radial20_branch
+
+    # The generic pre-Phase-5 deceleration zone must not also run for
+    # radial20, or the legacy speed/guidance profile would briefly compete
+    # with the new regulator in the terminal_goal_intercept_distance_m
+    # (0.90 m) to radial_stop_terminal_guidance_distance_m (0.75 m) gap.
+    terminal_active_source = control[
+        control.index("terminal_active = (") : control.index(
+            "terminal_active = ("
+        )
+        + 400
+    ]
+    assert "not self.radial20_active" in terminal_active_source
+
+    result = function_source("publish_terminal_result")
+    assert "if self.radial20_active:" in result
+    assert "elif self.precision_terminal_enabled:" in result
+    reset = function_source("_reset_precision_terminal")
+    assert "self._reset_radial20_terminal(reason)" in reset
 
 
 def test_terminal_override_is_additive_and_visible_in_speed_debug():

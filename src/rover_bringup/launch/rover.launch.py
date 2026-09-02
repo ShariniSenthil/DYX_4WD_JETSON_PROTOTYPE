@@ -59,6 +59,15 @@ MISSION_METADATA_FILE = (
 CRUISE_SPEED_MPS = 0.60
 TERMINAL_FLOOR_SPEED_MPS = 0.15
 
+# Single source of truth for which terminal-stop authority is active.
+# rpp_controller and mission_manager each independently declare and validate
+# their own terminal_stop_mode parameter (so each node still fails fast on a
+# bad value at its own startup), but referencing the same Python constant
+# here is what keeps them from ever drifting apart when launched together --
+# see the plan review's mutual-exclusivity requirement (R1).
+# "legacy" | "precision_fsm" | "radial20"
+TERMINAL_STOP_MODE = "legacy"
+
 
 def generate_launch_description() -> LaunchDescription:
     mavros = ExecuteProcess(
@@ -274,6 +283,7 @@ def generate_launch_description() -> LaunchDescription:
                         "precision_path_contract_enabled": True,
                         # Phase-6 verifier remains dormant until Phase-5 RPP
                         # certificate authority is deliberately enabled.
+                        "terminal_stop_mode": TERMINAL_STOP_MODE,
                         "precision_terminal_enabled": False,
                         "precision_terminal_heartbeat_timeout_sec": 0.50,
                         "maximum_marking_points": 10000,
@@ -401,7 +411,11 @@ def generate_launch_description() -> LaunchDescription:
                         "deceleration_max_dt_sec": 0.10,
                         # Uneven-ground terminal steering separation.
                         "terminal_decel_correction_limit_deg": 12.0,
-                        "terminal_near_correction_limit_deg": 3.0,
+                        # Field bags 184246/184406: the previous 3-degree
+                        # final cap pinned while cross-track grew through the
+                        # goal plane. Keep this well below the 12-degree
+                        # deceleration cap and PX4's 45-degree pivot entry.
+                        "terminal_near_correction_limit_deg": 4.5,
                         "terminal_near_correction_start_distance_m": 0.79,
                         "terminal_bearing_freeze_distance_m": 0.04,
                         "terminal_correction_slew_rate_degps": 15.0,
@@ -564,6 +578,25 @@ def generate_launch_description() -> LaunchDescription:
                         "precision_tracking_cruise_threshold_mps": 0.80,
                         # Phase-5 measured <=10 mm controller-frame stop.
                         # Default-OFF preserves the production 30 mm latch.
+                        "terminal_stop_mode": TERMINAL_STOP_MODE,
+                        # radial20 (terminal_stop_regulator.py). Not enabled
+                        # by TERMINAL_STOP_MODE above yet.
+                        # conservative_decel_mps2 and the stationary-window
+                        # thresholds are calibration inputs -- replace with
+                        # values measured during the post-RO_SPEED_I=0.2
+                        # bench sweep before ever setting TERMINAL_STOP_MODE
+                        # to radial20 in the field. See the plan review.
+                        "radial_stop_radial_tolerance_m": 0.020,
+                        "radial_stop_terminal_guidance_distance_m": 0.75,
+                        "radial_stop_conservative_decel_mps2": 0.30,
+                        "radial_stop_brake_margin_m": 0.010,
+                        "radial_stop_stationary_window_sec": 0.50,
+                        "radial_stop_stationary_displacement_m": 0.005,
+                        "radial_stop_stationary_yaw_rate_radps": 0.050,
+                        "radial_stop_max_position_sample_gap_sec": 0.20,
+                        "radial_stop_terminal_timeout_sec": 15.0,
+                        "radial_stop_settle_timeout_sec": 5.0,
+                        "radial_stop_telemetry_timeout_sec": 0.25,
                         "precision_terminal_enabled": False,
                         "precision_terminal_radial_tolerance_m": 0.010,
                         "precision_terminal_capture_tolerance_m": 0.010,
