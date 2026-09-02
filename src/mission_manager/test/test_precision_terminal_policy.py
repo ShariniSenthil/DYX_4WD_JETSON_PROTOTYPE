@@ -74,6 +74,19 @@ def test_shared_v2_certificate_allows_mode_as_additive_top_level_metadata(
     assert decision.reason == "valid"
 
 
+def test_hold_zero_state_is_also_valid_for_radial20():
+    """radial20's CERTIFIED->HOLD_ZERO transition is a single tick; by the
+    time a heartbeat is checked it has almost always already moved to
+    hold_zero. Unlike the dormant Phase-5 FSM (which stays reporting
+    "certified" forever), radial20 must not be rejected once it does."""
+
+    payload = valid_heartbeat()
+    payload["state"] = "hold_zero"
+    decision = decide(payload)
+    assert decision.valid
+    assert decision.reason == "valid"
+
+
 @pytest.mark.parametrize(
     ("field", "value", "reason"),
     [

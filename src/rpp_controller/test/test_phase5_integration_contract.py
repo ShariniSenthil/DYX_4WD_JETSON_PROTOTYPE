@@ -111,11 +111,15 @@ def test_precision_mode_20mm_does_not_enter_legacy_30mm_latch():
 
 
 def test_radial20_mode_defaults_off_and_is_mutually_exclusive_with_every_other_authority():
-    """terminal_stop_mode=legacy is the default; exactly one authority runs."""
+    """terminal_stop_mode's own code-level default is legacy (a source
+    property that must hold regardless of deployment config); the launch
+    file's TERMINAL_STOP_MODE constant is a deliberate, operator-set
+    deployment choice (currently radial20 for field testing) and is not
+    asserted here -- only that both nodes reference the one shared constant,
+    never a hardcoded per-node value that could drift apart (R1)."""
 
     assert 'declare_parameter("terminal_stop_mode", "legacy")' in NODE
-    assert '"terminal_stop_mode": TERMINAL_STOP_MODE' in LAUNCH
-    assert 'TERMINAL_STOP_MODE = "legacy"' in LAUNCH
+    assert LAUNCH.count('"terminal_stop_mode": TERMINAL_STOP_MODE') == 2
     assert '"radial_stop_radial_tolerance_m", 0.020' in NODE
 
     control = function_source("control_loop")

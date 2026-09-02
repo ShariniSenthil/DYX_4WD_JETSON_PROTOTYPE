@@ -72,7 +72,18 @@ def validate_precision_terminal_heartbeat(
         return PrecisionTerminalDecision(False, "source_mismatch")
     if payload.get("precision_terminal_enabled") is not True:
         return PrecisionTerminalDecision(False, "precision_terminal_disabled")
-    if str(payload.get("state") or "").strip().lower() != "certified":
+    # The dormant Phase-5 FSM has no distinct post-certification state: it
+    # stays reporting "certified" forever once certified. radial20's state
+    # machine (terminal_stop_regulator.py) splits that into a one-tick
+    # "certified" event followed by a persistent "hold_zero" state -- by the
+    # time this heartbeat is checked, radial20 has almost always already
+    # moved past the single "certified" tick. Accept both: "currently_valid"/
+    # "zero_latched"/"precision_pass" below are what actually gate hold/spray
+    # authority, not the state label itself.
+    if str(payload.get("state") or "").strip().lower() not in (
+        "certified",
+        "hold_zero",
+    ):
         return PrecisionTerminalDecision(False, "state_not_certified")
     if payload.get("currently_valid") is not True:
         return PrecisionTerminalDecision(False, "certificate_not_currently_valid")
