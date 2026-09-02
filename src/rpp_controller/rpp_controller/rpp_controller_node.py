@@ -622,7 +622,10 @@ class RPPController(Node):
         # still-outstanding bench sweep, which should replace these with
         # measured values, not just wider guesses.
         self.declare_parameter("radial_stop_conservative_decel_mps2", 0.20)
-        self.declare_parameter("radial_stop_brake_margin_m", 0.05)
+        # 0.05 crashed the node on startup: RadialStopConfig.__post_init__
+        # requires brake_margin_m <= radial_tolerance_m (0.020m). Capped at
+        # 0.015, the largest value under that hard ceiling.
+        self.declare_parameter("radial_stop_brake_margin_m", 0.015)
         self.declare_parameter("radial_stop_stationary_window_sec", 0.50)
         self.declare_parameter("radial_stop_stationary_displacement_m", 0.005)
         self.declare_parameter("radial_stop_stationary_yaw_rate_radps", 0.050)

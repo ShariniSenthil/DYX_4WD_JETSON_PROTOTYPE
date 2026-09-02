@@ -596,7 +596,11 @@ def generate_launch_description() -> LaunchDescription:
                         # just wider ones; the bench sweep is still the real
                         # fix.
                         "radial_stop_conservative_decel_mps2": 0.20,
-                        "radial_stop_brake_margin_m": 0.05,
+                        # 0.05 crashed rpp_controller_node on startup:
+                        # RadialStopConfig requires brake_margin_m <=
+                        # radial_stop_radial_tolerance_m (0.020m). Capped at
+                        # 0.015, the largest value under that hard ceiling.
+                        "radial_stop_brake_margin_m": 0.015,
                         "radial_stop_stationary_window_sec": 0.50,
                         "radial_stop_stationary_displacement_m": 0.005,
                         "radial_stop_stationary_yaw_rate_radps": 0.050,
