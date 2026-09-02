@@ -614,8 +614,15 @@ class RPPController(Node):
         self.declare_parameter("terminal_stop_mode", "legacy")
         self.declare_parameter("radial_stop_radial_tolerance_m", 0.020)
         self.declare_parameter("radial_stop_terminal_guidance_distance_m", 0.75)
-        self.declare_parameter("radial_stop_conservative_decel_mps2", 0.30)
-        self.declare_parameter("radial_stop_brake_margin_m", 0.010)
+        # 2026-09-02 field runs (mission.csv_20260902_160021/160148): every
+        # point overshot the goal plane by 35-50mm despite the along<=0 zero
+        # guard firing exactly on time (speed_cmd hit 0.0 the same sample
+        # along crossed zero) -- pure physical coast, since 0.30/0.010 were
+        # unmeasured guesses. Widened as an interim mitigation pending the
+        # still-outstanding bench sweep, which should replace these with
+        # measured values, not just wider guesses.
+        self.declare_parameter("radial_stop_conservative_decel_mps2", 0.20)
+        self.declare_parameter("radial_stop_brake_margin_m", 0.05)
         self.declare_parameter("radial_stop_stationary_window_sec", 0.50)
         self.declare_parameter("radial_stop_stationary_displacement_m", 0.005)
         self.declare_parameter("radial_stop_stationary_yaw_rate_radps", 0.050)

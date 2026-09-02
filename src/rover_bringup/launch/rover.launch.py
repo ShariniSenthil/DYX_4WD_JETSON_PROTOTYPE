@@ -587,8 +587,16 @@ def generate_launch_description() -> LaunchDescription:
                         # to radial20 in the field. See the plan review.
                         "radial_stop_radial_tolerance_m": 0.020,
                         "radial_stop_terminal_guidance_distance_m": 0.75,
-                        "radial_stop_conservative_decel_mps2": 0.30,
-                        "radial_stop_brake_margin_m": 0.010,
+                        # 2026-09-02: widened 0.30->0.20 / 0.010->0.05 as an
+                        # interim mitigation for the 35-50mm physical-coast
+                        # overshoot seen on every point in
+                        # mission.csv_20260902_160021/160148 -- the along<=0
+                        # guard fired exactly on time, the drivetrain just
+                        # couldn't stop that fast. Still unmeasured guesses,
+                        # just wider ones; the bench sweep is still the real
+                        # fix.
+                        "radial_stop_conservative_decel_mps2": 0.20,
+                        "radial_stop_brake_margin_m": 0.05,
                         "radial_stop_stationary_window_sec": 0.50,
                         "radial_stop_stationary_displacement_m": 0.005,
                         "radial_stop_stationary_yaw_rate_radps": 0.050,
