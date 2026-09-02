@@ -167,13 +167,11 @@ class RPPController(Node):
         # along-track distance and zero is still controlled only by the exact
         # radial waypoint tolerance.
         self.declare_parameter("terminal_decel_correction_limit_deg", 3.0)
-        # 2026-09-01 field bags 184246/184406 showed the old production
-        # 3-degree near-goal cap saturating while cross-track continued to
-        # grow through the goal plane.  4.5 degrees restores modest steering
-        # authority during the final deceleration without approaching PX4's
-        # 45-degree native-pivot boundary; the outer deceleration cap remains
-        # independently limited by terminal_decel_correction_limit_deg.
-        self.declare_parameter("terminal_near_correction_limit_deg", 4.5)
+        # Reverted 2026-09-02: the 4.5deg value this held briefly was never
+        # grounded in a bag-based diagnosis (P1->P2 cross-track root cause is
+        # still unconfirmed -- see CLAUDE.md). Back to the known production
+        # baseline pending that diagnosis.
+        self.declare_parameter("terminal_near_correction_limit_deg", 1.0)
         self.declare_parameter("terminal_near_correction_start_distance_m", 0.15)
         self.declare_parameter("terminal_bearing_freeze_distance_m", 0.06)
         self.declare_parameter("terminal_correction_slew_rate_degps", 8.0)

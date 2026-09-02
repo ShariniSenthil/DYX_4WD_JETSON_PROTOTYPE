@@ -411,11 +411,10 @@ def generate_launch_description() -> LaunchDescription:
                         "deceleration_max_dt_sec": 0.10,
                         # Uneven-ground terminal steering separation.
                         "terminal_decel_correction_limit_deg": 12.0,
-                        # Field bags 184246/184406: the previous 3-degree
-                        # final cap pinned while cross-track grew through the
-                        # goal plane. Keep this well below the 12-degree
-                        # deceleration cap and PX4's 45-degree pivot entry.
-                        "terminal_near_correction_limit_deg": 4.5,
+                        # Reverted 2026-09-02: 4.5deg was never grounded in a
+                        # bag-based diagnosis. Back to the known production
+                        # baseline (3.0) pending that diagnosis.
+                        "terminal_near_correction_limit_deg": 3.0,
                         "terminal_near_correction_start_distance_m": 0.79,
                         "terminal_bearing_freeze_distance_m": 0.04,
                         "terminal_correction_slew_rate_degps": 15.0,
