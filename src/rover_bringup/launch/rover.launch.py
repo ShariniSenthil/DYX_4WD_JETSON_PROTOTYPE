@@ -66,7 +66,7 @@ TERMINAL_FLOOR_SPEED_MPS = 0.15
 # here is what keeps them from ever drifting apart when launched together --
 # see the plan review's mutual-exclusivity requirement (R1).
 # "legacy" | "precision_fsm" | "radial20"
-TERMINAL_STOP_MODE = "legacy"
+TERMINAL_STOP_MODE = "radial20"
 
 
 def generate_launch_description() -> LaunchDescription:
