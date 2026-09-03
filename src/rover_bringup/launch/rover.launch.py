@@ -593,7 +593,34 @@ def generate_launch_description() -> LaunchDescription:
                         # couldn't stop that fast. Still unmeasured guesses,
                         # just wider ones; the bench sweep is still the real
                         # fix.
-                        "radial_stop_conservative_decel_mps2": 0.20,
+                        #
+                        # 2026-09-03: raised 0.20->0.75 to fix a much bigger
+                        # problem introduced by the 1.0 m/s cruise deploy the
+                        # same day. At 0.20, stopping_distance(1.0 m/s) =
+                        # 1.0^2/(2*0.20) + brake_margin = 2.52 m, over 3x the
+                        # fixed 0.75 m radial_stop_terminal_guidance_distance_m
+                        # above -- so BRAKE_PROFILE was entered already "late"
+                        # relative to its own model and had to snap the
+                        # command from 1.00 m/s to ~0.51 m/s in a single
+                        # control cycle (confirmed in bag
+                        # mission.csv_20260903_101912/102226:
+                        # /rpp/command_speed_mps and /rpp/terminal_certificate,
+                        # 10/10 stops across both runs), felt as a hard brake
+                        # jerk, then crawled the last ~650mm at that gentle
+                        # 0.20 m/s^2 rate for 2.5-3s, much of it inside the
+                        # documented 0.143-0.219 m/s motor breakaway deadband
+                        # (the "slow creep"). 0.75 is the smallest value that
+                        # clears stopping_distance(1.0 m/s, 0.75) = 0.68 m <=
+                        # 0.75 m, restoring a continuous (non-jumping) speed
+                        # at BRAKE_PROFILE entry. NOTE: 0.20 was itself a
+                        # 2026-09-02 reduction from 0.30 to fix a DIFFERENT
+                        # problem -- 35-50mm terminal overshoot because the
+                        # drivetrain couldn't brake that hard near the goal.
+                        # Neither 0.20/0.30 nor this 0.75 has been bench-swept
+                        # -- watch the next run's terminal overshoot at
+                        # arrival (not just the entry jerk) in case 0.75
+                        # reintroduces that older failure mode.
+                        "radial_stop_conservative_decel_mps2": 0.75,
                         # 0.05 crashed rpp_controller_node on startup:
                         # RadialStopConfig requires brake_margin_m <=
                         # radial_stop_radial_tolerance_m (0.020m). Capped at
