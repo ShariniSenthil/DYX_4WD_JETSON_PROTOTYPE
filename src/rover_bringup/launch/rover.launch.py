@@ -37,7 +37,7 @@ MISSION_METADATA_FILE = (
 # recomputes its acceleration/deceleration rates from it at init -- so this is
 # a restart-time setting, never a live `ros2 param set`.
 #
-# STAGED BRING-UP, 2026-09-01: 0.40 -> **0.60** -> 0.80 -> 1.00.
+# STAGED BRING-UP, 2026-09-01: 0.40 -> 0.60 -> 0.80 -> **1.00**.
 #
 # Step 1 (0.40) is measured and closed. With RO_SPEED_LIM raised to 1.2 and
 # RO_SPEED_I raised 0 -> 0.2 on the FCU, achieved speed went from 0.235 m/s
@@ -45,18 +45,16 @@ MISSION_METADATA_FILE = (
 # PX4 speed loop's integrator still converging, not a clamp: PX4's internally
 # used setpoint was proven from ulog to be the full 0.400 m/s.
 #
-# Step 2 raises this to 0.60. Prerequisites are already satisfied on the FCU
-# (RO_SPEED_LIM 1.2 > 0.60, RO_SPEED_I 0.2), so this is a restart-only change.
-# Feedforward interaction to watch: PX4 throttle is roughly
-# setpoint/RO_MAX_THR_SPEED, so 0.60 asks for 0.32 throttle versus 0.21 at
-# 0.40 -- further out of the measured 0.143-0.219 breakaway deadband, so
-# tracking should IMPROVE, not degrade, as speed rises.
-#
-# Before going past ~0.60, settle RO_MAX_THR_SPEED: no log yet contains
-# throttle above 0.277, and the measured local slope there is 1.25 m/s per
-# unit throttle against the 1.9 the feedforward assumes. See CLAUDE.md
-# 2026-09-01 session notes for the bench sweep that would resolve it.
-CRUISE_SPEED_MPS = 0.60
+# 2026-09-03: raised straight to 1.00 (skipping the 0.60/0.80 intermediate
+# steps) at explicit operator instruction, WITHOUT the RO_MAX_THR_SPEED bench
+# sweep the 2026-09-01 session recommended before going past ~0.60. No log
+# has ever contained throttle above 0.277, and the measured local slope there
+# (1.25 m/s per unit throttle) disagrees with the 1.9 the feedforward assumes
+# -- so tracking accuracy and PX4's speed-loop margin at 1.00 m/s are
+# UNVERIFIED from data. 1.00 m/s also sits exactly at cmd_vel_bridge's
+# non-overridable ABSOLUTE_MAXIMUM_SPEED_MPS ceiling, i.e. zero headroom.
+# Watch the first run closely and be ready to drop this back down.
+CRUISE_SPEED_MPS = 1.00
 TERMINAL_FLOOR_SPEED_MPS = 0.15
 
 # Single source of truth for which terminal-stop authority is active.
