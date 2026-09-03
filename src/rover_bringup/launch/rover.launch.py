@@ -343,7 +343,19 @@ def generate_launch_description() -> LaunchDescription:
                         # -- it only reduces speed while that pre-existing
                         # offset is still being corrected. See P4 bag
                         # forensic analysis (2026-08-27).
-                        "acceleration_distance_m": 0.50,
+                        # 2026-09-03: raised 0.50->1.00 at explicit operator
+                        # instruction. acceleration_rate = cruise_speed^2 /
+                        # (2*acceleration_distance), so at cruise=1.00 m/s
+                        # this halves the ramp rate 1.0 -> 0.5 m/s^2 and
+                        # doubles the theoretical ramp duration 1.0 -> 2.0s.
+                        # Measured in mission.csv_20260903_113411/113625/113846
+                        # (morning_run_2, post radial_stop_conservative_decel_
+                        # mps2=0.75 brake fix): cmd_speed reached 1.0 m/s at
+                        # ~0.52-0.63m / ~1.55-2.1s from a standing start at
+                        # the old 0.50m setting -- already past the 0.5m
+                        # theoretical target, so expect roughly ~1.05-1.15m /
+                        # ~2.5-2.7s to reach cruise at this new 1.00m setting.
+                        "acceleration_distance_m": 1.00,
                         # Bootstrap ceiling exists only to prevent drivetrain
                         # deadlock; the profile itself starts from literal zero.
                         #
