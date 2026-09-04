@@ -635,9 +635,49 @@ def generate_launch_description() -> LaunchDescription:
                         "radial_stop_conservative_decel_mps2": 0.75,
                         # 0.05 crashed rpp_controller_node on startup:
                         # RadialStopConfig requires brake_margin_m <=
-                        # radial_stop_radial_tolerance_m (0.020m). Capped at
-                        # 0.015, the largest value under that hard ceiling.
-                        "radial_stop_brake_margin_m": 0.015,
+                        # radial_stop_radial_tolerance_m (0.020m), so 0.020 is
+                        # the hard ceiling here.
+                        #
+                        # 2026-09-04: 0.015 -> 0.003. Measured from the
+                        # 2026-09-03 evening dataset (8 bags + 8 ulogs, 43
+                        # waypoints, raw GNSS RTK-FIXED for 100% of every
+                        # run): 35/43 points stopped SHORT of the surveyed
+                        # target, median 18.3 mm, sign test p = 4.2e-5, and
+                        # the settled EKF agreed with raw RTK to a median of
+                        # 1.1 mm -- so the short stop is the profile, not the
+                        # estimator.
+                        #
+                        # Mechanism. BRAKE_PROFILE commands
+                        #   sqrt(2 * conservative_decel * (along_rem - margin))
+                        # which crosses the measured 0.143 m/s motor breakaway
+                        # at margin + 0.143^2/(2*decel):
+                        #   0.015 / 0.75 -> 0.0286 m     (as-run 2026-09-03)
+                        #   0.003 / 0.75 -> 0.0166 m     (this change)
+                        # Inside that distance the command is below what the
+                        # Sabertooth pair can turn the wheels with, so the
+                        # rover stalls and the remainder is never driven.
+                        # Confirmed in mission.csv_20260903_174520: median
+                        # advance after the last non-zero command was -0.2 mm.
+                        #
+                        # conservative_decel_mps2 is left at 0.75 ON PURPOSE.
+                        # Raising it shrinks d_break too, but it also brings
+                        # BRAKE_PROFILE entry closer to the goal and that is
+                        # exactly what produced the 2026-09-02 35-50 mm coast
+                        # overshoot recorded above. One term at a time so the
+                        # next run's terminal error stays attributable. If the
+                        # next run lands short by roughly 3-17 mm as predicted
+                        # and shows no overshoot, 0.75 -> 1.00 is the staged
+                        # next step (d_break -> 0.0132 m).
+                        #
+                        # KNOWN LIMIT, do not expect this to reach zero. The
+                        # rover cannot be commanded below ~0.15 m/s (it does
+                        # not move) and cannot stop in under ~35 mm from that
+                        # speed (the 2026-09-02 overshoot). Ramping to zero
+                        # lands short; holding the floor lands long. Landing
+                        # ON the point needs a settle-then-remeasure-then-
+                        # creep retry, which is a controller change, not a
+                        # tuning value.
+                        "radial_stop_brake_margin_m": 0.003,
                         "radial_stop_stationary_window_sec": 0.50,
                         "radial_stop_stationary_displacement_m": 0.005,
                         "radial_stop_stationary_yaw_rate_radps": 0.050,

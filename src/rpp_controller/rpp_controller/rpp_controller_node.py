@@ -623,9 +623,23 @@ class RPPController(Node):
         # measured values, not just wider guesses.
         self.declare_parameter("radial_stop_conservative_decel_mps2", 0.20)
         # 0.05 crashed the node on startup: RadialStopConfig.__post_init__
-        # requires brake_margin_m <= radial_tolerance_m (0.020m). Capped at
-        # 0.015, the largest value under that hard ceiling.
-        self.declare_parameter("radial_stop_brake_margin_m", 0.015)
+        # requires brake_margin_m <= radial_tolerance_m (0.020m), so the
+        # ceiling here is 0.020 and nothing above it is reachable.
+        #
+        # 2026-09-04: lowered 0.015 -> 0.003 on measured evidence from the
+        # 2026-09-03 evening runs (8 bags / 8 ulogs, 43 waypoints). The brake
+        # profile is sqrt(2*a*(along_remaining - brake_margin)), so it falls
+        # under the measured 0.143 m/s motor breakaway at
+        #     d_break = brake_margin + 0.143^2 / (2 * conservative_decel)
+        # which was 0.0286 m at 0.015/0.75 -- the last ~29 mm was commanded
+        # but not executable, and the rover simply stalled there. Raw
+        # RTK-FIXED truth: 35/43 points stopped SHORT, median 18.3 mm, sign
+        # test p = 4.2e-5. At 0.003 the same formula gives d_break = 0.0166 m.
+        # conservative_decel_mps2 is deliberately NOT raised alongside this:
+        # it would shrink d_break further but reintroduces the 2026-09-02
+        # 35-50 mm coast overshoot, and changing one term at a time keeps the
+        # next run's result attributable.
+        self.declare_parameter("radial_stop_brake_margin_m", 0.003)
         self.declare_parameter("radial_stop_stationary_window_sec", 0.50)
         self.declare_parameter("radial_stop_stationary_displacement_m", 0.005)
         self.declare_parameter("radial_stop_stationary_yaw_rate_radps", 0.050)
