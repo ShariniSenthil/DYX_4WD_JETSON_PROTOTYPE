@@ -419,6 +419,17 @@ class TrajectoryGenerator(Node):
             retained_qos,
         )
 
+        # Surveyed geodetic targets, exactly as uploaded. This is the ONLY
+        # place the un-projected mission coordinates leave this node, and it
+        # exists so mission_manager can report physical stop accuracy against
+        # the surveyed point instead of against a projected local goal.
+        # Report path only -- nothing steers from this topic.
+        self.survey_targets_pub = self.create_publisher(
+            String,
+            "/trajectory_generator/survey_targets",
+            retained_qos,
+        )
+
         self.ready_pub = self.create_publisher(
             Bool,
             "/trajectory_generator/ready",
@@ -2133,6 +2144,47 @@ class TrajectoryGenerator(Node):
         message.data = signature or ""
         self.path_signature_pub.publish(message)
 
+    def _publish_survey_targets(
+        self,
+        signature: str | None,
+        *,
+        cleared: bool = False,
+    ) -> None:
+        """Publish the surveyed lat/lon for each marking point.
+
+        Only GPS missions have a surveyed coordinate; a local-ENU mission
+        publishes an explicitly empty payload so mission_manager reports
+        survey truth as unavailable rather than inventing a reference.
+        """
+
+        payload: dict = {
+            "schema": "dyx4wd/survey_targets@1",
+            "coordinate_mode": self.raw_coordinate_mode or "unknown",
+            "path_signature": signature or "",
+            "points": [],
+        }
+        if cleared:
+            # A cleared/invalid mission must retract the targets, not leave the
+            # last mission's coordinates latched for the next report.
+            payload["coordinate_mode"] = "none"
+        elif self.raw_coordinate_mode == "gps":
+            for index, point in enumerate(self.raw_marking_points):
+                latitude, longitude = float(point[0]), float(point[1])
+                if not (math.isfinite(latitude) and math.isfinite(longitude)):
+                    payload["points"] = []
+                    break
+                payload["points"].append(
+                    {
+                        "point_id": f"P{index+1:04d}",
+                        "point_index": index,
+                        "latitude": latitude,
+                        "longitude": longitude,
+                    }
+                )
+        message = String()
+        message.data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        self.survey_targets_pub.publish(message)
+
     def _publish_empty_outputs(
         self,
     ) -> None:
@@ -2153,6 +2205,8 @@ class TrajectoryGenerator(Node):
         )
 
         self._publish_path_signature(None)
+
+        self._publish_survey_targets(None, cleared=True)
 
     def _publish_status(
         self,
@@ -2429,6 +2483,8 @@ class TrajectoryGenerator(Node):
                 # Commit marker: subscribers install the separately retained
                 # path components only after this matching signature arrives.
                 self._publish_path_signature(signature)
+
+                self._publish_survey_targets(signature)
 
                 self.prepare_requested = False
                 self.preparing = False

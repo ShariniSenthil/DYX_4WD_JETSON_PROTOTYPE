@@ -24,6 +24,7 @@ deceleration, pivot commands, heading alignment or cross-track correction.
 
 from __future__ import annotations
 
+import collections
 import copy
 import json
 import math
@@ -54,6 +55,11 @@ from mission_manager.path_contract import (
     is_valid_path_signature,
     make_goal_instance_id,
     resolve_path_signature,
+)
+from mission_manager.survey_truth import (
+    GnssFix,
+    SurveyTarget,
+    compute_survey_truth,
 )
 from mission_manager.precision_terminal_policy import (
     PrecisionTerminalDecision,
@@ -113,6 +119,17 @@ class MissionManager(Node):
         # ----------------------------------------------------------
         self.declare_parameter("local_frame", "map")
         self.declare_parameter("marking_tolerance_m", 0.03)
+        # Survey-truth reporting (raw GNSS vs the surveyed mission coordinate).
+        # REPORT ONLY: these never gate motion, spray, or the point verdict --
+        # the 30 mm latch stays on RPP exactly as before. See survey_truth.py.
+        self.declare_parameter("survey_truth_enabled", True)
+        self.declare_parameter("survey_truth_window_sec", 2.0)
+        self.declare_parameter("survey_truth_minimum_samples", 3)
+        # 60 mm: a parked window scatters 8.7 mm p95 on RTK FIXED (2026-09-03,
+        # 43 stops), so this rejects a window the rover was still moving
+        # through without rejecting a genuine stop.
+        self.declare_parameter("survey_truth_max_scatter_m", 0.060)
+        self.declare_parameter("survey_truth_history_sec", 12.0)
         self.declare_parameter("arrival_settle_sec", 0.30)
         self.declare_parameter("marking_hold_sec", 3.00)
         self.declare_parameter("stationary_speed_tolerance_mps", 0.01)
@@ -136,6 +153,21 @@ class MissionManager(Node):
         self.declare_parameter("precision_terminal_heartbeat_timeout_sec", 0.50)
 
         self.local_frame = str(self.get_parameter("local_frame").value).strip()
+        self.survey_truth_enabled = bool(
+            self.get_parameter("survey_truth_enabled").value
+        )
+        self.survey_truth_window_sec = float(
+            self.get_parameter("survey_truth_window_sec").value
+        )
+        self.survey_truth_minimum_samples = int(
+            self.get_parameter("survey_truth_minimum_samples").value
+        )
+        self.survey_truth_max_scatter_m = float(
+            self.get_parameter("survey_truth_max_scatter_m").value
+        )
+        self.survey_truth_history_sec = float(
+            self.get_parameter("survey_truth_history_sec").value
+        )
         self.marking_tolerance_m = float(
             self.get_parameter("marking_tolerance_m").value
         )
@@ -294,6 +326,13 @@ class MissionManager(Node):
             "/mavros/gpsstatus/gps1/raw",
             self._gps_status_callback,
             odom_qos,
+            callback_group=self._io_group,
+        )
+        self.create_subscription(
+            String,
+            "/trajectory_generator/survey_targets",
+            self._survey_targets_callback,
+            retained_qos,
             callback_group=self._io_group,
         )
         self.create_subscription(
@@ -561,6 +600,16 @@ class MissionManager(Node):
 
         self._gps_fix_type = 0
         self._last_gps_fix_rx_monotonic: Optional[float] = None
+        # Raw GNSS history, survey truth only. Sized from history_sec at the
+        # 10 Hz GPSRAW rate with headroom; bounded so it can never grow.
+        self._gnss_history: collections.deque[GnssFix] = collections.deque(
+            maxlen=max(16, int(self.survey_truth_history_sec * 20.0))
+        )
+        # Surveyed lat/lon exactly as uploaded, published by
+        # trajectory_generator. None until a GPS mission is prepared.
+        self._survey_targets: list[SurveyTarget] = []
+        self._survey_targets_signature: Optional[str] = None
+        self._survey_targets_mode: Optional[str] = None
         self._rtk_healthy = False
         self._last_rtk_health_rx_monotonic: Optional[float] = None
         self._rtk_correction_age_sec: Optional[float] = None
@@ -996,7 +1045,152 @@ class MissionManager(Node):
     def _gps_status_callback(self, message: GPSRAW) -> None:
         with self._lock:
             self._gps_fix_type = int(message.fix_type)
-            self._last_gps_fix_rx_monotonic = time.monotonic()
+            now = time.monotonic()
+            self._last_gps_fix_rx_monotonic = now
+            if not self.survey_truth_enabled:
+                return
+            # GPSRAW carries position and quality in one atomic message, so a
+            # sample can never be paired with a fix type from a different
+            # instant. lat/lon are int32 * 1e-7 deg (an 11.06 mm quantum).
+            try:
+                latitude = float(message.lat) * 1e-7
+                longitude = float(message.lon) * 1e-7
+                horizontal_accuracy = float(message.h_acc) * 1e-3
+                satellites = int(message.satellites_visible)
+            except (AttributeError, TypeError, ValueError):
+                return
+            if not (math.isfinite(latitude) and math.isfinite(longitude)):
+                return
+            if latitude == 0.0 and longitude == 0.0:
+                return
+            self._gnss_history.append(
+                GnssFix(
+                    monotonic_sec=now,
+                    latitude_deg=latitude,
+                    longitude_deg=longitude,
+                    fix_type=int(message.fix_type),
+                    satellites=satellites,
+                    horizontal_accuracy_m=horizontal_accuracy,
+                )
+            )
+
+    def _survey_targets_callback(self, message: String) -> None:
+        """Ingest the surveyed lat/lon that were uploaded with the mission.
+
+        Data only: these coordinates are the report's reference and are never
+        used to steer.  A malformed or non-GPS payload clears the targets, so
+        survey truth reports unavailable rather than reporting against a
+        stale mission.
+        """
+
+        try:
+            payload = json.loads(message.data or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        targets: list[SurveyTarget] = []
+        signature: Optional[str] = None
+        mode: Optional[str] = None
+        if isinstance(payload, dict):
+            mode = str(payload.get("coordinate_mode") or "").strip().lower() or None
+            raw_signature = payload.get("path_signature")
+            if isinstance(raw_signature, str) and raw_signature:
+                signature = raw_signature
+            entries = payload.get("points")
+            if isinstance(entries, list):
+                for index, entry in enumerate(entries):
+                    if not isinstance(entry, dict):
+                        targets = []
+                        break
+                    try:
+                        latitude = float(entry["latitude"])
+                        longitude = float(entry["longitude"])
+                    except (KeyError, TypeError, ValueError):
+                        targets = []
+                        break
+                    if not (
+                        math.isfinite(latitude) and math.isfinite(longitude)
+                    ):
+                        targets = []
+                        break
+                    point_index = entry.get("point_index")
+                    point_index = (
+                        int(point_index)
+                        if isinstance(point_index, int)
+                        else index
+                    )
+                    point_id = entry.get("point_id")
+                    targets.append(
+                        SurveyTarget(
+                            point_id=(
+                                str(point_id)
+                                if isinstance(point_id, str) and point_id
+                                else f"P{point_index+1:04d}"
+                            ),
+                            point_index=point_index,
+                            latitude_deg=latitude,
+                            longitude_deg=longitude,
+                        )
+                    )
+        with self._lock:
+            self._survey_targets = targets
+            self._survey_targets_signature = signature
+            self._survey_targets_mode = mode
+
+    def _survey_truth_for_point(self, marking_number: int) -> dict[str, Any]:
+        """Measure the physical stop against the surveyed coordinate.
+
+        Kept deliberately outside _capture_accuracy_snapshot's copy-only
+        contract: this is an INDEPENDENT measurement from a different sensor
+        and a different frame, not a recomputation of anything RPP reported.
+        Report only -- the caller never lets it decide an outcome.
+
+        Deliberately does NOT take self._lock. Six of the eight
+        _capture_accuracy_snapshot call sites already hold it and the lock is
+        not reentrant, so acquiring here would deadlock the control loop. The
+        two reads are safe without it: list(deque) is atomic in CPython, and
+        _survey_targets is only ever rebound wholesale in the subscription
+        callback, never mutated in place, so a reader sees either the whole
+        old mission or the whole new one and never a torn list.
+        """
+
+        if not self.survey_truth_enabled:
+            return {
+                "measurement_source": "RAW_GNSS_SURVEY",
+                "available": False,
+                "reason": "SURVEY_TRUTH_DISABLED",
+            }
+        target = None
+        previous = None
+        for candidate in self._survey_targets:
+            if candidate.point_index == marking_number:
+                target = candidate
+            elif candidate.point_index == marking_number - 1:
+                previous = candidate
+        if target is None and self._survey_targets_mode not in (None, "gps"):
+            return {
+                "measurement_source": "RAW_GNSS_SURVEY",
+                "available": False,
+                "reason": "MISSION_NOT_IN_GPS_COORDINATES",
+            }
+        truth = compute_survey_truth(
+            target=target,
+            previous_target=previous,
+            fixes=list(self._gnss_history),
+            now_monotonic_sec=time.monotonic(),
+            window_sec=self.survey_truth_window_sec,
+            minimum_samples=self.survey_truth_minimum_samples,
+            max_scatter_m=self.survey_truth_max_scatter_m,
+            tolerance_m=self.marking_tolerance_m,
+            # _yaw is ENU (0 = east, CCW). survey_truth works in the NED
+            # sense (0 = north, CW), same convention as the surveyed bearing
+            # it falls back from, so convert rather than passing it raw.
+            fallback_bearing_rad=(
+                (math.pi / 2.0) - self._yaw
+                if isinstance(self._yaw, float) and math.isfinite(self._yaw)
+                else None
+            ),
+        )
+        return truth.to_payload()
 
     def _rtk_health_callback(self, message: Bool) -> None:
         with self._lock:
@@ -2780,6 +2974,20 @@ class MissionManager(Node):
                 "speed_mps": None,
             }
 
+        # INDEPENDENT SECOND MEASUREMENT, report only.
+        #
+        # Everything above this line is a verbatim copy of what RPP decided in
+        # the estimator frame -- that is the control truth and it still owns
+        # every gate: the 30 mm latch, spray, and the point verdict are
+        # unchanged by anything below.
+        #
+        # `survey` is a different question answered from a different sensor:
+        # raw GNSS against the surveyed coordinate the operator uploaded. It
+        # is attached under its own key so the two can never be confused, and
+        # it is allowed to be unavailable (degraded fix, rover still moving,
+        # local-coordinate mission) without affecting the snapshot.
+        snapshot["survey"] = self._survey_truth_for_point(marking_number)
+
         if 0 <= marking_number < len(self._point_accuracy_snapshots):
             self._point_accuracy_snapshots[marking_number] = copy.deepcopy(snapshot)
 
@@ -3012,6 +3220,10 @@ class MissionManager(Node):
             "xtrack_mm": accuracy_payload.get("cross_track_error_mm"),
             "along_error_m": accuracy_payload.get("along_track_error_m"),
             "along_error_mm": accuracy_payload.get("along_track_error_mm"),
+            # Survey truth rides alongside, never merged into the flat RPP
+            # aliases above -- a consumer that wants physical error has to ask
+            # for it by name and therefore knows which frame it is reading.
+            "survey": copy.deepcopy(accuracy_payload.get("survey")),
             "overall_accuracy_mm": accuracy_payload.get("overall_accuracy_mm"),
             "accuracy": accuracy_payload,
             "spray": spray_payload,
@@ -3195,6 +3407,24 @@ class MissionManager(Node):
                 and self._rtk_correction_age_sec > self.MAX_RTK_CORRECTION_AGE_SEC
             ),
             "rtk_gate_mode": "FRESH_FIX_TYPE_6_ONLY",
+            # Survey-truth reporting health. The panel keeps showing RPP's
+            # live view; these say whether the REPORT will be able to carry a
+            # physical measurement for the points completed so far.
+            "survey_truth_enabled": self.survey_truth_enabled,
+            "survey_truth_targets_loaded": len(self._survey_targets),
+            "survey_truth_coordinate_mode": self._survey_targets_mode,
+            "survey_truth_gnss_samples": len(self._gnss_history),
+            "survey_truth_ready": bool(
+                self.survey_truth_enabled
+                and self._survey_targets
+                and len(self._gnss_history) >= self.survey_truth_minimum_samples
+            ),
+            "point_survey_snapshots": [
+                copy.deepcopy(snapshot.get("survey"))
+                if isinstance(snapshot, dict)
+                else None
+                for snapshot in self._point_accuracy_snapshots
+            ],
             "gps_fix_status_age_sec": round(
                 self._age(self._last_gps_fix_rx_monotonic), 3
             ),
