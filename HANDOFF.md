@@ -5,8 +5,14 @@ legs) and the patches that came out of it. Three landed, one was reverted. No
 field run was possible this session, so **everything applied here is unverified
 in the field** — that is stated per patch, with what to watch for.
 
-Dataset: `~/Documents/QGroundControl Daily/Logs/4WD/Madhavaram/Sep_03/evening_run_2/`
-(`Bags/` and `Ulogs/` side by side, all 8 bundles and all 8 ulogs present).
+Datasets:
+
+- `~/Documents/QGroundControl Daily/Logs/4WD/Madhavaram/Sep_03/evening_run_2/`
+  (`Bags/` and `Ulogs/` side by side, all 8 bundles and all 8 ulogs present)
+- `~/Documents/QGroundControl Daily/Logs/4WD/Madhavaram/Sep_04/Run_01/` — five
+  bundles pulled from the Jetson this session: `mission.csv_20260904_{141428,
+  141904,142609,142908,143312}`, 38 waypoints, 37 straight legs, 6 real pivots.
+  **These ran with Patch A already live**, so they verify it.
 
 | bag | ulog | role |
 |---|---|---|
@@ -35,12 +41,16 @@ Dataset: `~/Documents/QGroundControl Daily/Logs/4WD/Madhavaram/Sep_03/evening_ru
 | T2 | log_82 EKF false-position investigation | **NOT STARTED** |
 | T4 | Pivot → settle → reanchor → drive lifecycle | **NOT STARTED** |
 | T5 | Accuracy-panel vs report truth separation (spec) | **Superseded** by Patch B |
+| — | Sep-04 verification of Patch A + weakest-link ranking | **DONE** |
+| — | Tracking-architecture review vs the 3WD `PX4_DXP` stack | **DONE** |
+| — | Fix design for straight-line tracking (Steps 0/1/2) | **DESIGNED, NOT APPLIED** |
 | T6 | Ranked bug verdict table | **NOT STARTED** — needs T2 and T4 |
 
 Reports published this session:
 
 - T0 + T1 — https://claude.ai/code/artifact/606c5224-b35a-432d-b1e4-db60cfb14e36
 - T3 — https://claude.ai/code/artifact/93ca9eba-1f9f-486b-a169-251e26eba3fb
+- Sep-04 / what blocks 1 cm — https://claude.ai/code/artifact/c37fa012-47aa-4526-9487-4f90c060fb71
 
 ---
 
@@ -130,6 +140,128 @@ Rejected: **software delay.** The loop runs at 20.00 Hz with **0 deadline misses
 in 6 240 cycles**, compute 4.6 ms p50, odom age 15 ms p50.
 
 ---
+
+### Sep-04 Run_01 — Patch A verified, and cross-track is now the binding term
+
+38 waypoints, RTK FIXED throughout, `radial_stop_brake_margin_m: 0.003` live.
+
+**Patch A worked.** Median along-track went **+18.3 mm short → +6.7 mm short**;
+the command now runs to 8.8 mm remaining instead of 18.0 mm. The systematic
+short bias is gone.
+
+**What replaced it as the limit is cross-track**, which carries **66% of the
+radial error energy** (variance 1122 vs 566 mm²): |cross| p50 22.9 mm / p95
+63.3 mm against |along| p50 14.3 mm. Zero the cross term and 24 of 33 stops are
+already inside 20 mm; zero along and only 13 of 33 are. Radial p50 is 41.2 mm
+and 7 of 38 stops made 20 mm.
+
+The cross error is **inherited whole from the leg**:
+`corr(cross-track at end of cruise → physical cross error at the stop) =
++0.858`, and the terminal 0.75 m shifts it by only −3.2 mm (p50).
+
+Along-track bias is solved but the **spread is not**: 24/33 within ±20 mm,
+6 short by >20 mm, and 3 that overshoot by 38–43 mm having coasted 34–58 mm
+after the last command — while 24 of 38 last commands were still below the
+0.143 m/s breakaway. Both failure modes now appear in one dataset, which is the
+reachability limit showing up directly.
+
+**Longer legs did not help.** These legs are 6.0 m against Sep-03's 4.5 m and
+the loop still does not converge: |xtrack| 24.1 mm entering the cruise, 19.2 mm
+leaving it, improved on 19 of 37 legs, **27 of 37 crossing the line**. The
+Sep-03 reading that a 4.5 m leg was simply too short to contain one 3.7 m
+correction cycle was incomplete — length was not the constraint.
+
+### Pivots (Sep-04, 6 real pivots) — the pivot is not the problem
+
+Real pivots are ALIGNMENT blocks entered above 20° with under 1 m of walk; the
+other 20 ALIGNMENT blocks are alignment *drives* (1.9° median entry, up to 3.8 m
+travel) and pooling them corrupts every statistic.
+
+| | p50 | p95 | max |
+|---|---|---|---|
+| turn angle | 92° | 153° | 173° |
+| pivot walk | 575 mm | 636 | 651 |
+| **\|HE\| at exit** | **1.43°** | 6.61° | 7.57° |
+| **\|X\| at exit** | **21.0 mm** | 28.0 | 29.6 |
+| heading swing, first 2 m | 2.54° | 13.2° | 15.3° |
+| xtrack swing as reported, first 2 m | 63.5 mm | 126 | 142 |
+| physical curvature, same window | 6.1 mm | 80.7 | 124.5 |
+
+The pivot delivers good heading — **5 of 6 exit under 4°**. It does not deliver
+zero cross-track: **21.0 mm p50**, only 2 of 6 inside 20 mm.
+
+⚠ Roughly half the *reported* post-pivot swing is the reference line being
+rebuilt, not the rover moving (physical curvature 6.1 mm p50). The **172.7° row
+reversal** is the genuine outlier on every axis: exit HE 7.57°, heading swing
+15.3°, and 124.5 mm of real physical curvature.
+
+### Why straight-line tracking does not converge — the structural cause
+
+```
+lookahead time  = 0.9 s   (precision_lookahead_time_s x speed = 0.936 m @ 1.03 m/s)
+command→heading = 1.0 s   (EKF yaw), 1.2 s (course over ground, raw GNSS only)
+```
+
+**The actuation delay equals the lookahead time.** Pure pursuit is stable only
+when lookahead time comfortably exceeds loop delay; here the rover reaches the
+aim point about when it finishes turning toward it. That is the marginal
+stability condition, and it produces exactly the measured 3.59 s correction
+cycle with no net convergence.
+
+The delay is structural: `cmd_vel_bridge` sends `type_mask = 3527`
+(`IGNORE_YAW | IGNORE_YAW_RATE`, `yaw = 0.0`, `yaw_rate = 0.0`), so **the
+controller has no heading authority at all**. It steers by rotating the
+velocity vector and waiting for PX4 to infer a turn from `atan2(vE, vN)`.
+
+⚠ **`line_tracking_lookahead_m: 0.55` is not the lookahead that runs.**
+`precision_guidance_enabled` is true, so `guidance.py:11` uses
+`clamp(precision_lookahead_time_s x speed + xtrack_gain x |xtrack|, 0.2, 1.0)`
+with the gain at 0.0. Measured live: 0.936 m. Tune the time constant.
+
+### The 3WD `PX4_DXP` stack, for comparison
+
+Same output topic (`/mavros/setpoint_raw/local`, PositionTarget, 50 Hz) and the
+same controller/bridge split. The node is named `twist_to_setpoint` and the
+3WD CLAUDE.md mentions `setpoint_velocity/cmd_vel` (TwistStamped) — both are
+misleading; production publishes PositionTarget.
+
+The difference is the mask. `PX4_DXP/src/twist_to_setpoint_node.py` sends
+**2503** (velocity + **explicit yaw**, `msg.yaw = atan2(v_n, v_e)` recomputed
+every cycle) and **455** when a yaw-rate feedforward is live, switching
+dynamically. Its own comment gives the reason: PX4's derived-yaw path "lags on
+turns". Steering law is otherwise the same pure-pursuit core, with
+`l_d = clamp(1.6·v_smoothed + 0.05·|xtrack|, 0.52, 1.0)` and a
+`1.5·theta_e` yaw-rate feedforward clamped to ±0.45 rad/s.
+
+⚠ Do not port mask 455 on the strength of that tree alone: its own CLAUDE.md
+states velocity OFFBOARD *discards* `trajectory_setpoint.yawspeed`, so explicit
+**yaw** is the demonstrated half and the yaw-**rate** is not. (The operator
+states the 3WD achieves cm tracking at 1 m/s and that repo's speed notes are
+stale — do not repeat the "only at 0.35 m/s" caveat from its docs.)
+
+### FIX vs GUARD — the layering that matters
+
+| layer | what it does | current state |
+|---|---|---|
+| **Fix** | makes the lateral loop converge | broken (delay ≈ lookahead time) |
+| **Guard** | bounds damage when tracking is already wrong | **neutral** |
+
+Guards are `xtrack_priority_speed_mps` (= cruise, inert),
+`xtrack_priority_correction_limit_deg: 22`, and
+`terminal_goal_intercept_bearing_limit_deg: 22`. `bearing_clamp_fired` was
+**0 cycles** across the Sep-03 straight legs, so the clamps are not binding
+either — **the whole guard layer is currently inert, which is a clean baseline
+for measuring a fix.**
+
+⚠ **The cross-track speed cap was repeatedly mis-filed in this session as a
+defect to fix** (both reports, an earlier revision of this file, and commit
+`96c35e6` which set it to 0.60 and was reverted). **That framing was wrong and
+the revert was right.** Lookahead is `time_s × speed`, so capping 1.03 → 0.60
+shortens it 0.936 → 0.540 m and **step-changes pure-pursuit steering gain by
+~1.7× (gain ∝ 1/L)**, discontinuously, at the 15 mm engage threshold, with
+hysteresis on release — in a loop already marginally stable. That is a swing
+generator, and the operator observed exactly that in the field. Guards stay
+neutral while the fix is measured.
 
 ## 3. Patches
 
@@ -292,10 +424,14 @@ dataset; a gross transient divergence is a different failure and log_82 is the
 run to test it on. That run's `sep@rest` max was 105 mm, the joint highest.
 
 ### T4 — pivot → settle → reanchor → drive
-Not started, and now the higher-value one. T3 showed the lateral loop does not
-converge within a leg, so whatever cross-track the pivot and reanchor hand it
-largely survives to the stop (median entry error 22.6 mm, worst 93.4 mm).
-Reducing the entry error is the other half of the stop problem.
+**Partly answered by the Sep-04 dataset (see §2): the pivot is not the culprit.**
+It exits at 1.43° median heading error with 5 of 6 under 4°. What it does not
+deliver is zero cross-track — 21.0 mm p50 — and whether that is a failing
+reanchor is blocked on Step 0 observability. The 172.7° row reversal is the one
+pivot case with genuine physical curvature (124.5 mm) and deserves separate work.
+
+What remains unmeasured: reanchor bearing, xtrack/HE at translation release,
+post-settle creep, hold duration.
 
 Per pivot: entry bearing, exit heading error, physical pivot walk (RTK) vs odom
 walk, reanchor bearing, xtrack and HE at reanchor, xtrack/HE at translation
@@ -308,25 +444,78 @@ release, post-settle creep, hold duration.
 `/rpp/debug` + `/rpp/geometry_debug` + odom timestamps. If a run is ever possible
 again, getting those topics publishing would make T4 much cheaper.
 
-### T3 follow-up — the cross-track speed cap is a no-op (OPEN, nothing applied)
-Measured, not disputed, and nothing in the build addresses it.
+### THE MAIN OPEN ITEM — straight-line tracking does not converge
 
-`xtrack_priority_speed_mps` is set to `CRUISE_SPEED_MPS`, so the latch caps speed
-at exactly the speed it is capping. It was ENGAGED on **89.6% of cruise cycles**
-on 2026-09-03 and limited nothing. `update_xtrack_speed_cap_state`'s own
-docstring still describes it as "the hardened 0.15 m/s xtrack speed-cap latch".
+Cause and evidence are in §2. Nothing is applied. The designed fix, in order:
 
-Consequence, measured across 29 straight legs: the lateral correction cycle takes
-3.59 s, which at 1.03 m/s consumes 3.71 m of a 4.5 m leg, so the loop cannot
-converge inside a leg. |cross-track| was 22.6 mm entering the cruise and 22.6 mm
-leaving it (median reduction +0.0 mm), and 22 of 29 legs crossed the line and
-finished on the opposite side.
+**Step 0 — observability. Prerequisite, do this first.**
+`rpp_controller` publishes **nothing** when it reanchors, and `/rpp/pivot_debug`
+exists as a topic with **zero messages**. So "did this pivot actually reanchor?"
+cannot be answered from any bag that exists. Publish the reanchor decision on
+`/rpp/pivot_debug`: outcome (`FIRED` / `DECLINED` / `FAILED`), the declining
+condition when it declines (`segment_runtime_reanchored` already set,
+`distance <= waypoint_tolerance`, `_install_runtime_entry_path` returned False),
+anchor x/y, goal x/y, resulting bearing, and cross-track immediately after.
+~20 lines, no runtime cost, no behaviour change.
 
-A patch setting this to 0.60 m/s was written and reverted. Whatever is done here
-instead, the constraint is that the correction distance (speed × 3.59 s) has to
-fit inside a leg. Lowering cruise speed and shortening `precision_lookahead_time_s`
-are the other two routes; neither has been tried, and no run exists at any
-lookahead other than 0.936 m.
+This is not optional bookkeeping. Twice this session a pivot/reanchor conclusion
+was drawn from the wrong observable and had to be retracted (see below).
+
+**Step 1 — explicit yaw. The structural fix.**
+In `cmd_vel_bridge`: drop `IGNORE_YAW` (mask `3527 -> 2503`) and set
+`msg.yaw = atan2(v_n, v_e)` in ENU, holding the last value below ~0.01 m/s to
+avoid `atan2(0,0)`. This removes PX4's heading-inference step, which is where
+the 1.0 s delay lives. The 3WD runs exactly this in production.
+
+⚠ **Main risk, needs a deliberate test.** 4WD pivots are executed by PX4's own
+differential logic reacting to the heading error implied by the velocity vector
+(`RD_TRANS_DRV_TRN = 45 deg`). Commanding yaw explicitly changes what PX4 is
+given as the target during that transition. Do **not** deploy straight to a
+marking mission: one straight-line run, then one run with a single 90 deg pivot,
+watching `/mavros/state` mode and the pivot walk.
+
+**Step 2 — `precision_lookahead_time_s`, only after Step 1 is measured.**
+With the delay reduced a shorter lookahead raises gain usefully instead of
+destabilising. Tuning it now, against a 1.0 s delay, trades oscillation for
+sluggishness. No run exists at any lookahead other than 0.936 m.
+
+**Guards stay neutral throughout** — see the FIX vs GUARD table in §2. If the
+loop converges the xtrack cap never engages and its value stops mattering.
+
+### Reanchor — correct in source, unverifiable in the field
+
+Two claims made this session were **wrong and are retracted**; recorded so they
+are not re-derived:
+
+1. ⛔ *"The runtime line is anchored before the pivot walk, so the pivot throws
+   the rover off the line it just built."* **False.**
+   `/runtime_nav_path` is published by **mission_manager**
+   (`mission_manager_node.py:420`) and republished as goals advance — its point
+   count falls monotonically through a run (1120 -> 995 -> 882 -> 758 -> 626 ->
+   496 on `mission.csv_20260904_141428`). It has nothing to do with the
+   reanchor, and timing it against pivots proves nothing.
+
+2. ⛔ *"The cross-track speed cap being a no-op is a defect to fix."* **False,
+   see §2** — it is a guard held neutral, and lowering it step-changes loop gain.
+
+What the source actually does, verified by reading:
+`legacy_alignment._settle_certificate_and_hold` emits `REANCHOR_ZERO` only after
+`_chassis_stationary_debounced` passes and the `settle_sec` dwell elapses — i.e.
+**after** the pivot settles. `reanchor_runtime_path_after_pivot` anchors at
+`self.current_x/current_y` (post-pivot position) and never moves the goal. When
+it succeeds, `path_bearing` follows the reanchored line
+(`rpp_controller_node.py:9370-9382`). **CLAUDE.md's description is accurate.**
+
+Also verified, because it would have invalidated the whole tracking analysis:
+`/rpp/debug.cross_track_error_mm` comes from `goal_signed_cross_track`
+(`rpp_controller_node.py:9442`), computed against `path_bearing` — which IS the
+reanchored line. So the leg-convergence numbers are genuine tracking error, not
+an artefact of measuring against `/nav_path`.
+
+**Still open:** cross-track at pivot exit is 21.0 mm p50 when a successful
+reanchor should leave it near zero by construction. Either the reanchor is
+declining or something moves the reference afterwards. **Step 0 answers this;
+nothing else can.**
 
 ### T6 — ranked bug verdict table
 Blocked on T2 and T4.
@@ -344,8 +533,10 @@ Blocked on T2 and T4.
 - **`line_tracking_lookahead_m: 0.55` does not govern.** `precision_guidance_enabled`
   is true, so `guidance.py` uses
   `clamp(lookahead_time_s · speed + xtrack_lookahead_gain · |xtrack|, 0.2, 1.0)`.
-  CLAUDE.md's note about 0.55 / 0.35–0.8 adaptive describes an inactive path and
-  should be corrected there.
+  CLAUDE.md's note about 0.55 / 0.35–0.8 adaptive describes an inactive path.
+  **Corrected in CLAUDE.md on 2026-09-04** — but CLAUDE.md is gitignored in this
+  repo, so that correction is local to the machine it was written on and this
+  file is the only copy that travels.
 - **`xtrack_priority_lookahead_m: 0.55` appears unreachable** while precision
   guidance is on — measured lookahead stayed 0.936 m throughout. Worth confirming
   in code whether that parameter can ever apply.
@@ -367,6 +558,10 @@ Blocked on T2 and T4.
   are not preserved in the repo. Everything they produced is in the two published
   reports and in `CLAUDE.md`. If T2/T4 are picked up, they will need to be
   rewritten — budget for that.
+- **Verify which node publishes a topic before reading anything into its
+  timing.** Two conclusions this session were drawn from `/runtime_nav_path`
+  and had to be retracted; it belongs to `mission_manager`, not the reanchor.
+  `grep -rn "<topic>" src/ --include="*.py"` first, every time.
 - One caution from experience this session: a topic missing from a decoder's
   subscription list returns "0 of 0" and looks exactly like a real finding. It
   happened once here (`xtrack_speed_cap_active`) and would have inverted a
