@@ -387,6 +387,14 @@ class RoverState:
                 "start_failed_stage": None,
                 "arrival_settle_elapsed_sec": 0.0,
                 "arrival_settle_required_sec": 0.30,
+                # Survey-truth recording health, defaulted OFF so a backend
+                # that has not yet heard from mission_manager never claims
+                # physical truth is being captured when it may not be.
+                "survey_truth_enabled": False,
+                "survey_truth_ready": False,
+                "survey_truth_targets_loaded": 0,
+                "survey_truth_gnss_samples": 0,
+                "survey_truth_coordinate_mode": None,
                 "hold_elapsed_sec": 0.0,
                 "hold_required_sec": 3.0,
                 "alignment_active": False,

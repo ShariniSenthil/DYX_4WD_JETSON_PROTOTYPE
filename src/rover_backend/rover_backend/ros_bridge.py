@@ -2431,6 +2431,33 @@ class RoverBackendRosNode(Node):
                 "point_status",
                 [],
             ),
+            # Survey-truth RECORDING HEALTH. Scalars only -- these say whether
+            # the mission will be able to carry a physical measurement, so the
+            # operator learns before starting that targets did not load or GNSS
+            # is not streaming, instead of finding an empty report afterwards.
+            # The per-point survey measurements themselves travel on the report
+            # (accuracy.survey), not on this high-rate channel.
+            "survey_truth_enabled": bool(
+                payload.get("survey_truth_enabled", False)
+            ),
+            "survey_truth_ready": bool(payload.get("survey_truth_ready", False)),
+            "survey_truth_targets_loaded": int(
+                _finite_float(
+                    payload.get("survey_truth_targets_loaded"),
+                    0.0,
+                )
+                or 0.0
+            ),
+            "survey_truth_gnss_samples": int(
+                _finite_float(
+                    payload.get("survey_truth_gnss_samples"),
+                    0.0,
+                )
+                or 0.0
+            ),
+            "survey_truth_coordinate_mode": payload.get(
+                "survey_truth_coordinate_mode"
+            ),
             "message": payload.get("message"),
             "error": payload.get("error"),
         }

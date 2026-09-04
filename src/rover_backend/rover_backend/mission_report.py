@@ -429,6 +429,29 @@ class MissionReportStore:
                 if key in accuracy:
                     canonical_accuracy[key] = copy.deepcopy(accuracy[key])
 
+        # ----------------------------------------------------------
+        # SURVEY TRUTH -- passthrough only.
+        #
+        # accuracy["survey"] is an INDEPENDENT measurement produced by
+        # mission_manager from raw RTK GNSS against the surveyed coordinate
+        # the operator uploaded. It is not derived from anything above it and
+        # the backend must not touch it: no recalculation, no normalisation,
+        # no unit conversion, no defaulting. It carries its own `available`
+        # and `reason`, so an unusable measurement stays visibly unusable
+        # rather than being quietly replaced by the RPP numbers.
+        #
+        # Deliberately OUTSIDE the `if source_is_rpp:` block above. Survey
+        # truth does not depend on RPP having produced a valid terminal
+        # result -- a point RPP could not measure may still have a perfectly
+        # good physical measurement, and folding this into that branch would
+        # silently couple the two. See test_survey_truth_survives_when_rpp_
+        # accuracy_is_unavailable.
+        # ----------------------------------------------------------
+        survey = accuracy.get("survey")
+
+        if isinstance(survey, dict):
+            canonical_accuracy["survey"] = copy.deepcopy(survey)
+
         return {
             "point_id": f"P{index + 1:04d}",
             "point_index": index,

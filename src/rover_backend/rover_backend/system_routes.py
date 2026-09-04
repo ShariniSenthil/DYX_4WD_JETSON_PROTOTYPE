@@ -377,6 +377,15 @@ def build_mission_status_payload() -> dict[str, Any]:
             or settings.arrival_settle_seconds
         ),
         "alignment_active": bool(mission.get("alignment_active", False)),
+        "survey_truth_enabled": bool(mission.get("survey_truth_enabled", False)),
+        "survey_truth_ready": bool(mission.get("survey_truth_ready", False)),
+        "survey_truth_targets_loaded": int(
+            _finite_float(mission.get("survey_truth_targets_loaded"), 0.0) or 0.0
+        ),
+        "survey_truth_gnss_samples": int(
+            _finite_float(mission.get("survey_truth_gnss_samples"), 0.0) or 0.0
+        ),
+        "survey_truth_coordinate_mode": mission.get("survey_truth_coordinate_mode"),
         "hold_elapsed_sec": (
             _finite_float(
                 mission.get("hold_elapsed_sec"),
