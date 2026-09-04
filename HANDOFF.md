@@ -39,11 +39,11 @@ Datasets:
 | T3 | Straight-line tracking / the 3–5 cm weave | **DONE** |
 | — | Patch C: cross-track recovery speed | **REVERTED — not applied.** Finding stands, see §6 |
 | T2 | log_82 EKF false-position investigation | **NOT STARTED** |
-| T4 | Pivot → settle → reanchor → drive lifecycle | **NOT STARTED** |
+| T4 | Pivot → settle → reanchor → drive lifecycle | **INSTRUMENTED, FIELD VERIFICATION PENDING** |
 | T5 | Accuracy-panel vs report truth separation (spec) | **Superseded** by Patch B |
 | — | Sep-04 verification of Patch A + weakest-link ranking | **DONE** |
 | — | Tracking-architecture review vs the 3WD `PX4_DXP` stack | **DONE** |
-| — | Fix design for straight-line tracking (Steps 0/1/2) | **DESIGNED, NOT APPLIED** |
+| — | Straight-line tracking fix plan | **STEP 0 APPLIED (`60d4149`); STEPS 1/2 NOT APPLIED** |
 | T6 | Ranked bug verdict table | **NOT STARTED** — needs T2 and T4 |
 
 Reports published this session:
@@ -346,6 +346,49 @@ Six tests in `test_precision_mission_report.py`. Frontend work (types, remark,
 export columns) is the operator's and lives in the separate
 `DYX_GCS_Frontend` repo.
 
+### Patch E — post-pivot reanchor observability · `60d4149`
+
+Diagnostics only. **No rover control behaviour, return value, fallback, speed,
+lookahead, brake profile, pivot logic, or PX4 command was changed.**
+
+`rpp_controller.reanchor_runtime_path_after_pivot()` now publishes one
+best-effort structured event on `/rpp/pivot_debug` for every decision:
+
+- `FIRED / runtime_path_installed`
+- `DECLINED / segment_runtime_reanchored`
+- `DECLINED / distance_le_waypoint_tolerance`
+- `DECLINED / _install_runtime_entry_path_returned_false`
+- `FAILED / missing_anchor_or_goal`
+
+The payload carries `source=RPP_POST_PIVOT_REANCHOR`, schema version, goal
+number, post-pivot anchor x/y, goal x/y, resulting bearing, and immediate
+cross-track. On `FIRED`, immediate cross-track is `0.0` by construction because
+the regenerated C'→goal line starts at the rover's current post-pivot position.
+
+Publication is exception-contained and is never control authority. A failed
+debug publisher therefore cannot change the original success/failure result of
+the reanchor function.
+
+Regression coverage was committed with the controller change. Verification
+before commit/push:
+
+- focused reanchor telemetry tests: **11 passed**
+- functional `rpp_controller` suite: **436 passed**
+- Python syntax / compile checks: passed
+- `git diff --check`: passed
+- simulated publisher failure preserved the original controller result
+- all five decision paths emitted exactly one correctly classified event
+
+ROS ament lint wrappers were not available on the local machine because their
+Python modules are not installed.
+
+Commit `60d4149 feat(rpp): instrument post-pivot reanchor decisions` was pushed
+to `origin/feat/rtk-injection-v2` on 2026-09-04.
+
+**Not deployed and not field-verified.** A rover test is not currently possible,
+so Step 0 is complete at source/test/repository level only. Do not claim that a
+real pivot has emitted this event until a future bag verifies it.
+
 ### Patch C — cross-track recovery speed · **REVERTED, NOT IN THE BUILD**
 
 Proposed as `xtrack_priority_speed_mps: 1.00 → 0.60`, committed, then reverted
@@ -424,42 +467,53 @@ dataset; a gross transient divergence is a different failure and log_82 is the
 run to test it on. That run's `sep@rest` max was 105 mm, the joint highest.
 
 ### T4 — pivot → settle → reanchor → drive
-**Partly answered by the Sep-04 dataset (see §2): the pivot is not the culprit.**
-It exits at 1.43° median heading error with 5 of 6 under 4°. What it does not
-deliver is zero cross-track — 21.0 mm p50 — and whether that is a failing
-reanchor is blocked on Step 0 observability. The 172.7° row reversal is the one
-pivot case with genuine physical curvature (124.5 mm) and deserves separate work.
+**Partly answered by the Sep-04 dataset (see §2): the pivot itself is not the
+primary culprit.** It exits at 1.43° median heading error with 5 of 6 under 4°.
+The 172.7° row reversal remains the genuine outlier, with 124.5 mm of physical
+curvature.
 
-What remains unmeasured: reanchor bearing, xtrack/HE at translation release,
-post-settle creep, hold duration.
+The previous observability blocker is now fixed in source by Patch E
+(`60d4149`). Future runs can directly show whether
+`reanchor_runtime_path_after_pivot()` fired, declined, or failed and what C'→goal
+geometry it created.
 
-Per pivot: entry bearing, exit heading error, physical pivot walk (RTK) vs odom
-walk, reanchor bearing, xtrack and HE at reanchor, xtrack/HE at translation
-release, post-settle creep, hold duration.
+**However, no rover test is currently possible.** Therefore T4 is still open at
+the field-evidence level. Existing Sep-04 bags predate Patch E and cannot prove
+the new events work on the rover.
 
-⚠ **Evidence gap:** `/rpp/pivot_debug`, `/rpp/speed_debug`,
+Still unmeasured in a field run: reanchor bearing from the new event, xtrack/HE
+at translation release, post-settle creep, and hold duration.
+
+Per future pivot: entry bearing, exit heading error, physical pivot walk (RTK)
+vs odom walk, reanchor outcome/reason, anchor x/y, goal x/y, reanchor bearing,
+xtrack/HE at translation release, post-settle creep, and hold duration.
+
+Historical evidence gap: `/rpp/pivot_debug`, `/rpp/speed_debug`,
 `/rpp/tracking_debug`, `/rpp/terminal_bearing_frozen`,
 `/rpp/terminal_precision_armed` and `/rpp/terminal_correction_deg` all recorded
-**0 messages** in these bags. Pivot lifecycle has to be reconstructed from
-`/rpp/debug` + `/rpp/geometry_debug` + odom timestamps. If a run is ever possible
-again, getting those topics publishing would make T4 much cheaper.
+0 messages in the old bags. Those old runs still require reconstruction from
+`/rpp/debug` + `/rpp/geometry_debug` + odom timestamps.
 
 ### THE MAIN OPEN ITEM — straight-line tracking does not converge
 
 Cause and evidence are in §2. Nothing is applied. The designed fix, in order:
 
-**Step 0 — observability. Prerequisite, do this first.**
-`rpp_controller` publishes **nothing** when it reanchors, and `/rpp/pivot_debug`
-exists as a topic with **zero messages**. So "did this pivot actually reanchor?"
-cannot be answered from any bag that exists. Publish the reanchor decision on
-`/rpp/pivot_debug`: outcome (`FIRED` / `DECLINED` / `FAILED`), the declining
-condition when it declines (`segment_runtime_reanchored` already set,
-`distance <= waypoint_tolerance`, `_install_runtime_entry_path` returned False),
-anchor x/y, goal x/y, resulting bearing, and cross-track immediately after.
-~20 lines, no runtime cost, no behaviour change.
+**Step 0 — observability. DONE in `60d4149`, not field-verified.**
+`rpp_controller` now publishes the post-pivot runtime-reanchor decision on
+`/rpp/pivot_debug` with source `RPP_POST_PIVOT_REANCHOR`: outcome
+(`FIRED` / `DECLINED` / `FAILED`), exact reason, anchor x/y, goal x/y, resulting
+bearing, and immediate cross-track.
 
-This is not optional bookkeeping. Twice this session a pivot/reanchor conclusion
-was drawn from the wrong observable and had to be retracted (see below).
+Controller + regression tests were committed together and pushed. This is
+diagnostics-only and preserves the original control result even if publication
+fails.
+
+Because a rover test is not currently possible, there is still no field bag
+containing these new events. Treat Step 0 as **source/test complete, field
+verification pending**.
+
+This observability remains important because two earlier pivot/reanchor
+conclusions were drawn from the wrong observable and had to be retracted.
 
 **Step 1 — explicit yaw. The structural fix.**
 In `cmd_vel_bridge`: drop `IGNORE_YAW` (mask `3527 -> 2503`) and set
@@ -512,13 +566,15 @@ Also verified, because it would have invalidated the whole tracking analysis:
 reanchored line. So the leg-convergence numbers are genuine tracking error, not
 an artefact of measuring against `/nav_path`.
 
-**Still open:** cross-track at pivot exit is 21.0 mm p50 when a successful
-reanchor should leave it near zero by construction. Either the reanchor is
-declining or something moves the reference afterwards. **Step 0 answers this;
-nothing else can.**
+**Still open in field evidence:** cross-track at pivot exit was 21.0 mm p50
+in the pre-instrumentation Sep-04 bags, while a successful reanchor creates zero
+cross-track at C' by construction. Patch E now exposes whether the reanchor
+fires, declines, or fails, but no rover run is currently possible. The next
+available pivot bag must use the new event before deciding whether the reference
+moves afterwards or the reanchor is being declined.
 
 ### T6 — ranked bug verdict table
-Blocked on T2 and T4.
+Blocked on T2 and the remaining field-verification portion of T4.
 
 ### Carried over, not addressed this session
 - **`RO_MAX_THR_SPEED = 1.9` is unverified** — no log contains throttle above
