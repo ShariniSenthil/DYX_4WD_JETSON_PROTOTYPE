@@ -38,7 +38,7 @@ Datasets:
 | — | Patch D: backend passthrough for survey truth | **DONE, committed.** Frontend is the operator's |
 | T3 | Straight-line tracking / the 3–5 cm weave | **DONE** |
 | — | Patch C: cross-track recovery speed | **REVERTED — not applied.** Finding stands, see §6 |
-| T2 | log_82 EKF false-position investigation | **NOT STARTED** |
+| T2 | log_82 / GNSS false-position | **OPEN.** ~150 mm vertical offset verified and power-cycle-cleared; horizontal error still unexplained |
 | T4 | Pivot → settle → reanchor → drive lifecycle | **INSTRUMENTED, FIELD VERIFICATION PENDING** |
 | T5 | Accuracy-panel vs report truth separation (spec) | **Superseded** by Patch B |
 | — | Sep-04 verification of Patch A + weakest-link ranking | **DONE** |
@@ -453,18 +453,119 @@ work is report-only and the cross-track patch was reverted.
 
 ## 6. Open work
 
-### T2 — log_82 EKF false-position (`mission.csv_20260903_171227`)
-Not started. The bundle carries an `INCOMPLETE` marker and
-`fcu_params.captured: false`. Needed: EKF↔raw horizontal separation P50/P95/max
-over the run, timestamp of divergence onset, RTK quality at that moment, EKF
-resets and innovations from the ulog, and the exact abort trigger from
-`events.jsonl` + `/mission_manager/status`. The question to answer directly: did
-RPP believe it had reached the coordinates while raw RTK showed the rover
-physically displaced?
+### T2 — log_82 / GNSS false-position — **STILL OPEN**
 
-Note T0 does **not** clear this. T0 shows no steady bias at rest across the
-dataset; a gross transient divergence is a different failure and log_82 is the
-run to test it on. That run's `sep@rest` max was 105 mm, the joint highest.
+**Status: a real decimetre GNSS anomaly is now VERIFIED, and it does NOT explain
+the physical error the operator observed. T2 remains open.**
+
+#### The operational fact that frames everything below
+
+Per the operator: **runs 1-3 (`165719`, `165926`, `171227`) ran BEFORE a rover
+power-off. Runs 4-8 (`171757`, `172119`, `174005`, `174203`, `174520`) ran AFTER
+it.** `171227` (log_82) is the LAST run before the power cycle, and it is the run
+in which the operator saw a physical position error and aborted.
+
+#### VERIFIED — a ~150 mm vertical offset that the power cycle cleared
+
+Raw GNSS altitude (`/mavros/global_position/raw/fix`), median per run, against
+the median across all eight:
+
+| run | time | offset | |
+|---|---|---|---|
+| `165719` | 16:57 | **-131 mm** | before power-off |
+| `165926` | 16:59 | **-152 mm** | before power-off |
+| `171227` | 17:12 | **-125 mm** | before power-off — log_82 |
+| `171757` | 17:17 | +52 mm | after |
+| `172119` | 17:21 | +29 mm | after |
+| `174005` | 17:40 | -2 mm | after |
+| `174203` | 17:42 | +2 mm | after |
+| `174520` | 17:45 | +13 mm | after |
+
+Terrain is removed by comparing the **same surveyed pile** across runs. At the
+four piles `171227` shares with `171757`/`172119`, its altitude is **139, 154,
+155 and 160 mm lower — 4 of 4 stops, same sign, same magnitude.** Every other
+run agrees with every other run at the same pile to within +-36 mm.
+
+**Throughout both groups the receiver reported `fix_type 6` (RTK FIXED), 17
+satellites and `h_acc 15 mm`.** It never flagged anything.
+
+This is the operator's original concern #1 reproduced from data: a solution that
+is confidently wrong by a decimetre, persists across runs, and **clears on a
+power cycle**. The offset is present in all three pre-power-off runs and absent
+in all five after.
+
+#### VERIFIED — no horizontal common-mode shift is detectable in log_82
+
+Raw-GNSS stop error vector vs the surveyed target, per run (mm N/E):
+
+| run | mean vector | spread |
+|---|---|---|
+| `171227` | 27.3 mm | 35.6 mm |
+| all others | 4.1 - 40.9 mm | 19 - 59 mm |
+
+A common-mode shift shows as a **large mean with a small spread**. `171227` shows
+a small mean with an ordinary spread, indistinguishable from every other run.
+With only 4 stops the bound is roughly **< 50 mm**: a decimetre-scale horizontal
+shift would have shown, a ~5 cm one would not.
+
+⚠ Only `171227` overlaps piles with the post-power-off runs; `165719` and
+`165926` visited different piles, so the pre-group cannot be pooled to tighten
+that bound.
+
+#### WHY THIS IS NOT A CLOSE
+
+The verified anomaly is **vertical only**. The operator observed a **horizontal**
+physical error. A vertical offset does not displace a marking point in 2D, so
+this finding does not account for what was seen. Recording it as the answer
+would be dressing up the wrong axis.
+
+What it *does* establish is that the mechanism is real on this vehicle: the RTK
+solution can be wrong by 15 cm while self-reporting healthy, and neither the
+receiver's own quality fields nor any EKF-vs-raw comparison can detect it.
+
+#### The blind spot in T0 that this exposed — do not repeat it
+
+T0 concluded "EKF-vs-raw separation is transport latency, not bias" and that
+conclusion is correct **and insufficient**. `/mavros/global_position/global` is
+*derived from* the raw fix, so under a common-mode GNSS error both streams are
+wrong together and agree perfectly. **Comparing raw against fused measures
+internal consistency, never correctness.** Detecting a bad fix needs an external
+reference — here, the same physical pile revisited across runs.
+
+#### Still needed to close T2
+
+- The magnitude and direction of the physical error the operator saw in
+  `171227`, and at which point. That decides whether the < 50 mm horizontal
+  bound above already excludes it or not.
+- Whether the vertical offset is a wrong RTK integer-ambiguity fix specifically,
+  or a base-station / NTRIP reference change that a client restart at power-off
+  also happened to clear. **Not determined** — the receiver's ambiguity state is
+  not in these bags. A contiguous block of runs sharing one offset is consistent
+  with either.
+- The abort trigger is answered and is NOT the estimator: `events.jsonl` shows
+  `P0004 COMPLETED at 15.4mm` at t+60.41, then `P0005 precision hold
+  blocked/reset: raw_path_index_mismatch` at t+61.52 and `heartbeat_expired` at
+  t+62.17. The backend heartbeat expired; the bundle carries an `INCOMPLETE`
+  marker and `fcu_params.captured: false`. That is infrastructural.
+
+#### Two earlier "residuals" from this run, both retracted
+
+Neither is rover behaviour; both were artefacts of the analysis:
+
+1. ⛔ *"85-105 mm EKF-vs-raw disagreement at rest, t+5.6-6.1 s."* The rover was
+   in `ALIGNMENT` pivoting at **0.85-0.97 rad/s**. Position-derived speed read
+   0.000 m/s because **rotation in place produces near-zero net translation**
+   over a +-0.25 s window, so pivot samples landed in the "at rest" bucket.
+   This contaminates T0's at-rest split in the conservative direction — pivot
+   samples are the large ones, so true at-rest agreement is better than the
+   11-15 mm reported, and T0's conclusion holds a fortiori.
+2. ⛔ *"2.61 m/s position-derived speed at t+26.6 = a raw GNSS jump."* Three
+   fixes arrived within **1.0 ms** of each other (26.6396 / 26.6402 / 26.6406)
+   while the underlying epochs were 0.1 s apart. 419 mm of genuine motion
+   divided by 0.1606 s of *arrival* time gives 2.61 m/s. `fix_type 6`, 17 sats,
+   `h_acc 15 mm`, steady ~100 mm steps, `CONTROL_OUTPUT` at 1.0 m/s throughout.
+   Zero true duplicate timestamps in the stream. It is burst delivery, not a
+   position jump.
 
 ### T4 — pivot → settle → reanchor → drive
 **Partly answered by the Sep-04 dataset (see §2): the pivot itself is not the
@@ -605,6 +706,22 @@ Blocked on T2 and the remaining field-verification portion of T4.
 
 - **Never treat EKF coordinates as physical truth.** Keep RPP/EKF control truth
   and raw RTK survey truth separate in every number reported.
+- **Comparing raw GNSS against fused global proves nothing about correctness.**
+  `/mavros/global_position/global` is derived from the raw fix, so a
+  common-mode GNSS error makes both wrong together and they agree perfectly.
+  That agreement measures internal consistency only. Detecting a bad fix needs
+  an **external reference** — the same physical point revisited across runs is
+  the one available here (see T2). `fix_type 6` and `h_acc` are the receiver's
+  self-assessment and are exactly what is wrong in this failure mode.
+- **Position-derived speed cannot distinguish parked from pivoting in place.**
+  Rotation produces near-zero net translation over a ~0.5 s window, so pivot
+  samples fall into an "at rest" bucket and carry the largest errors. Gate on
+  yaw rate as well — the controller already does
+  (`radial_stop_stationary_yaw_rate_radps`); the analysis scripts did not.
+- **Position-derived speed uses bag RECEIVE time, which compresses under bursty
+  delivery.** Three fixes 1.0 ms apart representing 0.3 s of real motion
+  produced a spurious 2.61 m/s. `NavSatFix` carries a header stamp that
+  `_p_navsatfix` currently reads and discards; use it instead.
 - **Never judge "is it stopped / how fast" from EKF twist.** Differentiate raw
   GNSS position over a ~0.5 s window and say which source each number came from.
 - **Do not hand-roll CDR parsing.** Import `_CDR` and the parsers from
