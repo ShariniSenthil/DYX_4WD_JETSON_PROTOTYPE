@@ -227,17 +227,9 @@ class RPPController(Node):
             "xtrack_priority_hold_sec",
             0.30,
         )
-        # 2026-09-04: 1.00 -> 0.60. At 1.00 this equalled cruise_speed_mps, so
-        # the latch engaged (89.6% of cruise cycles on the 2026-09-03 straight
-        # runs) and capped nothing. The lateral correction cycle takes 3.59 s
-        # regardless of speed, so at 1.03 m/s it consumed 3.71 m of a 4.5 m leg
-        # and never converged: |xtrack| was 22.6 mm entering the cruise and
-        # 22.6 mm leaving it, with 22 of 29 legs crossing the line. 0.60 m/s
-        # puts that cycle at 2.15 m. See rover.launch.py XTRACK_RECOVERY_SPEED_MPS
-        # for the full derivation; the launch value is what actually runs.
         self.declare_parameter(
             "xtrack_priority_speed_mps",
-            0.60,
+            1.00,
         )
         self.declare_parameter(
             "xtrack_priority_lookahead_m",

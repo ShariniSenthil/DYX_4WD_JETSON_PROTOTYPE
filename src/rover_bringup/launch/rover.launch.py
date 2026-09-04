@@ -55,49 +55,6 @@ MISSION_METADATA_FILE = (
 # non-overridable ABSOLUTE_MAXIMUM_SPEED_MPS ceiling, i.e. zero headroom.
 # Watch the first run closely and be ready to drop this back down.
 CRUISE_SPEED_MPS = 1.00
-
-# Speed the rover is held to while the cross-track priority latch is engaged
-# (|xtrack| >= xtrack_priority_enter_m, released at exit_m).
-#
-# 2026-09-04, from the 2026-09-03 evening straight-line runs (29 straight legs
-# across log_87/89/98/100/103, all at 1.03 m/s):
-#
-#   * The latch was ENGAGED on 89.6% of cruise cycles -- median cross-track was
-#     22.6 mm against a 15 mm engage threshold -- and capped speed at 1.000 m/s,
-#     exactly the cruise speed. It did nothing. update_xtrack_speed_cap_state's
-#     own docstring still calls it "the hardened 0.15 m/s xtrack speed-cap
-#     latch"; the cap had been widened to cruise speed and lost its function.
-#
-#   * The lateral loop takes 3.59 s to complete one correction cycle. That time
-#     is set by the lookahead TIME constant (precision_lookahead_time_s = 0.9,
-#     and guidance.py computes lookahead = clamp(time_s * speed, 0.2, 1.0)), so
-#     it does not change with speed -- but the DISTANCE it consumes does:
-#     3.59 s * 1.03 m/s = 3.71 m, against legs that are only 4.5 m long (p50;
-#     3.5 m shortest). The loop cannot converge inside a leg.
-#
-#   * Measured consequence: |cross-track| was 22.6 mm entering the cruise and
-#     22.6 mm leaving it, median reduction +0.0 mm, and 22 of 29 legs crossed
-#     the line and finished on the opposite side. One half-cycle per leg.
-#
-# 0.60 m/s puts the correction cycle at 3.59 * 0.60 = 2.15 m, roughly half a
-# leg, so it can complete and settle. It also shortens the lookahead to
-# 0.9 * 0.60 = 0.54 m while correcting (from 0.936 m), tightening the geometry
-# through the existing formula rather than by changing a gain.
-#
-# Why not lower: motor breakaway is 0.143-0.219 m/s and the speed loop droops,
-# so anything near the old 0.15 m/s would stall. 0.60 m/s is a demonstrated
-# operating point for this rover (staged bring-up 0.4 -> 0.6 -> 0.8 -> 1.0).
-# Why not shorten precision_lookahead_time_s instead: that changes loop gain and
-# damping everywhere, including the terminal phase, and no run exists at any
-# other lookahead value. This capping path already exists, is already engaging,
-# is scoped to exactly the off-line condition, and releases at 8 mm.
-#
-# UNVERIFIED IN THE FIELD. Every one of the 29 legs ran at 1.03 m/s with a
-# 0.936 m lookahead; the scaling above is derived from the guidance formula,
-# not measured at 0.6 m/s. First run with this change should be watched for
-# whether cross-track converges within a leg and whether the mission gets
-# slower in a way that matters.
-XTRACK_RECOVERY_SPEED_MPS = 0.60
 TERMINAL_FLOOR_SPEED_MPS = 0.15
 
 # Single source of truth for which terminal-stop authority is active.
@@ -491,16 +448,12 @@ def generate_launch_description() -> LaunchDescription:
                         #   for 1.00 s more, then releases straight into the
                         #   normal acceleration ramp (no moving recapture)
                         #   aligned-start (no carrier latch) still uses 1.00 m/s
-                        #   global xtrack recovery      = XTRACK_RECOVERY_SPEED_MPS
+                        #   global xtrack recovery      = 1.00 m/s
                         #   xtrack engage/release      = 15 mm / 8 mm
                         #   release heading            = <=4 deg stable for 0.30 s
                         "segment_alignment_speed_mps": CRUISE_SPEED_MPS,
                         "segment_alignment_recovery_speed_mps": CRUISE_SPEED_MPS,
-                        # 2026-09-04: was CRUISE_SPEED_MPS, i.e. a cap equal to
-                        # the speed it was capping -- the latch engaged and
-                        # changed nothing. See XTRACK_RECOVERY_SPEED_MPS above
-                        # for the measurement this value comes from.
-                        "xtrack_priority_speed_mps": XTRACK_RECOVERY_SPEED_MPS,
+                        "xtrack_priority_speed_mps": CRUISE_SPEED_MPS,
                         "decel_profile_speed_1_mps": CRUISE_SPEED_MPS,
                         "decel_profile_speed_2_mps": CRUISE_SPEED_MPS,
                         "decel_profile_speed_3_mps": CRUISE_SPEED_MPS,

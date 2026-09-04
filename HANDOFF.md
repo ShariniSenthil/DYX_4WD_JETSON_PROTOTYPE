@@ -1,9 +1,9 @@
 # Handoff — 2026-09-04 session
 
 Analysis of the **2026-09-03 evening dataset** (8 runs, 43 waypoints, 29 straight
-legs) and the three patches that came out of it. No field run was possible this
-session, so **every patch below is unverified in the field** — that is stated
-per patch, with what to watch for.
+legs) and the patches that came out of it. Three landed, one was reverted. No
+field run was possible this session, so **everything applied here is unverified
+in the field** — that is stated per patch, with what to watch for.
 
 Dataset: `~/Documents/QGroundControl Daily/Logs/4WD/Madhavaram/Sep_03/evening_run_2/`
 (`Bags/` and `Ulogs/` side by side, all 8 bundles and all 8 ulogs present).
@@ -29,8 +29,9 @@ Dataset: `~/Documents/QGroundControl Daily/Logs/4WD/Madhavaram/Sep_03/evening_ru
 | T1 | Stop accuracy per waypoint, both truths, find the cause | **DONE** |
 | — | Patch A: stop profile | **DONE, committed, unverified in field** |
 | — | Patch B: survey truth in mission_manager | **DONE, committed, unverified in field** |
+| — | Patch D: backend passthrough for survey truth | **DONE, committed.** Frontend is the operator's |
 | T3 | Straight-line tracking / the 3–5 cm weave | **DONE** |
-| — | Patch C: cross-track recovery speed | **DONE, committed, unverified in field** |
+| — | Patch C: cross-track recovery speed | **REVERTED — not applied.** Finding stands, see §6 |
 | T2 | log_82 EKF false-position investigation | **NOT STARTED** |
 | T4 | Pivot → settle → reanchor → drive lifecycle | **NOT STARTED** |
 | T5 | Accuracy-panel vs report truth separation (spec) | **Superseded** by Patch B |
@@ -130,7 +131,7 @@ in 6 240 cycles**, compute 4.6 ms p50, odom age 15 ms p50.
 
 ---
 
-## 3. Patches applied
+## 3. Patches
 
 ### Patch A — stop profile · `4bfa04e`
 
@@ -184,9 +185,44 @@ again stays visible as a rejection). The 3 points still differing by 7–17 mm a
 the ones where the rover kept moving 15–66 mm *after* the latch — different
 instants, not a disagreement.
 
-### Patch C — cross-track recovery speed · this session, see git log
+### Patch D — backend passthrough for survey truth · `2093b26`
 
-`xtrack_priority_speed_mps: CRUISE_SPEED_MPS (1.00) → XTRACK_RECOVERY_SPEED_MPS (0.60)`
+`mission_manager` was producing `accuracy["survey"]` and the backend was
+dropping it in two places. Both are passthrough only — no recalculation, no
+normalisation, and no effect on gating or the point verdict.
+
+- `MissionReportStore._canonical_point()` rebuilds `accuracy` from a fixed
+  allowlist, so the nested `survey` object never reached
+  `GET /api/mission/report`. Added outside the `if source_is_rpp:` block on
+  purpose: a point RPP could not measure may still have a good physical
+  measurement, and folding it into that branch would couple the two. A test
+  locks the placement in.
+- `survey_truth_enabled` / `_ready` / `_targets_loaded` / `_gnss_samples` /
+  `_coordinate_mode` now flow `ros_bridge` → `state` →
+  `build_mission_status_payload()`, which serves both
+  `GET /api/system/status` and the `mission_status` socket event. This is the
+  half the report cannot cover: the report says *afterwards* that survey truth
+  was not recorded; `survey_truth_ready` says *before you start* that targets
+  did not load or GNSS is not streaming, while it can still be fixed.
+
+Deliberately NOT added to `_mission_progress_payload` — that payload is
+change-gated by a signature over its whole contents and
+`survey_truth_gnss_samples` is a constantly-moving counter, so including it
+would make `mission_progress` fire every tick instead of on real progress.
+
+Six tests in `test_precision_mission_report.py`. Frontend work (types, remark,
+export columns) is the operator's and lives in the separate
+`DYX_GCS_Frontend` repo.
+
+### Patch C — cross-track recovery speed · **REVERTED, NOT IN THE BUILD**
+
+Proposed as `xtrack_priority_speed_mps: 1.00 → 0.60`, committed, then reverted
+on the operator's instruction before any field use. The parameter is back at
+`CRUISE_SPEED_MPS` (1.00).
+
+**The measurement below is unaffected by the revert and still stands** — it is
+kept because the finding is what matters, not the patch that was tried. The
+open item is carried in §6.
 
 The latch was **engaged on 89.6% of cruise cycles** (median cross-track 22.6 mm
 against a 15 mm engage threshold) and capped speed at 1.000 m/s — exactly the
@@ -194,18 +230,10 @@ cruise speed. It did nothing. `update_xtrack_speed_cap_state`'s own docstring
 still calls it "the hardened 0.15 m/s xtrack speed-cap latch"; the cap had been
 widened to cruise speed and lost its function.
 
-Why this rather than shortening the lookahead: the correction cycle *time*
-(3.59 s) is set by `precision_lookahead_time_s` and does not change with speed,
-but the *distance* it consumes does. At 0.60 m/s the cycle is **2.15 m instead of
-3.71 m**, roughly half a leg, so it can complete and settle. It also shortens the
-lookahead to 0.54 m while correcting (from 0.936 m) through the existing
-`clamp(time_s · speed, 0.2, 1.0)` formula, tightening the geometry without
-touching a gain. This path already exists, already engages, is scoped to exactly
-the off-line condition, and releases at 8 mm.
-
-Why not lower than 0.60: motor breakaway is 0.143–0.219 m/s, so anything near the
-old 0.15 m/s would stall. 0.60 is a demonstrated operating point (staged bring-up
-0.4 → 0.6 → 0.8 → 1.0).
+The reasoning for the reverted value: the correction cycle *time* (3.59 s) is set
+by `precision_lookahead_time_s` and does not change with speed, but the *distance*
+it consumes does, so 0.60 m/s would have put the cycle at 2.15 m instead of
+3.71 m. It was never run, so that is a hypothesis, not a result.
 
 ---
 
@@ -228,21 +256,20 @@ stay on the machine they were written on and will **not** appear on the Jetson.
 
 ## 5. What to watch on the next run
 
-In priority order, because all three patches land at once:
+In priority order. Only the stop profile changes rover behaviour; the survey-truth
+work is report-only and the cross-track patch was reverted.
 
 1. **Terminal error sign and size.** Patch A should give 3–17 mm short. If any
    point *overshoots*, `radial_stop_brake_margin_m` went too small — that is the
    2026-09-02 failure mode returning, and the value to move back is this one, not
    `conservative_decel_mps2`.
-2. **Cross-track convergence within a leg.** Patch C should make |xtrack| at
-   cruise end clearly smaller than at cruise start, and should stop most legs
-   crossing the line. `/rpp/xtrack_speed_cap_mps` should now read 0.600, not
-   1.000, whenever `/rpp/xtrack_speed_cap_active` is true.
-3. **Mission duration.** Patch C slows the rover whenever it is more than 15 mm
-   off-line, which on the Sep-03 data was 89.6% of cruise time. If the latch does
-   not release more often once tracking improves, missions get materially slower.
-   That is the main way this patch could be wrong.
-4. **`accuracy["survey"]` present and `available: true`** on completed points,
+2. **Cross-track is unchanged and will stay unchanged.** Patch C was reverted, so
+   expect the same behaviour as 2026-09-03: |xtrack| roughly equal at the start
+   and end of each leg, and most legs still crossing the line.
+   `/rpp/xtrack_speed_cap_mps` will still read 1.000 — equal to cruise speed,
+   capping nothing — whenever `/rpp/xtrack_speed_cap_active` is true. Worth
+   confirming rather than assuming, since it is the evidence behind §6.
+3. **`accuracy["survey"]` present and `available: true`** on completed points,
    with `sample_count` ≥ 3 and `fix_type` 6. If it reports
    `GNSS_WINDOW_NOT_STATIONARY` often, `survey_truth_window_sec` (2.0) is
    straddling motion for that capture site.
@@ -280,6 +307,26 @@ release, post-settle creep, hold duration.
 **0 messages** in these bags. Pivot lifecycle has to be reconstructed from
 `/rpp/debug` + `/rpp/geometry_debug` + odom timestamps. If a run is ever possible
 again, getting those topics publishing would make T4 much cheaper.
+
+### T3 follow-up — the cross-track speed cap is a no-op (OPEN, nothing applied)
+Measured, not disputed, and nothing in the build addresses it.
+
+`xtrack_priority_speed_mps` is set to `CRUISE_SPEED_MPS`, so the latch caps speed
+at exactly the speed it is capping. It was ENGAGED on **89.6% of cruise cycles**
+on 2026-09-03 and limited nothing. `update_xtrack_speed_cap_state`'s own
+docstring still describes it as "the hardened 0.15 m/s xtrack speed-cap latch".
+
+Consequence, measured across 29 straight legs: the lateral correction cycle takes
+3.59 s, which at 1.03 m/s consumes 3.71 m of a 4.5 m leg, so the loop cannot
+converge inside a leg. |cross-track| was 22.6 mm entering the cruise and 22.6 mm
+leaving it (median reduction +0.0 mm), and 22 of 29 legs crossed the line and
+finished on the opposite side.
+
+A patch setting this to 0.60 m/s was written and reverted. Whatever is done here
+instead, the constraint is that the correction distance (speed × 3.59 s) has to
+fit inside a leg. Lowering cruise speed and shortening `precision_lookahead_time_s`
+are the other two routes; neither has been tried, and no run exists at any
+lookahead other than 0.936 m.
 
 ### T6 — ranked bug verdict table
 Blocked on T2 and T4.
