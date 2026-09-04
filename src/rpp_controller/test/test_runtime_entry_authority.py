@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import math
 from pathlib import Path
 import sys
@@ -43,8 +44,13 @@ def _method_source(name: str) -> str:
     return source
 
 
+class _String:
+    def __init__(self):
+        self.data = ""
+
+
 def _load_methods(*names: str):
-    namespace = {"math": math}
+    namespace = {"json": json, "math": math, "String": _String}
     module = ast.fix_missing_locations(
         ast.Module(
             body=[_controller_method(name) for name in names],
@@ -55,9 +61,18 @@ def _load_methods(*names: str):
     return tuple(namespace[name] for name in names)
 
 
-_lock_c_to_p1_line, _reanchor_c_to_p1_after_pivot = _load_methods(
+(
+    _finite_or_none,
+    _publish_reanchor_debug,
+    _lock_c_to_p1_line,
+    _reanchor_c_to_p1_after_pivot,
+    _reanchor_runtime_path_after_pivot,
+) = _load_methods(
+    "_finite_or_none",
+    "_publish_reanchor_debug",
     "lock_c_to_p1_line",
     "reanchor_c_to_p1_after_pivot",
+    "reanchor_runtime_path_after_pivot",
 )
 
 
@@ -69,9 +84,23 @@ class _Logger:
         pass
 
 
+class _Publisher:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.messages = []
+
+    def publish(self, message):
+        if self.fail:
+            raise RuntimeError("test publisher failure")
+        self.messages.append(message)
+
+
 class _Controller:
+    _finite_or_none = _finite_or_none
+    _publish_reanchor_debug = _publish_reanchor_debug
     lock_c_to_p1_line = _lock_c_to_p1_line
     reanchor_c_to_p1_after_pivot = _reanchor_c_to_p1_after_pivot
+    reanchor_runtime_path_after_pivot = _reanchor_runtime_path_after_pivot
 
     RUNTIME_ENTRY_SPACING_M = 0.05
 
@@ -93,6 +122,9 @@ class _Controller:
         self.xtrack_priority_active = False
         self.xtrack_priority_inside_since = None
         self.waypoint_tolerance = 0.03
+        self.segment_runtime_reanchored = False
+        self.segment_goal_number = 2
+        self.pivot_debug_pub = _Publisher()
         self.legacy_reset_reasons = []
         self.xtrack_reset_count = 0
 
@@ -211,6 +243,84 @@ def test_post_pivot_reanchor_uses_fresh_local_odom_c_prime_and_resets_cursor():
     assert controller.runtime_entry_lookahead_index == 1
     assert controller.runtime_entry_goal_index == len(controller.runtime_entry_points) - 1
     assert _maximum_segment_length(controller.runtime_entry_points) <= 0.05 + 1.0e-12
+
+
+def test_runtime_reanchor_debug_outcome_reason_and_json_contract():
+    expected_fields = {
+        "schema_version",
+        "source",
+        "outcome",
+        "reason",
+        "goal_number",
+        "anchor_x",
+        "anchor_y",
+        "goal_x",
+        "goal_y",
+        "bearing_rad",
+        "bearing_deg",
+        "cross_track_m",
+        "cross_track_mm",
+    }
+
+    cases = (
+        ("FIRED", "runtime_path_installed", lambda controller: None, True),
+        (
+            "DECLINED",
+            "segment_runtime_reanchored",
+            lambda controller: setattr(controller, "segment_runtime_reanchored", True),
+            False,
+        ),
+        (
+            "DECLINED",
+            "distance_le_waypoint_tolerance",
+            lambda controller: (
+                setattr(controller, "current_x", 1.99),
+                setattr(controller, "current_y", 0.0),
+            ),
+            False,
+        ),
+        (
+            "DECLINED",
+            "_install_runtime_entry_path_returned_false",
+            lambda controller: setattr(
+                controller, "_install_runtime_entry_path", lambda *_args: False
+            ),
+            False,
+        ),
+        (
+            "FAILED",
+            "missing_anchor_or_goal",
+            lambda controller: setattr(controller, "current_x", None),
+            False,
+        ),
+    )
+
+    for outcome, reason, arrange, expected_return in cases:
+        controller = _Controller()
+        arrange(controller)
+
+        assert controller.reanchor_runtime_path_after_pivot(2.0, 0.0) is expected_return
+        assert len(controller.pivot_debug_pub.messages) == 1
+        payload = json.loads(controller.pivot_debug_pub.messages[0].data)
+        assert set(payload) == expected_fields
+        assert payload["schema_version"] == 1
+        assert payload["source"] == "RPP_POST_PIVOT_REANCHOR"
+        assert (payload["outcome"], payload["reason"]) == (outcome, reason)
+
+        if outcome == "FIRED":
+            assert payload["cross_track_mm"] == 0.0
+
+
+def test_runtime_reanchor_debug_publisher_failure_preserves_control_return():
+    success = _Controller()
+    success.pivot_debug_pub = _Publisher(fail=True)
+    assert success.reanchor_runtime_path_after_pivot(2.0, 0.0) is True
+    assert success.segment_runtime_reanchored is True
+
+    declined = _Controller()
+    declined.segment_runtime_reanchored = True
+    declined.pivot_debug_pub = _Publisher(fail=True)
+    assert declined.reanchor_runtime_path_after_pivot(2.0, 0.0) is False
 
 
 def test_runtime_tracker_advances_without_intermediate_stops_or_backtracking():

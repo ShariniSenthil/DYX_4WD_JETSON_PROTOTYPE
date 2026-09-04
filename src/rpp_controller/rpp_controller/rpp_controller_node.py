@@ -4843,6 +4843,53 @@ class RPPController(Node):
             hard_speed_cap_mps=speed,
         )
 
+    def _publish_reanchor_debug(
+        self,
+        outcome,
+        reason,
+        *,
+        anchor_x,
+        anchor_y,
+        goal_x,
+        goal_y,
+        bearing=None,
+        cross_track=None,
+    ):
+        """Publish one best-effort post-pivot reanchor decision event."""
+        try:
+            cross_track_value = self._finite_or_none(cross_track)
+            bearing_value = self._finite_or_none(bearing)
+            payload = {
+                "schema_version": 1,
+                "source": "RPP_POST_PIVOT_REANCHOR",
+                "outcome": str(outcome),
+                "reason": str(reason),
+                "goal_number": self.segment_goal_number,
+                "anchor_x": self._finite_or_none(anchor_x),
+                "anchor_y": self._finite_or_none(anchor_y),
+                "goal_x": self._finite_or_none(goal_x),
+                "goal_y": self._finite_or_none(goal_y),
+                "bearing_rad": bearing_value,
+                "bearing_deg": (
+                    None if bearing_value is None else math.degrees(bearing_value)
+                ),
+                "cross_track_m": cross_track_value,
+                "cross_track_mm": (
+                    None if cross_track_value is None
+                    else self.ground_xtrack(cross_track_value) * 1000.0
+                ),
+            }
+            message = String()
+            message.data = json.dumps(
+                payload,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
+            )
+            self.pivot_debug_pub.publish(message)
+        except Exception as error:  # diagnostics are never control authority
+            self.get_logger().error(f"REANCHOR DEBUG PUBLISH FAILED | {error}")
+
     def _publish_pivot_debug(self, result, *, anchor_error, heading_error):
         """Best-effort diagnostics; serialization/DDS cannot escape a tick."""
         try:
@@ -5759,19 +5806,45 @@ class RPPController(Node):
         runtime_entry_tracking_solution() declines any path whose endpoint no
         longer matches the requested goal, so a stale one cannot be followed.
         """
+        if self.segment_runtime_reanchored:
+            self._publish_reanchor_debug(
+                "DECLINED",
+                "segment_runtime_reanchored",
+                anchor_x=self.current_x,
+                anchor_y=self.current_y,
+                goal_x=goal_x,
+                goal_y=goal_y,
+            )
+            return False
+
         if (
-            self.segment_runtime_reanchored
-            or self.current_x is None
+            self.current_x is None
             or self.current_y is None
             or goal_x is None
             or goal_y is None
         ):
+            self._publish_reanchor_debug(
+                "FAILED",
+                "missing_anchor_or_goal",
+                anchor_x=self.current_x,
+                anchor_y=self.current_y,
+                goal_x=goal_x,
+                goal_y=goal_y,
+            )
             return False
 
         start_x = float(self.current_x)
         start_y = float(self.current_y)
         distance = math.hypot(goal_x - start_x, goal_y - start_y)
         if distance <= self.waypoint_tolerance:
+            self._publish_reanchor_debug(
+                "DECLINED",
+                "distance_le_waypoint_tolerance",
+                anchor_x=start_x,
+                anchor_y=start_y,
+                goal_x=goal_x,
+                goal_y=goal_y,
+            )
             return False
 
         if not self._install_runtime_entry_path(
@@ -5781,6 +5854,14 @@ class RPPController(Node):
             float(goal_y),
             "post-pivot leg reanchor",
         ):
+            self._publish_reanchor_debug(
+                "DECLINED",
+                "_install_runtime_entry_path_returned_false",
+                anchor_x=start_x,
+                anchor_y=start_y,
+                goal_x=goal_x,
+                goal_y=goal_y,
+            )
             return False
 
         self.segment_runtime_reanchored = True
@@ -5789,6 +5870,16 @@ class RPPController(Node):
         self.xtrack_priority_inside_since = None
 
         bearing = math.atan2(goal_y - start_y, goal_x - start_x)
+        self._publish_reanchor_debug(
+            "FIRED",
+            "runtime_path_installed",
+            anchor_x=start_x,
+            anchor_y=start_y,
+            goal_x=goal_x,
+            goal_y=goal_y,
+            bearing=bearing,
+            cross_track=0.0,
+        )
         self.get_logger().warn(
             "POST-PIVOT LEG REANCHOR + PATH REGENERATED | "
             f"goal=P{self.segment_goal_number} | "
