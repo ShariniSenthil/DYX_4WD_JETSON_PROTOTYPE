@@ -739,3 +739,27 @@ Blocked on T2 and the remaining field-verification portion of T4.
   subscription list returns "0 of 0" and looks exactly like a real finding. It
   happened once here (`xtrack_speed_cap_active`) and would have inverted a
   conclusion. Check message counts against the bag's own topic table first.
+
+## 2026-09-04 — EKF / GNSS / Hardware Audit
+
+Detailed audit recorded in:
+
+- `docs/2026-09-04_EKF_GNSS_Hardware_Audit.md`
+
+Key conclusions:
+
+- `log_82` horizontal false-position hypothesis rejected; horizontal failure = ordinary controller/tracking/stop error.
+- Separate vertical anomaly remains real: raw GNSS altitude was ~125–152 mm displaced before power cycle and corrected afterward while RTK remained FIXED.
+- Exact firmware path confirms GNSS was configured as EKF2 height authority:
+  - `EKF2_GPS_CTRL=15`
+  - `EKF2_HGT_REF=1`
+  - `EKF2_REQ_GPS_H=1 s`
+  - `EKF2_GPS_P_NOISE=0.01 m`
+- EKF2 did not create the original raw GNSS offset, but can accept a stable confidently-reported bad GNSS solution as its height datum.
+- Production hardware baseline corrected:
+  - Pixhawk 6X / `px4_fmu-v6x`
+  - Septentrio mosaic-H using dedicated PX4 Septentrio/SBF driver
+  - 4 motors
+  - 2 × dual-channel Sabertooth controllers
+  - Sabertooth controlled through duplicated PX4 PWM left/right actuator outputs; no dedicated Sabertooth PX4 driver found.
+- Next GNSS investigation: mosaic-H SBF PVT/RTK status, ambiguity/correction/base-reference state, fields discarded before `sensor_gps`, and what receiver state is cleared by power cycle.
