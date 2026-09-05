@@ -1,0 +1,118 @@
+==============================================================================
+TASK 2.1 — GNSS / EKF NOISE, MEASURED FROM STATIONARY WINDOWS
+==============================================================================
+gates: |motor| < 0.01, |yaw rate| < 0.02 rad/s, settle 2.0s, min window 2.0s
+
+run                                  dur    stat  wins   fix6    sHz    sVt    resets  window lengths (s)
+log_100_2026-9-3-17-43-28.ulg      66.2s    2.1s     1 100.0%   3.1m   2.7m   0/0/0/0  2.1
+log_103_2026-9-3-17-46-44.ulg      65.2s    2.3s     1 100.0%   2.1m   2.8m   0/0/0/0  2.3
+log_77_2026-9-3-16-58-24.ulg       47.2s    0.0s     0 100.0%   nanm   nanm   0/0/0/0  
+log_79_2026-9-3-17-00-46.ulg       60.9s    7.0s     2 100.0%   2.6m   4.1m   0/0/0/0  2.0 4.9
+log_82_2026-9-3-17-13-56.ulg       71.8s    5.7s     1 100.0%   2.7m   5.6m   0/0/0/0  5.7
+log_87_2026-9-3-17-20-42.ulg      147.2s    6.2s     2 100.0%   2.2m   4.3m   0/0/0/0  4.0 2.2  [dropped 3.9s/59mm-ramp]
+log_89_2026-9-3-17-24-26.ulg      169.1s   20.7s     4 100.0%   2.6m   5.1m   0/0/0/0  5.6 4.1 6.1 5.0
+log_98_2026-9-3-17-41-32.ulg       69.1s   11.6s     2 100.0%   2.7m   4.8m   0/0/0/0  5.7 5.9
+
+------------------------------------------------------------------------------
+1) MEASURED SIGMA (residual about each window's own mean; parked)
+------------------------------------------------------------------------------
+quantity                      sigma     p95|.|     max|.|       n
+raw GNSS north               1.7 mm        3.4       5.3     555
+raw GNSS east                1.9 mm        3.7       6.4     555
+raw GNSS horiz (2D)          2.6 mm        4.4       7.5     555
+raw GNSS alt MSL             4.8 mm        9.3      16.6     555
+raw GNSS alt ellips          4.8 mm        9.3      16.6     555
+raw GNSS vel N               7.9 mm/s      15.9      32.6     555
+raw GNSS vel E               8.3 mm/s      16.0      42.7     555
+raw GNSS vel D              10.6 mm/s      20.4      48.5     555
+raw GNSS yaw                 0.1 deg       0.3       0.4     555
+EKF local x                  2.1 mm        4.3       5.7     557
+EKF local y                  3.1 mm        5.8      13.3     557
+EKF local z                  5.7 mm       11.1      18.2     557
+EKF vel x                    4.3 mm/s       8.4      15.1     557
+EKF vel y                    4.7 mm/s       9.3      23.5     557
+EKF vel z                    4.7 mm/s      10.3      15.5     557
+EKF yaw                      0.0 deg       0.0       0.0     557
+
+------------------------------------------------------------------------------
+2) SIGMA vs AVERAGING TIME  (white noise would fall as 1/sqrt(tau))
+------------------------------------------------------------------------------
+quantity                 unit     t=0.1s     t=0.5s       t=2s    white@2s
+raw GNSS north             mm       1.75       1.25       0.35        0.39
+raw GNSS east              mm       1.94       1.31       1.39        0.43
+raw GNSS alt MSL           mm       4.76       3.65       3.74        1.06
+raw GNSS alt ellips        mm       4.76       3.65       3.74        1.06
+raw GNSS vel N           mm/s       7.88       2.49       0.27        1.76
+raw GNSS vel E           mm/s       8.29       2.77       0.48        1.85
+raw GNSS vel D           mm/s      10.55       4.73       0.49        2.36
+raw GNSS yaw              deg       0.13       0.07       0.01        0.03
+EKF local x                mm       2.07       1.93       0.86        0.46
+EKF local y                mm       3.13       2.98       3.63        0.70
+EKF local z                mm       5.73       5.50       6.51        1.28
+EKF vel x                mm/s       2.55       2.38       1.14        0.57
+EKF vel y                mm/s       3.83       3.68       5.42        0.86
+EKF vel z                mm/s       4.18       3.93       3.66        0.94
+EKF yaw                   deg       0.01       0.01       0.01        0.00
+
+------------------------------------------------------------------------------
+3) RECEIVER / ESTIMATOR SELF-REPORTED ACCURACY (same windows)
+------------------------------------------------------------------------------
+field                               p50        p95        max
+GNSS eph                          15.0      15.0      20.0 mm
+GNSS epv                          25.0      30.0      35.0 mm
+GNSS s_variance_m_s                0.4       0.5      31.0 mm/s
+GNSS heading_accuracy              0.2       0.3       0.3 deg
+GNSS satellites_used              17.0      18.0      18.0 
+EKF eph                           13.0      15.1      18.5 mm
+EKF epv                           14.2      16.3      17.2 mm
+EKF evh                           38.9      42.3      45.4 mm/s
+EKF evv                           29.0      30.9      31.4 mm/s
+EKF heading sigma                  0.5       0.5       0.5 deg
+
+------------------------------------------------------------------------------
+4) INNOVATION TEST RATIOS  (>1.0 = rejected by the gate)
+------------------------------------------------------------------------------
+aid source       set              n      p50      p95      p99      max    rej%  fused%
+                 stationary     111    0.000    0.002    0.003    0.003   0.00% 100.00%
+                 moving        1279    0.002    0.017    0.045    0.143   0.00% 100.00%
+gnss_pos         all           1390    0.001    0.016    0.044    0.143   0.00% 100.00%
+                 stationary     111    0.000    0.000    0.000    0.001   0.00% 100.00%
+                 moving        1279    0.001    0.011    0.021    0.059   0.00% 100.00%
+gnss_vel         all           1390    0.000    0.010    0.020    0.059   0.00% 100.00%
+                 stationary     111    0.000    0.002    0.004    0.006   0.00% 100.00%
+                 moving        1279    0.000    0.004    0.012    0.024   0.00% 100.00%
+gnss_hgt         all           1390    0.000    0.004    0.011    0.024   0.00% 100.00%
+                 stationary     111    0.000    0.001    0.001    0.002   0.00% 100.00%
+                 moving        1279    0.000    0.003    0.037    0.099   0.00% 100.00%
+gnss_yaw         all           1390    0.000    0.002    0.036    0.099   0.00% 100.00%
+
+------------------------------------------------------------------------------
+5) LOW-FREQUENCY SCATTER — spread of the WINDOW MEANS
+------------------------------------------------------------------------------
+Within-window sigma above measures jitter only. These are the run-to-run/stop-to-stop
+means, which is the error scale that actually reaches a marking point.
+
+revisited locations (windows within 0.30 m of each other):
+
+  cluster at N+1.23 E-0.00  (4 windows)
+    run                                 dN(mm)    dE(mm)   dAlt(mm)
+    log_103_2026-9-3-17-46-44.ulg         -9.1      29.7      -14.4
+    log_87_2026-9-3-17-20-42.ulg          34.7       3.2       14.4
+    log_89_2026-9-3-17-24-26.ulg          -9.6     -12.1       14.5
+    log_98_2026-9-3-17-41-32.ulg         -15.9     -20.7      -27.6
+    spread: horiz 34.8 mm max, vert 42.1 mm range
+
+  cluster at N-0.01 E+6.30  (2 windows)
+    run                                 dN(mm)    dE(mm)   dAlt(mm)
+    log_87_2026-9-3-17-20-42.ulg         -12.3       5.9        1.3
+    log_89_2026-9-3-17-24-26.ulg          12.3      -5.9       -1.3
+    spread: horiz 13.7 mm max, vert 2.6 mm range
+
+NOTE: a cluster mixes true RTK repeatability with the rover not parking in
+      exactly the same spot, so horizontal spread is an UPPER bound. Vertical
+      spread at one spot is the cleaner signal.
+
+estimator_gps_status: 0/1390 samples with a failing GPS check (0.00%)
+
+NOTE: the t=0.1s sigma is high-frequency jitter. RTK error is time-correlated —
+      read the tau table before choosing EKF2_GPS_P_NOISE (Task 2.2).
