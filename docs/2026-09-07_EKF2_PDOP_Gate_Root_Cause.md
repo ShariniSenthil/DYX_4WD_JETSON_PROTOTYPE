@@ -35,6 +35,15 @@ resets totalling ~1.78m and ~1.63m; pre-M5: one ~2.3m dead-reckoning
 excursion) are both instances of this same mechanism, not two different
 phenomena as an earlier pass at this data concluded.
 
+**The single clearest piece of evidence is a direct contradiction in the
+same session** (full detail in §3.3): at boot (`log_51`) the estimator
+actively fused a `fix_type=4`, **2.7 m**-accuracy 3D fix because PDOP was
+fine, while later (`log_52`) it rejected a `fix_type=6` RTK-FIXED, **2.5
+cm**-accuracy sample solely because PDOP exceeded 3.0. `EKF2_REQ_EPH=3.0 m`
+is the only accuracy check that could otherwise have caught the 2.7 m fix,
+and 3.0 m is far too permissive to serve as the horizontal-quality gate on
+its own - so this is not simply a "remove the PDOP bit" fix; see §6.
+
 ---
 
 ## 2. Firmware mechanism, cited line-by-line
@@ -189,6 +198,95 @@ floor elevation (`noise_per_ms=0`, `automatic_gain_control=0`) at any point
 in either window - this reads as a reception/geometry event, not
 interference.
 
+### 3.3 The `log_51`-vs-`log_52` contradiction (strongest single piece of evidence)
+
+Decoded `log_51` (17:23:56-17:24:49 IST, the very first log of the session,
+boot/warm-up) directly:
+
+| Sample | fix_type | eph | HDOP | VDOP | PDOP | `estimator_aid_src_gnss_pos.fused` |
+|---|---:|---:|---:|---:|---:|---|
+| first 15+ samples | **4** (3D fix, not RTK) | **2.6-2.8 m** | 0.81-0.89 | 1.30-1.52 | 1.53-1.76 | **1 (True)** |
+
+Confirmed directly from `estimator_aid_src_gnss_pos` (not inferred from
+`fix_type` alone): the EKF was **actively fusing a 2.6-2.8 m horizontal-
+accuracy 3D fix** at boot, because PDOP was comfortably under 3.0 and the
+only fix-type check in the firmware is `gps.fix_type < 3`
+(`gps_checks.cpp:63`) - so `fix_type=4` passes it outright, regardless of
+how coarse the fix actually is. Compare against `log_52` half a session
+later: `fix_type=6` (RTK FIXED), `eph=0.025 m` (2.5 cm), rejected outright
+because `PDOP=3.2485 > 3.0`. On this rover, today, the quality gate can and
+did do:
+
+```text
+2.7 m horizontal accuracy, good PDOP        -> ACCEPTED, fused
+2.5 cm horizontal accuracy, high VDOP only  -> REJECTED, sample skipped
+```
+
+This is the clearest demonstration that PDOP (vertical-geometry-coupled) is
+the wrong horizontal-quality authority for this rover, and that
+`EKF2_REQ_EPH=3.0 m` (the only accuracy-based check that would otherwise
+have caught the 2.7 m fix) is **far too permissive to serve as the horizontal
+quality gate on its own** - a straight "drop PDOP, rely on EPH" fix would
+still accept metre-level fixes like this `log_51` one.
+
+### 3.4 Two more mechanism details, confirmed against source
+
+- **Horizontal fusion noise uses the receiver's own reported accuracy, not
+  the noise-floor parameter:** `gps_control.cpp:257`,
+  `float pos_noise = math::max(gnss_sample.hacc, _params.gps_pos_noise);`
+  With `EKF2_GPS_P_NOISE=0.01 m` (live) and the receiver typically reporting
+  `eph=0.015-0.025 m`, the `max()` almost always resolves to the receiver's
+  own `eph`, not the 0.01 m floor. Across all 21 logs, zero samples show the
+  noise floor binding, and all 6 total `innovation_rejected` events (checked
+  directly on `estimator_aid_src_gnss_pos`, all 21 logs) occur in `log_52`,
+  during the PDOP-starvation window - not scattered elsewhere. **This clears
+  `EKF2_GPS_P_NOISE=0.01` as a contributor to today's GNSS loss** - it may
+  still be worth revisiting on other grounds (2026-09-05's own note that it
+  is far below the *correlated* GNSS error), but it did not cause this.
+- **The 1-second `inertial_dead_reckoning` flag is real and separate from the
+  7-second fusion-stop:** `common.h:479`,
+  `const unsigned no_aid_timeout_max{1'000'000};`, consumed in
+  `ekf_helper.cpp:807-816` - if the last horizontal velocity or position
+  fusion is older than this 1 s, `inertial_dead_reckoning` is set true. This
+  is a softer, earlier warning flag than the hard 7 s `stopGnssFusion()` in
+  section 2.3; both are real, hardcoded, and distinct from each other and
+  from `EKF2_NOAID_TOUT` (`valid_timeout_max`, governs when the *state
+  estimate itself* is reported invalid, not when fusion stops).
+
+### 3.5 Correction: PDOP does **not** measurably knock out GNSS yaw or height here
+
+An earlier pass at this data claimed GNSS yaw and height fusion also dropped
+to ~33.9% active during the `log_52` PDOP-starvation window, reasoning that
+a single rejected GNSS sample should gate all four aid sources
+(position/velocity/yaw/height) together since they come from the same
+`_gps_data_ready` check. **Checked directly and it does not hold up:**
+
+| Aid source, `log_52` (bad window) | n samples | % fused |
+|---|---:|---:|
+| `estimator_aid_src_gnss_pos` | 103 | 51.5% |
+| `estimator_aid_src_gnss_vel` | 103 | 51.5% |
+| `estimator_aid_src_gnss_yaw` | 59 | **100.0%** |
+| `estimator_aid_src_gnss_hgt` | 59 | **100.0%** |
+
+Position and velocity fusion did drop (to 51.5%, not 33.9% either), but yaw
+and height stayed at 100% fused throughout the same window, in a normal log
+(`log_57`) for comparison, all four sit at 100%/n=136. Note the differing
+sample counts (103 vs 59) between position/velocity and yaw/height in the
+same log and time window - this points to a logging-rate or
+publish-on-success-only asymmetry between how these topics are recorded,
+which was not chased down further here. **Do not cite a yaw/height fusion
+drop as part of this evidence chain** until that asymmetry is understood;
+the position/velocity fusion drop and the `log_51`/`log_52` contradiction in
+§3.3 stand on their own regardless.
+
+*Not independently verified in this document:* a separate claim that
+shifting fused position 40-60 ms earlier collapses the moving raw-vs-fused
+difference to ~11 mm (consistent in direction with the existing 2026-09-03
+"transport latency, not estimator bias" finding, and with `EKF2_GPS_DELAY
+=50 ms` being applied before the GNSS sample enters the delayed buffer) -
+plausible and not contradicted by anything here, but the specific per-
+mission shift numbers were not re-derived in this pass.
+
 ---
 
 ## 4. HDOP vs VDOP attribution, all 21 logs
@@ -234,11 +332,21 @@ vertical-geometry characteristic of this site/time, not an isolated event.
   combines HDOP and VDOP.
 - The 7-second dead-reckoning-then-reset behavior is a real, hardcoded
   firmware mechanism, not a hypothesis - `reset_timeout_max` is a named
-  constant with a comment describing exactly this behavior.
+  constant with a comment describing exactly this behavior; the softer 1 s
+  `inertial_dead_reckoning` flag (`no_aid_timeout_max`) is a separate,
+  earlier-firing, equally real mechanism (§3.4).
 - Every PDOP rejection observed today was driven by VDOP; HDOP was never
   close to the gate.
 - This recurs across the session and across a power cycle - it is a property
   of the sky/antenna geometry here, not a transient the reboot fixed.
+- The estimator fused a 2.7 m-accuracy fix at boot while rejecting a 2.5 cm
+  RTK-fixed sample later in the same session, solely on PDOP (§3.3) -
+  `EKF2_REQ_EPH=3.0 m` would not have caught the 2.7 m fix either.
+- `EKF2_GPS_P_NOISE=0.01` is cleared as a contributor: horizontal fusion
+  noise uses `max(receiver eph, 0.01)`, which resolves to the receiver's own
+  (larger) `eph` in practice, and all 6 innovation rejections across all 21
+  logs occur inside the `log_52` PDOP-starvation window, not elsewhere
+  (§3.4).
 
 **Not established, and not claimed:**
 - *Why* VDOP degrades at these specific times (satellite constellation
@@ -254,13 +362,25 @@ vertical-geometry characteristic of this site/time, not an isolated event.
   degradation - M1 was aborted before reaching this state's consequences
   mattered, and M2-M7 were already confirmed EKF-healthy during their own
   execution windows by the earlier Findings doc.
+- **A claimed GNSS yaw/height fusion drop during the PDOP-starvation
+  window - checked directly and retracted (§3.5).** Yaw and height stayed
+  100% fused throughout `log_52`; only position/velocity fusion (51.5%,
+  not the originally claimed 33.9%) was affected. Do not carry the
+  yaw/height claim forward.
+- The `EKF2_GPS_DELAY`/raw-vs-fused timing-shift analysis (§3.4) - plausible
+  and consistent with prior findings, but not independently re-derived here.
 
 ## 6. Recommendation
 
-Do not change `EKF2_GPS_CHECK`, `EKF2_REQ_PDOP`, or any related parameter
-from this document alone. The evidence here supports specifically
-evaluating: (a) disabling the PDOP bit (bit 1, value 2) in
-`EKF2_GPS_CHECK` given HDOP/EPH/NSATS/SACC are already independently
-enabled and would continue gating genuine horizontal-quality problems, or
-(b) some other separation of horizontal from vertical GNSS quality gating -
-through the normal task-sheet decision process, not applied directly here.
+Do not change `EKF2_GPS_CHECK`, `EKF2_REQ_PDOP`, `EKF2_REQ_EPH`, or any
+related parameter from this document alone. **This is not simply "remove
+the PDOP bit"**: §3.3 shows `EKF2_REQ_EPH=3.0 m` is on its own far too
+permissive to replace PDOP as the horizontal-quality authority (it would
+have accepted the 2.7 m `log_51` fix too). The evidence here supports
+specifically evaluating a **combined** horizontal-quality gate - RTK fix
+state (`fix_type>=5` or `=6`) plus a materially tightened `EKF2_REQ_EPH`,
+decoupled from `EKF2_REQ_PDOP`/VDOP entirely - rather than either keeping
+PDOP as-is or dropping it with no replacement. That decision, and any
+resulting parameter or (per the closing question in the relayed trace) EKF2
+firmware-gate change, belongs in the normal task-sheet process, not applied
+directly from this document.
