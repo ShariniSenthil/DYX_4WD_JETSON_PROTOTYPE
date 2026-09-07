@@ -7,9 +7,15 @@ proposed EKF2_GPS_CHECK / EKF2_REQ_* change can be scored against real recorded
 GNSS behaviour before any param is touched or firmware flashed.
 
 Reports, per candidate: percentage of samples rejected, the longest continuous
-rejection run, and whether that run exceeds EKF2_NOAID_TOUT -- which is the
-threshold at which gps_control.cpp calls stopGnssFusion() and therefore forces
-a horizontal position reset on recovery.
+rejection run, and whether that run exceeds reset_timeout_max -- the threshold at
+which gps_control.cpp:82 calls stopGnssFusion() and therefore forces a horizontal
+position reset on recovery.
+
+⚠ reset_timeout_max is `const unsigned {7'000'000}` (common.h:478) -- a 7 s
+COMPILE-TIME CONSTANT that no parameter binds to. It is NOT EKF2_NOAID_TOUT.
+EKF2_NOAID_TOUT maps to valid_timeout_max (5 s, common.h:482), which only marks
+the state estimate invalid (ekf_helper.cpp:880) and does not stop GNSS fusion.
+Conflating the two is easy and wrong; the stop-fusion threshold cannot be tuned.
 
 The drift/speed checks (HDRIFT/VDRIFT/HSPD/VSPD) are omitted: they only evaluate
 when (!in_air && vehicle_at_rest), and estimator_gps_status shows they never
@@ -17,7 +23,7 @@ failed in the 2026-09-07 session. Verify that assumption with
 scripts/ekf2_gnss_gate_report.py before trusting this on a new dataset.
 
 Usage:
-  python3 scripts/ekf2_gate_simulate.py <dir-of-ulogs> [--noaid-tout 5.0]
+  python3 scripts/ekf2_gate_simulate.py <dir-of-ulogs> [--reset-timeout 7.0]
 """
 import argparse
 import glob
@@ -72,7 +78,9 @@ def evaluate(d, c):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("logdir")
-    ap.add_argument("--noaid-tout", type=float, default=5.0)
+    ap.add_argument("--reset-timeout", type=float, default=7.0,
+                    help="reset_timeout_max in seconds (common.h:478, compile-time "
+                         "const 7.0; NOT EKF2_NOAID_TOUT)")
     args = ap.parse_args()
 
     logs = sorted(glob.glob(os.path.join(os.path.expanduser(args.logdir), "*.ulg")))
@@ -90,7 +98,7 @@ def main():
         raise SystemExit(f"no usable ULogs under {args.logdir}")
 
     print(f"{'config':17s}{'GPS_CHECK':>10s}{'REQ_EPH':>9s}{'REQ_FIX':>9s}"
-          f"{'%fail':>8s}{'worst_run_s':>13s}{'>NOAID':>9s}  offenders")
+          f"{'%fail':>8s}{'worst_run_s':>13s}{'>7s':>6s}  stops fusion in")
     print("-" * 100)
     for name, c in CONFIGS:
         tot = fl = 0
@@ -104,15 +112,21 @@ def main():
             if fail.any():
                 r = longest_run(fail, t)
                 worst = max(worst, r)
-                if r > args.noaid_tout:
+                if r > args.reset_timeout:
                     offenders.append(f"{lname}:{r:.1f}s")
         print(f"{name:17s}{c['mask']:>10d}{c['eph']:>9.1f}{c['fix']:>9d}"
               f"{100 * fl / tot:7.2f}%{worst:13.2f}"
-              f"{('YES' if offenders else 'no'):>9s}  "
+              f"{('YES' if offenders else 'no'):>6s}  "
               f"{', '.join(offenders) if offenders else '-'}")
 
-    print("\nA run exceeding NOAID_TOUT means stopGnssFusion() and a horizontal\n"
-          "position reset on recovery. 'no' in that column is the goal.")
+    print(f"\nA continuous rejection run longer than reset_timeout_max "
+          f"({args.reset_timeout:.0f}s, common.h:478) means stopGnssFusion()\n"
+          "(gps_control.cpp:82) and a horizontal position reset on recovery. "
+          "'no' is the goal.\n"
+          "Note: the PDOP fail FLAG is computed unconditionally "
+          "(gps_checks.cpp:69) and is still\nlogged as check_fail_max_pdop even "
+          "when the mask bit is cleared -- the mask only\ncontrols whether it "
+          "causes runGnssChecks() to return false.")
 
 
 if __name__ == "__main__":

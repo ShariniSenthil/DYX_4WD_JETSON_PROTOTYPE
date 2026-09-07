@@ -1,7 +1,9 @@
 # EKF2 GNSS gate — production fix, traced to source and sized from data
 
-**Date:** 2026-09-07. **Status:** evidence complete, replay-verified, **nothing
-applied — no param set, no firmware flashed**.
+**Date:** 2026-09-07. **Status:** source-traced and replay-verified against 21
+ULogs; **approved for controlled field validation, NOT field-verified** — the
+rover has never yet run with the change. **Nothing applied: no param set, no
+firmware flashed.**
 
 > **Verdict (§5): set `EKF2_GPS_CHECK` from `831` to `829`. That is the entire
 > fix.** One parameter, no firmware, instantly reversible. Replayed over all
@@ -9,6 +11,17 @@ applied — no param set, no firmware flashed**.
 > **0.00 s** and eliminates both position resets. Every other candidate —
 > including tightening `EKF2_REQ_EPH` — is strictly worse on this data and
 > belongs in a separate decision.
+
+**Corrections applied 2026-09-07 after independent review** (verdict unchanged,
+supporting statements were wrong):
+- The stop-fusion threshold is **`reset_timeout_max` = 7 s**, a compile-time
+  constant — **not** `EKF2_NOAID_TOUT` (5 s), which does something else entirely
+  and cannot widen it. See §1.
+- **`check_fail_max_pdop` will still be logged** after applying `829`; the fail
+  flag is computed unconditionally and the mask only gates its effect. The
+  earlier "expect no `max_pdop` rows" validation criterion was wrong. See §6.
+- The `EKF2_REQ_FIX` patch is **source-review plausible, not verified** — never
+  built, replayed, flashed or field-tested.
 
 **Supersedes the candidate** sketched in the PDOP handoff
 (`PDOP off + EKF2_REQ_FIX = 6`) — see §4, that value is unsafe on this firmware.
@@ -46,7 +59,7 @@ runGnssChecks() returns false       gps_checks.cpp:171-185
 _gps_data_ready = false             gps_control.cpp:79-80
    │  ← the sample is DISCARDED, not merely "not used to start fusion"
    ▼
-failures persist > EKF2_NOAID_TOUT (5 s)
+failures persist > reset_timeout_max (7 s, hardcoded)
    │
    ▼
 stopGnssFusion()  "GNSS quality poor - stopping use"   gps_control.cpp:82-84
@@ -62,12 +75,32 @@ resetHorizontalPositionToGnss()     gps_control.cpp:200
 ```
 
 **Measured confirmation (`log_52`):** two continuous PDOP-fail runs of **8.50 s
-and 8.00 s**, both past the 5.0 s timeout, and `estimator_status.reset_count_pos_ne`
+and 8.00 s**, both past the 7 s threshold, and `estimator_status.reset_count_pos_ne`
 goes **7 → 9** — exactly two resets, matching the two the operator saw.
 
-Near-miss worth noting: `log_71`'s longest run was **4.00 s**, just under the
-timeout. No reset. The margin between "brief glitch" and "position jump" is
-about one second of VDOP.
+Near-miss worth noting: `log_71`'s longest run was **4.00 s**, under the
+threshold. No reset.
+
+### ⚠ Three different timeouts, and only one of them stops fusion
+
+An earlier revision of this document, and both scripts, wrongly named
+`EKF2_NOAID_TOUT` as the stop-fusion trigger. Corrected from source:
+
+| constant | value | settable? | what it actually does |
+|---|---|---|---|
+| `no_aid_timeout_max` | 1 s | no (`const`) | declares the sensor no longer contributing to aiding (`common.h:479`) |
+| `valid_timeout_max` | 5 s | **yes** — this is `EKF2_NOAID_TOUT` (`EKF2.cpp:146`) | reports the *state estimate* invalid after dead reckoning (`ekf_helper.cpp:880`) |
+| `reset_timeout_max` | **7 s** | **no** — `const unsigned` (`common.h:478`) | **calls `stopGnssFusion()`** (`gps_control.cpp:82`) |
+
+Two consequences. First, the threshold that matters here is **7 s, not 5 s**.
+Second, **it cannot be tuned** — no parameter binds to `reset_timeout_max`, so
+any plan that proposes "raise the timeout to buy margin" is not available on this
+firmware. `EKF2_NOAID_TOUT` is a different knob for a different purpose.
+
+The correction does not change the verdict: `log_52`'s two runs were 8.50 s and
+8.00 s (8.90 s measured off `vehicle_gps_position` timestamps rather than
+`estimator_gps_status`), all comfortably past 7 s, and the recommended
+configuration has no sustained run at all.
 
 ## 2. Which checks actually fail — the decisive measurement
 
@@ -136,7 +169,7 @@ Sized from the logs — longest continuous run below each fix type:
 
 `log_63` spent **95.4 continuous seconds below RTK FIXED** (83.2% of it at RTK
 FLOAT, EPH ≈ 0.02–0.97 m — perfectly usable). With `EKF2_REQ_FIX = 6` that
-becomes a 95-second total GNSS rejection: `stopGnssFusion` at t+5 s, 90 s of IMU
+becomes a 95-second total GNSS rejection: `stopGnssFusion` at t+7 s, 88 s of IMU
 dead reckoning, then a position reset on recovery. **It converts a benign RTK
 degradation into a guaranteed instance of the exact fault we are removing.**
 
@@ -153,7 +186,7 @@ only absolute reference instead of pausing the mission.
 candidate (`scripts/ekf2_gate_simulate.py`). This is what decides the verdict;
 everything above is why the candidates were chosen.
 
-| config | `GPS_CHECK` | `REQ_EPH` | `REQ_FIX` | %fail | worst fail run | exceeds NOAID? |
+| config | `GPS_CHECK` | `REQ_EPH` | `REQ_FIX` | %fail | worst fail run | stops fusion (>7 s)? |
 |---|---|---|---|---|---|---|
 | A — as-run today | 831 | 3.0 | 3 | 3.50% | 8.90 s | **YES** `log_52` |
 | **B0 — mask only** | **829** | **3.0** | 3 | **0.01%** | **0.00 s** | **no** |
@@ -172,7 +205,7 @@ everything above is why the candidates were chosen.
 HDRIFT, VSPD, SPOOFED.
 
 Replayed over the whole session this leaves **0.01% failing samples, a worst
-continuous fail run of 0.00 s, and no run anywhere exceeding `EKF2_NOAID_TOUT`** —
+continuous fail run of 0.00 s, and no run anywhere exceeding `reset_timeout_max`** —
 i.e. **zero `stopGnssFusion` events and zero position resets**, against 8.90 s
 and two resets today. `log_63`'s RTK-FLOAT stretch also goes to 0.00 s. Nothing
 else in the session's behaviour changes.
@@ -241,9 +274,16 @@ Params after flashing:
 | `EKF2_REQ_EPH` | **`1.0`** | sits inside the measured `(0.970, 1.115)` gap. |
 
 Residual risk of `EKF2_REQ_FIX = 5`: `log_63`'s longest sub-FLOAT run was
-**4.0 s** against the 5.0 s `EKF2_NOAID_TOUT` — a 1-second margin. If Phase 2
-proceeds, consider raising `EKF2_NOAID_TOUT` alongside it, or treat `5` as
-gated on a longer observation window than one session.
+**4.0 s** against the 7 s `reset_timeout_max` — a 3-second margin, wider than
+the 1 s an earlier revision claimed, because that revision used the wrong
+constant. **That margin cannot be widened**: `reset_timeout_max` is a
+compile-time `const` with no parameter binding, so the only way to buy room is
+to make rejections rarer, not the timeout longer. Treat `5` as gated on a longer
+observation window than one session.
+
+**This patch is not production-verified.** It has not been built, replayed,
+flashed or field-tested. "Applies cleanly and is source-review plausible" is the
+whole of its current status.
 
 ## 6. Verification before any flash
 
@@ -263,9 +303,31 @@ bit, its effect is exactly computable from the recorded samples, and
 `scripts/ekf2_gate_simulate.py` has already scored it over the full session
 (§5). It is reversible with a single `param set`.
 
-Field confirmation for it is simply the next session's logs: re-run
-`scripts/ekf2_gnss_gate_report.py` and expect **no `max_pdop` rows** and an
-unchanged `reset_count_pos_ne`.
+But **it has never actually been run on the rover**, so its status is *approved
+for controlled field validation*, not *field-verified*.
+
+### ⚠ What to expect in the validation logs — `max_pdop` will still appear
+
+An earlier revision said to expect **no `max_pdop` rows** after applying `829`.
+That is wrong. `flags.pdop` is computed **unconditionally**
+(`gps_checks.cpp:69`) and published straight to
+`estimator_gps_status.check_fail_max_pdop` (`EKF2.cpp:1241`). The mask only
+controls whether that flag makes `runGnssChecks()` return false. So whenever
+VDOP pushes PDOP past 3.0, the flag will still be logged.
+
+Judge the validation on consequences, not on the flag:
+
+| signal | expected with `829` |
+|---|---|
+| `check_fail_max_pdop` | **may still be true** — not a failure |
+| `"GNSS quality poor - stopping use"` | **absent** |
+| `reset_count_pos_ne` | **constant** across the run |
+| GNSS position fusion | **stays active** throughout |
+| sustained PDOP-driven dead reckoning | **none** |
+
+`scripts/ekf2_gnss_gate_report.py` reports the raw flags and now says so in its
+own header; read its `>7s` column and the `resets` column, not the presence of a
+row.
 
 ## 7. Still open (unchanged by this work)
 
@@ -287,6 +349,6 @@ python3 scripts/ekf2_gnss_gate_report.py ~/Documents/QGroundControl\ Daily/Logs/
 ```
 
 It prints live params, per-log fix/DOP behaviour, which checks failed, whether a
-fail run exceeded `EKF2_NOAID_TOUT` and the resulting `reset_count_pos_ne`, the
+fail run exceeded `reset_timeout_max` and the resulting `reset_count_pos_ne`, the
 HDOP/VDOP attribution, and the EPH separation gap. Point it at any ULog
 directory to re-run this analysis on a later session.

@@ -6,10 +6,15 @@ Answers, from a directory of ULogs:
   - whether PDOP failures are HDOP- or VDOP-driven
   - EPH separation between RTK and non-RTK fixes (sizes EKF2_REQ_EPH)
   - longest continuous run below each fix type (sizes EKF2_REQ_FIX)
-  - whether a fail run exceeds EKF2_NOAID_TOUT, and the resulting position resets
+  - whether a fail run exceeds reset_timeout_max (7 s), and the resulting resets
+
+⚠ The check_fail_* flags are computed UNCONDITIONALLY (gps_checks.cpp:63-76)
+and logged regardless of EKF2_GPS_CHECK. A masked-off check still reports its
+flag here; the mask only controls whether it makes runGnssChecks() return false.
+So a row appearing below does not by itself mean samples were rejected.
 
 Usage:
-  python3 scripts/ekf2_gnss_gate_report.py <dir-of-ulogs> [--noaid-tout 5.0]
+  python3 scripts/ekf2_gnss_gate_report.py <dir-of-ulogs> [--reset-timeout 7.0]
 """
 import argparse
 import glob
@@ -46,8 +51,9 @@ def _longest_run(mask, t):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("logdir")
-    ap.add_argument("--noaid-tout", type=float, default=5.0,
-                    help="EKF2_NOAID_TOUT in seconds (default 5.0)")
+    ap.add_argument("--reset-timeout", type=float, default=7.0,
+                    help="reset_timeout_max in seconds (common.h:478, compile-time "
+                         "const 7.0; NOT EKF2_NOAID_TOUT)")
     args = ap.parse_args()
 
     logs = sorted(glob.glob(os.path.join(os.path.expanduser(args.logdir), "*.ulg")))
@@ -101,7 +107,7 @@ def main():
                     resets = f"{int(rc[0])}->{int(rc[-1])}"
                 fail_rows.append((name, key.replace("check_fail_", ""),
                                   100 * np.mean(v), run,
-                                  run > args.noaid_tout, resets))
+                                  run > args.reset_timeout, resets))
 
     print("=== LIVE PARAMS (from ULogs; authoritative over any QGC export) ===")
     for k in PARAMS:
@@ -119,7 +125,7 @@ def main():
     if not fail_rows:
         print("  none")
     else:
-        hdr = f"{'log':9s}{'check':16s}{'%fail':>7s}{'longest_s':>11s}{'>NOAID':>8s}  resets"
+        hdr = f"{'log':9s}{'check':16s}{'%fail':>7s}{'longest_s':>11s}{'>7s':>6s}  resets"
         print(hdr, "\n" + "-" * (len(hdr) + 4), sep="")
         for name, key, pct, run, over, resets in fail_rows:
             print(f"{name:9s}{key:16s}{pct:7.2f}{run:11.2f}{'YES' if over else '-':>8s}  {resets}")

@@ -73,7 +73,7 @@ index deb08c5..d2fec43 100644
  
  		// Used by EKF-GSF experimental yaw estimator
 diff --git a/src/modules/ekf2/params_gnss.yaml b/src/modules/ekf2/params_gnss.yaml
-index 957d2d7..06825d7 100644
+index 957d2d7..d3a7ee8 100644
 --- a/src/modules/ekf2/params_gnss.yaml
 +++ b/src/modules/ekf2/params_gnss.yaml
 @@ -115,15 +115,16 @@ parameters:
@@ -96,7 +96,7 @@ index 957d2d7..06825d7 100644
        max: 100
        unit: m
        decimal: 1
-@@ -178,6 +179,22 @@ parameters:
+@@ -178,6 +179,25 @@ parameters:
        max: 1.5
        decimal: 2
        unit: m/s
@@ -104,9 +104,12 @@ index 957d2d7..06825d7 100644
 +      description:
 +        short: Required GNSS fix type
 +        long: 'Minimum GNSS fix type required for GNSS usage. Only enforced when bit 10
-+          of EKF2_GPS_CHECK is set. NOTE: values above 5 (RTK float) reject every sample
-+          during an RTK degradation; a degradation longer than EKF2_NOAID_TOUT stops GNSS
-+          fusion and forces a position reset on recovery.'
++          of EKF2_GPS_CHECK is set. WARNING: a value above 5 (RTK float) rejects every
++          sample for the whole duration of an RTK degradation. This build checks every
++          sample continuously (there is no relaxed in-flight path), and a continuous
++          rejection longer than reset_timeout_max - a 7 s compile-time constant that no
++          parameter can change, NOT EKF2_NOAID_TOUT - calls stopGnssFusion() and forces a
++          horizontal position reset on recovery.'
 +      type: enum
 +      values:
 +        0: No fix required
