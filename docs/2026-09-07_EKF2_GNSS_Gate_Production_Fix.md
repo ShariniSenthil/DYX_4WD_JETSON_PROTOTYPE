@@ -1,7 +1,16 @@
 # EKF2 GNSS gate — production fix, traced to source and sized from data
 
-**Date:** 2026-09-07. **Status:** evidence complete, decision proposed, **nothing
-applied**. **Supersedes the candidate** sketched in the PDOP handoff
+**Date:** 2026-09-07. **Status:** evidence complete, replay-verified, **nothing
+applied — no param set, no firmware flashed**.
+
+> **Verdict (§5): set `EKF2_GPS_CHECK` from `831` to `829`. That is the entire
+> fix.** One parameter, no firmware, instantly reversible. Replayed over all
+> 9,488 GNSS samples it takes the worst continuous rejection run from 8.90 s to
+> **0.00 s** and eliminates both position resets. Every other candidate —
+> including tightening `EKF2_REQ_EPH` — is strictly worse on this data and
+> belongs in a separate decision.
+
+**Supersedes the candidate** sketched in the PDOP handoff
 (`PDOP off + EKF2_REQ_FIX = 6`) — see §4, that value is unsafe on this firmware.
 
 **Reads on:** [2026-09-07_EKF2_PDOP_Gate_Root_Cause.md](2026-09-07_EKF2_PDOP_Gate_Root_Cause.md)
@@ -138,29 +147,72 @@ different questions for different layers. The second one already has a home —
 `rtk_stable_sec: 3.0`. Requiring RTK FIXED *inside the estimator* removes its
 only absolute reference instead of pausing the mission.
 
-## 5. Proposed fix
+## 5. Verdict — the fix is one parameter
 
-### Phase 1 — parameters only, no firmware, no flash
+`runGnssChecks` was replayed sample-by-sample over all 9,488 samples under each
+candidate (`scripts/ekf2_gate_simulate.py`). This is what decides the verdict;
+everything above is why the candidates were chosen.
 
-| param | now | proposed | why |
-|---|---|---|---|
-| `EKF2_GPS_CHECK` | `831` | **`829`** | clears PDOP bit 1. Removes 100% of the session's check failures and both resets. |
-| `EKF2_REQ_EPH` | `3.0` | **`2.0`** | rejects the 2.4–2.9 m code-differential fixes `log_51` accepted; accepts all RTK. `2.0` is the declared metadata minimum, so it stays in-range. |
+| config | `GPS_CHECK` | `REQ_EPH` | `REQ_FIX` | %fail | worst fail run | exceeds NOAID? |
+|---|---|---|---|---|---|---|
+| A — as-run today | 831 | 3.0 | 3 | 3.50% | 8.90 s | **YES** `log_52` |
+| **B0 — mask only** | **829** | **3.0** | 3 | **0.01%** | **0.00 s** | **no** |
+| B — mask + EPH 2.0 | 829 | 2.0 | 3 | 5.68% | 53.68 s | YES `log_51` |
+| C — mask + EPH 1.0 | 829 | 1.0 | 3 | 6.10% | 53.68 s | YES `log_51` |
+| D — + `REQ_FIX=5` | 1853 | 1.0 | 5 | 6.10% | 53.68 s | YES `log_51` |
+| E — + `REQ_FIX=6` | 1853 | 1.0 | 6 | 15.79% | 95.39 s | YES `log_51`, `log_63` |
 
-`829 = 831 − 2`. Bits remaining: nsats, EPH, EPV, SACC, HDRIFT, VSPD, SPOOFED.
+### ✅ Apply this, and only this
 
-Replayed against this session, Phase 1 yields **zero GNSS check failures and
-zero PDOP-driven resets**, while `log_51`'s 2.7 m origin fix is rejected.
+| param | now | set to |
+|---|---|---|
+| `EKF2_GPS_CHECK` | `831` | **`829`** |
 
-`EKF2_REQ_PDOP` is deliberately **not** raised instead: its declared max is
-`5.0` and `log_52` peaked at `5.61`, so raising it cannot cover the observed
-range and would still fail. Turning the bit off is the only complete option.
+`829 = 831 − 2` (clears PDOP bit 1). Remaining bits: nsats, EPH, EPV, SACC,
+HDRIFT, VSPD, SPOOFED.
 
-### Phase 2 — optional firmware backport, defense in depth
+Replayed over the whole session this leaves **0.01% failing samples, a worst
+continuous fail run of 0.00 s, and no run anywhere exceeding `EKF2_NOAID_TOUT`** —
+i.e. **zero `stopGnssFusion` events and zero position resets**, against 8.90 s
+and two resets today. `log_63`'s RTK-FLOAT stretch also goes to 0.00 s. Nothing
+else in the session's behaviour changes.
 
-Phase 1 leans entirely on receiver-self-reported EPH, and the 2026-09-04
-vertical anomaly proved this receiver can be *confidently wrong*. A structural
-fix-type gate is worth having as a second, independent axis.
+It is one `param set`, instantly reversible, and needs no build or flash.
+
+`EKF2_REQ_PDOP` is deliberately **not** raised instead: its declared max is `5.0`
+and `log_52` peaked at `5.61`, so raising it cannot cover the observed range.
+Clearing the bit is the only complete option.
+
+### ⚠ Do NOT bundle the EPH change with it
+
+An earlier revision of this document proposed `EKF2_REQ_EPH 3.0 → 2.0` alongside
+the mask change. **The replay shows that is wrong to bundle**, for a reason the
+static analysis missed: `log_51` was **armed, with GNSS position fusion active
+100% of the log and `xy_global` true**. It was not a harmless pre-origin warmup.
+Tightening EPH there does not "block a bad origin" — it removes the vehicle's
+only global position for 53.7 s **while armed**, which is a capability change,
+not a bug fix. And it fixes a condition that produced **no reset**
+(`log_51` `reset_count_pos_ne` 6 → 6).
+
+The 2.7 m origin fix is still a genuine weakness, and `EKF2_REQ_EPH = 2.0` is
+still the right lever for it (fix-4 EPH 2.425–2.925 m occurs *only* in `log_51`,
+so it costs nothing in any other log). But it is a **separate decision about what
+the rover should do when RTK is unavailable** — refuse to provide a position, or
+provide a degraded one — and it belongs in the task sheet with operator sign-off,
+not smuggled in behind a reset fix.
+
+### Phase 2 — optional firmware backport, NOT required for this fault
+
+The mask change fully removes the observed fault, so this section is **not part
+of the fix**. It exists because the remaining weakness — accepting a metre-scale
+fix, as in `log_51` — is currently gated only by receiver-self-reported EPH, and
+the 2026-09-04 vertical anomaly proved this receiver can be *confidently wrong*.
+A structural fix-type gate is a second, independent axis for that.
+
+Note the replay verdict: **D (`REQ_FIX=5`) is not better than B0 on any log in
+this session** — it is strictly more restrictive, and its only benefit is against
+a failure mode this session did not exhibit. Treat it as insurance to be argued
+on its own merits, not as an improvement on the fix.
 
 **Patch:** [docs/patches/0001-ekf2-backport-EKF2_REQ_FIX-onto-54f0455.patch](patches/0001-ekf2-backport-EKF2_REQ_FIX-onto-54f0455.patch)
 — 5 files, 121 lines, **verified to apply cleanly** to `54f0455` with
@@ -206,9 +258,14 @@ The specific questions to answer:
 3. Does `log_51` fail its checks at boot, i.e. is the 2.7 m origin rejected?
 4. Do the 16 clean logs replay bit-identical to baseline?
 
-Phase 1 needs no replay — it only clears a mask bit and tightens an existing
-threshold, both of which are exactly computable from the recorded
-`check_fail_*` fields, and both are trivially reversible via `param set`.
+The `EKF2_GPS_CHECK = 829` fix needs no firmware replay: it only clears a mask
+bit, its effect is exactly computable from the recorded samples, and
+`scripts/ekf2_gate_simulate.py` has already scored it over the full session
+(§5). It is reversible with a single `param set`.
+
+Field confirmation for it is simply the next session's logs: re-run
+`scripts/ekf2_gnss_gate_report.py` and expect **no `max_pdop` rows** and an
+unchanged `reset_count_pos_ne`.
 
 ## 7. Still open (unchanged by this work)
 
