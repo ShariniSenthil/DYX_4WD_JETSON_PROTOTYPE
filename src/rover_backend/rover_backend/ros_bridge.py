@@ -2466,6 +2466,28 @@ class RoverBackendRosNode(Node):
         if manager_run_id:
             mission_updates["mission_run_id"] = manager_run_id
 
+        # DYX WAYPOINT SURVEY DISPLAY ONLY
+        #
+        # Clear old waypoint display snapshots when a new mission run begins.
+        # This changes display state only.
+        current_backend_mission = rover_state.section("mission")
+        current_survey_run_id = str(
+            current_backend_mission.get("waypoint_survey_run_id") or ""
+        ).strip()
+
+        if manager_run_id and manager_run_id != current_survey_run_id:
+            mission_updates["waypoint_survey_snapshots"] = {}
+            mission_updates["last_waypoint_survey_snapshot"] = None
+            mission_updates["waypoint_survey_run_id"] = manager_run_id
+
+        elif (
+            effective_state_name in {"EMPTY", "READY"}
+            and not manager_run_id
+        ):
+            mission_updates["waypoint_survey_snapshots"] = {}
+            mission_updates["last_waypoint_survey_snapshot"] = None
+            mission_updates["waypoint_survey_run_id"] = None
+
         if preparation_in_progress and state_name == "EMPTY":
             # Preserve the uploaded mission metadata and the trajectory
             # generator's PREPARING message while mission_manager is clearing
@@ -2650,7 +2672,91 @@ class RoverBackendRosNode(Node):
 
         point_results = dict(mission.get("point_results") or {})
 
+        # DYX WAYPOINT SURVEY DISPLAY ONLY
+        #
+        # This map is ONLY for the waypoint-table physical stop snapshot.
+        # Live cross/along/speed/heading/distance remain RPP telemetry.
+        #
+        # Mission Manager already calculated accuracy["survey"] from:
+        #   uploaded CSV surveyed point
+        #       VS
+        #   RAW GPS1 RTK FIXED stop position.
+        #
+        # Backend performs NO geometry and NO tolerance decision here.
+        waypoint_survey_snapshots_raw = mission.get("waypoint_survey_snapshots")
+        waypoint_survey_snapshots = (
+            dict(waypoint_survey_snapshots_raw)
+            if isinstance(waypoint_survey_snapshots_raw, dict)
+            else {}
+        )
+
+        last_waypoint_survey_snapshot_raw = mission.get(
+            "last_waypoint_survey_snapshot"
+        )
+        last_waypoint_survey_snapshot = (
+            copy.deepcopy(last_waypoint_survey_snapshot_raw)
+            if isinstance(last_waypoint_survey_snapshot_raw, dict)
+            else None
+        )
+
+        stored_survey_run_id = str(
+            mission.get("waypoint_survey_run_id") or ""
+        ).strip()
+        event_survey_run_id = str(
+            payload.get("mission_run_id") or ""
+        ).strip()
+
+        # Defensive mission-run boundary: never mix survey rows from
+        # two separate mission runs.
+        if (
+            event_survey_run_id
+            and stored_survey_run_id
+            and event_survey_run_id != stored_survey_run_id
+        ):
+            waypoint_survey_snapshots = {}
+            last_waypoint_survey_snapshot = None
+
+        if event_survey_run_id:
+            stored_survey_run_id = event_survey_run_id
+
         point_id = str(payload.get("point_id") or "").strip()
+
+        # Freeze the physical survey snapshot at the RPP terminal outcome.
+        # COMPLETED/spray events must not create a second measurement.
+        if (
+            point_id
+            and event_name in {"ACCURACY_ACHIEVED", "ACCURACY_FAILED"}
+            and point_id not in waypoint_survey_snapshots
+        ):
+            survey_candidate = None
+
+            if isinstance(accuracy_snapshot, dict):
+                nested_survey = accuracy_snapshot.get("survey")
+                if isinstance(nested_survey, dict):
+                    survey_candidate = nested_survey
+
+            # Compatibility: Mission Manager also places the same survey
+            # object at the point-event top level.
+            if survey_candidate is None:
+                top_level_survey = payload.get("survey")
+                if isinstance(top_level_survey, dict):
+                    survey_candidate = top_level_survey
+
+            if isinstance(survey_candidate, dict):
+                frozen_survey = copy.deepcopy(survey_candidate)
+
+                waypoint_survey_snapshots[point_id] = frozen_survey
+
+                last_waypoint_survey_snapshot = {
+                    "point_id": point_id,
+                    "point_index": point_index,
+                    "mission_run_id": (
+                        event_survey_run_id or stored_survey_run_id or None
+                    ),
+                    "event": event_name,
+                    "survey": copy.deepcopy(frozen_survey),
+                    "received_at": payload.get("received_at"),
+                }
 
         if point_id:
             existing = point_results.get(point_id)
@@ -2730,6 +2836,14 @@ class RoverBackendRosNode(Node):
             "mission",
             last_point_event=payload,
             point_results=point_results,
+            # DISPLAY ONLY: frontend waypoint table may read these.
+            waypoint_survey_snapshots=waypoint_survey_snapshots,
+            last_waypoint_survey_snapshot=copy.deepcopy(
+                last_waypoint_survey_snapshot
+            ),
+            waypoint_survey_run_id=(
+                stored_survey_run_id or None
+            ),
         )
         _notify_authoritative_state_changed()
 
