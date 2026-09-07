@@ -1,0 +1,121 @@
+diff --git a/src/modules/ekf2/EKF/aid_sources/gnss/gps_checks.cpp b/src/modules/ekf2/EKF/aid_sources/gnss/gps_checks.cpp
+index 81b3fcc..ac886f5 100644
+--- a/src/modules/ekf2/EKF/aid_sources/gnss/gps_checks.cpp
++++ b/src/modules/ekf2/EKF/aid_sources/gnss/gps_checks.cpp
+@@ -54,13 +54,14 @@
+ #define MASK_GPS_HSPD    (1<<7)
+ #define MASK_GPS_VSPD    (1<<8)
+ #define MASK_GPS_SPOOFED (1<<9)
++#define MASK_GPS_FIX     (1<<10)
+ 
+ bool Ekf::runGnssChecks(const gnssSample &gps)
+ {
+ 	_gps_check_fail_status.flags.spoofed = gps.spoofed;
+ 
+ 	// Check the fix type
+-	_gps_check_fail_status.flags.fix = (gps.fix_type < 3);
++	_gps_check_fail_status.flags.fix = (gps.fix_type < _params.req_fix);
+ 
+ 	// Check the number of satellites
+ 	_gps_check_fail_status.flags.nsats = (gps.nsats < _params.req_nsats);
+@@ -169,7 +170,7 @@ bool Ekf::runGnssChecks(const gnssSample &gps)
+ 
+ 	// if any user selected checks have failed, record the fail time
+ 	if (
+-		_gps_check_fail_status.flags.fix ||
++		(_gps_check_fail_status.flags.fix     && (_params.gps_check_mask & MASK_GPS_FIX)) ||
+ 		(_gps_check_fail_status.flags.nsats   && (_params.gps_check_mask & MASK_GPS_NSATS)) ||
+ 		(_gps_check_fail_status.flags.pdop    && (_params.gps_check_mask & MASK_GPS_PDOP)) ||
+ 		(_gps_check_fail_status.flags.hacc    && (_params.gps_check_mask & MASK_GPS_HACC)) ||
+diff --git a/src/modules/ekf2/EKF/common.h b/src/modules/ekf2/EKF/common.h
+index 5ec5e42..1ceb64c 100644
+--- a/src/modules/ekf2/EKF/common.h
++++ b/src/modules/ekf2/EKF/common.h
+@@ -335,7 +335,7 @@ struct parameters {
+ 
+ 	// these parameters control the strictness of GPS quality checks used to determine if the GPS is
+ 	// good enough to set a local origin and commence aiding
+-	int32_t gps_check_mask{21};             ///< bitmask used to control which GPS quality checks are used
++	int32_t gps_check_mask{1045};           ///< bitmask used to control which GPS quality checks are used
+ 	float req_hacc{5.0f};                   ///< maximum acceptable horizontal position error (m)
+ 	float req_vacc{8.0f};                   ///< maximum acceptable vertical position error (m)
+ 	float req_sacc{1.0f};                   ///< maximum acceptable speed error (m/s)
+@@ -343,6 +343,7 @@ struct parameters {
+ 	float req_pdop{2.0f};                   ///< maximum acceptable position dilution of precision
+ 	float req_hdrift{0.3f};                 ///< maximum acceptable horizontal drift speed (m/s)
+ 	float req_vdrift{0.5f};                 ///< maximum acceptable vertical drift speed (m/s)
++	int32_t req_fix{3};                     ///< minimum acceptable GNSS fix type
+ 
+ # if defined(CONFIG_EKF2_GNSS_YAW)
+ 	// GNSS heading fusion
+diff --git a/src/modules/ekf2/EKF2.cpp b/src/modules/ekf2/EKF2.cpp
+index 2e84439..d808655 100644
+--- a/src/modules/ekf2/EKF2.cpp
++++ b/src/modules/ekf2/EKF2.cpp
+@@ -96,6 +96,7 @@ EKF2::EKF2(bool multi_mode, const px4::wq_config_t &config, bool replay_mode):
+ 	_param_ekf2_req_pdop(_params->req_pdop),
+ 	_param_ekf2_req_hdrift(_params->req_hdrift),
+ 	_param_ekf2_req_vdrift(_params->req_vdrift),
++	_param_ekf2_req_fix(_params->req_fix),
+ 	_param_ekf2_gsf_tas_default(_params->EKFGSF_tas_default),
+ #endif // CONFIG_EKF2_GNSS
+ #if defined(CONFIG_EKF2_BAROMETER)
+diff --git a/src/modules/ekf2/EKF2.hpp b/src/modules/ekf2/EKF2.hpp
+index deb08c5..d2fec43 100644
+--- a/src/modules/ekf2/EKF2.hpp
++++ b/src/modules/ekf2/EKF2.hpp
+@@ -533,6 +533,7 @@ private:
+ 		(ParamExtFloat<px4::params::EKF2_REQ_PDOP>)   _param_ekf2_req_pdop,
+ 		(ParamExtFloat<px4::params::EKF2_REQ_HDRIFT>) _param_ekf2_req_hdrift,
+ 		(ParamExtFloat<px4::params::EKF2_REQ_VDRIFT>) _param_ekf2_req_vdrift,
++		(ParamExtInt<px4::params::EKF2_REQ_FIX>)      _param_ekf2_req_fix,
+ 		(ParamFloat<px4::params::EKF2_REQ_GPS_H>)     _param_ekf2_req_gps_h,
+ 
+ 		// Used by EKF-GSF experimental yaw estimator
+diff --git a/src/modules/ekf2/params_gnss.yaml b/src/modules/ekf2/params_gnss.yaml
+index 957d2d7..06825d7 100644
+--- a/src/modules/ekf2/params_gnss.yaml
++++ b/src/modules/ekf2/params_gnss.yaml
+@@ -115,15 +115,16 @@ parameters:
+         7: Horizontal speed offset (EKF2_REQ_HDRIFT)
+         8: Vertical speed offset (EKF2_REQ_VDRIFT)
+         9: Spoofing
+-      default: 1023
++        10: GNSS fix type (EKF2_REQ_FIX)
++      default: 2047
+       min: 0
+-      max: 1023
++      max: 2047
+     EKF2_REQ_EPH:
+       description:
+         short: Required EPH to use GPS
+       type: float
+       default: 3.0
+-      min: 2
++      min: 0.5
+       max: 100
+       unit: m
+       decimal: 1
+@@ -178,6 +179,22 @@ parameters:
+       max: 1.5
+       decimal: 2
+       unit: m/s
++    EKF2_REQ_FIX:
++      description:
++        short: Required GNSS fix type
++        long: 'Minimum GNSS fix type required for GNSS usage. Only enforced when bit 10
++          of EKF2_GPS_CHECK is set. NOTE: values above 5 (RTK float) reject every sample
++          during an RTK degradation; a degradation longer than EKF2_NOAID_TOUT stops GNSS
++          fusion and forces a position reset on recovery.'
++      type: enum
++      values:
++        0: No fix required
++        2: 2D fix
++        3: 3D fix
++        4: RTCM code differential
++        5: RTK float
++        6: RTK fixed
++      default: 3
+     EKF2_REQ_GPS_H:
+       description:
+         short: Required GPS health time on startup
