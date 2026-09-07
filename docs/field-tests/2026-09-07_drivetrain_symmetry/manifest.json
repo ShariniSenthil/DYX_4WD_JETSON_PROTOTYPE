@@ -1,0 +1,27 @@
+{
+  "recorded_date": "2026-09-07",
+  "source_host": "flash@192.168.3.101",
+  "firmware_git": "54f0455ffcd755534539a7cf33a09a20bf71d29d",
+  "files": [
+    {
+      "archive": "ground_symmetry_clean_20260907.py.txt",
+      "original": "/tmp/ground_symmetry_clean_20260907.py",
+      "sha256": "114e74a5c2a0870ba65586148edae7468c638a870254d5123b0306b75139b7e6"
+    },
+    {
+      "archive": "ground_symmetry_20260907.py.txt",
+      "original": "/tmp/ground_symmetry_20260907.py",
+      "sha256": "6f6db3f41fe51aafd71e65f7daf4bbf585d22dde4acb26942b0095a1aa01bfcf"
+    },
+    {
+      "archive": "symmetry_px4_shell_probe.py.txt",
+      "original": "/tmp/symmetry_px4_shell_probe.py",
+      "sha256": "1ce9f4a270f43820cea913258072db5b61182ecf736ca025e06834712cf46f39"
+    },
+    {
+      "archive": "result.json",
+      "original": "/tmp/ground_symmetry_clean_20260907_result.json",
+      "sha256": "615d75ec9e704db33e50adebdd11d3b4ce76e1e170f548b94d47b1bd82aba3b5"
+    }
+  ]
+}

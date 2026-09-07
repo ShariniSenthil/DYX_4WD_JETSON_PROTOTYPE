@@ -1,0 +1,114 @@
+{
+  "manual_entered": true,
+  "armed_neutral_stable": true,
+  "restored": true,
+  "errors": [],
+  "logger_after": "logger status\nINFO  [logger] Running in mode: all\nINFO  [logger] Number of subscriptions: 136 (4352 bytes)\nINFO  [logger] Not logging\nnsh> ",
+  "param_save_output": "param save\nnsh> ",
+  "param_show_output": "param show COM_RC_IN_MODE\nSymbols: x = used, + = saved, * = unsaved\nx + COM_RC_IN_MODE [179,509] : 0\n\n 766/1590 parameters used.\nnsh> ",
+  "sequence_executed": [
+    {
+      "label": "neutral",
+      "y": 0,
+      "requested_duration_s": 3,
+      "start_monotonic": 5290.659943923,
+      "actual_duration_s": 3.000145230999806
+    },
+    {
+      "label": "LEFT",
+      "y": -400,
+      "requested_duration_s": 3,
+      "start_monotonic": 5293.660089154,
+      "actual_duration_s": 2.999945132999528
+    },
+    {
+      "label": "neutral",
+      "y": 0,
+      "requested_duration_s": 3,
+      "start_monotonic": 5296.660034287,
+      "actual_duration_s": 3.0023830420004742
+    },
+    {
+      "label": "RIGHT",
+      "y": 400,
+      "requested_duration_s": 3,
+      "start_monotonic": 5299.662417329,
+      "actual_duration_s": 2.9972928209999736
+    },
+    {
+      "label": "neutral",
+      "y": 0,
+      "requested_duration_s": 3,
+      "start_monotonic": 5302.65971015,
+      "actual_duration_s": 3.0002805280000757
+    },
+    {
+      "label": "LEFT",
+      "y": -550,
+      "requested_duration_s": 3,
+      "start_monotonic": 5305.659990678,
+      "actual_duration_s": 2.9998727479996887
+    },
+    {
+      "label": "neutral",
+      "y": 0,
+      "requested_duration_s": 3,
+      "start_monotonic": 5308.659863426,
+      "actual_duration_s": 3.0005716980003854
+    },
+    {
+      "label": "RIGHT",
+      "y": 550,
+      "requested_duration_s": 3,
+      "start_monotonic": 5311.660435124,
+      "actual_duration_s": 2.999963917000059
+    },
+    {
+      "label": "neutral",
+      "y": 0,
+      "requested_duration_s": 3,
+      "start_monotonic": 5314.660399041,
+      "actual_duration_s": 2.999633129999893
+    },
+    {
+      "label": "LEFT",
+      "y": -700,
+      "requested_duration_s": 3,
+      "start_monotonic": 5317.660032171,
+      "actual_duration_s": 3.0001353429997835
+    },
+    {
+      "label": "neutral",
+      "y": 0,
+      "requested_duration_s": 3,
+      "start_monotonic": 5320.660167514,
+      "actual_duration_s": 3.0006962750003368
+    },
+    {
+      "label": "RIGHT",
+      "y": 700,
+      "requested_duration_s": 3,
+      "start_monotonic": 5323.660863789,
+      "actual_duration_s": 2.9989082919992143
+    },
+    {
+      "label": "neutral",
+      "y": 0,
+      "requested_duration_s": 5,
+      "start_monotonic": 5326.659772081,
+      "actual_duration_s": 4.999944746000438
+    }
+  ],
+  "ulog": "/fs/microsd/log/2026-09-07/07_34_22.ulg",
+  "abort_reason": null,
+  "failsafe_messages": [],
+  "last_px4_setpoint": {
+    "valid": true,
+    "source": 3,
+    "throttle": 0.0,
+    "roll": 0.0,
+    "timestamp": 5352689221,
+    "age": 0.000509,
+    "sample_lag": 6e-06
+  }
+}

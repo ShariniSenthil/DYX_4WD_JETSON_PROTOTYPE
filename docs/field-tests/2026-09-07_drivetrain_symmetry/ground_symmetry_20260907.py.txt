@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Temporary operator-armed MANUAL drivetrain test. No production imports/edits."""
+import json, os, signal, threading, time
+from pathlib import Path
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.signals import SignalHandlerOptions
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+from mavros_msgs.msg import ManualControl, State, StatusText, RCOut, RCIn
+from mavros_msgs.srv import ParamPull, ParamSetV2, FileList, CommandLong, CommandBool, SetMode
+from rcl_interfaces.srv import GetParameters
+from std_msgs.msg import Bool
+
+SEQUENCE = [('neutral',0,3),('LEFT',-400,3),('neutral',0,3),('RIGHT',400,3),
+ ('neutral',0,3),('LEFT',-550,3),('neutral',0,3),('RIGHT',550,3),
+ ('neutral',0,3),('LEFT',-700,3),('neutral',0,3),('RIGHT',700,3),('neutral',0,5)]
+BASE='/fs/microsd/log'
+REPORT=Path('/tmp/ground_symmetry_20260907_result.json')
+TRACE=Path('/tmp/ground_symmetry_20260907_commands.csv')
+
+class Test(Node):
+ def __init__(self):
+  super().__init__('temporary_ground_drivetrain_symmetry')
+  self.lock=threading.RLock(); self.state=None; self.state_time=0.; self.estop=None
+  self.rc_input=None; self.rc_input_time=0.; self.rc_config=None
+  self.rc=None; self.rc_time=0.; self.abort_reason=None; self.start=None; self.done=threading.Event()
+  self.active=False; self.last_tick=None; self.step=-1; self.executed=[]; self.count=0
+  self.pub=self.create_publisher(ManualControl,'/mavros/manual_control/send',1)
+  self.create_subscription(State,'/mavros/state',self.on_state,QoSProfile(depth=10,reliability=ReliabilityPolicy.BEST_EFFORT))
+  q=QoSProfile(depth=1,durability=DurabilityPolicy.VOLATILE,reliability=ReliabilityPolicy.BEST_EFFORT)
+  self.create_subscription(Bool,'/emergency_stop',self.on_estop,q)
+  self.create_subscription(RCOut,'/mavros/rc/out',self.on_rc,q)
+  self.create_subscription(RCIn,'/mavros/rc/in',self.on_rc_input,q)
+  self.create_subscription(StatusText,'/mavros/statustext/recv',lambda m: print('PX4:',m.text,flush=True),q)
+  self.svc_clients={
+   'pull':self.create_client(ParamPull,'/mavros/param/pull'),
+   'get':self.create_client(GetParameters,'/mavros/param/get_parameters'),
+   'set':self.create_client(ParamSetV2,'/mavros/param/set'),
+   'ftp':self.create_client(FileList,'/mavros/ftp/list'),
+   'cmd':self.create_client(CommandLong,'/mavros/cmd/command'),
+   'arm':self.create_client(CommandBool,'/mavros/cmd/arming'),
+   'mode':self.create_client(SetMode,'/mavros/set_mode')}
+  self.trace=TRACE.open('w',buffering=1); self.trace.write('monotonic,sequence_elapsed,label,x,y,z,r\n')
+  self.timer=self.create_timer(.02,self.tick)
+ def on_state(self,m):
+  with self.lock:
+   self.state=m; self.state_time=time.monotonic()
+   if self.active and (not m.connected or not m.armed or m.mode!='MANUAL'):
+    self.abort('Lost armed MANUAL control path')
+ def on_rc_input(self,m):self.rc_input=m;self.rc_input_time=time.monotonic()
+ def arm_switch_off(self):
+  if self.rc_config is None:return False
+  p=self.rc_config;channel=int(p['RC_MAP_ARM_SW'])
+  if channel==0:return True
+  if self.rc_input is None or time.monotonic()-self.rc_input_time>1 or len(self.rc_input.channels)<channel:return False
+  prefix='RC'+str(channel)+'_';v=self.rc_input.channels[channel-1]
+  mn,mx,tr,dz,rev=[p[prefix+k] for k in ['MIN','MAX','TRIM','DZ','REV']]
+  if v>tr+dz:value=(v-tr-dz)/(mx-tr-dz)
+  elif v<tr-dz:value=(v-tr+dz)/(tr-mn-dz)
+  else:value=0
+  value=(max(-1,min(1,value))*rev+1)/2;th=p['RC_ARMSWITCH_TH']
+  if th<0:value=-value
+  return value<=th
+ def on_rc(self,m): self.rc=m; self.rc_time=time.monotonic()
+ def on_estop(self,m):
+  with self.lock:
+   self.estop=m.data
+   if m.data and self.active: self.abort('E-stop asserted')
+ def publish(self,y):
+  assert y in (0,-400,400,-550,550,-700,700)
+  m=ManualControl(); m.header.stamp=self.get_clock().now().to_msg()
+  m.x=0.; m.y=float(y); m.z=500.; m.r=0.; self.pub.publish(m)
+ def abort(self,reason):
+  with self.lock:
+   if self.abort_reason is None: self.abort_reason=reason; print('ABORT:',reason,flush=True)
+   self.publish(0); self.done.set()
+ def tick(self):
+  with self.lock:
+   now=time.monotonic(); y=0; label='neutral_guard'; elapsed=None
+   if self.active and not self.abort_reason:
+    if now-self.state_time>1.5: self.abort('MAVROS state stale')
+    if self.last_tick is not None and now-self.last_tick>.10: self.abort('Publisher scheduling gap exceeded 100 ms')
+    if self.estop is not False: self.abort('E-stop not clear')
+   if self.start is not None and not self.abort_reason and not self.done.is_set():
+    elapsed=now-self.start; boundary=0
+    for i,(label,y,duration) in enumerate(SEQUENCE):
+     boundary+=duration
+     if elapsed<boundary:
+      if i!=self.step:
+       if self.executed: self.executed[-1]['actual_duration_s']=now-self.executed[-1]['start_monotonic']
+       self.step=i; self.executed.append(dict(label=label,y=y,requested_duration_s=duration,start_monotonic=now))
+       print('STEP',i,label,y,'duration',duration,'elapsed',round(elapsed,4),flush=True)
+      break
+    else:
+     if self.executed: self.executed[-1]['actual_duration_s']=now-self.executed[-1]['start_monotonic']
+     y=0; label='neutral_after'; self.done.set(); print('SEQUENCE_COMPLETE',flush=True)
+   if self.abort_reason: y=0; label='neutral_abort'
+   self.publish(y); self.last_tick=now; self.count+=1
+   self.trace.write(f'{now:.9f},{elapsed if elapsed is not None else ""},{label},0,{y},500,0\n')
+ def call(self,key,req,timeout=12):
+  c=self.svc_clients[key]
+  if not c.wait_for_service(timeout_sec=5): raise RuntimeError(key+' service unavailable')
+  f=c.call_async(req); end=time.monotonic()+timeout
+  while not f.done() and time.monotonic()<end: time.sleep(.02)
+  if not f.done(): raise RuntimeError(key+' response timeout')
+  return f.result()
+ def params(self,names,fresh=True):
+  if fresh:
+   q=ParamPull.Request(); q.force_pull=True; p=self.call('pull',q,35)
+   if not p.success: raise RuntimeError('Fresh parameter pull failed')
+  q=GetParameters.Request(); q.names=names; p=self.call('get',q)
+  return {k:(v.integer_value if v.type==2 else v.double_value if v.type==3 else None) for k,v in zip(names,p.values)}
+ def files(self,path):
+  q=FileList.Request(); q.dir_path=path; p=self.call('ftp',q,15)
+  if not p.success: raise RuntimeError('FTP list failed '+path+' errno='+str(p.r_errno))
+  return p.list
+ def logs(self):
+  out={}
+  for folder in self.files(BASE):
+   if folder.type==1:
+    for f in self.files(BASE+'/'+folder.name):
+     if f.type==0 and f.name.endswith('.ulg'):out[BASE+'/'+folder.name+'/'+f.name]=f.size
+  return out
+ def wait_for(self,predicate,timeout,description,allow_abort=False):
+  end=time.monotonic()+timeout
+  while time.monotonic()<end:
+   if self.abort_reason and not allow_abort: raise RuntimeError(self.abort_reason)
+   if predicate():return
+   time.sleep(.05)
+  raise RuntimeError('Timeout: '+description)
+
+def main():
+ rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+ n=Test(); ex=SingleThreadedExecutor(); ex.add_node(n)
+ thread=threading.Thread(target=ex.spin,daemon=True); thread.start()
+ for sig in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP):
+  signal.signal(sig,lambda number,frame:n.abort('Signal '+str(number)))
+ report={'sequence_requested':SEQUENCE,'ulog':None,'restored':False,'saved_ack':False,'errors':[]}
+ saw_armed=False; before={}
+ try:
+  n.wait_for(lambda:n.state is not None and n.estop is not None,10,'state and E-stop telemetry')
+  if n.state.armed: raise RuntimeError('Already armed before neutral stream was established; manual disarm required')
+  p=n.params(['COM_RC_IN_MODE','SDLOG_MODE']);print('LIVE_PARAMS',p,flush=True)
+  if p.get('COM_RC_IN_MODE')==0:
+   q=ParamSetV2.Request();q.param_id='COM_RC_IN_MODE';q.value.type=2;q.value.integer_value=1
+   ack=n.call('set',q)
+   if not ack.success or ack.value.type!=2 or ack.value.integer_value!=1:raise RuntimeError('Temporary COM_RC_IN_MODE=1 not acknowledged by PX4')
+   print('PX4_PARAMETER_ECHO',ack,flush=True)
+   p=n.params(['COM_RC_IN_MODE','SDLOG_MODE'],fresh=False);print('VERIFIED_TEMPORARY_PARAMS',p,flush=True)
+  if p!={'COM_RC_IN_MODE':1,'SDLOG_MODE':0}:raise RuntimeError('Required input/logging parameters not confirmed')
+  if n.count_publishers('/mavros/manual_control/send')!=1:raise RuntimeError('Competing MANUAL_CONTROL publisher')
+  if n.pub.get_subscription_count()!=1:raise RuntimeError('MAVROS MANUAL_CONTROL subscriber not uniquely available')
+  n.rc_config=n.params(['RC_MAP_ARM_SW','RC_ARMSWITCH_TH'],fresh=False)
+  ch=int(n.rc_config['RC_MAP_ARM_SW'])
+  if ch:n.rc_config.update(n.params(['RC'+str(ch)+'_'+k for k in ['MIN','MAX','TRIM','DZ','REV']],fresh=False))
+  print('RC_ARM_SWITCH_OFF',n.arm_switch_off(),flush=True)
+  before=n.logs(); report['logs_before']=before
+  n.wait_for(lambda:n.count>=150,8,'three seconds neutral streaming')
+  print('NEUTRAL_STREAMING_50HZ; waiting for operator E-stop release and manual arming',flush=True)
+  q=SetMode.Request(); q.custom_mode='MANUAL'
+  if not n.call('mode',q).mode_sent:raise RuntimeError('MANUAL mode request rejected')
+  n.wait_for(lambda:n.state.mode=='MANUAL',8,'MANUAL mode confirmation')
+  print('MANUAL_CONFIRMED; operator must clear GCS E-stop and arm manually; no arming command will be sent',flush=True)
+  n.wait_for(lambda:n.state.armed and n.estop is False,600,'operator manual arming with E-stop clear')
+  if n.state.mode!='MANUAL':raise RuntimeError('Operator arming did not preserve MANUAL mode')
+  n.active=True; saw_armed=True
+  deadline=time.monotonic()+15; first=None
+  while time.monotonic()<deadline:
+   if n.abort_reason:raise RuntimeError(n.abort_reason)
+   logs=n.logs(); new=set(logs)-set(before)
+   if len(new)>1:raise RuntimeError('More than one new full ULog')
+   if new:
+    path=next(iter(new))
+    if first and first[0]==path and logs[path]>first[1]:report['ulog']=path; break
+    first=(path,logs[path])
+   time.sleep(.5)
+  if not report['ulog']:raise RuntimeError('No new growing ULog confirmed after manual arming')
+  print('ULOG_CONFIRMED',report['ulog'],flush=True)
+  n.wait_for(lambda:n.rc is not None and time.monotonic()-n.rc_time<1 and len(n.rc.channels)>=4,5,'fresh motor PWM telemetry')
+  if any(abs(pwm-1500)>20 for pwm in n.rc.channels[:4]):raise RuntimeError('Neutral MANUAL motor PWM not centered: '+str(n.rc.channels[:4]))
+  print('NEUTRAL_PWM_CONFIRMED',n.rc.channels[:4],flush=True)
+  with n.lock:n.start=time.monotonic()
+  n.wait_for(lambda:n.done.is_set(),45,'41 second sequence')
+  if n.abort_reason:raise RuntimeError(n.abort_reason)
+ except Exception as e:
+  report['errors'].append(str(e)); n.abort(str(e))
+ finally:
+  with n.lock:
+   n.start=None; n.active=False; n.publish(0)
+  # Keep neutral publishing throughout disarm, log closure, and restoration.
+  time.sleep(3)
+  try:
+   if n.state and n.state.armed:
+    q=CommandBool.Request(); q.value=False; p=n.call('arm',q)
+    if not p.success:raise RuntimeError('Disarm rejected: '+str(p))
+    n.wait_for(lambda:not n.state.armed,8,'disarm confirmation',allow_abort=True)
+   if not n.state or n.state.armed:raise RuntimeError('Cannot confirm disarmed before parameter restoration')
+   print('DISARMED; waiting for SD ULog closure',flush=True)
+   time.sleep(3)
+   try:
+    if report['ulog']:
+     path=report['ulog']; parent,name=path.rsplit('/',1); sizes=[]
+     for _ in range(3):
+      sizes.append(next(f.size for f in n.files(parent) if f.name==name));time.sleep(1)
+     report['final_ulog_sizes']=sizes
+     if len(set(sizes))!=1:report['errors'].append('ULog size did not stabilize after disarm')
+     if set(n.logs())-set(before)!={path}:report['errors'].append('Unexpected full ULog count after sequence')
+   except Exception as e:report['errors'].append('Log closure verification: '+str(e))
+   print('WAITING_FOR_RC_ARM_SWITCH_DISARM before input restoration',flush=True)
+   n.wait_for(n.arm_switch_off,600,'RC arm switch DISARM before restoration',allow_abort=True)
+   time.sleep(1)
+   if not n.arm_switch_off():raise RuntimeError('RC arm switch changed before restoration')
+   if n.state.armed:raise RuntimeError('Unexpected arming before restoration')
+   q=ParamSetV2.Request(); q.param_id='COM_RC_IN_MODE';q.value.type=2;q.value.integer_value=0
+   p=n.call('set',q)
+   if not p.success:raise RuntimeError('COM_RC_IN_MODE restoration rejected')
+   report['restored']=n.params(['COM_RC_IN_MODE'])=={'COM_RC_IN_MODE':0}
+   if not report['restored']:raise RuntimeError('COM_RC_IN_MODE restoration verification failed')
+   q=CommandLong.Request();q.command=245;q.param1=1.
+   p=n.call('cmd',q);report['saved_ack']=p.success and p.result==0
+   if not report['saved_ack']:raise RuntimeError('Parameter save not acknowledged: '+str(p))
+   time.sleep(2)
+   report['final_live_params']=n.params(['COM_RC_IN_MODE'])
+   if n.state.armed:
+    q=CommandBool.Request();q.value=False
+    if not n.call('arm',q).success:raise RuntimeError('Disarm after RC input restoration rejected')
+    n.wait_for(lambda:not n.state.armed,8,'disarm after RC restoration',allow_abort=True)
+    report['errors'].append('RC switch rearmed vehicle after restoring RC input; immediately disarmed again')
+   print('RESTORED_AND_SAVE_ACK',report['final_live_params'],flush=True)
+  except Exception as e:
+   report['errors'].append('CLEANUP: '+str(e)); print('CLEANUP_ERROR',e,flush=True)
+  report['sequence_executed']=n.executed;report['abort_reason']=n.abort_reason
+  REPORT.write_text(json.dumps(report,indent=2));print('RESULT',json.dumps(report),flush=True)
+  time.sleep(3);ex.shutdown();thread.join(timeout=3);n.trace.close();n.destroy_node();rclpy.shutdown()
+if __name__=='__main__':main()

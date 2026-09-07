@@ -1,0 +1,23 @@
+import os,sys,time
+os.environ['MAVLINK20']='1';sys.path.insert(0,'/tmp/ground_symmetry_deps')
+import rclpy
+from rclpy.qos import qos_profile_sensor_data
+from mavros_msgs.msg import Mavlink
+from mavros.mavlink import convert_to_rosmsg,convert_to_bytes
+from pymavlink.dialects.v20 import common as mav
+rclpy.init();n=rclpy.create_node('symmetry_px4_shell_probe')
+encoder=mav.MAVLink(None,srcSystem=1,srcComponent=191);decoder=mav.MAVLink(None)
+p=n.create_publisher(Mavlink,'/uas1/mavlink_sink',qos_profile_sensor_data)
+def rx(m):
+ if m.msgid!=126:return
+ for pkt in decoder.parse_buffer(convert_to_bytes(m)) or []:
+  if pkt.get_type()=='SERIAL_CONTROL':print(bytes(pkt.data[:pkt.count]).decode(errors='replace'),end='',flush=True)
+n.create_subscription(Mavlink,'/uas1/mavlink_source',rx,qos_profile_sensor_data)
+end=time.monotonic()+2
+while time.monotonic()<end:rclpy.spin_once(n,timeout_sec=.05)
+def send(s,flags=mav.SERIAL_CONTROL_FLAG_RESPOND):
+ b=s.encode();msg=encoder.serial_control_encode(mav.SERIAL_CONTROL_DEV_SHELL,flags,0,0,len(b),list(b)+[0]*(70-len(b)));msg.pack(encoder);encoder.seq=(encoder.seq+1)%256;p.publish(convert_to_rosmsg(msg))
+send('\nver all\nlistener manual_control_setpoint -n 2 -r 5\n')
+end=time.monotonic()+10
+while time.monotonic()<end:rclpy.spin_once(n,timeout_sec=.05)
+send('',0);time.sleep(.2);n.destroy_node();rclpy.shutdown()
