@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""One-off, explicitly-requested change to RD_MAX_THR_YAW_R via verified NSH
+transport, while disarmed. Sets, saves, and verifies."""
+import os, sys, time, threading, signal, re
+os.environ['MAVLINK20'] = '1'
+sys.path.insert(0, '/tmp/ground_symmetry_deps')
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.signals import SignalHandlerOptions
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+from mavros_msgs.msg import Mavlink, State
+from mavros.mavlink import convert_to_rosmsg, convert_to_bytes
+from pymavlink.dialects.v20 import common as mav
+
+TARGET = sys.argv[1] if len(sys.argv) > 1 else '0.35'
+PARAM = sys.argv[2] if len(sys.argv) > 2 else 'RD_MAX_THR_YAW_R'
+
+class Probe(Node):
+    def __init__(self):
+        super().__init__('temporary_param_set')
+        self.encoder = mav.MAVLink(None, srcSystem=1, srcComponent=191)
+        self.decoder = mav.MAVLink(None)
+        self.shell_text = ''
+        self.state = None
+        self.rawpub = self.create_publisher(Mavlink, '/uas1/mavlink_sink', 10)
+        q = QoSProfile(depth=1000, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.create_subscription(Mavlink, '/uas1/mavlink_source', self.raw_rx, q)
+        self.create_subscription(State, '/mavros/state', self.on_state,
+                                  QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
+
+    def on_state(self, m):
+        self.state = m
+
+    def raw_rx(self, m):
+        if m.msgid != 126:
+            return
+        try:
+            packets = self.decoder.parse_buffer(convert_to_bytes(m)) or []
+        except Exception:
+            return
+        for packet in packets:
+            if packet.get_type() != 'SERIAL_CONTROL':
+                continue
+            self.shell_text += bytes(packet.data[:packet.count]).decode(errors='replace')
+
+    def send_shell(self, text, flags=mav.SERIAL_CONTROL_FLAG_RESPOND):
+        raw = text.encode()
+        chunks = [raw[i:i+70] for i in range(0, len(raw), 70)] or [b'']
+        for chunk in chunks:
+            msg = self.encoder.serial_control_encode(mav.SERIAL_CONTROL_DEV_SHELL, flags, 0, 0, len(chunk), list(chunk)+[0]*(70-len(chunk)))
+            msg.pack(self.encoder); self.encoder.seq = (self.encoder.seq+1) % 256
+            self.rawpub.publish(convert_to_rosmsg(msg))
+
+    def shell(self, command, timeout=12, retries=3):
+        for attempt in range(retries):
+            try:
+                return self._shell_once(command, timeout)
+            except RuntimeError:
+                if attempt == retries - 1:
+                    raise
+                time.sleep(1)
+
+    def _shell_once(self, command, timeout):
+        offset = len(self.shell_text); self.send_shell(command + '\n'); end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            result = self.shell_text[offset:]
+            if command in result and 'nsh>' in result[result.find(command)+len(command):]:
+                return re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', result)
+            time.sleep(.02)
+        raise RuntimeError('timeout: ' + command)
+
+def main():
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    n = Probe(); ex = SingleThreadedExecutor(); ex.add_node(n)
+    thread = threading.Thread(target=ex.spin, daemon=True); thread.start()
+    signal.signal(signal.SIGINT, lambda a, b: sys.exit(0))
+    try:
+        end = time.monotonic() + 8
+        while (n.state is None or n.rawpub.get_subscription_count() == 0) and time.monotonic() < end:
+            time.sleep(.1)
+        if n.state is None:
+            print('ABORT: no mavros state'); return
+        if n.state.armed:
+            print('ABORT: vehicle is armed; refusing to change parameter while armed')
+            return
+        print('DISARMED_CONFIRMED, armed=' + str(n.state.armed))
+        print(n.shell('param set ' + PARAM + ' ' + TARGET))
+        print(n.shell('param save'))
+        shown = n.shell('param show ' + PARAM)
+        print(shown)
+        ok = bool(re.search(re.escape(PARAM) + r'[^\r\n:]*:\s*' + re.escape(TARGET).replace(r'\.', r'\.') + r'\d*\b', shown))
+        print('VERIFIED_SET_TO_' + TARGET + ':', ok)
+    finally:
+        n.send_shell('', flags=0); time.sleep(.3)
+        ex.shutdown(); thread.join(timeout=3); n.destroy_node(); rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

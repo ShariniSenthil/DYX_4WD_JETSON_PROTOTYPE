@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""Temporary operator-armed ACRO full-steering fixed-duration baseline.
+Reuses the exact verified transport/arming architecture from today's
+sessions. Fixed-duration (open-loop timing), full-scale y, ACRO mode
+(closed-loop internal rate PID, unchanged live params - no FCU parameter
+is set/changed except the standard temporary COM_RC_IN_MODE=1 -> 0).
+z (throttle) held at neutral (500) for the entire run - pure steering
+exercise, no translation.
+"""
+import json, os, re, signal, sys, threading, time
+from pathlib import Path
+
+os.environ['MAVLINK20'] = '1'
+sys.path.insert(0, '/tmp/ground_symmetry_deps')
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.signals import SignalHandlerOptions
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+from mavros_msgs.msg import ManualControl, State, StatusText, RCOut, RCIn, Mavlink
+from mavros_msgs.srv import ParamPull, CommandBool, SetMode
+from rcl_interfaces.srv import GetParameters
+from std_msgs.msg import Bool
+from mavros.mavlink import convert_to_rosmsg, convert_to_bytes
+from pymavlink.dialects.v20 import common as mav
+
+NEUTRAL_Y = 0
+LEFT, RIGHT = -1000, 1000
+# label, y, duration_s
+# 5 s pulses (up from 3 s) to separate breakaway/rise transient, steady-state
+# error, integrator behavior, and stopping/neutral decay - requested for the
+# RD_MAX_THR_YAW_R=0.37 validation pass.
+SEQUENCE = [
+    ('neutral', NEUTRAL_Y, 3),
+    ('LEFT', LEFT, 5), ('neutral', NEUTRAL_Y, 5),
+    ('RIGHT', RIGHT, 5), ('neutral', NEUTRAL_Y, 5),
+    ('LEFT', LEFT, 5), ('neutral', NEUTRAL_Y, 5),
+    ('RIGHT', RIGHT, 5), ('neutral', NEUTRAL_Y, 5),
+]
+LEGAL_Y = {y for _, y, _ in SEQUENCE}
+BASE = '/fs/microsd/log'
+REPORT = Path('/tmp/acro_fullsteer_5s_20260907_result.json')
+TRACE = Path('/tmp/acro_fullsteer_5s_20260907_commands.csv')
+MONITOR_FILE = Path('/tmp/acro_fullsteer_5s_20260907_px4_monitor.txt')
+
+
+class Test(Node):
+    def __init__(self):
+        super().__init__('temporary_ground_acro_fullsteer_5s')
+        self.lock = threading.RLock()
+        self.state = None; self.state_time = 0.; self.estop = None
+        self.rc_input = None; self.rc_input_time = 0.; self.rc_config = None
+        self.rc = None; self.rc_time = 0.
+        self.abort_reason = None; self.start = None; self.done = threading.Event()
+        self.active = False; self.last_tick = None; self.step = -1
+        self.executed = []; self.count = 0
+        self.streaming = False; self.monitor_guard = False; self.manual_guard = False
+        self.neutral_check = False
+        self.current_y = NEUTRAL_Y; self.changed_at = 0.
+        self.mc_time = 0.; self.mc = None; self.mc_samples = 0; self.mc_stamp = 0; self.mc_block = ''
+        self.shell_text = ''; self.ulog = None; self.failsafe_messages = []
+
+        self.pub = self.create_publisher(ManualControl, '/mavros/manual_control/send', 1)
+        self.create_subscription(State, '/mavros/state', self.on_state,
+                                  QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
+        q = QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.create_subscription(Bool, '/emergency_stop', self.on_estop, q)
+        self.create_subscription(RCOut, '/mavros/rc/out', self.on_rc, q)
+        self.create_subscription(RCIn, '/mavros/rc/in', self.on_rc_input, q)
+        self.create_subscription(StatusText, '/mavros/statustext/recv', self.status_rx, q)
+
+        self.svc_clients = {
+            'pull': self.create_client(ParamPull, '/mavros/param/pull'),
+            'get': self.create_client(GetParameters, '/mavros/param/get_parameters'),
+            'arm': self.create_client(CommandBool, '/mavros/cmd/arming'),
+            'mode': self.create_client(SetMode, '/mavros/set_mode'),
+        }
+
+        self.encoder = mav.MAVLink(None, srcSystem=1, srcComponent=191)
+        self.decoder = mav.MAVLink(None)
+        self.rawpub = self.create_publisher(Mavlink, '/uas1/mavlink_sink', 10)
+        self.create_subscription(Mavlink, '/uas1/mavlink_source', self.raw_rx,
+                                  QoSProfile(depth=1000, reliability=ReliabilityPolicy.BEST_EFFORT))
+        self.shell_file = MONITOR_FILE.open('w', buffering=1)
+
+        self.trace = TRACE.open('w', buffering=1)
+        self.trace.write('monotonic,sequence_elapsed,label,x,y,z,r\n')
+        self.timer = self.create_timer(.02, self.tick)
+
+    def on_state(self, m):
+        with self.lock:
+            self.state = m; self.state_time = time.monotonic()
+            if self.active and (not m.connected or not m.armed or m.mode != 'ACRO'):
+                self.abort('Lost armed ACRO control path')
+            if self.manual_guard and (m.mode != 'ACRO' or m.system_status in (5, 6)):
+                self.abort('ACRO lost or FCU critical status: ' + m.mode + '/' + str(m.system_status))
+
+    def on_rc_input(self, m):
+        self.rc_input = m; self.rc_input_time = time.monotonic()
+
+    def arm_switch_off(self):
+        if self.rc_config is None:
+            return False
+        p = self.rc_config; channel = int(p['RC_MAP_ARM_SW'])
+        if channel == 0:
+            return True
+        if self.rc_input is None or time.monotonic() - self.rc_input_time > 1 or len(self.rc_input.channels) < channel:
+            return False
+        prefix = 'RC' + str(channel) + '_'; v = self.rc_input.channels[channel - 1]
+        mn, mx, tr, dz, rev = [p[prefix + k] for k in ['MIN', 'MAX', 'TRIM', 'DZ', 'REV']]
+        if v > tr + dz:
+            value = (v - tr - dz) / (mx - tr - dz)
+        elif v < tr - dz:
+            value = (v - tr + dz) / (tr - mn - dz)
+        else:
+            value = 0
+        value = (max(-1, min(1, value)) * rev + 1) / 2; th = p['RC_ARMSWITCH_TH']
+        if th < 0:
+            value = -value
+        return value <= th
+
+    def on_rc(self, m):
+        self.rc = m; self.rc_time = time.monotonic()
+
+    def on_estop(self, m):
+        with self.lock:
+            self.estop = m.data
+            if m.data and self.active:
+                self.abort('E-stop asserted')
+
+    def status_rx(self, m):
+        match = re.search(r'(/fs/microsd/log/\S+\.ulg)', m.text)
+        if match:
+            self.ulog = match.group(1)
+        lower = m.text.lower()
+        if 'failsafe' in lower and any(x in lower for x in ('activated', 'triggered', 'enabled')):
+            self.failsafe_messages.append(m.text)
+            if self.manual_guard:
+                self.abort('PX4 ' + m.text)
+        print('PX4:', m.text, flush=True)
+
+    def publish(self, y):
+        assert y in LEGAL_Y, 'refusing illegal y command ' + str(y)
+        if y != self.current_y:
+            self.changed_at = time.monotonic(); self.current_y = y
+        m = ManualControl()
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.x = 0.; m.y = float(y); m.z = 500.; m.r = 0.
+        self.pub.publish(m)
+
+    def abort(self, reason):
+        with self.lock:
+            if self.abort_reason is None:
+                self.abort_reason = reason; print('ABORT:', reason, flush=True)
+            self.publish(NEUTRAL_Y); self.done.set()
+
+    def tick(self):
+        with self.lock:
+            now = time.monotonic()
+            if not self.streaming:
+                return
+            y = NEUTRAL_Y; label = 'neutral_guard'; elapsed = None
+
+            if self.active and not self.abort_reason:
+                if now - self.state_time > 1.5:
+                    self.abort('MAVROS state stale')
+                if self.last_tick is not None and now - self.last_tick > .10:
+                    self.abort('Publisher scheduling gap exceeded 100 ms')
+                if self.estop is not False:
+                    self.abort('E-stop not clear')
+
+            if self.monitor_guard and not self.abort_reason:
+                if now - self.mc_time > .65:
+                    self.abort('PX4 manual_control_setpoint monitor stale')
+
+            if self.start is not None and not self.abort_reason and not self.done.is_set():
+                elapsed = now - self.start; boundary = 0
+                for i, (label, y, duration) in enumerate(SEQUENCE):
+                    boundary += duration
+                    if elapsed < boundary:
+                        if i != self.step:
+                            if self.executed:
+                                self.executed[-1]['actual_duration_s'] = now - self.executed[-1]['start_monotonic']
+                            self.step = i
+                            self.executed.append(dict(label=label, y=y, requested_duration_s=duration, start_monotonic=now))
+                            print('STEP', i, label, y, 'duration', duration, 'elapsed', round(elapsed, 4), flush=True)
+                        break
+                else:
+                    if self.executed:
+                        self.executed[-1]['actual_duration_s'] = now - self.executed[-1]['start_monotonic']
+                    y = NEUTRAL_Y; label = 'neutral_after'; self.done.set(); print('SEQUENCE_COMPLETE', flush=True)
+
+            if self.neutral_check and self.state and self.state.armed and self.current_y == NEUTRAL_Y and now - self.changed_at > .25:
+                if self.rc is None or now - self.rc_time > .65:
+                    self.abort('PWM telemetry stale during armed neutral')
+                elif len(self.rc.channels) < 4 or any(abs(v - 1500) > 1 for v in self.rc.channels[:4]):
+                    self.abort('Non-neutral PWM while neutral requested: ' + str(self.rc.channels[:4]))
+
+            if self.abort_reason:
+                y = NEUTRAL_Y; label = 'neutral_abort'
+
+            self.publish(y); self.last_tick = now; self.count += 1
+            self.trace.write(f'{now:.9f},{elapsed if elapsed is not None else ""},{label},0,{y},500,0\n')
+
+    def send_shell(self, text, flags=mav.SERIAL_CONTROL_FLAG_RESPOND):
+        raw = text.encode()
+        chunks = [raw[i:i + 70] for i in range(0, len(raw), 70)] or [b'']
+        for chunk in chunks:
+            msg = self.encoder.serial_control_encode(
+                mav.SERIAL_CONTROL_DEV_SHELL, flags, 0, 0, len(chunk), list(chunk) + [0] * (70 - len(chunk)))
+            msg.pack(self.encoder); self.encoder.seq = (self.encoder.seq + 1) % 256
+            self.rawpub.publish(convert_to_rosmsg(msg))
+
+    def shell(self, command, timeout=12, retries=3):
+        for attempt in range(retries):
+            try:
+                return self._shell_once(command, timeout)
+            except RuntimeError:
+                if attempt == retries - 1:
+                    raise
+                time.sleep(1)
+
+    def _shell_once(self, command, timeout):
+        offset = len(self.shell_text); self.send_shell(command + '\n'); end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            result = self.shell_text[offset:]
+            if command in result and 'nsh>' in result[result.find(command) + len(command):]:
+                return re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', result)
+            time.sleep(.02)
+        raise RuntimeError('PX4 shell command timeout: ' + command)
+
+    def end_monitor(self):
+        self.monitor_guard = False; self.manual_guard = False; self.send_shell('\x03')
+        time.sleep(.4)
+
+    def raw_rx(self, m):
+        if m.msgid != 126:
+            return
+        try:
+            packets = self.decoder.parse_buffer(convert_to_bytes(m)) or []
+        except Exception as e:
+            if self.monitor_guard:
+                self.abort('PX4 shell decoding failed: ' + str(e))
+            return
+        for packet in packets:
+            if packet.get_type() != 'SERIAL_CONTROL':
+                continue
+            text = bytes(packet.data[:packet.count]).decode(errors='replace')
+            self.shell_file.write(text); self.shell_text += text
+            self.mc_block += text
+            while 'sticks_moving:' in self.mc_block and '\n' in self.mc_block.split('sticks_moving:', 1)[1]:
+                idx = self.mc_block.index('\n', self.mc_block.index('sticks_moving:'))
+                block = self.mc_block[:idx + 1]; self.mc_block = self.mc_block[idx + 1:]
+                begin = block.rfind('TOPIC: manual_control_setpoint')
+                if begin < 0:
+                    continue
+                block = block[begin:]
+
+                def field(name):
+                    match = re.search(r'^\s*' + name + r':\s*([^\r\n]+)', block, re.M)
+                    return match.group(1).strip() if match else None
+
+                try:
+                    stamp = int(field('timestamp').split()[0]); valid = field('valid') == 'True'
+                    source = int(field('data_source')); throttle = float(field('throttle')); roll = float(field('roll'))
+                    age_match = re.search(r'timestamp:\s*\d+\s*\(([\d.]+) seconds ago\)', block)
+                    age = float(age_match.group(1)) if age_match else 0.
+                    sample = int(field('timestamp_sample').split()[0]); lag = (stamp - sample) / 1e6
+                    data = dict(valid=valid, source=source, throttle=throttle, roll=roll, timestamp=stamp, age=age, sample_lag=lag)
+                    expected_roll = self.current_y / 1000.
+                    fresh = (valid and 2 <= source <= 7 and stamp > self.mc_stamp and age < .20 and lag < .20
+                              and throttle == 0. and abs(roll - expected_roll) < 0.02)
+                    if fresh:
+                        self.mc_samples += 1
+                    self.mc = data; self.mc_stamp = stamp; self.mc_time = time.monotonic()
+                    # 5 Hz NSH listener sampling can straddle a step transition: a sample whose
+                    # PX4-side timestamp predates self.changed_at will legitimately still show the
+                    # previous command. Grace period avoids a false-positive abort on that race.
+                    in_transition_grace = (time.monotonic() - self.changed_at) < 0.30
+                    if self.monitor_guard and not fresh and not in_transition_grace:
+                        self.abort('PX4 manual_control_setpoint check failed: ' + str(data) + ' expected_roll=' + str(expected_roll))
+                except (TypeError, ValueError, AttributeError) as e:
+                    if self.monitor_guard:
+                        self.abort('Incomplete PX4 setpoint record: ' + str(e))
+            if len(self.mc_block) > 12000:
+                self.mc_block = self.mc_block[-6000:]
+
+    def call(self, key, req, timeout=12):
+        c = self.svc_clients[key]
+        if not c.wait_for_service(timeout_sec=5):
+            raise RuntimeError(key + ' service unavailable')
+        f = c.call_async(req); end = time.monotonic() + timeout
+        while not f.done() and time.monotonic() < end:
+            time.sleep(.02)
+        if not f.done():
+            raise RuntimeError(key + ' response timeout')
+        return f.result()
+
+    def params(self, names, fresh=True):
+        if fresh:
+            q = ParamPull.Request(); q.force_pull = True; p = self.call('pull', q, 35)
+            if not p.success:
+                raise RuntimeError('Fresh parameter pull failed')
+        q = GetParameters.Request(); q.names = names; p = self.call('get', q)
+        return {k: (v.integer_value if v.type == 2 else v.double_value if v.type == 3 else None) for k, v in zip(names, p.values)}
+
+    def wait_for(self, predicate, timeout, description, allow_abort=False):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if self.abort_reason and not allow_abort:
+                raise RuntimeError(self.abort_reason)
+            if predicate():
+                return
+            time.sleep(.05)
+        raise RuntimeError('Timeout: ' + description)
+
+
+def main():
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    n = Test(); ex = SingleThreadedExecutor(); ex.add_node(n)
+    thread = threading.Thread(target=ex.spin, daemon=True); thread.start()
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda number, frame: n.abort('Signal ' + str(number)))
+
+    report = {'acro_entered': False, 'armed_neutral_stable': False, 'restored': False, 'errors': []}
+    try:
+        n.wait_for(lambda: n.state is not None and n.estop is not None, 10, 'state and E-stop telemetry')
+
+        if n.state.armed:
+            print('PRE-EXISTING ARMED STATE DETECTED - disarming before proceeding', flush=True)
+            q = CommandBool.Request(); q.value = False
+            if not n.call('arm', q).success:
+                raise RuntimeError('Disarm rejected')
+            n.wait_for(lambda: not n.state.armed, 5, 'disarmed confirmation')
+        print('STEP_1_DISARMED_CONFIRMED', flush=True)
+
+        n.rc_config = n.params(['RC_MAP_ARM_SW', 'RC_ARMSWITCH_TH'], fresh=True)
+        channel = int(n.rc_config['RC_MAP_ARM_SW'])
+        if channel:
+            n.rc_config.update(n.params(['RC' + str(channel) + '_' + k for k in ['MIN', 'MAX', 'TRIM', 'DZ', 'REV']], fresh=False))
+        print('RC_ARM_SWITCH_OFF', n.arm_switch_off(), flush=True)
+
+        n.wait_for(lambda: n.rawpub.get_subscription_count() > 0, 5, 'PX4 shell route')
+        print('SHELL_READY', n.shell('echo acro_fullsteer_5s_ready'), flush=True)
+        print(n.shell('param set COM_RC_IN_MODE 1'), flush=True)
+        saved = n.shell('param save'); print(saved, flush=True)
+        shown = n.shell('param show COM_RC_IN_MODE'); print(shown, flush=True)
+        if not re.search(r'COM_RC_IN_MODE[^\r\n:]*:\s*1\b', shown):
+            raise RuntimeError('PX4 did not verify COM_RC_IN_MODE=1')
+
+        if not n.state or n.state.armed:
+            raise RuntimeError('Rover armed before neutral startup')
+
+        print('LOGGER_BEFORE', n.shell('logger status'), flush=True)
+
+        if n.count_publishers('/mavros/manual_control/send') != 1:
+            raise RuntimeError('Competing manual-control publisher')
+
+        n.streaming = True; print('STEP_3_NEUTRAL_STREAM_STARTED_50HZ', flush=True)
+        n.send_shell('listener manual_control_setpoint -n 100000 -r 5\n')
+        n.wait_for(lambda: n.mc_samples >= 10, 10, 'ten fresh valid PX4 MAVLink manual-control samples (roll=0, throttle=0)')
+        print('STEP_4_PX4_SETPOINT_VERIFIED', n.mc, flush=True)
+        n.monitor_guard = True
+
+        if n.estop is not False:
+            raise RuntimeError('Backend E-stop is latched')
+        if n.state.armed:
+            raise RuntimeError('Operator armed before ACRO stability verification')
+
+        q = SetMode.Request(); q.custom_mode = 'ACRO'
+        if not n.call('mode', q).mode_sent:
+            raise RuntimeError('ACRO mode request failed')
+        n.wait_for(lambda: n.state.mode == 'ACRO' and not n.state.armed, 5, 'disarmed ACRO confirmation')
+        n.manual_guard = True; start = time.monotonic()
+        n.wait_for(lambda: time.monotonic() - start >= 3, 4, 'three seconds stable disarmed ACRO')
+        if n.state.armed:
+            raise RuntimeError('Armed before three seconds of disarmed ACRO stability')
+        report['acro_entered'] = True
+        print('STEP_6_ACRO_STABLE_3_SECONDS; ARMING_NOW (script-commanded, not operator)', flush=True)
+
+        if n.estop is not False:
+            raise RuntimeError('Backend E-stop is latched immediately before arming')
+        if n.state.mode != 'ACRO' or n.state.armed:
+            raise RuntimeError('ACRO/disarmed precondition lost immediately before arming')
+        q = CommandBool.Request(); q.value = True
+        if not n.call('arm', q).success:
+            raise RuntimeError('Script-commanded arm rejected')
+        n.wait_for(lambda: n.state.armed, 5, 'script-commanded arming confirmation')
+        n.active = True; n.neutral_check = True; n.changed_at = time.monotonic()
+        n.wait_for(lambda: n.ulog is not None, 3, 'PX4 SD ULog start announcement')
+        print('ULOG', n.ulog, flush=True)
+
+        with n.lock:
+            n.start = time.monotonic()
+        n.wait_for(lambda: n.step >= 1 or n.done.is_set(), 4, 'three seconds armed neutral')
+        if n.abort_reason:
+            raise RuntimeError(n.abort_reason)
+        report['armed_neutral_stable'] = True
+
+        n.wait_for(lambda: n.done.is_set(), 55, 'remaining sequence')
+        if n.abort_reason:
+            raise RuntimeError(n.abort_reason)
+    except Exception as e:
+        report['errors'].append(str(e)); n.abort(str(e))
+    finally:
+        n.monitor_guard = False; n.manual_guard = False; n.active = False; n.neutral_check = False
+        with n.lock:
+            n.start = None; n.streaming = True; n.publish(NEUTRAL_Y)
+        time.sleep(3); n.end_monitor()
+        try:
+            if n.state and n.state.armed:
+                q = CommandBool.Request(); q.value = False
+                if not n.call('arm', q).success:
+                    raise RuntimeError('Cleanup disarm rejected')
+                n.wait_for(lambda: not n.state.armed, 8, 'cleanup disarmed', allow_abort=True)
+            print('STEP_11_DISARMED', flush=True); time.sleep(3)
+            logger = n.shell('logger status'); report['logger_after'] = logger; print('LOGGER_AFTER', logger, flush=True)
+            if n.rc_config:
+                print('WAIT_RC_ARM_SWITCH_DISARM', flush=True)
+                n.wait_for(n.arm_switch_off, 600, 'RC switch disarm before restoring input', allow_abort=True)
+            # Re-check immediately before touching input authority: an external
+            # arm could have landed after the earlier disarm check above.
+            if n.state and n.state.armed:
+                q = CommandBool.Request(); q.value = False
+                if not n.call('arm', q).success:
+                    raise RuntimeError('Late disarm (pre-restore re-check) rejected')
+                n.wait_for(lambda: not n.state.armed, 8, 'late disarm confirmation before restore')
+                report['errors'].append('Vehicle was armed again immediately before restore; disarmed again before proceeding')
+            print(n.shell('param set COM_RC_IN_MODE 0'), flush=True)
+            save = n.shell('param save'); print(save, flush=True); report['param_save_output'] = save
+            shown = n.shell('param show COM_RC_IN_MODE'); print(shown, flush=True)
+            report['restored'] = bool(re.search(r'COM_RC_IN_MODE[^\r\n:]*:\s*0\b', shown)); report['param_show_output'] = shown
+            if not report['restored']:
+                raise RuntimeError('Restore verification failed')
+            time.sleep(2)
+            if n.state.armed:
+                q = CommandBool.Request(); q.value = False; n.call('arm', q)
+                n.wait_for(lambda: not n.state.armed, 5, 'post-restoration disarm', allow_abort=True)
+                report['errors'].append('RC switch rearmed after restoration; disarmed again')
+        except Exception as e:
+            report['errors'].append('CLEANUP: ' + str(e)); print('CLEANUP_ERROR', e, flush=True)
+        report.update(sequence_executed=n.executed, ulog=n.ulog, abort_reason=n.abort_reason,
+                       failsafe_messages=n.failsafe_messages, last_px4_setpoint=n.mc)
+        REPORT.write_text(json.dumps(report, indent=2)); print('RESULT', json.dumps(report), flush=True)
+        time.sleep(3); n.send_shell('', flags=0); time.sleep(.2)
+        ex.shutdown(); thread.join(timeout=3); n.trace.close(); n.shell_file.close(); n.destroy_node(); rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

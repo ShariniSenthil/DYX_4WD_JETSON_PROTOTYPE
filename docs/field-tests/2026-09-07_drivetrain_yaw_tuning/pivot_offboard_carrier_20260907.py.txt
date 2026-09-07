@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""OFFBOARD 'pivot keeper' replica - exercises the REAL production heading
+loop (RO_YAW_P via DifferentialVelControl -> DifferentialAttControl ->
+DifferentialRateControl), not ACRO's direct rate command. Runs against a
+standalone mavros instance (production rover.launch.py stack was torn down
+first, specifically because cmd_vel_bridge publishes to the same
+/mavros/setpoint_raw/local topic unconditionally at 50 Hz and would race
+with this harness - confirmed zero competing publishers before running).
+
+Mechanism replicated exactly from rpp_controller_node.py
+(_publish_legacy_native_carrier / terminal_native_pivot_command), confirmed
+against live rpp_controller params before the teardown:
+  segment_alignment_speed_mps          = 1.0   (speed used here, per operator choice)
+  terminal_native_pivot_enter_error_deg    = 45.0
+  terminal_native_pivot_release_error_deg  = 4.0
+  terminal_native_pivot_request_error_deg  = 60.0
+  segment_pivot_keeper_timeout_sec         = 10.0 (production bound; this
+    harness uses a more generous abort timeout and reports if 10s is exceeded)
+
+Mechanism: rather than aiming at the true target bearing (which would let
+PX4 exit its native SPOT_TURNING state as soon as ITS OWN commanded-vector
+error drops below RD_TRANS_DRV_TRN=45deg, well before the true target is
+reached - the documented cause of premature exit / cross-track drift), a
+"carrier" bearing = current_yaw +/- 60deg is recomputed every cycle, always
+60deg ahead of wherever the vehicle currently points, in the correct turn
+direction. This keeps PX4 latched in SPOT_TURNING (speed_body_x_setpoint
+stays 0, pure pivot) for the whole maneuver. Release happens on the TRUE
+heading error dropping to <=4deg (rpp_controller's own threshold, tighter
+than PX4's native 6deg RD_TRANS_TRN_DRV), at which point this harness
+commands zero velocity and settle-watches, matching the ACRO pivot tests.
+
+Message construction matches cmd_vel_bridge.py exactly: PositionTarget,
+FRAME_LOCAL_NED, velocity-only type_mask (position/accel/yaw/yaw_rate all
+ignored), ENU ROS field convention (velocity.x=East, velocity.y=North).
+
+No production node is imported, edited, or restarted; this script IS what
+replaces cmd_vel_bridge as the sole publisher on /mavros/setpoint_raw/local
+for the duration of this test only. No PX4 parameter is changed at all -
+this test only reads FCU state and publishes offboard setpoints.
+"""
+import json, math, os, re, signal, sys, threading, time
+from pathlib import Path
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.signals import SignalHandlerOptions
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+from mavros_msgs.msg import State, StatusText, PositionTarget
+from mavros_msgs.srv import CommandBool, SetMode
+from nav_msgs.msg import Odometry
+from std_msgs.msg import Bool
+
+SPEED_MPS = 1.0
+CARRIER_OFFSET_RAD = math.radians(60.0)   # terminal_native_pivot_request_error_deg (live)
+RELEASE_RAD = math.radians(4.0)           # terminal_native_pivot_release_error_deg (live)
+ENTER_RAD = math.radians(45.0)            # terminal_native_pivot_enter_error_deg (live)
+
+LEFT, RIGHT = -1, 1
+PIVOTS = [
+    ('90_LEFT', LEFT, 90.0),
+    ('90_RIGHT', RIGHT, 90.0),
+    ('180_LEFT', LEFT, 180.0),
+    ('180_RIGHT', RIGHT, 180.0),
+]
+PRE_SETTLE_S = 3.0
+POST_SETTLE_S = 3.0
+FINAL_SETTLE_S = 5.0
+OVERSHOOT_WATCH_S = 4.0
+TIMEOUT_S = {90.0: 20.0, 180.0: 30.0}
+PRODUCTION_TIMEOUT_S = 10.0  # segment_pivot_keeper_timeout_sec (live) - report, don't abort, if exceeded
+
+BASE = '/fs/microsd/log'
+REPORT = Path('/tmp/pivot_offboard_carrier_20260907_result.json')
+TRACE = Path('/tmp/pivot_offboard_carrier_20260907_commands.csv')
+
+
+def wrap_pi(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def quat_yaw(q):
+    return math.atan2(2. * (q.w * q.z + q.x * q.y), 1. - 2. * (q.y * q.y + q.z * q.z))
+
+
+class Test(Node):
+    def __init__(self):
+        super().__init__('temporary_ground_pivot_offboard_carrier')
+        self.lock = threading.RLock()
+        self.state = None; self.state_time = 0.; self.estop = None
+        self.abort_reason = None; self.done = threading.Event()
+        self.active = False; self.last_tick = None
+        self.streaming = False; self.manual_guard = False
+        self.ulog = None; self.failsafe_messages = []
+
+        self.yaw = None; self.yaw_time = 0.
+        self.phase = 'idle'  # idle | pivoting
+        self.pivot_label = None; self.target_bearing = None; self.turn_sign = 0; self.pivot_target_deg = 90.0
+        self.pivot_start_time = None; self.release_time = None
+        self.results = []
+        self.exceeded_production_timeout = []
+
+        self.pub = self.create_publisher(PositionTarget, '/mavros/setpoint_raw/local', 1)
+        self.create_subscription(State, '/mavros/state', self.on_state,
+                                  QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
+        q = QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.create_subscription(Bool, '/emergency_stop', self.on_estop, q)
+        self.create_subscription(StatusText, '/mavros/statustext/recv', self.status_rx, q)
+        self.create_subscription(Odometry, '/mavros/local_position/odom', self.on_odom,
+                                  QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
+
+        self.svc_clients = {
+            'arm': self.create_client(CommandBool, '/mavros/cmd/arming'),
+            'mode': self.create_client(SetMode, '/mavros/set_mode'),
+        }
+
+        self.trace = TRACE.open('w', buffering=1)
+        self.trace.write('monotonic,phase,label,north,east,speed,yaw_deg,target_deg,true_error_deg\n')
+        self.timer = self.create_timer(.02, self.tick)
+
+    def on_state(self, m):
+        with self.lock:
+            self.state = m; self.state_time = time.monotonic()
+            if self.active and (not m.connected or not m.armed or m.mode != 'OFFBOARD'):
+                self.abort('Lost armed OFFBOARD control path')
+            if self.manual_guard and (m.mode != 'OFFBOARD' or m.system_status in (5, 6)):
+                self.abort('OFFBOARD lost or FCU critical status: ' + m.mode + '/' + str(m.system_status))
+
+    def on_estop(self, m):
+        with self.lock:
+            self.estop = m.data
+            if m.data and self.active:
+                self.abort('E-stop asserted')
+
+    def status_rx(self, m):
+        match = re.search(r'(/fs/microsd/log/\S+\.ulg)', m.text)
+        if match:
+            self.ulog = match.group(1)
+        lower = m.text.lower()
+        if 'failsafe' in lower and any(x in lower for x in ('activated', 'triggered', 'enabled')):
+            self.failsafe_messages.append(m.text)
+            if self.manual_guard:
+                self.abort('PX4 ' + m.text)
+        print('PX4:', m.text, flush=True)
+
+    def on_odom(self, m):
+        with self.lock:
+            self.yaw = quat_yaw(m.pose.pose.orientation)
+            self.yaw_time = time.monotonic()
+
+    def publish_velocity(self, north, east):
+        m = PositionTarget()
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+        m.type_mask = (PositionTarget.IGNORE_PX | PositionTarget.IGNORE_PY | PositionTarget.IGNORE_PZ
+                       | PositionTarget.IGNORE_AFX | PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ
+                       | PositionTarget.IGNORE_YAW | PositionTarget.IGNORE_YAW_RATE)
+        # MAVROS ROS fields are ENU: x=East, y=North (matches cmd_vel_bridge.py exactly).
+        m.velocity.x = float(east)
+        m.velocity.y = float(north)
+        m.velocity.z = 0.0
+        m.position.x = 0.0; m.position.y = 0.0; m.position.z = 0.0
+        m.acceleration_or_force.x = 0.0; m.acceleration_or_force.y = 0.0; m.acceleration_or_force.z = 0.0
+        m.yaw = 0.0; m.yaw_rate = 0.0
+        self.pub.publish(m)
+
+    def abort(self, reason):
+        with self.lock:
+            if self.abort_reason is None:
+                self.abort_reason = reason; print('ABORT:', reason, flush=True)
+            self.publish_velocity(0., 0.); self.done.set()
+
+    def start_pivot(self, label, sign, target_deg):
+        with self.lock:
+            self.pivot_label = label
+            self.pivot_target_deg = target_deg
+            self.target_bearing = wrap_pi(self.yaw + sign * math.radians(target_deg))
+            self.turn_sign = 0  # latched on first tick
+            self.pivot_start_time = time.monotonic(); self.release_time = None
+            self.phase = 'pivoting'
+
+    def tick(self):
+        with self.lock:
+            now = time.monotonic()
+            if not self.streaming:
+                return
+            north, east = 0., 0.; label = 'neutral'; true_error_deg = 0.; target_deg = 0.
+
+            if self.active and not self.abort_reason:
+                if now - self.state_time > 1.5:
+                    self.abort('MAVROS state stale')
+                if self.last_tick is not None and now - self.last_tick > .10:
+                    self.abort('Publisher scheduling gap exceeded 100 ms')
+                # NOTE: /emergency_stop has no publisher in this standalone-mavros
+                # configuration (mission_manager, its actual owner, was not brought
+                # back up - operator decision, option b). Software E-stop check is
+                # therefore INTENTIONALLY absent here; every other guard (mode-loss,
+                # odom staleness, publisher-gap, PX4 failsafe text) still applies,
+                # and the physical E-stop remains the primary safety control.
+                if now - self.yaw_time > .5:
+                    self.abort('Odom/yaw telemetry stale')
+
+            if self.phase == 'pivoting' and not self.abort_reason and not self.done.is_set():
+                true_error = wrap_pi(self.target_bearing - self.yaw)
+                true_error_deg = math.degrees(true_error)
+                target_deg = math.degrees(self.target_bearing)  # world-frame target bearing, for the trace only
+                if self.turn_sign == 0:
+                    self.turn_sign = 1 if true_error > 0. else -1
+                    if abs(true_error) < ENTER_RAD:
+                        self.abort('Heading error below native-pivot entry threshold at pivot start: '
+                                   + str(true_error_deg) + 'deg')
+
+                if self.release_time is None:
+                    if abs(true_error) <= RELEASE_RAD:
+                        self.release_time = now
+                        elapsed = now - self.pivot_start_time
+                        if elapsed > PRODUCTION_TIMEOUT_S:
+                            self.exceeded_production_timeout.append(self.pivot_label)
+                        print('PIVOT_RELEASED', self.pivot_label, 'true_error_deg', round(true_error_deg, 2),
+                              'elapsed_s', round(elapsed, 2), flush=True)
+                    elif now - self.pivot_start_time > TIMEOUT_S[self.pivot_target_deg]:
+                        self.abort('Pivot timeout before release: ' + self.pivot_label)
+                    else:
+                        # rpp_controller's exact carrier-vector convention: never aim at the
+                        # true target - aim 60deg ahead of CURRENT yaw (recomputed every
+                        # cycle) so PX4's own commanded-vector error stays above its 45deg
+                        # native-pivot entry threshold for the whole maneuver.
+                        carrier_error = self.turn_sign * CARRIER_OFFSET_RAD
+                        request_bearing = wrap_pi(self.yaw + carrier_error)
+                        north = SPEED_MPS * math.sin(request_bearing)
+                        east = SPEED_MPS * math.cos(request_bearing)
+                        label = self.pivot_label
+                if self.release_time is not None:
+                    label = self.pivot_label + '_released'
+                    north, east = 0., 0.
+                    if now - self.release_time > OVERSHOOT_WATCH_S:
+                        self.phase = 'idle'
+                        self.results.append(dict(
+                            label=self.pivot_label,
+                            target_deg=self.pivot_target_deg,
+                            release_error_deg=true_error_deg,
+                            duration_to_release_s=self.release_time - self.pivot_start_time,
+                        ))
+                        print('PIVOT_SETTLED', self.pivot_label,
+                              'final_true_error_deg', round(true_error_deg, 2), flush=True)
+
+            if self.abort_reason:
+                north, east = 0., 0.
+
+            self.publish_velocity(north, east); self.last_tick = now
+            yaw_deg = math.degrees(self.yaw) if self.yaw is not None else float('nan')
+            self.trace.write(f'{now:.9f},{self.phase},{label},{north:.4f},{east:.4f},'
+                              f'{math.hypot(north, east):.4f},{yaw_deg:.3f},{target_deg:.3f},{true_error_deg:.3f}\n')
+
+    def call(self, key, req, timeout=12):
+        c = self.svc_clients[key]
+        if not c.wait_for_service(timeout_sec=5):
+            raise RuntimeError(key + ' service unavailable')
+        f = c.call_async(req); end = time.monotonic() + timeout
+        while not f.done() and time.monotonic() < end:
+            time.sleep(.02)
+        if not f.done():
+            raise RuntimeError(key + ' response timeout')
+        return f.result()
+
+    def wait_for(self, predicate, timeout, description, allow_abort=False):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if self.abort_reason and not allow_abort:
+                raise RuntimeError(self.abort_reason)
+            if predicate():
+                return
+            time.sleep(.05)
+        raise RuntimeError('Timeout: ' + description)
+
+
+def main():
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    n = Test(); ex = SingleThreadedExecutor(); ex.add_node(n)
+    thread = threading.Thread(target=ex.spin, daemon=True); thread.start()
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda number, frame: n.abort('Signal ' + str(number)))
+
+    report = {'offboard_entered': False, 'armed_neutral_stable': False, 'errors': []}
+    try:
+        n.wait_for(lambda: n.state is not None, 10, 'state telemetry')  # no /emergency_stop publisher; see NOTE in tick()
+        n.wait_for(lambda: n.yaw is not None, 10, 'odom yaw telemetry')
+
+        if n.state.armed:
+            print('PRE-EXISTING ARMED STATE DETECTED - disarming before proceeding', flush=True)
+            q = CommandBool.Request(); q.value = False
+            if not n.call('arm', q).success:
+                raise RuntimeError('Disarm rejected')
+            n.wait_for(lambda: not n.state.armed, 5, 'disarmed confirmation')
+        print('STEP_1_DISARMED_CONFIRMED', flush=True)
+
+        if n.count_publishers('/mavros/setpoint_raw/local') != 1:
+            raise RuntimeError('Competing publisher on /mavros/setpoint_raw/local')
+
+        n.streaming = True; print('STEP_2_ZERO_VELOCITY_STREAM_STARTED_50HZ', flush=True)
+        time.sleep(2.0)  # settle before requesting OFFBOARD (PX4 needs a setpoint history)
+
+        q = SetMode.Request(); q.custom_mode = 'OFFBOARD'
+        if not n.call('mode', q).mode_sent:
+            raise RuntimeError('OFFBOARD request failed')
+        n.wait_for(lambda: n.state.mode == 'OFFBOARD' and not n.state.armed, 5, 'disarmed OFFBOARD confirmation')
+        n.manual_guard = True; start = time.monotonic()
+        n.wait_for(lambda: time.monotonic() - start >= 3, 4, 'three seconds stable disarmed OFFBOARD')
+        if n.state.armed:
+            raise RuntimeError('Armed before three seconds of disarmed OFFBOARD stability')
+        report['offboard_entered'] = True
+        print('STEP_3_OFFBOARD_STABLE_3_SECONDS; ARMING_NOW (script-commanded)', flush=True)
+
+        if n.state.mode != 'OFFBOARD' or n.state.armed:
+            raise RuntimeError('OFFBOARD/disarmed precondition lost immediately before arming')
+        q = CommandBool.Request(); q.value = True
+        if not n.call('arm', q).success:
+            raise RuntimeError('Script-commanded arm rejected')
+        n.wait_for(lambda: n.state.armed, 5, 'script-commanded arming confirmation')
+        n.active = True
+        n.wait_for(lambda: n.ulog is not None, 3, 'PX4 SD ULog start announcement')
+        print('ULOG', n.ulog, flush=True)
+
+        time.sleep(PRE_SETTLE_S)
+        if n.abort_reason:
+            raise RuntimeError(n.abort_reason)
+        report['armed_neutral_stable'] = True
+
+        for idx, (label, sign, target_deg) in enumerate(PIVOTS):
+            if n.abort_reason:
+                raise RuntimeError(n.abort_reason)
+            print('PIVOT_START', label, 'target_deg', target_deg, flush=True)
+            n.start_pivot(label, sign, target_deg)
+            n.wait_for(lambda: n.phase == 'idle' or n.abort_reason,
+                       TIMEOUT_S[target_deg] + OVERSHOOT_WATCH_S + 2, 'pivot ' + label)
+            if n.abort_reason:
+                raise RuntimeError(n.abort_reason)
+            time.sleep(POST_SETTLE_S if idx != len(PIVOTS) - 1 else FINAL_SETTLE_S)
+            if n.abort_reason:
+                raise RuntimeError(n.abort_reason)
+    except Exception as e:
+        report['errors'].append(str(e)); n.abort(str(e))
+    finally:
+        n.manual_guard = False; n.active = False
+        with n.lock:
+            n.phase = 'idle'; n.streaming = True; n.publish_velocity(0., 0.)
+        time.sleep(3)
+        try:
+            if n.state and n.state.armed:
+                q = CommandBool.Request(); q.value = False
+                if not n.call('arm', q).success:
+                    raise RuntimeError('Cleanup disarm rejected')
+                n.wait_for(lambda: not n.state.armed, 8, 'cleanup disarmed', allow_abort=True)
+            print('STEP_FINAL_DISARMED', flush=True); time.sleep(2)
+        except Exception as e:
+            report['errors'].append('CLEANUP: ' + str(e)); print('CLEANUP_ERROR', e, flush=True)
+        report.update(pivot_results=n.results, ulog=n.ulog, abort_reason=n.abort_reason,
+                       failsafe_messages=n.failsafe_messages,
+                       exceeded_production_timeout_10s=n.exceeded_production_timeout)
+        REPORT.write_text(json.dumps(report, indent=2)); print('RESULT', json.dumps(report), flush=True)
+        time.sleep(1)
+        ex.shutdown(); thread.join(timeout=3); n.trace.close(); n.destroy_node(); rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
