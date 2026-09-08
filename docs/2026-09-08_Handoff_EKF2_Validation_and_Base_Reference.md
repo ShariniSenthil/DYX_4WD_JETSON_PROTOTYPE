@@ -148,20 +148,133 @@ session should run the same survey-vs-target check on these.
 | `SDLOG_MODE` | `0` | reverted back to default (armed-until-disarm) after the convergence testing was done; confirmed saved |
 | `SEP_DUMP_COMM` | `3` | **left at "both directions"** from this morning's convergence-test setup — not reverted. Decide whether to leave it (useful for future raw-SBF debugging) or set back to `0` to reduce log volume/link load, given the FTP-reliability note above |
 
+## 8. `SEP_YAW_OFFS` / `EKF2_GPS_YAW_OFF` — heading offset investigated, not the cause
+
+Physical mounting confirmed by operator: master (reference) antenna rear,
+slave (heading) antenna front. Both offset params read `0.0` live.
+Source-verified at the flashed commit (`54f0455ffc`):
+
+- `SEP_YAW_OFFS` is a genuine mounting-angle compensation, sent via the `sto`
+  SBF command. The driver's own docs (`module.yaml:63-69`) say to set it to
+  `0` exactly when "the rover antenna is in front" — matching this vehicle's
+  actual mounting. **`0.0` is the documented-correct value here, not a
+  missing offset.**
+- `EKF2_GPS_YAW_OFF` is **provably inert for this driver**: it only applies
+  as a fallback when the GNSS driver doesn't report its own `heading_offset`
+  field, but the Septentrio driver always populates that field itself
+  (`septentrio.cpp:1736`), so the EKF2-side param never fires regardless of
+  its value.
+- Empirically confirmed too: raw dual-antenna GNSS heading vs EKF fused yaw
+  agree to **0.016° mean / 0.41° std** across 465 RTK-FIXED samples
+  (`ekf_run_03/Ulogs/log_30`) — no 180° flip, no meaningful fixed offset.
+
+**Heading is closed out as a cause.** The historical CLAUDE.md note claiming
+a live `GPS_YAW_OFFSET=180.0` doesn't correspond to any parameter that
+exists in this driver or EKF2 — worth fixing in CLAUDE.md itself, but it was
+never going to matter even if real.
+
+## 9. `ekf_run_03` (4 missions) survey-vs-target check — done
+
+11/16 points (69%) passed the 30mm survey latch (`_172350` 2/4, `_172544`
+**4/4**, `_172708` 3/4, `_172843` 2/4). Unlike `EKF2_run2`'s pattern, the
+cross-track direction (LEFT/RIGHT) flips essentially randomly point-to-point
+within each mission — no persistent bias direction, no row-transition
+pattern (these are 4-point missions, nothing to transition through). Reads
+like ordinary tracking/stop-precision noise, not a GNSS-side effect — see §11
+for direct confirmation.
+
+## 10. Full-day RTCM rejection audit — 26 ULogs, two real outages found, mission failures cleared
+
+Every ULog pulled today (`Estimator_Compare/A` + `Madhavaram/EKF2_RUN_01` +
+`EKF2_run2` + `EKF2_run_3`, 26 logs total, 72,049 GPS samples) checked for
+`rtcm_msg_used`/`rtcm_crc_failed`/`rtcm_injection_rate`. **Zero CRC failures
+anywhere, all day** — every correction that arrived was valid; this is
+entirely a delivery-gap story, never corruption.
+
+Two real, multi-minute outages, both isolated events:
+- **`log_18` (16:28:00, 76 min): 7 separate outages totaling ~14 min**,
+  worst single gap **422s (~7 min)** at 15:54:06-16:01:08 IST. This is the
+  log tied to the ~14m position offset found earlier — a real, severe
+  correction-stream failure, most likely caster/network-side.
+- **`log_17` (15:09:34): a 110.6s gap.** The large offset in this log's
+  early window (~13m) was independently shown to be the rover simply not
+  yet being on the target point (arrived and settled to ~1m by t=240s) —
+  not caused by this gap.
+
+**All 5 failing points from the `ekf_run_03` missions (§9) checked
+individually against RTCM injection rate at their exact settle timestamp:
+100% used, full rate (~6.0), zero gaps, every single one.** RTCM is
+conclusively cleared as the cause of those failures.
+
+## 11. The repeatable ~150mm offset — confirmed real, EKF2 fusion cleared, points to raw GNSS
+
+Late-session live spot checks (rover physically confirmed on P0001) found a
+**stable ~140-155mm offset**, RTK FIXED, RTCM confirmed clean on both ends
+(ROS topics and a direct NSH query of PX4's own `vehicle_gps_position`
+counters — `rtcm_injection_rate=6.0`, `rtcm_crc_failed=False`,
+`rtcm_msg_used=2`). Captured in two fresh ULogs, `Madhavaram/log_47` (MANUAL,
+470s, clean RTCM) and `log_48` (MANUAL, 184s, one 10s RTCM gap that
+correlates with a brief fix_type 6→3 drop, otherwise clean).
+
+**Ruled out averaging/sampling noise**: single-sample, full-window-mean, and
+`mission_manager`-style 15-sample-trimmed-mean offsets all agree to a few mm
+on both logs (std <1.3mm). This is a real, stable, repeatable bias, not
+noise — confirms the operator's own read of it.
+
+**Deep comparison (`Estimator_Compare/A` = 11 good OFFBOARD mission ULogs vs
+`B` = the 2 bad MANUAL ULogs) against every EKF2-internal signal:**
+
+- **The offset is already present in the raw GNSS fix, before EKF2 fusion.**
+  Raw-vs-fused gap is ~10mm in the bad logs and ~7-10mm in the good logs —
+  indistinguishable, ordinary EKF smoothing in both. No fusion-step anomaly.
+- **GPS innovations center on zero with near-zero test ratios in both
+  groups** (3-4 orders of magnitude below the 1.0 rejection threshold
+  everywhere). The EKF isn't fighting a biased input in either group — it's
+  faithfully tracking whatever the raw fix already says.
+- **Every EKF2-internal signal checked is clean and identical between
+  groups**: control-status flags (`cs_gnss_pos/vel/yaw`=1 always,
+  `cs_fake_*`/`cs_constant_pos` never set), filter faults (0 everywhere),
+  reset counters (constant through every compared window, no fresh reset
+  near either bad or good window), check-fail flags (all 0), local-position
+  origin (stable, not freshly reset in either group).
+- **`nav_state` (MANUAL vs OFFBOARD) does not gate any EKF2 behavior found
+  here** — the earlier MANUAL/OFFBOARD categorical split looks like
+  coincidence of when these sessions happened, not a causal mechanism.
+- **One real, quantitative asymmetry**: satellites used, bad ~14.8-15.1 vs
+  good ~19.4-20.1; HDOP, bad 0.75-0.77 vs good 0.63-0.66. Both sides
+  comfortably inside normal RTK-FIXED gates (eph 15-16mm either way), so
+  this doesn't fully explain 150mm alone — but it's the one real difference
+  found, and it points at sky visibility/multipath at the raw-receiver
+  level as the next thing to check, not the estimator.
+
+**Verdict: this is not an EKF2 estimator bug.** The bias lives one layer
+earlier, in the raw SBF/receiver RTK solution itself. Comparison data
+organized at `4WD/Estimator_Compare/` (`A/` = 11 good OFFBOARD ULogs, `B/` =
+2 bad MANUAL ULogs, `mission_P1_ref.csv` = the P0001 target).
+
 ## 7. Open items, carried forward
 
-1. **What actually causes the session-to-session position variability**,
-   now that the base is cleared. Candidates not yet tested: antenna
-   placement repeatability, ambiguity-resolution/multipath state specific to
-   each cold start, the still-hardcoded Septentrio receiver dynamics
-   (`srd,high,UAV` — confirmed still not configurable even in the newest
-   available PX4 source, see 2026-09-08 driver investigation earlier this
-   thread).
-2. **Analyze the 4 new `ekf_run_03` missions** the same way as `EKF2_run2`.
-3. **`EKF2_REQ_EPH` decision** — still needs operator sign-off, not just data
+1. **The raw-GNSS-level ~150mm bias (§11) is the live open thread.** Next
+   step per the deep comparison: check whether sky visibility/antenna
+   orientation genuinely differed between the good and bad sessions
+   (obstruction, parking orientation, time-of-day constellation geometry) —
+   the satellite-count/HDOP gap is the one real lead. Do not re-open the
+   EKF2-fusion-bug hypothesis without new evidence; it was checked
+   exhaustively and cleared (§11).
+2. **`log_18`'s recurring multi-minute RTCM outages (§10)** — worth its own
+   investigation thread, separate from position accuracy (caster/network
+   side, not the rover).
+3. The still-hardcoded Septentrio receiver dynamics (`srd,high,UAV`,
+   confirmed not configurable even in the newest available PX4 source) —
+   still a candidate worth remembering, not yet tested against §11.
+4. **`EKF2_REQ_EPH` decision** — still needs operator sign-off, not just data
    (carried from 2026-09-07).
-4. **VDOP degradation root cause** — still completely unexplained (carried
+5. **VDOP degradation root cause** — still completely unexplained (carried
    from 2026-09-04/07).
-5. **P2 terminal swing** — now seen a second time, still unsolved.
-6. Whether to enable/tune `VerifiedPivotStateMachine` as the real P7 answer,
+6. **P2 terminal swing** — seen again in `EKF2_run2` (§4), still unsolved.
+   `ekf_run_03`'s 4-point missions (§9) don't show it (no row transition to
+   trigger it), consistent rather than contradictory.
+7. Whether to enable/tune `VerifiedPivotStateMachine` as the real P7 answer,
    now that it's confirmed built and dormant (§3).
+8. Fix the CLAUDE.md note claiming a live `GPS_YAW_OFFSET=180.0` — doesn't
+   correspond to any real parameter (§8).
