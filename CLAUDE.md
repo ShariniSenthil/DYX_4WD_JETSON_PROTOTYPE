@@ -746,6 +746,9 @@ Two independent methods agree. The audit searched every sample for
 cross-track problem already characterised above.
 
 **Vertical: OPEN — real receiver-native anomaly, root cause unproven.**
+⚠ Likely the same failure mode as the 2026-09-08 B group (§2026-09-08): same
+sign, same 100-150 mm magnitude, same "cleared by a power cycle". Read that
+section before re-opening this one.
 Raw GNSS altitude in the three runs **before** a rover power-off (`165719`,
 `165926`, `171227`) sits 125-152 mm below the eight-run median; all five runs
 **after** it sit within -2 to +52 mm. At the four piles `171227` shares with
@@ -830,6 +833,92 @@ Still wanted before Task 2.2 closes: **a 20-30 min static log** (parked, armed,
 RTK FIXED, full logging rate). It needs no bench and no mission, and it would
 measure the correlation time directly instead of the tau <= 2 s floor above.
 
+## 2026-09-08 — the ~150 mm RTK bias is receiver-side, and BeiDou is the lead
+
+Full writeup: `docs/2026-09-08_Handoff_Septentrio_BeiDou_Wrong_Fix.md`. Dataset
+`Estimator_Compare/` (A = 11 good ULogs 17:06-17:31, B = `log_47`/`log_48`
+19:21-19:25). Everything below was decoded from the raw serial traffic PX4
+captures in `gps_dump` (`SEP_DUMP_COMM=3`), not from `sensor_gps`.
+
+**Tool: `python3 scripts/gps_dump_sbf_report.py [--reference targets.csv] <*.ulg>`**
+— splits `gps_dump` into the two directions and decodes both: CRC-checked SBF
+from the receiver, CRC-checked RTCM3 into it. This is the only way to see which
+GNSS signals the RTK solution actually used, and the receiver's own ARP /
+phase-centre flags. Layouts come from PX4's `sbf/messages.h`, ArduPilot's
+`AP_GPS_SBF.h` and the mosaic-H v4.14.10 reference guide, each size-checked
+against the receiver's `Length`/`SBLength`. ⚠ ArduPilot's `VectorInfoGeod`
+declares `ReferenceID` as `u1`; spec and receiver both say `u2`, and the `u1`
+layout silently shifts `SignalInfo` by one byte.
+
+### Antenna ARP / phase-centre is NOT the cause of the good-vs-bad split
+
+- **PX4 never configures the antenna.** `SeptentrioDriver::configure()` sends
+  only `scs`, `sso`, `sdio`, `sto`, `srd`, `sga`, and `ssu` when
+  `SEP_CONST_USAGE != 0`. No `setAntennaOffset`, no antenna type, no PCO/PCV,
+  in **either** `SEP_AUTO_CONFIG` state. Antenna config is receiver NVRAM.
+- `PVTGeodetic.Misc` is `0x50`/`0x60` in all 13 logs, good and bad, in the same
+  proportion: bit 0 = 0 (baseline not known to point to base ARP), bit 1 = 0
+  (rover PCO not compensated), bits 6-7 = 1 (ARP-to-marker offset is zero).
+  Missing RTCM 1007/1008/1033 likewise identical in both groups.
+- `BaseVectorGeod.Misc` bits 0 and 1 are both clear, so the spec's "accurate
+  ARP-to-ARP baseline guaranteed only if both are set" is genuinely unmet —
+  real, worth closing, worth a few cm, **not this defect**.
+
+### What actually changed
+
+The receiver was **power-cycled** between the groups (uptime 3780 s -> 2678 s)
+and came back not using BeiDou. `PVTGeodetic.SignalInfo`:
+`0x30220909` (with BDS B1I+B2I) in A, `0x00220909` in B. BeiDou used in 88-100%
+of A epochs, **0.4% / 3.7%** of B epochs; `NrSV` 20 -> 15, VDOP 1.00 -> 1.64.
+
+- **Not the corrections.** RTCM 1124 carried 8-9 BeiDou satellites in B at the
+  same rate as A, yet `BaseVectorGeod.SignalInfo` reports no BeiDou corrections
+  available. The receiver discarded them.
+- **Not propagation.** BDS B2I (1207.14 MHz) was dropped while Galileo E5b at
+  the *same* frequency was kept; BDS B1I (1561 MHz) dropped while GPS L1CA
+  (1575 MHz) kept. Nothing frequency-selective does that.
+- **Not PX4.** `SEP_CONST_USAGE = 0` means "constellation usage isn't changed"
+  and the driver skips `ssu` entirely — the constellation set is receiver NVRAM
+  in both auto-config states.
+
+### The bad fix is a wrong integer ambiguity resolution
+
+B is static (0.10-0.36 m span over 184-470 s), so 148 mm is measurement, not
+control. `PosCovGeodetic` reports sigma_North ~9 mm against a 143-151 mm error
+while holding `Mode = 4` / `Error = 0` — wrong by ~16 sigma. It drifts smoothly
++123 -> +153 mm over 11 parked minutes (a fixed wrong integer set through a
+rotating geometry matrix; an antenna offset would be constant, noise random).
+**Height reads 100-140 mm below the good group at the same pile** — matching the
+still-open 2026-09-03 vertical anomaly (§2026-09-05) in sign, magnitude and in
+being cleared by a power cycle. Probably the same recurrent failure mode.
+
+Revised ranking: **#1 wrong ambiguity fix** (was #3), **#2 BeiDou loss as the
+trigger** (was "geometry"), **#3 antenna ARP/PCV** (was #1).
+
+### Sharpest open question
+
+`log_20` ran on a constellation about as thin as B's (`NrSV` 14, HDOP 1.12,
+BeiDou 19%) and stayed **RTK float for all 383 epochs** — it declined to fix.
+B, similarly thin, declared FIXED and was wrong by 150 mm. Unexplained.
+
+### Next moves (no field data needed for the first three)
+
+1. Interrogate the receiver via NSH/web UI and record: `lif,Permissions` (is
+   BeiDou licensed?), `gst`, `gsu`, `gao`, `lif,AntennaInfo`, `grd`, `gpm`, and
+   `lif,error` (every log has `ReceiverStatus.RxError` bit 3 `SOFTWARE` set, in
+   both groups, never explained; `lif,error` reports and clears it). Save to
+   NVRAM so a power cycle cannot change it again.
+2. Set `SEP_CONST_USAGE = 31` and `SEP_AUTO_CONFIG = 1` so PX4 commands `ssu`
+   every boot and the constellation set stops depending on NVRAM. ⚠ `ssu` sets
+   *usage*, not *tracking* — check both in step 1.
+3. Add `ReceiverSetup` (5902), `ChannelStatus` (4013) and `SatVisibility` (4012)
+   to a **second** receiver SBF stream (so auto-config can stay on) and
+   `gps_dump` will capture them. `SEP_SAT_INFO` does **not** do this — the driver
+   only copies the satellite count into `satellite_info`. Without those blocks no
+   log in this project contains per-satellite azimuth/elevation/CN0.
+4. Only then re-test: static placement at P0001, BeiDou confirmed in
+   `SignalInfo`, same post-sunset window, and see whether 150 mm returns.
+
 ## Repo status (2026-08-31)
 
 - **`WORKING_STATUS_24_06_2026.txt`** — stale (2026-06-24), architecture it
@@ -906,6 +995,21 @@ this rover IP, and this workspace backend as the verified 4WD stack.
   and parsers from `scripts/analyze_mission.py`. A wrong-alignment parse
   yields finite-but-absurd values that still plot — this already happened
   once here.
+- **Never read a mission-log stop error as GNSS accuracy.** The rover closes the
+  loop on this same GNSS and stops when its *reported* position reaches the
+  surveyed target, so a receiver bias is absorbed into the physical parking
+  position and does not appear in the reported error. Mission-stop numbers
+  measure controller convergence. Use an open-loop channel instead — **height**
+  is the one the rover never controls — or a static placement test.
+- **Do not hand-roll SBF or RTCM parsing either.** Use
+  `scripts/gps_dump_sbf_report.py`; its layouts are size-checked against the
+  receiver's own `Length`/`SBLength` at decode time. ArduPilot's
+  `VectorInfoGeod.ReferenceID` is `u1` and is wrong — spec and receiver say `u2`.
+- **PX4 does not configure the Septentrio antenna or its constellation set.**
+  No antenna/ARP/PCV command exists in the driver, and `SEP_CONST_USAGE = 0`
+  suppresses `ssu`. Both are receiver NVRAM and survive — or change across — a
+  power cycle, in either `SEP_AUTO_CONFIG` state. Do not infer receiver
+  configuration from PX4 parameters.
 
 ## Quick reference
 
@@ -924,6 +1028,10 @@ journalctl -u bag-autorecord.service -f      # the only systemd unit on this Jet
   stationary gate cleared, i.e. how long was spent waiting on the estimator
   rather than the rover. Also prints the gate signal's stationary noise floor,
   judged from position so the measurement does not assume its own conclusion.
+- `python3 scripts/gps_dump_sbf_report.py [--reference targets.csv] <*.ulg>`
+  — decodes the raw Septentrio SBF and injected RTCM3 out of `gps_dump`: which
+  signals/constellations the RTK solution used, ARP/phase-centre flags, base
+  correction contents, receiver uptime, and stationary error vs surveyed truth.
 - Backend: `http://192.168.3.101:5001` (FastAPI, port from
   `src/rover_backend/config/backend.env`).
 - Deploy/review workflow: see the `rover-ship` skill — this repo has no
