@@ -66,6 +66,202 @@ _WGS84_E2 = _WGS84_F * (2.0 - _WGS84_F)
 
 REQUIRED_FIX_TYPE = 6  # RTK FIXED; anything else is not survey grade.
 
+# DYX DIRECT WGS84 RAW OVERALL
+_WGS84_B = (1.0 - _WGS84_F) * _WGS84_A
+
+
+def wgs84_inverse_distance_m(
+    from_latitude_deg: float,
+    from_longitude_deg: float,
+    to_latitude_deg: float,
+    to_longitude_deg: float,
+) -> float:
+    # Direct WGS84 ellipsoid distance between two GPS coordinates.
+    # Vincenty inverse solution; no local rover projection is used.
+
+    values = (
+        from_latitude_deg,
+        from_longitude_deg,
+        to_latitude_deg,
+        to_longitude_deg,
+    )
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("WGS84 inverse requires finite coordinates")
+
+    if (
+        from_latitude_deg == to_latitude_deg
+        and from_longitude_deg == to_longitude_deg
+    ):
+        return 0.0
+
+    phi1 = math.radians(from_latitude_deg)
+    phi2 = math.radians(to_latitude_deg)
+
+    longitude_delta_deg = (
+        (to_longitude_deg - from_longitude_deg + 540.0) % 360.0
+    ) - 180.0
+    longitude_delta = math.radians(longitude_delta_deg)
+
+    reduced1 = math.atan((1.0 - _WGS84_F) * math.tan(phi1))
+    reduced2 = math.atan((1.0 - _WGS84_F) * math.tan(phi2))
+
+    sin_u1 = math.sin(reduced1)
+    cos_u1 = math.cos(reduced1)
+    sin_u2 = math.sin(reduced2)
+    cos_u2 = math.cos(reduced2)
+
+    lam = longitude_delta
+    converged = False
+
+    for _ in range(100):
+        sin_lam = math.sin(lam)
+        cos_lam = math.cos(lam)
+
+        sin_sigma = math.sqrt(
+            (cos_u2 * sin_lam) ** 2
+            + (
+                cos_u1 * sin_u2
+                - sin_u1 * cos_u2 * cos_lam
+            ) ** 2
+        )
+
+        if sin_sigma <= 1.0e-20:
+            return 0.0
+
+        cos_sigma = (
+            sin_u1 * sin_u2
+            + cos_u1 * cos_u2 * cos_lam
+        )
+        sigma = math.atan2(sin_sigma, cos_sigma)
+
+        sin_alpha = (
+            cos_u1 * cos_u2 * sin_lam / sin_sigma
+        )
+        cos_sq_alpha = max(
+            0.0,
+            1.0 - sin_alpha * sin_alpha,
+        )
+
+        if cos_sq_alpha <= 1.0e-20:
+            cos_two_sigma_m = 0.0
+        else:
+            cos_two_sigma_m = (
+                cos_sigma
+                - 2.0 * sin_u1 * sin_u2 / cos_sq_alpha
+            )
+
+        coefficient_c = (
+            _WGS84_F
+            / 16.0
+            * cos_sq_alpha
+            * (
+                4.0
+                + _WGS84_F
+                * (4.0 - 3.0 * cos_sq_alpha)
+            )
+        )
+
+        previous_lam = lam
+
+        lam = (
+            longitude_delta
+            + (1.0 - coefficient_c)
+            * _WGS84_F
+            * sin_alpha
+            * (
+                sigma
+                + coefficient_c
+                * sin_sigma
+                * (
+                    cos_two_sigma_m
+                    + coefficient_c
+                    * cos_sigma
+                    * (
+                        -1.0
+                        + 2.0 * cos_two_sigma_m**2
+                    )
+                )
+            )
+        )
+
+        if abs(lam - previous_lam) <= 1.0e-12:
+            converged = True
+            break
+
+    if not converged:
+        raise ValueError("WGS84 inverse geodesic did not converge")
+
+    u_sq = (
+        cos_sq_alpha
+        * (_WGS84_A**2 - _WGS84_B**2)
+        / (_WGS84_B**2)
+    )
+
+    coefficient_a = (
+        1.0
+        + u_sq
+        / 16384.0
+        * (
+            4096.0
+            + u_sq
+            * (
+                -768.0
+                + u_sq
+                * (320.0 - 175.0 * u_sq)
+            )
+        )
+    )
+
+    coefficient_b = (
+        u_sq
+        / 1024.0
+        * (
+            256.0
+            + u_sq
+            * (
+                -128.0
+                + u_sq
+                * (74.0 - 47.0 * u_sq)
+            )
+        )
+    )
+
+    delta_sigma = (
+        coefficient_b
+        * sin_sigma
+        * (
+            cos_two_sigma_m
+            + coefficient_b
+            / 4.0
+            * (
+                cos_sigma
+                * (
+                    -1.0
+                    + 2.0 * cos_two_sigma_m**2
+                )
+                - coefficient_b
+                / 6.0
+                * cos_two_sigma_m
+                * (
+                    -3.0
+                    + 4.0 * sin_sigma**2
+                )
+                * (
+                    -3.0
+                    + 4.0 * cos_two_sigma_m**2
+                )
+            )
+        )
+    )
+
+    distance_m = (
+        _WGS84_B
+        * coefficient_a
+        * (sigma - delta_sigma)
+    )
+
+    return max(0.0, distance_m)
+
 
 def metres_per_degree(latitude_deg: float) -> tuple[float, float]:
     """Return (north, east) metres per degree of latitude/longitude."""
@@ -355,7 +551,16 @@ def compute_survey_truth(
     north, east = local_offset_ne_m(
         target.latitude_deg, target.longitude_deg, latitude, longitude
     )
-    radial = math.hypot(north, east)
+
+    # DYX DIRECT WGS84 RAW OVERALL
+    # RAW GNSS overall is exact uploaded CSV target vs stable raw-GNSS
+    # antenna coordinate. north/east remain only for along/cross reporting.
+    radial = wgs84_inverse_distance_m(
+        target.latitude_deg,
+        target.longitude_deg,
+        latitude,
+        longitude,
+    )
 
     along_mm = cross_mm = None
     along_m = cross_m = None
