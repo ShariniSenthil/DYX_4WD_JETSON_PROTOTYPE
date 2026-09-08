@@ -835,6 +835,12 @@ measure the correlation time directly instead of the tau <= 2 s floor above.
 
 ## 2026-09-08 — the ~150 mm RTK bias is receiver-side, and BeiDou is the lead
 
+> ⚠ **SUPERSEDED on 2026-09-09 — read §2026-09-09 first.** The BeiDou lead, the
+> reboot framing and the A-vs-B height argument in this section are retracted;
+> `log_15` sits on a 210 mm-wrong fix with BeiDou at 99.7 %. What still holds:
+> antenna ARP/PCV is not the discriminator, the error is in the receiver's own
+> baseline, and the receiver cannot self-assess. The tool below is unchanged.
+
 Full writeup: `docs/2026-09-08_Handoff_Septentrio_BeiDou_Wrong_Fix.md`. Dataset
 `Estimator_Compare/` (A = 11 good ULogs 17:06-17:31, B = `log_47`/`log_48`
 19:21-19:25). Everything below was decoded from the raw serial traffic PX4
@@ -919,6 +925,81 @@ B, similarly thin, declared FIXED and was wrong by 150 mm. Unexplained.
 4. Only then re-test: static placement at P0001, BeiDou confirmed in
    `SignalInfo`, same post-sunset window, and see whether 150 mm returns.
 
+## 2026-09-09 — ROOT CAUSE: wrong integer ambiguity fix; it only changes on a re-fix
+
+Full writeup: `docs/2026-09-09_Handoff_RTK_Wrong_Ambiguity_Fix_Root_Cause.md`.
+Established over **every September ULog** (164 found, 142 unique, 119 with >20 s
+of GNSS), not one A/B bundle.
+
+**Inside one 98-minute log, at the same physical point, with nothing changed —
+no reboot, no parameter, no configuration, no constellation change — the reported
+position steps 192 mm, exactly on the only RTK ambiguity re-resolution in the log.**
+`log_15_2026-9-8-14-10-54`, parked fixes within 0.3 m of P0001, split on its one
+1093 s RTK outage (t = 2828 -> 3921 s):
+
+| | fixes | height p50 | sats | vdop | `eph` | BeiDou |
+|---|---|---|---|---|---|---|
+| before the re-fix | 10 064 | **-87.487 m** | 18 | 1.30 | **15 mm** | 99.7 % |
+| after the re-fix | 9 509 | **-87.295 m** | 19 | 1.14 | **15 mm** | 99.7 % |
+
+Within each band the height wanders only tens of mm across many parked windows.
+**Reported position is stable while a fix is held and steps by decimetres when the
+fix is re-resolved.** `log_18` corroborates (-210 mm across a 170 s re-fix at one
+spot). `log_47` is the control: 99.5 % fixed, no outage over 1.6 s, height held to
+30 mm across 4 minutes — one fix, held, wrong.
+
+Truth anchor: `log_12_2026-9-8-11-06-54` is verified good — parked 74.9 s, RTK
+fixed, raw **10.1 mm** and fused **5.2 mm** from surveyed P0001, `fused - raw` =
+N +6.1 / E -3.3 / **U -300.0 mm** (exactly `EKF2_GPS_POS_Z`), 0 innovation
+rejections, 0/974 `gps_check_fail_flags`. It reads **-87.277 m** at P0001 and the
+Sep-07 day median is **-87.261 m**. So log_15-before is ~210 mm low and log_47/48
+~110-165 mm low, while log_15-after is within 35 mm.
+
+### Retracted from the 2026-09-08 section
+
+- The **reboot** is not the mechanism — five receiver boots on Sep-08, four came
+  back with BeiDou (99.7/91.9/93.9/19->100 %), one did not (0.4/3.7 %). A reboot
+  just forces a re-fix.
+- **BeiDou is not necessary** — log_15 was 210 mm wrong with BeiDou at 99.7 %. Its
+  absence in boot #5 stays a real, unexplained receiver-side anomaly (the base sent
+  RTCM 1124 with 6-10 sv in every log all day) and a plausible aggravator, not the
+  cause.
+- The **A-vs-B height argument** was not evidence: log_15 swings 230 mm vertically
+  at P0001 within one log and goes *below* log_47.
+- **+148 mm North is not uniquely large** — log_15's long holds sit at dN +96..+108
+  at P0001. And nothing in these logs measures where the rover physically was.
+
+### Cleared by the September-wide sweep
+
+- **RTCM injection is healthy everywhere**: 112/119 logs at exactly 6.0 Hz median.
+  The 7 exceptions are 6 total outages (0 Hz, 0 % RTK: `log_83`/`log_84` 9-3,
+  `log_49`/`50`/`51` 9-7, `log_31` 9-8) plus `log_1` at 4.8 Hz. Reduced correction
+  rate is not a factor in any bad-position log.
+- **Constellation content is measurable only on 17 logs, all 2026-09-08**
+  (`SEP_DUMP_COMM` was 0 before that). Sep-01/03/04/07 cannot be checked at all.
+- **2026-09-08 is the anomalous day, not the evening.** Within-day vertical spread
+  at P0001: Sep-03 max **41.9 mm**, Sep-07 max **43.8 mm**, Sep-08 max **416.4 mm**,
+  starting in the 10:30 session. Unexplained; no parameter can do it (the only
+  GNSS-relevant diffs are `EKF2_GPS_CHECK` 831->829, `EKF2_GPS_YAW_OFF` 0->180 on
+  log_47, `SEP_AUTO_CONFIG`, `SEP_DUMP_COMM` — and EKF2 params cannot move raw GNSS).
+
+### What to do
+
+1. **The only defence that matches the failure.** `eph` is 15 mm in both the correct
+   and the 210 mm-wrong state, so no innovation/DOP/fix_type/sat-count gate can
+   separate them — settled, not fixable by tightening anything. But the *transition*
+   is observable: `fix_type` dropping below 6 and returning. `mission_manager` should
+   treat an RTK re-fix as invalidating prior marking references and refuse to keep
+   marking until the rover re-verifies against a known surveyed point.
+2. **Quantify the exposure**: park at P0001, force ~10 re-fixes (cut corrections
+   60 s, restore, repeat), log each settled position. Discrete clusters 100-200 mm
+   apart confirm the mechanism. One hour, no bench, no mission.
+3. **Fix less often wrongly**: restore BeiDou determinism (`lif, Permissions`, `gst`,
+   `gsu`; `sst, all` + `eccf, Current, Boot` if tracking is off; `SEP_CONST_USAGE=31`
+   with `SEP_AUTO_CONFIG=1` — ⚠ `ssu` sets usage, not tracking); ask for a nearer
+   base or a VRS/MAC mountpoint (13.68 km is long for single-base integer fixing);
+   close the antenna gap (`sao` with antenna type, base 1006/1007/1008/1033).
+
 ## Repo status (2026-08-31)
 
 - **`WORKING_STATUS_24_06_2026.txt`** — stale (2026-06-24), architecture it
@@ -995,6 +1076,11 @@ this rover IP, and this workspace backend as the verified 4WD stack.
   and parsers from `scripts/analyze_mission.py`. A wrong-alignment parse
   yields finite-but-absurd values that still plot — this already happened
   once here.
+- **Never compare positions across an RTK re-fix.** A `fix_type` drop below 6 and
+  return can move the reported position by 100-500 mm with no change in `eph`,
+  satellite count or DOP (2026-09-09: 192 mm in `log_15`, -210 mm in `log_18`).
+  Split every dataset on re-fix boundaries before averaging, differencing, or
+  calling anything a bias.
 - **Never read a mission-log stop error as GNSS accuracy.** The rover closes the
   loop on this same GNSS and stops when its *reported* position reaches the
   surveyed target, so a receiver bias is absorbed into the physical parking
