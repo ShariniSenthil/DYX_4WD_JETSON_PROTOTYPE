@@ -72,6 +72,9 @@ LOGGER = logging.getLogger(__name__)
 
 
 RTCM_INJECTION_TOPIC = "/mavros/gps_rtk/send_rtcm"
+RAW_GNSS_COVARIANCE_SOURCE = (
+    "/mavros/global_position/raw/fix.position_covariance"
+)
 PX4_EARTH_RADIUS_M = 6_371_000.0
 
 
@@ -133,6 +136,41 @@ def _finite_float(
         return default
 
     return result
+
+
+def _raw_receiver_rms_from_navsatfix(
+    message: NavSatFix,
+) -> tuple[float | None, float | None]:
+    """Return raw-GNSS horizontal/vertical RMS from NavSatFix covariance."""
+
+    if int(message.position_covariance_type) == int(
+        NavSatFix.COVARIANCE_TYPE_UNKNOWN
+    ):
+        return None, None
+
+    covariance = message.position_covariance
+
+    if len(covariance) < 9:
+        return None, None
+
+    east_variance_m2 = _finite_float(covariance[0])
+    north_variance_m2 = _finite_float(covariance[4])
+    up_variance_m2 = _finite_float(covariance[8])
+
+    if (
+        east_variance_m2 is None
+        or north_variance_m2 is None
+        or up_variance_m2 is None
+        or east_variance_m2 < 0.0
+        or north_variance_m2 < 0.0
+        or up_variance_m2 < 0.0
+    ):
+        return None, None
+
+    return (
+        math.sqrt(east_variance_m2 + north_variance_m2),
+        math.sqrt(up_variance_m2),
+    )
 
 
 def _safe_int(
@@ -938,6 +976,7 @@ class RoverBackendRosNode(Node):
         latitude = _finite_float(message.latitude)
         longitude = _finite_float(message.longitude)
         altitude = _finite_float(message.altitude)
+        raw_hrms_m, raw_vrms_m = _raw_receiver_rms_from_navsatfix(message)
 
         if latitude is not None and not -90.0 <= latitude <= 90.0:
             latitude = None
@@ -950,6 +989,20 @@ class RoverBackendRosNode(Node):
             raw_latitude=latitude,
             raw_longitude=longitude,
             raw_altitude_m=altitude,
+            raw_hrms_source=RAW_GNSS_COVARIANCE_SOURCE,
+            raw_hrms_m=raw_hrms_m,
+            raw_hrms_mm=(
+                raw_hrms_m * 1000.0
+                if raw_hrms_m is not None
+                else None
+            ),
+            raw_vrms_m=raw_vrms_m,
+            raw_vrms_mm=(
+                raw_vrms_m * 1000.0
+                if raw_vrms_m is not None
+                else None
+            ),
+            raw_covariance_type=int(message.position_covariance_type),
         )
 
     def _gp_origin_callback(

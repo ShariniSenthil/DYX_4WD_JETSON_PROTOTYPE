@@ -498,8 +498,10 @@ def build_telemetry_payload() -> dict[str, Any]:
             gps.get("satellites_visible"),
             0,
         ),
-        "hrms": gps.get("px4_hrms_m"),
-        "vrms": gps.get("px4_vrms_m"),
+        # Frontend HRMS/VRMS authority: raw GNSS NavSatFix covariance.
+        # PX4 ESTIMATOR_STATUS accuracy remains available under gps.px4_*.
+        "hrms": gps.get("raw_hrms_m"),
+        "vrms": gps.get("raw_vrms_m"),
         "rtk_fixed": bool(gps.get("rtk_fixed", False)),
         "rtk_healthy": bool(rtk.get("healthy", False)),
         "rtk_correction_age_sec": rtk.get("correction_age_sec"),

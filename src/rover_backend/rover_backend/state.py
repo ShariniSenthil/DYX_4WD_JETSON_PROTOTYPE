@@ -181,6 +181,14 @@ class RoverState:
                 "hdop": None,
                 "vdop": None,
                 "rtk_fixed": False,
+                "raw_hrms_source": (
+                    "/mavros/global_position/raw/fix.position_covariance"
+                ),
+                "raw_hrms_m": None,
+                "raw_hrms_mm": None,
+                "raw_vrms_m": None,
+                "raw_vrms_mm": None,
+                "raw_covariance_type": None,
                 "px4_hrms_source": "MAVLINK_ESTIMATOR_STATUS_230",
                 "px4_hrms_m": None,
                 "px4_hrms_mm": None,
