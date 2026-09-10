@@ -66,6 +66,9 @@ TERMINAL_FLOOR_SPEED_MPS = 0.15
 # "legacy" | "precision_fsm" | "radial20"
 TERMINAL_STOP_MODE = "radial20"
 
+# Restart-only command transport authority shared by RPP and the bridge.
+RPP_EXPLICIT_YAW_ENABLED = False
+
 
 def generate_launch_description() -> LaunchDescription:
     mavros = ExecuteProcess(
@@ -125,6 +128,7 @@ def generate_launch_description() -> LaunchDescription:
                 respawn_delay=2.0,
                 parameters=[
                     {
+                        "rpp_explicit_yaw_enabled": RPP_EXPLICIT_YAW_ENABLED,
                         "command_timeout_sec": (0.25),
                         ("backend_heartbeat_" "timeout_sec"): 1.5,
                         # Bridge preserves the RPP ramp and only clamps
@@ -305,6 +309,7 @@ def generate_launch_description() -> LaunchDescription:
                 respawn_delay=2.0,
                 parameters=[
                     {
+                        "rpp_explicit_yaw_enabled": RPP_EXPLICIT_YAW_ENABLED,
                         "local_frame": "map",
                         # RPP motion profile + trajectory following.
                         # Extension/dummy generation remains owned by the

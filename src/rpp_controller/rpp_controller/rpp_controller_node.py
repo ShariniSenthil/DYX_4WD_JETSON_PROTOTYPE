@@ -132,7 +132,22 @@ class RPPController(Node):
     RUNTIME_ENTRY_SPACING_M = 0.05
 
     def __init__(self):
+        from rcl_interfaces.msg import ParameterDescriptor
+        from rpp_interfaces.msg import RppCommand
+
         super().__init__("rpp_controller")
+
+        self.declare_parameter(
+            "rpp_explicit_yaw_enabled",
+            False,
+            ParameterDescriptor(
+                read_only=True,
+                description="Restart-only RPP command transport; set in rover.launch.py",
+            ),
+        )
+        self.rpp_explicit_yaw_enabled = bool(
+            self.get_parameter("rpp_explicit_yaw_enabled").value
+        )
 
         self.declare_parameter("local_frame", "map")
         self.declare_parameter("cruise_speed_mps", 1.00)
@@ -1636,11 +1651,24 @@ class RPPController(Node):
             command_qos,
         )
 
-        self.velocity_pub = self.create_publisher(
-            Vector3Stamped,
-            "/rpp/velocity_ned",
-            command_qos,
-        )
+        if self.rpp_explicit_yaw_enabled:
+            # Keep both existing publication sites unchanged. This adapter owns
+            # only the atomic publisher and cannot publish a legacy command.
+            self.velocity_pub = _ExplicitYawStagingPublisher(
+                self.create_publisher(RppCommand, "/rpp/command", command_qos),
+                RppCommand,
+            )
+            self.get_logger().warn(
+                "RPP startup contract: B / EXPLICIT_YAW | "
+                "Patch 2 staging: zero velocity, yaw_valid=false; actuation disabled"
+            )
+        else:
+            self.velocity_pub = self.create_publisher(
+                Vector3Stamped,
+                "/rpp/velocity_ned",
+                command_qos,
+            )
+            self.get_logger().warn("RPP startup contract: A / LEGACY_VELOCITY")
 
         self.acceleration_active_pub = self.create_publisher(
             Bool,
@@ -10257,6 +10285,25 @@ class RPPController(Node):
             north,
             east,
         )
+
+
+class _ExplicitYawStagingPublisher:
+    """Adapt existing publication sites to atomic, stop-only Patch-2 output."""
+
+    def __init__(self, publisher, command_type):
+        self._publisher = publisher
+        self._command_type = command_type
+
+    def publish(self, velocity_message):
+        # Phase 3 has not supplied owning-call-site yaw. Discard the vector:
+        # invalid yaw plus nonzero velocity could otherwise steer via PX4.
+        command = self._command_type()
+        command.header = velocity_message.header
+        command.velocity_north_mps = 0.0
+        command.velocity_east_mps = 0.0
+        command.yaw_enu_rad = 0.0
+        command.yaw_valid = False
+        self._publisher.publish(command)
 
 
 def main(args=None):

@@ -1,7 +1,9 @@
 """Safety-gated PX4 velocity-vector bridge for the DYX rover.
 
-RPP input:
-    /rpp/velocity_ned (geometry_msgs/Vector3Stamped)
+RPP input (restart-only selection; default A):
+    B: /rpp/command (rpp_interfaces/RppCommand)
+        Patch 2 staging only: all commands rejected; zero output, yaw ignored.
+    A: /rpp/velocity_ned (geometry_msgs/Vector3Stamped)
         vector.x = North velocity [m/s]
         vector.y = East velocity [m/s]
         vector.z = 0
@@ -30,6 +32,8 @@ from typing import Any
 import rclpy
 from geometry_msgs.msg import Vector3Stamped
 from mavros_msgs.msg import PositionTarget, State
+from rcl_interfaces.msg import ParameterDescriptor
+from rpp_interfaces.msg import RppCommand
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy,
@@ -62,6 +66,18 @@ class CmdVelBridge(Node):
 
     def __init__(self) -> None:
         super().__init__("cmd_vel_bridge")
+
+        self.declare_parameter(
+            "rpp_explicit_yaw_enabled",
+            False,
+            ParameterDescriptor(
+                read_only=True,
+                description="Restart-only RPP command transport; set in rover.launch.py",
+            ),
+        )
+        self.rpp_explicit_yaw_enabled = bool(
+            self.get_parameter("rpp_explicit_yaw_enabled").value
+        )
 
         self.declare_parameter("command_timeout_sec", 0.25)
         self.declare_parameter("backend_heartbeat_timeout_sec", 1.5)
@@ -111,6 +127,12 @@ class CmdVelBridge(Node):
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
+        explicit_yaw_command_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         safety_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
@@ -124,12 +146,25 @@ class CmdVelBridge(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
 
-        self.create_subscription(
-            Vector3Stamped,
-            "/rpp/velocity_ned",
-            self._rpp_callback,
-            command_qos,
-        )
+        if self.rpp_explicit_yaw_enabled:
+            self.create_subscription(
+                RppCommand,
+                "/rpp/command",
+                self._rpp_command_callback,
+                explicit_yaw_command_qos,
+            )
+            self.get_logger().warn(
+                "Bridge startup contract: B / EXPLICIT_YAW | "
+                "Patch 2 staging: all atomic commands rejected; actuation disabled"
+            )
+        else:
+            self.create_subscription(
+                Vector3Stamped,
+                "/rpp/velocity_ned",
+                self._rpp_callback,
+                command_qos,
+            )
+            self.get_logger().warn("Bridge startup contract: A / LEGACY_VELOCITY")
         self.create_subscription(
             State,
             "/mavros/state",
@@ -249,6 +284,14 @@ class CmdVelBridge(Node):
         self.latest_north = north
         self.latest_east = east
         self.latest_command_time = self.get_clock().now()
+
+    def _rpp_command_callback(self, message: RppCommand) -> None:
+        # Phase 4 must explicitly implement B validation and yaw forwarding.
+        # Until then reject EVERY atomic command, even one claiming valid yaw.
+        # Never refresh freshness or route its velocity through _rpp_callback.
+        self.latest_north = 0.0
+        self.latest_east = 0.0
+        self.latest_command_time = None
 
     def _state_callback(self, message: State) -> None:
         self.connected = bool(message.connected)
