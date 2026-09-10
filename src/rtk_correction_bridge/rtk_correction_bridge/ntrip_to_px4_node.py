@@ -36,8 +36,12 @@ from rtk_correction_bridge.ntrip_failures import (
 )
 from rtk_correction_bridge.rtcm_transport import (
     DEFAULT_MAX_MAVROS_RTCM_FRAME_BYTES,
+    MAX_MAVROS_RTCM_FRAME_BYTES_LIMIT,
     RtcmWorkerTransport,
     validate_max_mavros_rtcm_frame_bytes,
+)
+from rtk_correction_bridge.serial_rtcm_sink import (
+    SerialRtcmSink,
 )
 from rtk_correction_bridge.status_snapshot import (
     build_correction_status_snapshot,
@@ -150,6 +154,42 @@ class NtripToPx4Node(Node):
             )
         )
 
+        self.direct_inject = bool(
+            worker_config.direct_inject
+        )
+
+        self.direct_serial_device = (
+            None
+            if worker_config.direct_serial_device is None
+            else str(
+                worker_config.direct_serial_device
+            )
+        )
+
+        self.direct_serial_baud = int(
+            worker_config.direct_serial_baud
+        )
+
+        self.direct_serial_write_timeout_sec = float(
+            worker_config.direct_serial_write_timeout_sec
+        )
+
+        self.direct_serial_reopen_sec = float(
+            worker_config.direct_serial_reopen_sec
+        )
+
+        self.injection_mode = (
+            'direct_serial'
+            if self.direct_inject
+            else 'mavros_px4'
+        )
+
+        self.effective_rtcm_frame_limit_bytes = (
+            MAX_MAVROS_RTCM_FRAME_BYTES_LIMIT
+            if self.direct_inject
+            else self.max_mavros_rtcm_frame_bytes
+        )
+
         self._password_source = (
             'inherited backend config FD'
         )
@@ -158,7 +198,7 @@ class NtripToPx4Node(Node):
 
         self.transport = RtcmWorkerTransport(
             max_mavros_rtcm_frame_bytes=(
-                self.max_mavros_rtcm_frame_bytes
+                self.effective_rtcm_frame_limit_bytes
             ),
         )
 
@@ -166,6 +206,26 @@ class NtripToPx4Node(Node):
             RTCM,
             self.rtcm_topic,
             50,
+        )
+
+        self._serial_sink = None
+
+        if self.direct_inject:
+            self._serial_sink = SerialRtcmSink(
+                self.direct_serial_device,
+                baudrate=self.direct_serial_baud,
+                write_timeout_sec=(
+                    self.direct_serial_write_timeout_sec
+                ),
+                reopen_delay_sec=(
+                    self.direct_serial_reopen_sec
+                ),
+            )
+
+        self._active_sink = (
+            self._serial_sink.write_frame
+            if self.direct_inject
+            else self._publish_rtcm_frame
         )
 
         status_qos = QoSProfile(
@@ -440,6 +500,54 @@ class NtripToPx4Node(Node):
         validate_max_mavros_rtcm_frame_bytes(
             self.max_mavros_rtcm_frame_bytes
         )
+
+        if (
+            self.direct_inject
+            and self.direct_serial_device is None
+        ):
+            raise ValueError(
+                'direct_serial_device is required '
+                'when direct_inject=true'
+            )
+
+        if (
+            self.direct_serial_device is not None
+            and not self.direct_serial_device.startswith(
+                '/dev/'
+            )
+        ):
+            raise ValueError(
+                'direct_serial_device must be '
+                'an absolute /dev path'
+            )
+
+        if self.direct_serial_baud <= 0:
+            raise ValueError(
+                'direct_serial_baud must be > 0'
+            )
+
+        if (
+            not math.isfinite(
+                self.direct_serial_write_timeout_sec
+            )
+            or self.direct_serial_write_timeout_sec
+            <= 0.0
+        ):
+            raise ValueError(
+                'direct_serial_write_timeout_sec '
+                'must be finite and > 0'
+            )
+
+        if (
+            not math.isfinite(
+                self.direct_serial_reopen_sec
+            )
+            or self.direct_serial_reopen_sec < 0.0
+        ):
+            raise ValueError(
+                'direct_serial_reopen_sec '
+                'must be finite and >= 0'
+            )
 
     def _gga_position_callback(
         self,
@@ -962,14 +1070,14 @@ class NtripToPx4Node(Node):
         candidates,
         now,
     ):
-        """Publish each size-gated complete RTCM3 frame exactly once."""
+        """Deliver each size-gated complete RTCM3 frame exactly once."""
 
         for frame_bytes in candidates:
 
             published = self.transport.attempt_publish(
                 frame_bytes,
                 now,
-                self._publish_rtcm_frame,
+                self._active_sink,
             )
 
             if not published:
@@ -986,6 +1094,40 @@ class NtripToPx4Node(Node):
         msg.data = list(frame_bytes)
 
         self.rtcm_pub.publish(msg)
+
+    def _reject_rtcm_frame(
+        self,
+        frame_bytes,
+    ):
+        """Reject delivery after node teardown has started."""
+
+        del frame_bytes
+
+        raise RuntimeError(
+            'RTCM delivery attempted during node teardown'
+        )
+
+    def destroy_node(self):
+        """Release direct-injection resources before ROS teardown."""
+
+        # Quiesce routing first. SerialRtcmSink.close() intentionally allows
+        # a later write to reopen the endpoint, so the node must stop exposing
+        # its write_frame callable before closing the port.
+        self._active_sink = (
+            self._reject_rtcm_frame
+        )
+
+        serial_sink = self._serial_sink
+        self._serial_sink = None
+
+        if serial_sink is not None:
+            try:
+                serial_sink.close()
+            except Exception:
+                # Cleanup must not prevent normal ROS node teardown.
+                pass
+
+        return super().destroy_node()
 
     def _correction_age(self):
         """Age of this session's most recently published supported frame.

@@ -7,6 +7,9 @@ RTCM3 protocol-valid frames may be 6..1029 bytes. The downstream MAVROS
 development size gate is separate and defaults to 720 bytes. A CRC-valid
 721..1029-byte frame remains protocol-valid: it updates valid-frame counters
 and timestamps, increments the oversize counter, and is not published.
+
+In direct-serial mode the node constructs this transport with the RTCM3
+protocol ceiling of 1029 bytes instead of the legacy MAVROS size gate.
 """
 
 from __future__ import annotations

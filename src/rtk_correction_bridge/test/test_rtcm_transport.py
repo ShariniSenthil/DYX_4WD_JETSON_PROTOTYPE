@@ -731,3 +731,36 @@ def test_supported_valid_frame_refreshes_source_valid_age():
         ) is False
         assert transport.source_is_stale(now, 10.0) is False
     assert transport.is_healthy(True, 20.0, 5.0) is True
+
+
+def test_direct_protocol_ceiling_accepts_1029_byte_frame():
+    frame = frame_of_total_length(
+        MAX_MAVROS_RTCM_FRAME_BYTES_LIMIT
+    )
+
+    transport = RtcmWorkerTransport(
+        max_mavros_rtcm_frame_bytes=(
+            MAX_MAVROS_RTCM_FRAME_BYTES_LIMIT
+        )
+    )
+
+    transport.new_parser_session()
+
+    candidates = transport.process_stream_bytes(
+        frame,
+        50.0,
+    )
+
+    assert candidates == [
+        frame
+    ]
+
+    assert (
+        transport.counters.rtcm_frames_valid_total
+        == 1
+    )
+
+    assert (
+        transport.counters.rtcm_frames_oversize_total
+        == 0
+    )
