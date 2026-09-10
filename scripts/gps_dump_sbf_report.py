@@ -72,11 +72,21 @@ def iter_sbf(data: bytes):
 # --------------------------------------------------------------------------- #
 
 BLOCK_NAMES = {
-    4001: 'DOP', 4007: 'PVTGeodetic', 4014: 'ReceiverStatus', 4028: 'BaseVectorGeod',
+    4001: 'DOP', 4007: 'PVTGeodetic', 4012: 'SatVisibility', 4013: 'ChannelStatus',
+    4014: 'ReceiverStatus', 4028: 'BaseVectorGeod',
     4052: 'PosLocal', 4076: 'PVTSupport', 4079: 'PVTSupportA', 5906: 'PosCovGeodetic',
     5908: 'VelCovGeodetic', 5921: 'EndOfPVT', 5938: 'AttEuler', 5939: 'AttCovEuler',
     5942: 'AuxAntPositions', 5943: 'EndOfAtt',
 }
+
+# The exact block list PX4 1.16.2 asks for with `sso` when SEP_AUTO_CONFIG != 0
+# (septentrio.cpp, k_command_sbf_output_pvt):
+#     sso,Stream<N>,COM<n>,PVTGeodetic+VelCovGeodetic+DOP+AttEuler+AttCovEuler
+#                          +EndOfPVT+ReceiverStatus,<rate>
+# PX4 clears only its own stream (`sso,Stream<N>,COM<n>,none,off`) and can never
+# ADD a block outside this set, so anything else arriving on the FCU link came
+# from a stream the receiver owns in its own configuration.
+PX4_SSO_BLOCKS = frozenset({4007, 5908, 4001, 5938, 5939, 5921, 4014})
 
 FMT = {
     4007: ('<BBdddfffffdfBBBBHHIBBHHHHB',
@@ -98,7 +108,47 @@ SUB_FMT = {
     5942: ('<BBBBdddddd',
            'NrSV Error AmbiguityType AuxAntID DeltaEast DeltaNorth DeltaUp '
            'EastVel NorthVel UpVel'.split()),
+    # mosaic-H Reference Guide v4.14.10, "SatVisibility Number: 4012" (p.365):
+    # SatInfo sub-block SVID/FreqNr/Azimuth(0.01deg)/Elevation(0.01deg)/RiseSet/SatelliteInfo.
+    4012: ('<BBHhBB', 'SVID FreqNr Azimuth Elevation RiseSet SatelliteInfo'.split()),
 }
+
+# mosaic-H Reference Guide v4.14.10, "ChannelStatus Number: 4013" (p.358-360).
+# Two-level sub-block: N ChannelSatInfo entries (SB1Length bytes each, fixed layout
+# below + receiver-defined padding we never assume), each followed by N2
+# ChannelStateInfo entries (SB2Length bytes each). Both lengths are read from the
+# block itself and used to advance -- never computed/guessed (CLAUDE.md hard rule).
+CHANNEL_SAT_FMT = ('<BB2xHHb', 'SVID FreqNr AzimuthRiseSet HealthStatus Elevation'.split())
+CHANNEL_STATE_FMT = ('<BxHHH', 'Antenna TrackingStatus PVTStatus PVTInfo'.split())
+
+
+def decode_channel_status(body: bytes):
+    """4013 ChannelStatus -> list of {SVID, Elevation, states:[{Antenna,TrackingStatus,PVTStatus}]}."""
+    if len(body) < 12:
+        return []
+    n, sb1_len, sb2_len = struct.unpack_from('<BBB', body, 6)
+    fmt1, names1 = CHANNEL_SAT_FMT
+    fmt2, names2 = CHANNEL_STATE_FMT
+    need1, need2 = struct.calcsize(fmt1), struct.calcsize(fmt2)
+    if sb1_len < need1 or sb2_len < need2:  # layout disagrees with the receiver -- refuse to guess
+        return []
+    out = []
+    off = 12
+    for _ in range(n):
+        if off + sb1_len > len(body):
+            break
+        rec = dict(zip(names1, struct.unpack_from(fmt1, body, off)))
+        n2 = body[off + 9]  # N2 field: byte offset 9 within ChannelSatInfo (SVID0 FreqNr1 Reserved1[2] Az/RiseSet[2] HealthStatus[2] Elevation1 N2@9)
+        off += sb1_len
+        states = []
+        for _ in range(n2):
+            if off + sb2_len > len(body):
+                break
+            states.append(dict(zip(names2, struct.unpack_from(fmt2, body, off))))
+            off += sb2_len
+        rec['states'] = states
+        out.append(rec)
+    return out
 
 # mosaic-H Reference Guide section 4.1.10, bit index -> signal
 SIGNALS = {
@@ -120,6 +170,50 @@ ARP_TO_MARKER = {0: 'unknown', 1: 'zero', 2: 'non-zero'}
 
 def signal_names(mask: int) -> str:
     return '+'.join(SIGNALS.get(b, f'bit{b}') for b in range(40) if mask >> b & 1) or 'none'
+
+
+# mosaic-H Reference Guide v4.14.10, "ChannelStatus Number: 4013" (p.358), the
+# per-constellation 2-bit-slot tables under "Health, tracking and PVT status
+# fields". Each entry maps (bit_hi, bit_lo) -> signal name. Slots not listed are
+# 'Reserved' in the guide and are skipped.
+CHANNEL_SIGNAL_SLOTS = {
+    'GPS':     {(11, 10): 'L1C', (9, 8): 'L5', (7, 6): 'L2C', (5, 4): 'P2(Y)', (3, 2): 'P1(Y)', (1, 0): 'L1CA'},
+    'GLONASS': {(9, 8): 'L3', (7, 6): 'L2CA', (5, 4): 'L2P', (3, 2): 'L1P', (1, 0): 'L1CA'},
+    'GALILEO': {(13, 12): 'E5ab', (11, 10): 'E5b', (9, 8): 'E5a', (7, 6): 'E6BC', (3, 2): 'L1BC'},
+    'SBAS':    {(3, 2): 'L5', (1, 0): 'L1'},
+    'BEIDOU':  {(11, 10): 'B2b', (9, 8): 'B2a', (7, 6): 'B1C', (5, 4): 'B3I', (3, 2): 'B2I', (1, 0): 'B1I'},
+}
+
+STATUS_2BIT = {0: 'idle/notused', 1: 'search/waitEph', 2: 'sync/used', 3: 'tracking/rejected'}
+
+
+def svid_constellation(svid: int) -> str:
+    """mosaic-H Reference Guide v4.14.10, section 4.1.9 (p.238) SVID ranges."""
+    if 1 <= svid <= 37:
+        return 'GPS'
+    if 38 <= svid <= 68:
+        return 'GLONASS'
+    if 71 <= svid <= 106:
+        return 'GALILEO'
+    if 120 <= svid <= 140 or 198 <= svid <= 215:
+        return 'SBAS'
+    if 141 <= svid <= 180 or 223 <= svid <= 245:
+        return 'BEIDOU'
+    if 181 <= svid <= 187:
+        return 'QZSS'
+    if 191 <= svid <= 197 or 216 <= svid <= 222:
+        return 'NAVIC'
+    return 'UNKNOWN'
+
+
+def decode_2bit_field(value: int, constellation: str, kind: str):
+    """kind: 'tracking' -> STATUS_2BIT{0..3} 0/1/2/3; 'pvt' -> not-used/waitEph/used/rejected."""
+    slots = CHANNEL_SIGNAL_SLOTS.get(constellation, {})
+    out = {}
+    for (hi, lo), name in slots.items():
+        code = (value >> lo) & 0b11
+        out[name] = code
+    return out
 
 
 def decode_sbf(data: bytes, want=None):
@@ -154,6 +248,8 @@ def decode_sbf(data: bytes, want=None):
                     break
                 subs.append(dict(zip(names, struct.unpack_from(fmt, body, off))))
             rec['subs'] = subs
+        elif num == 4013:
+            rec['sats'] = decode_channel_status(body)
         else:
             continue
         out[num].append(rec)
@@ -286,6 +382,20 @@ def report(ulg_path, ref, keep_dir=None, vmax=0.03, min_epochs=20):
     sbf = decode_sbf(frm, want={4001, 4007, 4014, 4028, 5942})
     pvt = [p for p in sbf[4007] if p['Lat'] > -1e9]
     print(f'\n===== {name} =====')
+
+    # --- whose configuration is this receiver actually running? --------------
+    emitted = {b for b, _rev, _len, _body in iter_sbf(frm)}
+    extra = sorted(emitted - PX4_SSO_BLOCKS)
+    missing = sorted(PX4_SSO_BLOCKS - emitted)
+    if extra or missing:
+        print(f'    config fingerprint: {len(emitted)} SBF blocks -- NOT PX4\'s sso set'
+              + (f'; receiver-owned: '
+                 + ' '.join(BLOCK_NAMES.get(b, str(b)) for b in extra) if extra else '')
+              + (f'; absent: ' + ' '.join(BLOCK_NAMES.get(b, str(b)) for b in missing)
+                 if missing else ''))
+    else:
+        print('    config fingerprint: 7 SBF blocks == PX4 sso set exactly '
+              '(no receiver-owned stream on this port)')
     if not pvt:
         print('  no usable PVTGeodetic')
         return

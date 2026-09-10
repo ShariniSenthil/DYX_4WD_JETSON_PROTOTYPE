@@ -730,11 +730,14 @@ accepted with a near-zero innovation.
 | `EKF2_GPS_CHECK` | 831 | vertical-drift and horizontal-speed-offset checks DISABLED |
 | `EKF2_GPS_DELAY` | 50 ms | |
 | `EKF2_GPS_POS_Z` | -0.30 m | vertical lever arm set |
-| `EKF2_GPS_POS_X/Y`, `EKF2_IMU_POS_*` | **effectively zero** | horizontal lever arms NOT configured — task sheet P1 |
+| `EKF2_GPS_POS_X/Y` | **0 / 0 — intentional, not a gap** | Rover pose origin = Main GNSS antenna = spray nozzle, by design (operator-confirmed 2026-09-09). This matches the 2026-09-01 pivot-walk section's independent finding ("the antenna doubles as the spray-nozzle reference, so the lever arm cannot be compensated without moving spray targeting"). There is no physical horizontal lever arm to measure here — do not "fix" this to a nonzero value. Earlier revisions of this file mischaracterized this as an unconfigured gap; that was wrong. |
+| `EKF2_IMU_POS_X/Y/Z` | still open | Genuinely separate from the antenna/nozzle colocation above — this is the IMU-to-body-origin offset. Task sheet (`docs/4WD_CM_TRACKING_PRODUCTION_TASKSHEET_FINAL.md`) Task 1.2 still applies to this one; it does **not** apply to `EKF2_GPS_POS_X/Y`. |
 
-⚠ The lever-arm params are **not** in the bag `fcu_params` capture — they came
-from an uploaded `.params` file, which this file's own hard rules rank below a
-live capture. Re-read them off the FCU before acting on them.
+✅ Re-confirmed live via NSH-over-SSH on 2026-09-09 (read-only `param show`,
+see `docs/PX4_NSH_OVER_SSH.md`): `EKF2_GPS_POS_X=0.0000`, `EKF2_GPS_POS_Y=0.0000`,
+`EKF2_GPS_POS_Z=-0.3000` — matches the uploaded `.params` file exactly. The
+earlier caveat about this coming only from an unverified static export no
+longer applies to `EKF2_GPS_POS_X/Y/Z`.
 
 ### The log_82 questions, resolved and unresolved
 
