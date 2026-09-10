@@ -61,7 +61,7 @@ def make_worker_config(
     )
 
 
-def test_worker_config_v3_round_trip_preserves_gga_policy():
+def test_worker_config_current_schema_round_trip_preserves_gga_policy():
     config = make_worker_config()
 
     decoded = decode_worker_config(
@@ -72,7 +72,7 @@ def test_worker_config_v3_round_trip_preserves_gga_policy():
 
     assert (
         decoded.schema_version
-        == 3
+        == WORKER_CONFIG_SCHEMA_VERSION
     )
 
     assert decoded.gga_enabled is True
@@ -98,11 +98,6 @@ def test_new_profile_defaults_to_gga_disabled(
         mountpoint="FIXED",
         username="rover",
         password=SECRET,
-    )
-
-    assert (
-        RTK_PROFILE_SCHEMA_VERSION
-        == 3
     )
 
     assert profile.gga_enabled is False
@@ -337,7 +332,7 @@ def test_v1_database_migrates_without_enabling_gga(
     finally:
         connection.close()
 
-    assert version == 3
+    assert version == RTK_PROFILE_SCHEMA_VERSION
 
 
 def test_v2_database_migrates_to_required_tls(
@@ -415,4 +410,4 @@ def test_v2_database_migrates_to_required_tls(
     finally:
         connection.close()
 
-    assert version == 3
+    assert version == RTK_PROFILE_SCHEMA_VERSION

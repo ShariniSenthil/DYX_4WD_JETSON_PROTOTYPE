@@ -1943,40 +1943,60 @@ changed on purpose — which is exactly the point.
 
 # 22. Mode-switch behavior
 
-A mode change must establish a clean new worker/sink lifetime.
+A mode change must establish a clean worker/sink lifetime boundary.
 
-Preferred lifecycle:
+The existing backend already provides the required fail-closed behavior.
+`RtkProfileStore.update_profile()` compares worker-affecting runtime values.
+When an active RUNNING profile changes, it persists:
 
 ```text
-profile update
-    ↓
-current RTK worker stops/reconciles
-    ↓
-serial/MAVROS sink resources are closed
-    ↓
-worker restarts with new WorkerConfig
-    ↓
-exactly one new active sink exists
+desired_state = STOPPED
 ```
 
-### ⚠ It does not restart today — this must be added
+`RtkControlService.update_profile()` then observes the RUNNING -> STOPPED
+transition and forwards the normal runtime STOP.
+For the five direct-injection fields:
 
-Earlier revisions left this as a checkpoint. Reading the source answers it:
-`RtkControlService.update_profile()` persists the change and then calls `_forward_forced_stop()`,
-which acts only when the store's **runtime state** differs before and after. A field-only edit on an
-enabled, running profile does not change runtime state, so **no stop and no restart is emitted.**
+```text
+direct_inject
+direct_serial_device
+direct_serial_baud
+direct_serial_write_timeout_sec
+direct_serial_reopen_sec
+```
 
-Consequence if left alone: an operator flips `direct_inject`, the API returns success, and the
-running worker keeps using the old sink until something else restarts it. An entire A/B window could
-be attributed to the wrong transport. This is a silent, plausible, and expensive failure — it is the
-single most likely way to get a wrong answer out of this experiment.
+they must remain included in `old_runtime_values`, so changing any of them
+while RUNNING follows this lifecycle:
 
-Required: treat `direct_inject` (and the serial settings) as **worker-affecting fields**, and force a
-controlled stop/start when any of them changes on a running profile. The stop must run the normal
-teardown path so the serial device or the publisher is released before the new worker starts.
+```text
+profile PATCH
+    |
+new profile values persist
+    |
+RtkProfileStore detects runtime_changed
+    |
+persisted desired_state becomes STOPPED
+    |
+RtkControlService forwards STOP
+    |
+current worker teardown completes
+    |
+system remains STOPPED
+    |
+operator explicitly issues START
+    |
+new worker receives the new WorkerConfig
+    |
+exactly one selected injection sink exists
+```
 
-Do not make hot switching inside a live stream the first production implementation. There is no
-demonstrated requirement for it, and a restart is a clean sink lifetime boundary.
+There is deliberately no automatic stop-then-start after a profile edit.
+This matches the existing safety convention: edited credentials or transport
+settings must never silently hot-swap under a running worker. During A/B field
+testing, changing injection mode therefore interrupts correction delivery until
+the operator explicitly starts RTK again.
+
+Do not implement live sink switching inside a running worker.
 
 ---
 
@@ -2198,9 +2218,6 @@ rtk_routes.py
 tests
 ```
 
-Also modify `rtk_control_service.py` so a change to `direct_inject` or the serial settings on a
-running profile forces a controlled worker stop/start — see §22. Without it the A/B switch is silent.
-
 Add direct fields with:
 
 ```text
@@ -2217,7 +2234,7 @@ old DB migration works, tested against a COPY OF THE JETSON'S REAL .db
     (a freshly created DB never exercises the migration branch)
 schema-version gate accepts both the old and new user_version
 legacy runtime config still generated
-changing direct_inject on a running profile emits a stop/start
+changing direct_inject on a running profile forces STOPPED; an explicit START is required
 ```
 
 ---
@@ -2490,15 +2507,13 @@ src/rover_backend/rover_backend/rtk_profile_store.py
 
 src/rover_backend/rover_backend/rtk_routes.py
 
-src/rover_backend/rover_backend/rtk_control_service.py
-
 relevant existing tests
 ```
 
-`rtk_control_service.py` is **required**, not optional: without it a change to `direct_inject`,
-`direct_serial_device`, `direct_serial_baud`, `direct_serial_write_timeout_sec` or
-`direct_serial_reopen_sec` persists without restarting a running worker, and the A/B switch is
-silent. See §22.
+The existing `rtk_control_service.py` requires no behavioral change for this
+feature. The store owns the worker-affecting comparison and persists STOPPED;
+the control service already forwards that forced RUNNING -> STOPPED transition.
+See §22.
 
 ### Documentation-only change
 
