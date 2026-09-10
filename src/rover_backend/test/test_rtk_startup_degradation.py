@@ -25,11 +25,21 @@ class _RosBridgeStub:
         self.running = False
 
 
+class _RosServiceOutcomeUnknownError(RuntimeError):
+    """Test stub matching the ros_bridge public exception surface."""
+
+    outcome = "UNKNOWN"
+    retry_safe = False
+
+
 _ros_bridge_module = types.ModuleType(
     "rover_backend.ros_bridge"
 )
 _ros_bridge_module.ros_bridge = (
     _RosBridgeStub()
+)
+_ros_bridge_module.RosServiceOutcomeUnknownError = (
+    _RosServiceOutcomeUnknownError
 )
 
 sys.modules[
