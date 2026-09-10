@@ -334,10 +334,12 @@ Constructor:
 ```python
 self._injection_mode = (
     INJECTION_MODE_DIRECT_SERIAL
-    if self.config.direct_inject
+    if worker_config.direct_inject
     else INJECTION_MODE_MAVROS_PX4
 )
 ```
+
+There is no `self.config` on this node — see §6.1.
 
 ---
 
@@ -667,6 +669,7 @@ def _open(self) -> None:
         xonxoff=False,
         rtscts=False,
         dsrdtr=False,
+        exclusive=True,
     )
 ```
 
@@ -1903,6 +1906,32 @@ and:
 
 ---
 
+## 20.8 Lock the deliberate MAVROS-gate behavior
+
+Not blocking, but worth having. §6.8 decides that direct mode keeps the MAVROS readiness gate. That
+is a deliberate choice, and an unlabelled deliberate choice eventually gets "fixed" by someone who
+reads it as an accidental regression.
+
+Add to:
+
+```text
+src/rover_backend/test/test_rtk_manager_core.py
+```
+
+Assert explicitly:
+
+```text
+direct_inject=true + mavros_ready=false
+    → RtkManagerCore stays WAITING_FOR_MAVROS
+    → no spawn action is emitted
+```
+
+The test name and docstring should say this is intended, and point at §6.8. If a later phase
+deliberately decouples direct mode from MAVROS readiness, this test is the thing that must be
+changed on purpose — which is exactly the point.
+
+---
+
 # 21. A/B state table
 
 | `direct_inject` | Parser | Frame ceiling after validation | MAVROS RTCM publish | Direct serial | Automatic fallback |
@@ -2120,8 +2149,19 @@ They remain two different truths.
 Before editing:
 
 ```text
-branch = feat/rtcm-direct-gnss-uart
-HEAD   = 0a5fac60a56d95ae2da8a8f5938fa539caaa7274
+working branch        = feat/rtcm-direct-gnss-uart
+working branch HEAD   = 2c5ba33
+source-code baseline  = 0a5fac60a56d95ae2da8a8f5938fa539caaa7274
+```
+
+The branch has moved past the verified source baseline because **this document is itself committed
+on it**. The only intervening change is documentation; no file under `src/` differs between
+`0a5fac6` and the current HEAD. Every source excerpt in this plan remains valid.
+
+Confirm that before Phase 1, and re-verify the excerpts if it ever stops being true:
+
+```text
+git diff --stat 0a5fac6..HEAD -- src/     # must be empty
 ```
 
 Record test baseline.
@@ -2440,8 +2480,6 @@ src/rtk_correction_bridge/test/test_serial_rtcm_sink.py
 ```text
 src/rtk_correction_bridge/rtk_correction_bridge/ntrip_to_px4_node.py
 
-src/rtk_correction_bridge/rtk_correction_bridge/rtcm_transport.py
-
 src/rtk_correction_bridge/rtk_correction_bridge/status_snapshot.py
 
 src/rtk_correction_bridge/package.xml
@@ -2452,8 +2490,25 @@ src/rover_backend/rover_backend/rtk_profile_store.py
 
 src/rover_backend/rover_backend/rtk_routes.py
 
+src/rover_backend/rover_backend/rtk_control_service.py
+
 relevant existing tests
 ```
+
+`rtk_control_service.py` is **required**, not optional: without it a change to `direct_inject`,
+`direct_serial_device`, `direct_serial_baud`, `direct_serial_write_timeout_sec` or
+`direct_serial_reopen_sec` persists without restarting a running worker, and the A/B switch is
+silent. See §22.
+
+### Documentation-only change
+
+```text
+src/rtk_correction_bridge/rtk_correction_bridge/rtcm_transport.py
+```
+
+**No functional code change** — see §5 and §8. Only the module docstring's description of the 720 B
+gate is edited. It is listed separately here so it is not counted as a behavioural diff during
+false-mode regression review.
 
 ### Do not modify unless a verified dependency appears
 
