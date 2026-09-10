@@ -791,9 +791,15 @@ Production B-side (this session):  NTRIP → Jetson → direct Mosaic-H native U
   brand-new profile is still `direct_inject = false`.
 - Backend startup reconciles from persisted `desired_state`: after one explicit operator START with
   `RUNNING` persisted, a normal `ros2 launch rover_bringup rover.launch.py` restores RTK
-  automatically, gated only on the pre-existing MAVROS-readiness check (`RtkManagerCore._maybe_launch()`
-  waits for MAVROS regardless of injection mode — accepted, not a defect, since MAVROS is part of the
-  same production launch and normally ready within seconds).
+  automatically. **Updated same day:** this was originally gated on MAVROS readiness regardless of
+  injection mode (`RtkManagerCore._maybe_launch()` waited for MAVROS even in direct mode); that gate
+  has now been bypassed for `direct_inject=true` profiles — `build_production_runtime()` in
+  `rtk_backend_lifecycle.py` wraps the MAVROS-derived readiness provider so a direct-inject profile
+  reports launch-ready unconditionally, without touching `RtkManagerCore` or
+  `rtk_mavros_readiness.py`. `direct_inject=false` keeps the original MAVROS-gated behavior exactly.
+  Verified at source/unit-test level (3 new tests in `test_rtk_backend_lifecycle.py`, full
+  `rover_backend` suite green — 469 passed); **not yet field-tested with PX4/MAVROS actually absent.**
+  Full detail in `docs/RTCM_DIRECT_INJECTION_AB_REVIEW_PLAN.md` §6.8's 2026-09-10 update.
 - **The first B-side attempt looked broken (no RTK, receiver stuck at 3D) and was not a USB/serial
   fault.** The profile's transport-field edit had correctly forced persisted `desired_state = STOPPED`
   per the existing safety lifecycle contract — RTK had simply never been re-started after the edit.

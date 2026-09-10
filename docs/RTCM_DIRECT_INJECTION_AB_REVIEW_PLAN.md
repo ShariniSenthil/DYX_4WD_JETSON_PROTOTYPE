@@ -84,11 +84,24 @@ STARTed once with `desired_state` persisted as `RUNNING`, a normal
 `ros2 launch rover_bringup rover.launch.py` restores RTK automatically — no repeat operator START
 needed. A fresh database still initializes to `STOPPED`.
 
-One accepted architectural detail, unchanged by this session (already documented at §6.8/§10.3/Phase
-6 below): `RtkManagerCore._maybe_launch()` still gates worker spawning on MAVROS readiness even in
-`direct_inject=true` mode. This does not route RTCM through MAVROS — it only means the direct-USB
-worker waits for MAVROS to become ready. Accepted as non-blocking because MAVROS is part of the same
-production launch and normally ready within seconds. **No patch was requested or made for this.**
+⚠ **Superseded later the same day (2026-09-10).** At the time of the field session above,
+`RtkManagerCore._maybe_launch()` still gated worker spawning on MAVROS readiness even in
+`direct_inject=true` mode — documented at §6.8/§10.3/Phase 6 below as "accepted as non-blocking, no
+patch requested." That was revisited the same day: `build_production_runtime()` in
+`src/rover_backend/rover_backend/rtk_backend_lifecycle.py` now wraps the MAVROS-derived readiness
+provider with `_make_launch_readiness_provider()`, which reads the active persisted profile and, when
+`direct_inject=true`, returns launch-ready unconditionally — bypassing PX4/MAVROS entirely for the
+direct-USB2 path. `direct_inject=false` behavior is untouched: the real MAVROS-derived provider is
+still consulted exactly as before. `RtkManagerCore` and `rtk_mavros_readiness.py` were **not**
+modified — the bypass lives one layer up, in what gets fed into `set_mavros_ready()`. Receiver
+availability is not separately gated at launch; `SerialRtcmSink`'s existing open/reopen retry already
+reports unhealthy until the Mosaic-H is reachable on the configured USB device and self-heals across an
+unplug/replug without a relaunch. Covered by new tests in `test_rtk_backend_lifecycle.py`
+(`test_launch_readiness_bypasses_mavros_for_direct_inject_profile`,
+`test_launch_readiness_still_gates_on_mavros_for_legacy_profile`,
+`test_launch_readiness_fails_closed_on_profile_store_error`); all 469 `rover_backend` tests pass.
+**This has not yet been field-tested with PX4/MAVROS actually absent** — it is verified at
+source/unit-test level only, same distinction as the rest of this document's acceptance criteria.
 
 ## Why the first B-side attempt appeared broken — root cause, not a defect
 
@@ -184,10 +197,12 @@ fields still gets the backend default `direct_inject=false`. Future UI enhanceme
 | 5 | A-side field validation | **PASS / closed** |
 | 6 | B-side direct USB2 field validation | **PASS / closed** |
 | 7 | A/B field accuracy comparison (survey truth) | **Not performed** — see accuracy boundary above |
+| — | PX4/MAVROS-independent launch for direct mode | **Implemented same day (2026-09-10), source/unit-test verified only — see the "Superseded later the same day" note above** |
 
 Current production correction route: `NTRIP → Jetson → Mosaic-H USB2`. Persisted `RUNNING` means a
-normal rover backend restart restores it automatically once the existing MAVROS-readiness gate clears
-(see above).
+normal rover backend restart restores it automatically — for `direct_inject=true`, as of the same-day
+follow-up above, without waiting on MAVROS/PX4 at all; for `direct_inject=false`, once the MAVROS-
+readiness gate clears, exactly as before.
 
 ---
 
@@ -706,6 +721,15 @@ followed by worker reconciliation/restart.
 
 ## 6.8 ⚠ Direct mode still requires MAVROS to be alive — decided, not overlooked
 
+⚠ **Superseded 2026-09-10 (see STATUS at the top of this document).** This section's "decision" —
+one shared launch precondition for both sides — was revisited the same day the field session above
+happened. `build_production_runtime()` now bypasses this gate entirely for `direct_inject=true`
+profiles via `_make_launch_readiness_provider()`; `RtkManagerCore` and `evaluate_mavros_rtcm_readiness()`
+below are unchanged, so everything this section says about *their* behavior is still accurate — only
+the "decided to leave it as-is" conclusion no longer holds. Read on for the original reasoning (it's
+why the bypass lives in `rtk_backend_lifecycle.py` rather than in these two files), then see STATUS
+for what actually changed.
+
 The RTK worker is launched by `RtkManagerCore`, and `_maybe_launch()` refuses to spawn it unless
 `_mavros_ready` is true, parking in `WAITING_FOR_MAVROS` instead. The same gate re-applies after any
 unexpected worker exit. `evaluate_mavros_rtcm_readiness()` in `rtk_mavros_readiness.py` requires all
@@ -728,16 +752,27 @@ the very topic the direct path bypasses.
   the RTK stack and is out of scope for a transport experiment.
 - Keeping one launch precondition for both sides keeps the A/B comparison honest.
 
-**Two consequences must be stated rather than discovered:**
+**Two consequences must be stated rather than discovered (as originally written — see the
+2026-09-10 update at the top of this section for what changed):**
 
 1. `self.rtcm_pub` must still be created in direct mode (§6.5), or the subscriber count is zero and
-   the worker never launches.
-2. **This work does not make correction delivery survive a MAVROS outage.** It removes the MAVLink
-   fragmentation and the 720 B ceiling from the correction path; it does not remove MAVROS as a
-   liveness dependency. Do not describe the B-side as "no longer depends on MAVROS."
+   the worker never launches. ⚠ *As of the 2026-09-10 bypass, this no longer applies to
+   `direct_inject=true`*: `evaluate_mavros_rtcm_readiness()` (and therefore the subscriber-count
+   check) is never consulted for a direct-inject profile's launch decision. It still applies
+   unchanged to `direct_inject=false`. Keeping `self.rtcm_pub` created in direct mode remains
+   correct regardless — it costs nothing and doesn't need removing.
+2. **This work does not make correction delivery survive a MAVROS outage — this claim also no
+   longer holds as written.** It was true at authoring time (removes MAVLink fragmentation and the
+   720 B ceiling from the correction path, but not MAVROS as a liveness dependency). As of
+   2026-09-10, `direct_inject=true` *does* survive a MAVROS outage at the launch-decision level — see
+   STATUS. What is still true: this was never a fix for the wrong-ambiguity/accuracy problem (§9,
+   Phase 7), and `SerialRtcmSink` still needs the receiver itself reachable on its own USB2 interface,
+   independent of anything PX4/MAVROS-related.
 
-If a future phase genuinely needs correction delivery without MAVROS, that is a separate change to
-`rtk_mavros_readiness.py` and `rtk_manager_core.py`, made deliberately and tested on its own.
+The "separate change to `rtk_mavros_readiness.py` and `rtk_manager_core.py`, made deliberately and
+tested on its own" that this section originally called for as future work is what happened on
+2026-09-10 — except it landed in `rtk_backend_lifecycle.py` instead, one layer above those two files,
+which were deliberately left untouched. See STATUS for why that location was chosen.
 
 ---
 
@@ -2097,6 +2132,16 @@ and:
 ---
 
 ## 20.8 Lock the deliberate MAVROS-gate behavior
+
+⚠ **Overtaken 2026-09-10 — see STATUS and §6.8.** §6.8's decision to keep the MAVROS gate for direct
+mode was reversed the same day this document's field-validation content was written. This test was
+never added (confirmed: no `direct_inject` reference exists in
+`src/rover_backend/test/test_rtk_manager_core.py` as of 2026-09-10), which is exactly why nothing
+needed to be un-locked when the decision changed — `RtkManagerCore` itself was never touched; the
+bypass was implemented one layer up in `rtk_backend_lifecycle.py`, which is now where the equivalent
+coverage lives (`test_rtk_backend_lifecycle.py::test_launch_readiness_bypasses_mavros_for_direct_inject_profile`
+and its two siblings). The paragraph below is kept for historical context only — do not add the test
+it describes; it would lock in behavior that no longer holds.
 
 Not blocking, but worth having. §6.8 decides that direct mode keeps the MAVROS readiness gate. That
 is a deliberate choice, and an unlabelled deliberate choice eventually gets "fixed" by someone who

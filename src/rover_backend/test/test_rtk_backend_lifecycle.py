@@ -176,9 +176,15 @@ def test_production_runtime_factory_wires_frozen_components(
         readiness_provider,
     )
 
+    # build_production_runtime no longer wires the raw MAVROS-derived
+    # provider straight through -- it wraps it with a direct-inject bypass
+    # (see _make_launch_readiness_provider). The wrapping itself must not
+    # touch the profile store (construction stays side-effect free, checked
+    # below); the wrapper's runtime fallback/bypass behavior is covered by
+    # the dedicated test_launch_readiness_* tests.
     assert (
         runtime._mavros_readiness_provider
-        is readiness_provider
+        is not readiness_provider
     )
 
     orchestrator = runtime._orchestrator
@@ -198,6 +204,115 @@ def test_production_runtime_factory_wires_frozen_components(
     )
 
     assert not store.database_file.exists()
+
+
+def test_launch_readiness_bypasses_mavros_for_direct_inject_profile(
+    tmp_path,
+):
+    """direct_inject=true has no protocol dependency on MAVROS/PX4: the
+    worker must be allowed to launch even when the raw MAVROS-derived
+    provider reports not-ready."""
+
+    store = RtkProfileStore(
+        tmp_path / "direct.sqlite3"
+    )
+    store.initialize()
+
+    profile = store.create_profile(
+        name="Direct USB2",
+        caster_host="caster.test",
+        caster_port=2101,
+        mountpoint="MOUNT",
+        username="rover",
+        password="LIFECYCLE_SECRET",
+        direct_inject=True,
+        direct_serial_device=(
+            "/dev/serial/by-id/test-device"
+        ),
+    )
+    store.set_active_profile(
+        profile.profile_id
+    )
+
+    raw_provider_calls = []
+
+    def raw_mavros_provider():
+        raw_provider_calls.append(True)
+        return False
+
+    runtime = build_production_runtime(
+        store,
+        raw_mavros_provider,
+    )
+
+    assert runtime._mavros_readiness_provider() is True
+    assert raw_provider_calls == []
+
+
+def test_launch_readiness_still_gates_on_mavros_for_legacy_profile(
+    tmp_path,
+):
+    """direct_inject=false (the A-side / default) must keep exactly the
+    original MAVROS-gated behavior."""
+
+    store = RtkProfileStore(
+        tmp_path / "legacy.sqlite3"
+    )
+    store.initialize()
+
+    profile = store.create_profile(
+        name="Legacy MAVROS",
+        caster_host="caster.test",
+        caster_port=2101,
+        mountpoint="MOUNT",
+        username="rover",
+        password="LIFECYCLE_SECRET",
+        direct_inject=False,
+    )
+    store.set_active_profile(
+        profile.profile_id
+    )
+
+    raw_provider_calls = []
+
+    def raw_mavros_provider():
+        raw_provider_calls.append(True)
+        return False
+
+    runtime = build_production_runtime(
+        store,
+        raw_mavros_provider,
+    )
+
+    assert runtime._mavros_readiness_provider() is False
+    assert raw_provider_calls == [True]
+
+
+def test_launch_readiness_fails_closed_on_profile_store_error(
+    tmp_path,
+):
+    """A profile-store read failure while deciding the bypass must fall
+    back to the real MAVROS-gated provider, never to an unconditional
+    launch allowance."""
+
+    store = RtkProfileStore(
+        tmp_path / "uninitialized.sqlite3"
+    )
+    # Deliberately not initialized: runtime_state() will raise.
+
+    raw_provider_calls = []
+
+    def raw_mavros_provider():
+        raw_provider_calls.append(True)
+        return False
+
+    runtime = build_production_runtime(
+        store,
+        raw_mavros_provider,
+    )
+
+    assert runtime._mavros_readiness_provider() is False
+    assert raw_provider_calls == [True]
 
 
 def test_start_reconciles_persisted_stopped(

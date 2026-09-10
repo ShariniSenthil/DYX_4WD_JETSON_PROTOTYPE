@@ -1030,8 +1030,15 @@ Production B-side (this rover's active profile): NTRIP → Jetson → direct Mos
   still `direct_inject = false`; do not assume that default describes this rover.
 - Backend startup reconciles from persisted `desired_state`, so a normal
   `ros2 launch rover_bringup rover.launch.py` restores RTK automatically once RTK has been explicitly
-  STARTed once — gated only on the pre-existing MAVROS-readiness check, which applies to direct mode
-  too (accepted, not a defect: MAVROS is part of the same production launch).
+  STARTed once. ⚠ **Updated same day (2026-09-10):** this used to also require PX4/MAVROS to be
+  connected before the worker would even spawn, in *either* injection mode. That MAVROS/PX4
+  dependency has since been bypassed for `direct_inject=true` profiles —
+  `build_production_runtime()` in `src/rover_backend/rover_backend/rtk_backend_lifecycle.py` now
+  wraps the readiness provider so a direct-inject profile is treated as launch-ready without waiting
+  on MAVROS at all. `RtkManagerCore`/`rtk_mavros_readiness.py` are unchanged; `direct_inject=false`
+  still gates on MAVROS exactly as before. Verified at source/unit-test level only (3 new tests,
+  full `rover_backend` suite green); not yet field-tested with PX4 actually absent. Detail in
+  `docs/RTCM_DIRECT_INJECTION_AB_REVIEW_PLAN.md` §6.8.
 - ⚠ **Changing any direct-injection field on a running profile forces persisted `desired_state` to
   `STOPPED`** (existing safety lifecycle contract) — RTK does not resume until an operator issues an
   explicit START again. A stationary direct-mode test once looked like a USB fault (no RTK, receiver
