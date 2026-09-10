@@ -1135,9 +1135,8 @@ class NtripToPx4Node(Node):
     def destroy_node(self):
         """Release direct-injection resources before ROS teardown."""
 
-        # Quiesce routing first. SerialRtcmSink.close() intentionally allows
-        # a later write to reopen the endpoint, so the node must stop exposing
-        # its write_frame callable before closing the port.
+        # Reject new routing, then permanently shut down the sink so a
+        # delivery that already captured write_frame cannot reopen it.
         self._active_sink = (
             self._reject_rtcm_frame
         )
@@ -1147,7 +1146,7 @@ class NtripToPx4Node(Node):
 
         if serial_sink is not None:
             try:
-                serial_sink.close()
+                serial_sink.shutdown()
             except Exception:
                 # Cleanup must not prevent normal ROS node teardown.
                 pass

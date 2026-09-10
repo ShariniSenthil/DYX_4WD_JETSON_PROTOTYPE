@@ -857,6 +857,8 @@ class RoverBackendRosNode(Node):
                 stream_connected=False,
                 stream_state="STALE",
                 status="STALE",
+                direct_serial_open=False,
+                direct_serial_last_successful_write_age_sec=None,
             )
 
     def _rpp_debug_stale_monitor(self) -> None:

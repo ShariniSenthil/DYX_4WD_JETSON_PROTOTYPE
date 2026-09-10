@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import ast
+import threading
 from pathlib import Path
+
+from rtk_correction_bridge.rtcm_transport import RtcmWorkerTransport
+from rtk_correction_bridge.serial_rtcm_sink import SerialRtcmSink
 
 
 SOURCE = (
@@ -22,23 +26,24 @@ def _routing_harness():
         _source()
     )
 
-    method = None
+    methods = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {
+            "_process_parsed_frames", "_reject_rtcm_frame", "destroy_node",
+        }
+    ]
+    assert len(methods) == 3
 
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.FunctionDef)
-            and node.name == "_process_parsed_frames"
-        ):
-            method = node
-            break
-
-    assert method is not None
+    class Base:
+        def destroy_node(self):
+            return True
 
     klass = ast.ClassDef(
         name="Harness",
-        bases=[],
+        bases=[ast.Name(id="Base", ctx=ast.Load())],
         keywords=[],
-        body=[method],
+        body=methods,
         decorator_list=[],
     )
 
@@ -51,7 +56,7 @@ def _routing_harness():
         module
     )
 
-    namespace = {}
+    namespace = {"Base": Base}
 
     exec(
         compile(
@@ -268,9 +273,61 @@ def test_destroy_node_closes_direct_sink():
         start:end
     ]
 
-    assert "serial_sink.close()" in method
+    assert "serial_sink.shutdown()" in method
 
     assert (
         "super().destroy_node()"
         in method
     )
+
+
+def test_delivery_captured_before_teardown_cannot_reopen_serial():
+    captured = threading.Event()
+    resume = threading.Event()
+    opens = []
+
+    class Port:
+        is_open = True
+
+        def write(self, data):
+            return len(data)
+
+        def close(self):
+            self.is_open = False
+
+    def factory(**kwargs):
+        port = Port()
+        opens.append(port)
+        return port
+
+    class PausedTransport(RtcmWorkerTransport):
+        def attempt_publish(self, frame, now, publisher):
+            captured.set()
+            if not resume.wait(3):
+                raise TimeoutError("test did not resume delivery")
+            return super().attempt_publish(frame, now, publisher)
+
+    sink = SerialRtcmSink("/dev/fake", serial_factory=factory)
+    sink.open()
+    worker = _worker(sink.write_frame)
+    worker._serial_sink = sink
+    worker.transport = PausedTransport()
+    thread = threading.Thread(
+        target=worker._process_parsed_frames, args=([b"late-frame"], 10.0),
+    )
+    thread.start()
+    try:
+        assert captured.wait(3)
+        assert worker.destroy_node() is True
+    finally:
+        resume.set()
+        thread.join(3)
+        sink.shutdown()
+
+    assert not thread.is_alive()
+    assert len(opens) == 1
+    assert sink.snapshot.serial_open is False
+    assert sink.snapshot.frames_written_total == 0
+    assert worker.transport.counters.rtcm_frames_published_total == 0
+    assert worker.transport.counters.rtcm_publish_errors_total == 1
+    assert worker._pending_publish_errors == 1

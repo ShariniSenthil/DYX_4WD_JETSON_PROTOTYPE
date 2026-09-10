@@ -144,6 +144,7 @@ class SerialRtcmSink:
         self._clock = clock
         self._serial_factory = serial_factory
         self._lock = threading.RLock()
+        self._shutdown = False
 
         self._serial: Optional[_SerialPort] = None
         self._next_open_at: Optional[float] = None
@@ -242,6 +243,14 @@ class SerialRtcmSink:
             self._close_serial_noexcept()
             self._next_open_at = None
 
+    def shutdown(self) -> None:
+        """Permanently reject delivery, including previously captured calls."""
+
+        with self._lock:
+            self._shutdown = True
+            self._close_serial_noexcept()
+            self._next_open_at = None
+
     def write_frame(
         self,
         frame_bytes: bytes | bytearray | memoryview,
@@ -313,7 +322,7 @@ class SerialRtcmSink:
                 self._close_serial_noexcept()
 
                 self._next_open_at = (
-                    now
+                    self._now()
                     + self.reopen_delay_sec
                 )
 
@@ -327,13 +336,18 @@ class SerialRtcmSink:
             )
 
             self._last_successful_write_monotonic = (
-                now
+                self._now()
             )
 
     def _ensure_open(
         self,
         now: float,
     ) -> None:
+        if self._shutdown:
+            raise SerialRtcmSinkUnavailableError(
+                "direct RTCM serial sink is shut down"
+            )
+
         if self._serial_is_open():
             return
 
@@ -407,7 +421,7 @@ class SerialRtcmSink:
             self._open_failures_total += 1
 
             self._next_open_at = (
-                now
+                self._now()
                 + self.reopen_delay_sec
             )
 

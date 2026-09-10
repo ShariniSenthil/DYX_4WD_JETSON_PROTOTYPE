@@ -467,6 +467,85 @@ def test_close_is_idempotent():
     assert sink.snapshot.serial_open is False
 
 
+@pytest.mark.parametrize("initially_open", [False, True])
+def test_shutdown_permanently_rejects_open_and_captured_write(initially_open):
+    factory = FakeFactory([FakeSerial(), FakeSerial()])
+    sink = make_sink(factory)
+    late_write = sink.write_frame
+    if initially_open:
+        sink.open()
+    sink.shutdown()
+    sink.shutdown()
+    sink.close()  # Ordinary close must not clear permanent shutdown.
+
+    for operation in (sink.open, lambda: late_write(b"late")):
+        with pytest.raises(SerialRtcmSinkUnavailableError, match="shut down"):
+            operation()
+    assert len(factory.calls) == int(initially_open)
+    assert sink.snapshot.serial_open is False
+
+
+def test_close_still_allows_normal_reopen():
+    factory = FakeFactory([FakeSerial(), FakeSerial()])
+    sink = make_sink(factory)
+    sink.write_frame(b"first")
+    sink.close()
+    sink.write_frame(b"second")
+    assert len(factory.calls) == 2
+    assert sink.snapshot.frames_written_total == 2
+
+
+def test_success_timestamp_follows_completion_of_all_partial_writes():
+    clock = FakeClock()
+
+    class SlowPort(FakeSerial):
+        def write(self, data):
+            clock.advance(0.5)
+            return super().write(data)
+
+    sink = make_sink(FakeFactory([SlowPort([2, 2])]), clock=clock)
+    sink.write_frame(b"abcd")
+    assert sink.snapshot.last_successful_write_monotonic == 101.0
+
+
+@pytest.mark.parametrize("failure_at", ["open", "write"])
+def test_retry_delay_starts_after_slow_failure(failure_at):
+    clock = FakeClock()
+
+    class SlowFailingPort(FakeSerial):
+        def write(self, data):
+            clock.advance(2.0)
+            raise OSError("write timed out")
+
+    factory = FakeFactory([SlowFailingPort(), FakeSerial()])
+
+    def slow_factory(**kwargs):
+        if failure_at == "open" and not factory.calls:
+            clock.advance(2.0)
+            factory.calls.append(kwargs)
+            factory.outcomes.pop(0)
+            raise OSError("open failed")
+        return factory(**kwargs)
+
+    sink = make_sink(slow_factory, clock=clock, reopen_delay_sec=1.0)
+    error_type = (
+        SerialRtcmSinkUnavailableError if failure_at == "open"
+        else SerialRtcmSinkWriteError
+    )
+    with pytest.raises(error_type):
+        sink.write_frame(b"failed")
+    assert clock.value == 102.0
+    assert sink.snapshot.serial_open is False
+    clock.advance(0.9)
+    with pytest.raises(SerialRtcmSinkUnavailableError, match="delay active"):
+        sink.write_frame(b"too-early")
+    assert len(factory.calls) == 1
+    clock.advance(0.1)
+    sink.write_frame(b"next")
+    assert len(factory.calls) == 2
+    assert sink.snapshot.frames_written_total == 1
+
+
 @pytest.mark.parametrize(
     "value",
     (

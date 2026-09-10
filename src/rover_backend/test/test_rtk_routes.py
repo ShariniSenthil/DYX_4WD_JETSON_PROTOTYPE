@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,11 +35,67 @@ from rover_backend.rtk_runtime_service import (
     RtkRuntimeServiceSnapshot,
 )
 from rover_backend.state import (
+    RoverState,
     rover_state,
 )
 
 
 SECRET = "ROUTE_SECRET_3819"
+
+
+@pytest.mark.parametrize("status_age", [0.1, 60.0])
+def test_serial_status_is_invalidated_when_worker_telemetry_is_stale(
+    api, status_age, monkeypatch,
+):
+    client, _, _, _ = api
+    state = RoverState()
+    monkeypatch.setattr("rover_backend.rtk_routes.rover_state", state)
+    source = (
+        Path(__file__).resolve().parents[1] / "rover_backend" / "ros_bridge.py"
+    )
+    tree = ast.parse(source.read_text())
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_stale_monitor_impl"
+    )
+    # Execute the actual monitor without importing ROS on the workstation.
+    namespace = {"rover_state": state}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
+    node = SimpleNamespace(
+        _last_ros_message_monotonic=0.0,
+        _last_fcu_message_monotonic=0.0,
+        _last_position_message_monotonic=0.0,
+        _last_rtk_message_monotonic=status_age,
+        _monotonic_age=lambda timestamp: timestamp,
+        ROS_MESSAGE_STALE_SEC=15.0,
+        FCU_STATE_STALE_SEC=15.0,
+        POSITION_STALE_SEC=15.0,
+        RTK_STATUS_STALE_SEC=15.0,
+        _fcu_connected=True,
+        _refresh_mavros_rtcm_readiness=lambda **kwargs: None,
+    )
+    state.update(
+        "rtk", injection_mode="direct_serial", direct_inject=True,
+        direct_serial_open=True, direct_serial_last_successful_write_age_sec=0.02,
+        direct_serial_frames_written_total=12, delivery_frames=12,
+        healthy=True, stream_connected=True, stream_state="HEALTHY",
+    )
+    state.update("gps", fix_type=6)
+    namespace["_stale_monitor_impl"](node)
+    response = client.get("/api/rtk/status")
+    assert response.status_code == 200
+    payload = response.json()["status"]
+    stream = payload["correction_stream"]
+    stale = status_age > node.RTK_STATUS_STALE_SEC
+    assert stream["state"] == ("STALE" if stale else "HEALTHY")
+    assert stream["healthy"] is (not stale)
+    assert stream["direct_serial"]["open"] is (not stale)
+    assert stream["direct_serial"]["last_successful_write_age_sec"] == (
+        None if stale else 0.02
+    )
+    assert stream["delivery_frames"] == 12
+    assert stream["direct_serial"]["frames_written_total"] == 12
+    assert payload["gnss_solution"]["rtk_fixed"] is True
 
 
 class FakeRuntime:
