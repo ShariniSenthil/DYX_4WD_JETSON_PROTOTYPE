@@ -499,6 +499,93 @@ def _telemetry_payload() -> dict[str, Any]:
 
     return {
         "correction_stream": {
+            "injection_mode": str(
+                rtk.get(
+                    "injection_mode",
+                    "unknown",
+                )
+            ),
+            "direct_inject": bool(
+                rtk.get(
+                    "direct_inject",
+                    False,
+                )
+            ),
+            "effective_rtcm_frame_limit_bytes": (
+                rtk.get(
+                    "effective_rtcm_frame_limit_bytes"
+                )
+            ),
+            "direct_serial": (
+                {
+                    "device": rtk.get(
+                        "direct_serial_device"
+                    ),
+                    "baud": rtk.get(
+                        "direct_serial_baud"
+                    ),
+                    "open": bool(
+                        rtk.get(
+                            "direct_serial_open",
+                            False,
+                        )
+                    ),
+                    "open_attempts_total": int(
+                        rtk.get(
+                            "direct_serial_open_attempts_total",
+                            0,
+                        )
+                        or 0
+                    ),
+                    "open_failures_total": int(
+                        rtk.get(
+                            "direct_serial_open_failures_total",
+                            0,
+                        )
+                        or 0
+                    ),
+                    "reopen_total": int(
+                        rtk.get(
+                            "direct_serial_reopen_total",
+                            0,
+                        )
+                        or 0
+                    ),
+                    "frames_written_total": int(
+                        rtk.get(
+                            "direct_serial_frames_written_total",
+                            0,
+                        )
+                        or 0
+                    ),
+                    "bytes_written_total": int(
+                        rtk.get(
+                            "direct_serial_bytes_written_total",
+                            0,
+                        )
+                        or 0
+                    ),
+                    "write_failures_total": int(
+                        rtk.get(
+                            "direct_serial_write_failures_total",
+                            0,
+                        )
+                        or 0
+                    ),
+                    "last_successful_write_age_sec": (
+                        rtk.get(
+                            "direct_serial_last_successful_write_age_sec"
+                        )
+                    ),
+                }
+                if bool(
+                    rtk.get(
+                        "direct_inject",
+                        False,
+                    )
+                )
+                else None
+            ),
             "state": str(
                 rtk.get(
                     "stream_state",
@@ -543,6 +630,16 @@ def _telemetry_payload() -> dict[str, Any]:
                 )
                 or 0
             ),
+            "delivery_frames": int(
+                rtk.get(
+                    "delivery_frames",
+                    rtk.get(
+                        "published_frames",
+                        0,
+                    ),
+                )
+                or 0
+            ),
             "crc_failures": int(
                 rtk.get(
                     "crc_failures",
@@ -582,6 +679,16 @@ def _telemetry_payload() -> dict[str, Any]:
                 rtk.get(
                     "publish_errors",
                     0,
+                )
+                or 0
+            ),
+            "delivery_errors": int(
+                rtk.get(
+                    "delivery_errors",
+                    rtk.get(
+                        "publish_errors",
+                        0,
+                    ),
                 )
                 or 0
             ),

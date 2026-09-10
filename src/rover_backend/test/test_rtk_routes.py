@@ -1096,3 +1096,78 @@ def test_patch_omitted_direct_device_preserves_it(
 
     assert profile["direct_serial_device"] == device
     assert profile["direct_serial_baud"] == 460800
+
+
+def test_status_exposes_direct_injection_delivery_health(
+    api,
+):
+    client, _, _, _ = api
+
+    rover_state.update(
+        "rtk",
+        stream_state="HEALTHY",
+        stream_connected=True,
+        healthy=True,
+        correction_age_sec=0.20,
+        injection_mode="direct_serial",
+        direct_inject=True,
+        effective_rtcm_frame_limit_bytes=1029,
+        valid_frames=25,
+        published_frames=24,
+        delivery_frames=24,
+        publish_errors=1,
+        delivery_errors=1,
+        direct_serial_device=(
+            "/dev/serial/by-id/"
+            "usb-Septentrio_mosaic-H-test"
+        ),
+        direct_serial_baud=230400,
+        direct_serial_open=True,
+        direct_serial_open_attempts_total=2,
+        direct_serial_open_failures_total=1,
+        direct_serial_reopen_total=1,
+        direct_serial_frames_written_total=24,
+        direct_serial_bytes_written_total=4096,
+        direct_serial_write_failures_total=1,
+        direct_serial_last_successful_write_age_sec=0.20,
+    )
+
+    response = client.get(
+        "/api/rtk/status"
+    )
+
+    assert response.status_code == 200
+
+    stream = response.json()[
+        "status"
+    ][
+        "correction_stream"
+    ]
+
+    assert (
+        stream["injection_mode"]
+        == "direct_serial"
+    )
+    assert stream["direct_inject"] is True
+    assert (
+        stream[
+            "effective_rtcm_frame_limit_bytes"
+        ]
+        == 1029
+    )
+
+    assert stream["delivery_frames"] == 24
+    assert stream["delivery_errors"] == 1
+
+    serial = stream["direct_serial"]
+
+    assert serial["open"] is True
+    assert serial["frames_written_total"] == 24
+    assert serial["bytes_written_total"] == 4096
+    assert serial["write_failures_total"] == 1
+    assert (
+        serial[
+            "last_successful_write_age_sec"
+        ]
+        == 0.20
+    )

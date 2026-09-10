@@ -318,8 +318,28 @@ class NtripToPx4Node(Node):
         )
 
         self.get_logger().warn(
-            f'RTCM output       : {self.rtcm_topic}'
+            f'RTCM injection mode: {self.injection_mode}'
         )
+
+        if self.direct_inject:
+            self.get_logger().warn(
+                f'Direct RTCM device: '
+                f'{self.direct_serial_device}'
+            )
+
+            self.get_logger().warn(
+                f'Direct serial baud: '
+                f'{self.direct_serial_baud}'
+            )
+
+            self.get_logger().warn(
+                f'MAVROS RTCM topic : {self.rtcm_topic} '
+                f'(readiness only)'
+            )
+        else:
+            self.get_logger().warn(
+                f'RTCM output       : {self.rtcm_topic}'
+            )
 
         self.get_logger().warn(
             'Health output     : '
@@ -377,8 +397,13 @@ class NtripToPx4Node(Node):
             )
 
         self.get_logger().warn(
-            f'MAVROS RTCM gate  : '
-            f'{self.max_mavros_rtcm_frame_bytes} B '
+            f'Legacy MAVROS gate: '
+            f'{self.max_mavros_rtcm_frame_bytes} B'
+        )
+
+        self.get_logger().warn(
+            f'Effective RTCM gate: '
+            f'{self.effective_rtcm_frame_limit_bytes} B '
             f'(protocol max 1029 B)'
         )
 
@@ -1160,6 +1185,21 @@ class NtripToPx4Node(Node):
             self.healthy_age_sec,
         )
 
+        direct_serial_snapshot = (
+            None
+            if self._serial_sink is None
+            else self._serial_sink.snapshot
+        )
+
+        # A direct sink failure closes the endpoint. Do not allow recent
+        # delivery history to keep /healthy true after that local failure.
+        if self.direct_inject:
+            healthy = bool(
+                healthy
+                and direct_serial_snapshot is not None
+                and direct_serial_snapshot.serial_open
+            )
+
         health_changed = (
             healthy != self.last_health_value
         )
@@ -1222,6 +1262,25 @@ class NtripToPx4Node(Node):
                     max_mavros_rtcm_frame_bytes=(
                         self.max_mavros_rtcm_frame_bytes
                     ),
+                    injection_mode=(
+                        self.injection_mode
+                    ),
+                    direct_inject=(
+                        self.direct_inject
+                    ),
+                    effective_rtcm_frame_limit_bytes=(
+                        self.effective_rtcm_frame_limit_bytes
+                    ),
+                    direct_serial_snapshot=(
+                        direct_serial_snapshot
+                    ),
+                    direct_serial_device=(
+                        self.direct_serial_device
+                    ),
+                    direct_serial_baud=(
+                        self.direct_serial_baud
+                    ),
+                    now_monotonic_sec=now,
                     gga_enabled=(
                         gga_status['enabled']
                     ),
@@ -1334,7 +1393,7 @@ class NtripToPx4Node(Node):
         if self._pending_publish_errors:
 
             self.get_logger().warn(
-                'RTCM publish errors: '
+                'RTCM delivery errors: '
                 f'{self._pending_publish_errors} '
                 f'(total={counters.rtcm_publish_errors_total})'
             )
@@ -1343,6 +1402,7 @@ class NtripToPx4Node(Node):
 
         self.get_logger().info(
             'RTK HEALTH | '
+            f'mode={self.injection_mode} '
             f'connected={self.connected} '
             f'healthy={healthy} '
             f'published_age={age_text} '

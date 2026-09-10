@@ -1834,6 +1834,66 @@ class RoverBackendRosNode(Node):
             correction_age
         )
 
+        injection_mode = str(
+            payload.get(
+                "injection_mode",
+                "mavros_px4",
+            )
+        ).strip().lower()
+
+        if injection_mode not in {
+            "mavros_px4",
+            "direct_serial",
+        }:
+            injection_mode = "unknown"
+
+        direct_inject = bool(
+            payload.get(
+                "direct_inject",
+                False,
+            )
+        )
+
+        effective_rtcm_frame_limit_bytes = (
+            _safe_int(
+                payload.get(
+                    "effective_rtcm_frame_limit_bytes"
+                ),
+                0,
+            )
+            or None
+        )
+
+        direct_serial = payload.get(
+            "direct_serial"
+        )
+
+        if not isinstance(
+            direct_serial,
+            dict,
+        ):
+            direct_serial = {}
+
+        direct_serial_device = (
+            direct_serial.get(
+                "device"
+            )
+        )
+
+        if not isinstance(
+            direct_serial_device,
+            str,
+        ):
+            direct_serial_device = None
+
+        direct_serial_last_success = (
+            _finite_float(
+                direct_serial.get(
+                    "last_successful_write_age_sec"
+                )
+            )
+        )
+
         gga = payload.get(
             "gga"
         )
@@ -1889,6 +1949,86 @@ class RoverBackendRosNode(Node):
         rover_state.update(
             "rtk",
             stream_state=state_name,
+            injection_mode=injection_mode,
+            direct_inject=direct_inject,
+            effective_rtcm_frame_limit_bytes=(
+                effective_rtcm_frame_limit_bytes
+            ),
+            direct_serial_device=(
+                direct_serial_device
+            ),
+            direct_serial_baud=(
+                _safe_int(
+                    direct_serial.get(
+                        "baud"
+                    ),
+                    0,
+                )
+                or None
+            ),
+            direct_serial_open=bool(
+                direct_serial.get(
+                    "open",
+                    False,
+                )
+            ),
+            direct_serial_open_attempts_total=max(
+                0,
+                _safe_int(
+                    direct_serial.get(
+                        "open_attempts_total"
+                    ),
+                    0,
+                ),
+            ),
+            direct_serial_open_failures_total=max(
+                0,
+                _safe_int(
+                    direct_serial.get(
+                        "open_failures_total"
+                    ),
+                    0,
+                ),
+            ),
+            direct_serial_reopen_total=max(
+                0,
+                _safe_int(
+                    direct_serial.get(
+                        "reopen_total"
+                    ),
+                    0,
+                ),
+            ),
+            direct_serial_frames_written_total=max(
+                0,
+                _safe_int(
+                    direct_serial.get(
+                        "frames_written_total"
+                    ),
+                    0,
+                ),
+            ),
+            direct_serial_bytes_written_total=max(
+                0,
+                _safe_int(
+                    direct_serial.get(
+                        "bytes_written_total"
+                    ),
+                    0,
+                ),
+            ),
+            direct_serial_write_failures_total=max(
+                0,
+                _safe_int(
+                    direct_serial.get(
+                        "write_failures_total"
+                    ),
+                    0,
+                ),
+            ),
+            direct_serial_last_successful_write_age_sec=(
+                direct_serial_last_success
+            ),
             stream_connected=connected,
             healthy=healthy,
             correction_age_sec=(
@@ -1917,6 +2057,18 @@ class RoverBackendRosNode(Node):
                 _safe_int(
                     payload.get(
                         "published_frames"
+                    ),
+                    0,
+                ),
+            ),
+            delivery_frames=max(
+                0,
+                _safe_int(
+                    payload.get(
+                        "delivery_frames",
+                        payload.get(
+                            "published_frames"
+                        ),
                     ),
                     0,
                 ),
@@ -1971,6 +2123,18 @@ class RoverBackendRosNode(Node):
                 _safe_int(
                     payload.get(
                         "publish_errors"
+                    ),
+                    0,
+                ),
+            ),
+            delivery_errors=max(
+                0,
+                _safe_int(
+                    payload.get(
+                        "delivery_errors",
+                        payload.get(
+                            "publish_errors"
+                        ),
                     ),
                     0,
                 ),
