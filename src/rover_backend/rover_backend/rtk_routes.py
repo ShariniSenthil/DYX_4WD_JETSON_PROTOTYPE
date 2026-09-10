@@ -187,6 +187,12 @@ class RtkProfileCreateRequest(BaseModel):
 
     max_mavros_rtcm_frame_bytes: Any = 720
 
+    direct_inject: Any = False
+    direct_serial_device: Any = None
+    direct_serial_baud: Any = 230400
+    direct_serial_write_timeout_sec: Any = 1.0
+    direct_serial_reopen_sec: Any = 1.0
+
     enabled: Any = True
 
     model_config = ConfigDict(
@@ -223,6 +229,12 @@ class RtkProfileUpdateRequest(BaseModel):
     tls_mode: Any = None
 
     max_mavros_rtcm_frame_bytes: Any = None
+
+    direct_inject: Any = None
+    direct_serial_device: Any = None
+    direct_serial_baud: Any = None
+    direct_serial_write_timeout_sec: Any = None
+    direct_serial_reopen_sec: Any = None
 
     enabled: Any = None
 
@@ -314,6 +326,19 @@ def _profile_payload(
         "tls_mode": profile.tls_mode,
         "max_mavros_rtcm_frame_bytes": (
             profile.max_mavros_rtcm_frame_bytes
+        ),
+        "direct_inject": profile.direct_inject,
+        "direct_serial_device": (
+            profile.direct_serial_device
+        ),
+        "direct_serial_baud": (
+            profile.direct_serial_baud
+        ),
+        "direct_serial_write_timeout_sec": (
+            profile.direct_serial_write_timeout_sec
+        ),
+        "direct_serial_reopen_sec": (
+            profile.direct_serial_reopen_sec
         ),
         "enabled": profile.enabled,
         "revision": profile.revision,

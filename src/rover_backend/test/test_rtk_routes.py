@@ -873,3 +873,226 @@ def test_registry_install_is_idempotent_and_clear(
         )
 
     assert response.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# Direct RTCM injection profile API
+# ---------------------------------------------------------------------------
+
+
+def test_create_profile_exposes_direct_injection_defaults(
+    api,
+):
+    client, _, _, _ = api
+
+    response = client.post(
+        "/api/rtk/profiles",
+        json=profile_body(),
+    )
+
+    assert response.status_code == 201
+
+    profile = response.json()["profile"]
+
+    assert profile["direct_inject"] is False
+    assert profile["direct_serial_device"] is None
+    assert profile["direct_serial_baud"] == 230400
+    assert (
+        profile["direct_serial_write_timeout_sec"]
+        == 1.0
+    )
+    assert (
+        profile["direct_serial_reopen_sec"]
+        == 1.0
+    )
+
+
+def test_create_direct_profile_exposes_usb_configuration(
+    api,
+):
+    client, _, _, _ = api
+
+    device = (
+        "/dev/serial/by-id/"
+        "usb-Septentrio_mosaic-H-test"
+    )
+
+    body = profile_body()
+    body.update(
+        {
+            "direct_inject": True,
+            "direct_serial_device": device,
+            "direct_serial_baud": 230400,
+            "direct_serial_write_timeout_sec": 0.5,
+            "direct_serial_reopen_sec": 2.0,
+        }
+    )
+
+    response = client.post(
+        "/api/rtk/profiles",
+        json=body,
+    )
+
+    assert response.status_code == 201
+
+    profile = response.json()["profile"]
+
+    assert profile["direct_inject"] is True
+    assert profile["direct_serial_device"] == device
+    assert profile["direct_serial_baud"] == 230400
+    assert (
+        profile["direct_serial_write_timeout_sec"]
+        == 0.5
+    )
+    assert (
+        profile["direct_serial_reopen_sec"]
+        == 2.0
+    )
+
+    assert SECRET not in response.text
+
+
+def test_patch_direct_serial_device_explicit_null_clears_it(
+    api,
+):
+    client, _, _, _ = api
+
+    body = profile_body()
+    body["direct_serial_device"] = (
+        "/dev/serial/by-id/"
+        "usb-Septentrio_mosaic-H-test"
+    )
+
+    created = client.post(
+        "/api/rtk/profiles",
+        json=body,
+    )
+
+    assert created.status_code == 201
+
+    profile_id = int(
+        created.json()["profile"]["id"]
+    )
+
+    response = client.patch(
+        f"/api/rtk/profiles/{profile_id}",
+        json={
+            "direct_serial_device": None,
+        },
+    )
+
+    assert response.status_code == 200
+
+    assert (
+        response.json()["profile"][
+            "direct_serial_device"
+        ]
+        is None
+    )
+
+
+def test_patch_direct_true_without_device_is_rejected(
+    api,
+):
+    client, _, _, _ = api
+
+    profile_id = create_profile(
+        client
+    )
+
+    response = client.patch(
+        f"/api/rtk/profiles/{profile_id}",
+        json={
+            "direct_inject": True,
+        },
+    )
+
+    assert response.status_code == 422
+
+    assert (
+        response.json()["detail"]["code"]
+        == "RTK_PROFILE_INVALID"
+    )
+
+
+def test_patch_direct_mode_while_running_forces_controlled_stop(
+    api,
+):
+    client, _, store, runtime = api
+
+    profile_id = create_profile(
+        client
+    )
+
+    activate_profile(
+        client,
+        profile_id,
+    )
+
+    start = client.post(
+        "/api/rtk/start"
+    )
+
+    assert start.status_code == 200
+    assert runtime.start_calls == 1
+
+    response = client.patch(
+        f"/api/rtk/profiles/{profile_id}",
+        json={
+            "direct_inject": True,
+            "direct_serial_device": (
+                "/dev/serial/by-id/"
+                "usb-Septentrio_mosaic-H-test"
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+
+    profile = response.json()["profile"]
+
+    assert profile["direct_inject"] is True
+
+    assert (
+        store.runtime_state().desired_state
+        is DesiredState.STOPPED
+    )
+
+    assert runtime.stop_calls == 1
+
+
+def test_patch_omitted_direct_device_preserves_it(
+    api,
+):
+    client, _, _, _ = api
+
+    device = (
+        "/dev/serial/by-id/"
+        "usb-Septentrio_mosaic-H-test"
+    )
+
+    body = profile_body()
+    body["direct_serial_device"] = device
+
+    created = client.post(
+        "/api/rtk/profiles",
+        json=body,
+    )
+
+    assert created.status_code == 201
+
+    profile_id = created.json()["profile"]["id"]
+
+    response = client.patch(
+        f"/api/rtk/profiles/{profile_id}",
+        json={
+            "direct_serial_baud": 460800,
+        },
+    )
+
+    assert response.status_code == 200
+
+    profile = response.json()["profile"]
+
+    assert profile["direct_serial_device"] == device
+    assert profile["direct_serial_baud"] == 460800

@@ -32,7 +32,19 @@ from rover_backend.rtk_process_protocol import (
 )
 
 
-RTK_PROFILE_SCHEMA_VERSION = 3
+RTK_PROFILE_SCHEMA_VERSION = 4
+
+DEFAULT_DIRECT_INJECT = False
+DEFAULT_DIRECT_SERIAL_DEVICE = None
+DEFAULT_DIRECT_SERIAL_BAUD = 230400
+DEFAULT_DIRECT_SERIAL_WRITE_TIMEOUT_SEC = 1.0
+DEFAULT_DIRECT_SERIAL_REOPEN_SEC = 1.0
+
+# update_profile() historically uses None to mean "field omitted".  The
+# direct serial device is intentionally nullable, so it needs a distinct
+# internal sentinel: omitted preserves the current path, explicit None clears
+# it.
+_UNSET = object()
 
 DEFAULT_RTK_DATABASE_FILE = (
     settings.rtk_database_file
@@ -101,6 +113,12 @@ class RtkProfileSnapshot:
     tls_mode: str
 
     max_mavros_rtcm_frame_bytes: int
+
+    direct_inject: bool
+    direct_serial_device: Optional[str]
+    direct_serial_baud: int
+    direct_serial_write_timeout_sec: float
+    direct_serial_reopen_sec: float
 
     enabled: bool
 
@@ -384,6 +402,7 @@ class RtkProfileStore:
                     0,
                     1,
                     2,
+                    3,
                     RTK_PROFILE_SCHEMA_VERSION,
                 }:
                     raise RtkProfileStoreError(
@@ -449,6 +468,23 @@ class RtkProfileStore:
                             max_mavros_rtcm_frame_bytes
                                 INTEGER NOT NULL,
 
+                            direct_inject INTEGER NOT NULL
+                                DEFAULT 0
+                                CHECK(direct_inject IN (0, 1)),
+
+                            direct_serial_device TEXT,
+
+                            direct_serial_baud INTEGER NOT NULL
+                                DEFAULT 230400,
+
+                            direct_serial_write_timeout_sec
+                                REAL NOT NULL
+                                DEFAULT 1.0,
+
+                            direct_serial_reopen_sec
+                                REAL NOT NULL
+                                DEFAULT 1.0,
+
                             enabled INTEGER NOT NULL
                                 CHECK(enabled IN (0, 1)),
 
@@ -510,6 +546,58 @@ class RtkProfileStore:
                                         'DISABLED'
                                     )
                                 )
+                            """
+                        )
+
+                    # Schema v1/v2/v3 -> v4:
+                    # add the opt-in direct-injection configuration. Existing
+                    # rover profiles remain on the legacy MAVROS/PX4 path.
+                    if existing_version in {
+                        1,
+                        2,
+                        3,
+                    }:
+                        connection.execute(
+                            """
+                            ALTER TABLE rtk_profiles
+                            ADD COLUMN direct_inject
+                                INTEGER NOT NULL
+                                DEFAULT 0
+                                CHECK(direct_inject IN (0, 1))
+                            """
+                        )
+
+                        connection.execute(
+                            """
+                            ALTER TABLE rtk_profiles
+                            ADD COLUMN direct_serial_device TEXT
+                            """
+                        )
+
+                        connection.execute(
+                            """
+                            ALTER TABLE rtk_profiles
+                            ADD COLUMN direct_serial_baud
+                                INTEGER NOT NULL
+                                DEFAULT 230400
+                            """
+                        )
+
+                        connection.execute(
+                            """
+                            ALTER TABLE rtk_profiles
+                            ADD COLUMN direct_serial_write_timeout_sec
+                                REAL NOT NULL
+                                DEFAULT 1.0
+                            """
+                        )
+
+                        connection.execute(
+                            """
+                            ALTER TABLE rtk_profiles
+                            ADD COLUMN direct_serial_reopen_sec
+                                REAL NOT NULL
+                                DEFAULT 1.0
                             """
                         )
 
@@ -619,6 +707,11 @@ class RtkProfileStore:
         gga_max_age_sec: object,
         tls_mode: object,
         max_mavros_rtcm_frame_bytes: object,
+        direct_inject: object,
+        direct_serial_device: object,
+        direct_serial_baud: object,
+        direct_serial_write_timeout_sec: object,
+        direct_serial_reopen_sec: object,
         enabled: object,
     ) -> dict[str, object]:
         profile_name = _normalise_name(
@@ -711,6 +804,19 @@ class RtkProfileStore:
                 max_mavros_rtcm_frame_bytes=(
                     max_mavros_rtcm_frame_bytes
                 ),
+                direct_inject=direct_inject,
+                direct_serial_device=(
+                    direct_serial_device
+                ),
+                direct_serial_baud=(
+                    direct_serial_baud
+                ),
+                direct_serial_write_timeout_sec=(
+                    direct_serial_write_timeout_sec
+                ),
+                direct_serial_reopen_sec=(
+                    direct_serial_reopen_sec
+                ),
             )
 
         except ConfigValidationError as error:
@@ -756,6 +862,21 @@ class RtkProfileStore:
             "tls_mode": config.tls_mode,
             "max_mavros_rtcm_frame_bytes": (
                 config.max_mavros_rtcm_frame_bytes
+            ),
+            "direct_inject": (
+                config.direct_inject
+            ),
+            "direct_serial_device": (
+                config.direct_serial_device
+            ),
+            "direct_serial_baud": (
+                config.direct_serial_baud
+            ),
+            "direct_serial_write_timeout_sec": (
+                config.direct_serial_write_timeout_sec
+            ),
+            "direct_serial_reopen_sec": (
+                config.direct_serial_reopen_sec
             ),
             "enabled": bool(enabled),
         }
@@ -830,6 +951,25 @@ class RtkProfileStore:
                     "max_mavros_rtcm_frame_bytes"
                 ]
             ),
+            direct_inject=bool(
+                row["direct_inject"]
+            ),
+            direct_serial_device=(
+                None
+                if row["direct_serial_device"] is None
+                else str(row["direct_serial_device"])
+            ),
+            direct_serial_baud=int(
+                row["direct_serial_baud"]
+            ),
+            direct_serial_write_timeout_sec=float(
+                row[
+                    "direct_serial_write_timeout_sec"
+                ]
+            ),
+            direct_serial_reopen_sec=float(
+                row["direct_serial_reopen_sec"]
+            ),
             enabled=bool(
                 row["enabled"]
             ),
@@ -898,6 +1038,19 @@ class RtkProfileStore:
         gga_max_age_sec: float = 5.0,
         tls_mode: str = "REQUIRED",
         max_mavros_rtcm_frame_bytes: int = 720,
+        direct_inject: bool = DEFAULT_DIRECT_INJECT,
+        direct_serial_device: Optional[str] = (
+            DEFAULT_DIRECT_SERIAL_DEVICE
+        ),
+        direct_serial_baud: int = (
+            DEFAULT_DIRECT_SERIAL_BAUD
+        ),
+        direct_serial_write_timeout_sec: float = (
+            DEFAULT_DIRECT_SERIAL_WRITE_TIMEOUT_SEC
+        ),
+        direct_serial_reopen_sec: float = (
+            DEFAULT_DIRECT_SERIAL_REOPEN_SEC
+        ),
         enabled: bool = True,
     ) -> RtkProfileSnapshot:
         values = self._validated_profile_values(
@@ -937,6 +1090,19 @@ class RtkProfileStore:
             max_mavros_rtcm_frame_bytes=(
                 max_mavros_rtcm_frame_bytes
             ),
+            direct_inject=direct_inject,
+            direct_serial_device=(
+                direct_serial_device
+            ),
+            direct_serial_baud=(
+                direct_serial_baud
+            ),
+            direct_serial_write_timeout_sec=(
+                direct_serial_write_timeout_sec
+            ),
+            direct_serial_reopen_sec=(
+                direct_serial_reopen_sec
+            ),
             enabled=enabled,
         )
 
@@ -968,6 +1134,11 @@ class RtkProfileStore:
                             gga_max_age_sec,
                             tls_mode,
                             max_mavros_rtcm_frame_bytes,
+                            direct_inject,
+                            direct_serial_device,
+                            direct_serial_baud,
+                            direct_serial_write_timeout_sec,
+                            direct_serial_reopen_sec,
                             enabled,
                             revision,
                             created_at,
@@ -977,6 +1148,7 @@ class RtkProfileStore:
                             ?, ?, ?, ?, ?, ?, ?,
                             ?, ?, ?, ?, ?, ?,
                             ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?,
                             1, ?, ?
                         )
                         """,
@@ -1002,6 +1174,21 @@ class RtkProfileStore:
                             values["tls_mode"],
                             values[
                                 "max_mavros_rtcm_frame_bytes"
+                            ],
+                            int(
+                                values["direct_inject"]
+                            ),
+                            values[
+                                "direct_serial_device"
+                            ],
+                            values[
+                                "direct_serial_baud"
+                            ],
+                            values[
+                                "direct_serial_write_timeout_sec"
+                            ],
+                            values[
+                                "direct_serial_reopen_sec"
                             ],
                             int(
                                 values["enabled"]
@@ -1150,6 +1337,15 @@ class RtkProfileStore:
         max_mavros_rtcm_frame_bytes: Optional[
             int
         ] = None,
+        direct_inject: Optional[bool] = None,
+        direct_serial_device: object = _UNSET,
+        direct_serial_baud: Optional[int] = None,
+        direct_serial_write_timeout_sec: Optional[
+            float
+        ] = None,
+        direct_serial_reopen_sec: Optional[
+            float
+        ] = None,
         enabled: Optional[bool] = None,
     ) -> RtkProfileSnapshot:
         if (
@@ -1292,6 +1488,56 @@ class RtkProfileStore:
                             is None
                             else max_mavros_rtcm_frame_bytes
                         ),
+                        "direct_inject": (
+                            bool(
+                                row["direct_inject"]
+                            )
+                            if direct_inject is None
+                            else direct_inject
+                        ),
+                        "direct_serial_device": (
+                            (
+                                None
+                                if row[
+                                    "direct_serial_device"
+                                ] is None
+                                else str(
+                                    row[
+                                        "direct_serial_device"
+                                    ]
+                                )
+                            )
+                            if direct_serial_device
+                            is _UNSET
+                            else direct_serial_device
+                        ),
+                        "direct_serial_baud": (
+                            int(
+                                row["direct_serial_baud"]
+                            )
+                            if direct_serial_baud is None
+                            else direct_serial_baud
+                        ),
+                        "direct_serial_write_timeout_sec": (
+                            float(
+                                row[
+                                    "direct_serial_write_timeout_sec"
+                                ]
+                            )
+                            if direct_serial_write_timeout_sec
+                            is None
+                            else direct_serial_write_timeout_sec
+                        ),
+                        "direct_serial_reopen_sec": (
+                            float(
+                                row[
+                                    "direct_serial_reopen_sec"
+                                ]
+                            )
+                            if direct_serial_reopen_sec
+                            is None
+                            else direct_serial_reopen_sec
+                        ),
                         "enabled": (
                             bool(
                                 row["enabled"]
@@ -1371,6 +1617,33 @@ class RtkProfileStore:
                                 "max_mavros_rtcm_frame_bytes"
                             ]
                         ),
+                        "direct_inject": bool(
+                            row["direct_inject"]
+                        ),
+                        "direct_serial_device": (
+                            None
+                            if row[
+                                "direct_serial_device"
+                            ] is None
+                            else str(
+                                row[
+                                    "direct_serial_device"
+                                ]
+                            )
+                        ),
+                        "direct_serial_baud": int(
+                            row["direct_serial_baud"]
+                        ),
+                        "direct_serial_write_timeout_sec": float(
+                            row[
+                                "direct_serial_write_timeout_sec"
+                            ]
+                        ),
+                        "direct_serial_reopen_sec": float(
+                            row[
+                                "direct_serial_reopen_sec"
+                            ]
+                        ),
                         "enabled": bool(
                             row["enabled"]
                         ),
@@ -1428,6 +1701,11 @@ class RtkProfileStore:
                                 gga_max_age_sec = ?,
                                 tls_mode = ?,
                                 max_mavros_rtcm_frame_bytes = ?,
+                                direct_inject = ?,
+                                direct_serial_device = ?,
+                                direct_serial_baud = ?,
+                                direct_serial_write_timeout_sec = ?,
+                                direct_serial_reopen_sec = ?,
                                 enabled = ?,
                                 revision = revision + 1,
                                 updated_at = ?
@@ -1473,6 +1751,21 @@ class RtkProfileStore:
                                 values["tls_mode"],
                                 values[
                                     "max_mavros_rtcm_frame_bytes"
+                                ],
+                                int(
+                                    values["direct_inject"]
+                                ),
+                                values[
+                                    "direct_serial_device"
+                                ],
+                                values[
+                                    "direct_serial_baud"
+                                ],
+                                values[
+                                    "direct_serial_write_timeout_sec"
+                                ],
+                                values[
+                                    "direct_serial_reopen_sec"
                                 ],
                                 int(
                                     values["enabled"]
@@ -2214,6 +2507,33 @@ class RtkProfileStore:
                         max_mavros_rtcm_frame_bytes=int(
                             row[
                                 "max_mavros_rtcm_frame_bytes"
+                            ]
+                        ),
+                        direct_inject=bool(
+                            row["direct_inject"]
+                        ),
+                        direct_serial_device=(
+                            None
+                            if row[
+                                "direct_serial_device"
+                            ] is None
+                            else str(
+                                row[
+                                    "direct_serial_device"
+                                ]
+                            )
+                        ),
+                        direct_serial_baud=int(
+                            row["direct_serial_baud"]
+                        ),
+                        direct_serial_write_timeout_sec=float(
+                            row[
+                                "direct_serial_write_timeout_sec"
+                            ]
+                        ),
+                        direct_serial_reopen_sec=float(
+                            row[
+                                "direct_serial_reopen_sec"
                             ]
                         ),
                     )

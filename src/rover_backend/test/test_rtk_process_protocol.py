@@ -763,3 +763,165 @@ def test_worker_protocol_tokens_reject_non_ascii(
                 field_name: field_value,
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# Worker configuration schema v4 — direct RTCM injection
+# ---------------------------------------------------------------------------
+
+
+def test_direct_injection_defaults_to_legacy_mode():
+    config = make_config()
+
+    assert config.direct_inject is False
+    assert config.direct_serial_device is None
+    assert config.direct_serial_baud == 230400
+    assert config.direct_serial_write_timeout_sec == 1.0
+    assert config.direct_serial_reopen_sec == 1.0
+
+    encoded = json.loads(
+        encode_worker_config(config)
+    )
+
+    assert encoded["direct_inject"] is False
+    assert encoded["direct_serial_device"] is None
+
+
+def test_direct_injection_requires_device():
+    with pytest.raises(
+        ConfigValidationError,
+        match="direct_serial_device is required",
+    ):
+        make_config(
+            direct_inject=True,
+        )
+
+    config = make_config(
+        direct_inject=True,
+        direct_serial_device=(
+            "/dev/serial/by-id/"
+            "usb-Septentrio_mosaic-H-test"
+        ),
+    )
+
+    assert config.direct_inject is True
+
+
+@pytest.mark.parametrize(
+    "device",
+    (
+        "",
+        "   ",
+        "ttyACM0",
+        "serial/by-id/mosaic",
+        "/tmp/mosaic",
+    ),
+)
+def test_direct_serial_device_requires_absolute_dev_path(
+    device,
+):
+    with pytest.raises(
+        ConfigValidationError
+    ):
+        make_config(
+            direct_serial_device=device,
+        )
+
+
+@pytest.mark.parametrize(
+    "baud",
+    (
+        0,
+        -1,
+        True,
+        230400.0,
+        "230400",
+    ),
+)
+def test_direct_serial_baud_rejects_invalid_values(
+    baud,
+):
+    with pytest.raises(
+        ConfigValidationError
+    ):
+        make_config(
+            direct_serial_baud=baud,
+        )
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    (
+        0,
+        -0.1,
+        True,
+        "1.0",
+        float("nan"),
+        float("inf"),
+    ),
+)
+def test_direct_serial_write_timeout_rejects_invalid_values(
+    timeout,
+):
+    with pytest.raises(
+        ConfigValidationError
+    ):
+        make_config(
+            direct_serial_write_timeout_sec=timeout,
+        )
+
+
+@pytest.mark.parametrize(
+    "reopen",
+    (
+        -0.1,
+        True,
+        "1.0",
+        float("nan"),
+        float("inf"),
+    ),
+)
+def test_direct_serial_reopen_rejects_invalid_values(
+    reopen,
+):
+    with pytest.raises(
+        ConfigValidationError
+    ):
+        make_config(
+            direct_serial_reopen_sec=reopen,
+        )
+
+
+def test_direct_serial_reopen_allows_zero():
+    config = make_config(
+        direct_serial_reopen_sec=0,
+    )
+
+    assert (
+        config.direct_serial_reopen_sec
+        == 0.0
+    )
+
+
+def test_direct_config_round_trip_preserves_usb_device():
+    config = make_config(
+        direct_inject=True,
+        direct_serial_device=(
+            "/dev/serial/by-id/"
+            "usb-Septentrio_mosaic-H-test"
+        ),
+        direct_serial_baud=230400,
+        direct_serial_write_timeout_sec=0.5,
+        direct_serial_reopen_sec=2.0,
+    )
+
+    decoded = decode_worker_config(
+        encode_worker_config(config)
+    )
+
+    assert decoded == config
+    assert decoded.direct_inject is True
+    assert (
+        decoded.direct_serial_device
+        == config.direct_serial_device
+    )

@@ -21,7 +21,7 @@ from typing import Optional
 from rover_backend.rtk_manager_core import WorkerExitReason
 
 
-WORKER_CONFIG_SCHEMA_VERSION = 3
+WORKER_CONFIG_SCHEMA_VERSION = 4
 WORKER_STATUS_SCHEMA_VERSION = 1
 MAX_WORKER_CONFIG_BYTES = 16 * 1024
 MAX_WORKER_STATUS_BYTES = 4 * 1024
@@ -209,6 +209,15 @@ class WorkerConfig:
     # DISABLED = explicit plaintext operator policy.
     tls_mode: str = "REQUIRED"
 
+    # Direct correction injection remains opt-in.  These defaults preserve
+    # the existing MAVROS/PX4 path for every configuration that does not
+    # explicitly select the direct sink.
+    direct_inject: bool = False
+    direct_serial_device: Optional[str] = None
+    direct_serial_baud: int = 230400
+    direct_serial_write_timeout_sec: float = 1.0
+    direct_serial_reopen_sec: float = 1.0
+
     def __post_init__(self) -> None:
         if (
             isinstance(self.schema_version, bool)
@@ -280,6 +289,53 @@ class WorkerConfig:
                 "tls_mode must be REQUIRED or DISABLED"
             )
 
+        if not isinstance(
+            self.direct_inject,
+            bool,
+        ):
+            raise ConfigValidationError(
+                "direct_inject must be a bool"
+            )
+
+        device = self.direct_serial_device
+
+        if device is not None:
+            _require_nonempty_string(
+                device,
+                "direct_serial_device",
+                ConfigValidationError,
+            )
+
+            if not device.startswith("/dev/"):
+                raise ConfigValidationError(
+                    "direct_serial_device must be "
+                    "an absolute /dev path"
+                )
+
+        if (
+            self.direct_inject
+            and device is None
+        ):
+            raise ConfigValidationError(
+                "direct_serial_device is required "
+                "when direct_inject=true"
+            )
+
+        if (
+            isinstance(
+                self.direct_serial_baud,
+                bool,
+            )
+            or not isinstance(
+                self.direct_serial_baud,
+                int,
+            )
+            or self.direct_serial_baud <= 0
+        ):
+            raise ConfigValidationError(
+                "direct_serial_baud must be an int > 0"
+            )
+
         timeout_names = (
             "connect_timeout_sec",
             "socket_timeout_sec",
@@ -289,12 +345,45 @@ class WorkerConfig:
             "first_data_timeout_sec",
             "gga_interval_sec",
             "gga_max_age_sec",
+            "direct_serial_write_timeout_sec",
         )
         for name in timeout_names:
             value = _require_positive_finite(
                 getattr(self, name), name, ConfigValidationError
             )
             object.__setattr__(self, name, value)
+
+        reopen = self.direct_serial_reopen_sec
+
+        if (
+            isinstance(reopen, bool)
+            or not isinstance(
+                reopen,
+                (int, float),
+            )
+        ):
+            raise ConfigValidationError(
+                "direct_serial_reopen_sec must be "
+                "a finite number >= 0"
+            )
+
+        reopen_value = float(reopen)
+
+        if (
+            not math.isfinite(reopen_value)
+            or reopen_value < 0.0
+        ):
+            raise ConfigValidationError(
+                "direct_serial_reopen_sec must be "
+                "a finite number >= 0"
+            )
+
+        object.__setattr__(
+            self,
+            "direct_serial_reopen_sec",
+            reopen_value,
+        )
+
         if self.stale_reconnect_sec <= self.healthy_age_sec:
             raise ConfigValidationError(
                 "stale_reconnect_sec must be greater than healthy_age_sec"
@@ -322,7 +411,11 @@ class WorkerConfig:
             "stale_reconnect_sec=%r, reconnect_delay_sec=%r, "
             "first_data_timeout_sec=%r, gga_enabled=%r, "
             "gga_interval_sec=%r, gga_max_age_sec=%r, "
-            "max_mavros_rtcm_frame_bytes=%r, tls_mode=%r)"
+            "max_mavros_rtcm_frame_bytes=%r, tls_mode=%r, "
+            "direct_inject=%r, direct_serial_device=%r, "
+            "direct_serial_baud=%r, "
+            "direct_serial_write_timeout_sec=%r, "
+            "direct_serial_reopen_sec=%r)"
             % (
                 self.schema_version,
                 self.run_id,
@@ -342,6 +435,11 @@ class WorkerConfig:
                 self.gga_max_age_sec,
                 self.max_mavros_rtcm_frame_bytes,
                 self.tls_mode,
+                self.direct_inject,
+                self.direct_serial_device,
+                self.direct_serial_baud,
+                self.direct_serial_write_timeout_sec,
+                self.direct_serial_reopen_sec,
             )
         )
 
@@ -367,6 +465,11 @@ _WORKER_CONFIG_FIELDS = frozenset(
         "gga_max_age_sec",
         "max_mavros_rtcm_frame_bytes",
         "tls_mode",
+        "direct_inject",
+        "direct_serial_device",
+        "direct_serial_baud",
+        "direct_serial_write_timeout_sec",
+        "direct_serial_reopen_sec",
     }
 )
 
@@ -436,6 +539,15 @@ def encode_worker_config(config: WorkerConfig) -> bytes:
         "gga_max_age_sec": config.gga_max_age_sec,
         "max_mavros_rtcm_frame_bytes": config.max_mavros_rtcm_frame_bytes,
         "tls_mode": config.tls_mode,
+        "direct_inject": config.direct_inject,
+        "direct_serial_device": config.direct_serial_device,
+        "direct_serial_baud": config.direct_serial_baud,
+        "direct_serial_write_timeout_sec": (
+            config.direct_serial_write_timeout_sec
+        ),
+        "direct_serial_reopen_sec": (
+            config.direct_serial_reopen_sec
+        ),
     }
     encoded = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), allow_nan=False

@@ -1056,3 +1056,339 @@ def test_profile_protocol_tokens_reject_non_ascii(
         value.create_profile(
             **kwargs
         )
+
+
+# ---------------------------------------------------------------------------
+# Schema v4 — direct RTCM injection persistence
+# ---------------------------------------------------------------------------
+
+
+def test_direct_injection_profile_defaults_are_legacy(
+    store,
+):
+    value, _ = store
+
+    profile = create_profile(value)
+
+    assert profile.direct_inject is False
+    assert profile.direct_serial_device is None
+    assert profile.direct_serial_baud == 230400
+    assert (
+        profile.direct_serial_write_timeout_sec
+        == 1.0
+    )
+    assert (
+        profile.direct_serial_reopen_sec
+        == 1.0
+    )
+
+
+def test_direct_injection_settings_persist_to_worker_config(
+    store,
+):
+    value, _ = store
+
+    profile = value.create_profile(
+        name="Direct USB",
+        caster_host="caster.test",
+        caster_port=2101,
+        mountpoint="MOUNT",
+        username="rover",
+        password=SECRET,
+        direct_inject=True,
+        direct_serial_device=(
+            "/dev/serial/by-id/"
+            "usb-Septentrio_mosaic-H-test"
+        ),
+        direct_serial_baud=230400,
+        direct_serial_write_timeout_sec=0.5,
+        direct_serial_reopen_sec=2.0,
+    )
+
+    value.set_active_profile(
+        profile.profile_id
+    )
+
+    config = value.build_active_worker_config(
+        "run-direct"
+    )
+
+    assert config.direct_inject is True
+    assert (
+        config.direct_serial_device
+        == profile.direct_serial_device
+    )
+    assert config.direct_serial_baud == 230400
+    assert (
+        config.direct_serial_write_timeout_sec
+        == 0.5
+    )
+    assert (
+        config.direct_serial_reopen_sec
+        == 2.0
+    )
+
+
+def test_direct_serial_device_can_be_explicitly_cleared(
+    store,
+):
+    value, _ = store
+
+    profile = value.create_profile(
+        name="Configured Direct Device",
+        caster_host="caster.test",
+        caster_port=2101,
+        mountpoint="MOUNT",
+        username="rover",
+        password=SECRET,
+        direct_serial_device=(
+            "/dev/serial/by-id/"
+            "usb-Septentrio_mosaic-H-test"
+        ),
+    )
+
+    updated = value.update_profile(
+        profile.profile_id,
+        direct_serial_device=None,
+    )
+
+    assert updated.direct_serial_device is None
+
+
+def test_omitted_direct_serial_device_preserves_value(
+    store,
+):
+    value, _ = store
+
+    device = (
+        "/dev/serial/by-id/"
+        "usb-Septentrio_mosaic-H-test"
+    )
+
+    profile = value.create_profile(
+        name="Preserve Direct Device",
+        caster_host="caster.test",
+        caster_port=2101,
+        mountpoint="MOUNT",
+        username="rover",
+        password=SECRET,
+        direct_serial_device=device,
+    )
+
+    updated = value.update_profile(
+        profile.profile_id,
+        direct_serial_baud=460800,
+    )
+
+    assert updated.direct_serial_device == device
+    assert updated.direct_serial_baud == 460800
+
+
+def test_direct_mode_rejects_device_clear(
+    store,
+):
+    value, _ = store
+
+    profile = value.create_profile(
+        name="Direct Active Config",
+        caster_host="caster.test",
+        caster_port=2101,
+        mountpoint="MOUNT",
+        username="rover",
+        password=SECRET,
+        direct_inject=True,
+        direct_serial_device=(
+            "/dev/serial/by-id/"
+            "usb-Septentrio_mosaic-H-test"
+        ),
+    )
+
+    with pytest.raises(
+        RtkProfileValidationError,
+        match="direct_serial_device is required",
+    ):
+        value.update_profile(
+            profile.profile_id,
+            direct_serial_device=None,
+        )
+
+
+def test_schema_v3_database_migrates_to_v4(
+    tmp_path: Path,
+):
+    """An existing production-style v3 DB must open and default to A-side."""
+
+    path = tmp_path / "rtk" / "rtk.sqlite3"
+    path.parent.mkdir(parents=True)
+
+    connection = sqlite3.connect(path)
+
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE rtk_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                caster_host TEXT NOT NULL,
+                caster_port INTEGER NOT NULL,
+                mountpoint TEXT NOT NULL,
+                username TEXT NOT NULL,
+                password_secret TEXT NOT NULL,
+                rtcm_topic TEXT NOT NULL,
+                connect_timeout_sec REAL NOT NULL,
+                socket_timeout_sec REAL NOT NULL,
+                healthy_age_sec REAL NOT NULL,
+                stale_reconnect_sec REAL NOT NULL,
+                reconnect_delay_sec REAL NOT NULL,
+                first_data_timeout_sec REAL NOT NULL,
+                gga_enabled INTEGER NOT NULL DEFAULT 0
+                    CHECK(gga_enabled IN (0, 1)),
+                gga_interval_sec REAL NOT NULL DEFAULT 10.0,
+                gga_max_age_sec REAL NOT NULL DEFAULT 5.0,
+                tls_mode TEXT NOT NULL DEFAULT 'REQUIRED'
+                    CHECK(tls_mode IN ('REQUIRED', 'DISABLED')),
+                max_mavros_rtcm_frame_bytes INTEGER NOT NULL,
+                enabled INTEGER NOT NULL
+                    CHECK(enabled IN (0, 1)),
+                revision INTEGER NOT NULL
+                    CHECK(revision >= 1),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE rtk_runtime_state (
+                singleton_id INTEGER PRIMARY KEY
+                    CHECK(singleton_id = 1),
+                active_profile_id INTEGER,
+                desired_state TEXT NOT NULL
+                    CHECK(desired_state IN ('STOPPED', 'RUNNING')),
+                revision INTEGER NOT NULL
+                    CHECK(revision >= 1),
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(active_profile_id)
+                    REFERENCES rtk_profiles(id)
+                    ON DELETE SET NULL
+            );
+
+            INSERT INTO rtk_profiles (
+                name,
+                caster_host,
+                caster_port,
+                mountpoint,
+                username,
+                password_secret,
+                rtcm_topic,
+                connect_timeout_sec,
+                socket_timeout_sec,
+                healthy_age_sec,
+                stale_reconnect_sec,
+                reconnect_delay_sec,
+                first_data_timeout_sec,
+                gga_enabled,
+                gga_interval_sec,
+                gga_max_age_sec,
+                tls_mode,
+                max_mavros_rtcm_frame_bytes,
+                enabled,
+                revision,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                'Existing Rover',
+                'caster.test',
+                2101,
+                'MOUNT',
+                'rover',
+                'existing-secret',
+                '/mavros/gps_rtk/send_rtcm',
+                10.0,
+                1.0,
+                5.0,
+                10.0,
+                5.0,
+                10.0,
+                0,
+                10.0,
+                5.0,
+                'REQUIRED',
+                720,
+                1,
+                1,
+                1800000000,
+                1800000000
+            );
+
+            INSERT INTO rtk_runtime_state (
+                singleton_id,
+                active_profile_id,
+                desired_state,
+                revision,
+                updated_at
+            )
+            VALUES (
+                1,
+                1,
+                'STOPPED',
+                1,
+                1800000000
+            );
+
+            PRAGMA user_version = 3;
+            """
+        )
+
+        connection.commit()
+
+    finally:
+        connection.close()
+
+    value = RtkProfileStore(path)
+
+    value.initialize()
+
+    connection = sqlite3.connect(path)
+
+    try:
+        version = connection.execute(
+            "PRAGMA user_version"
+        ).fetchone()[0]
+
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(rtk_profiles)"
+            ).fetchall()
+        }
+
+    finally:
+        connection.close()
+
+    assert version == 4
+
+    assert {
+        "direct_inject",
+        "direct_serial_device",
+        "direct_serial_baud",
+        "direct_serial_write_timeout_sec",
+        "direct_serial_reopen_sec",
+    } <= columns
+
+    profile = value.get_profile(1)
+
+    assert profile.name == "Existing Rover"
+    assert profile.direct_inject is False
+    assert profile.direct_serial_device is None
+    assert profile.direct_serial_baud == 230400
+    assert (
+        profile.direct_serial_write_timeout_sec
+        == 1.0
+    )
+    assert profile.direct_serial_reopen_sec == 1.0
+
+    config = value.build_active_worker_config(
+        "migration-check"
+    )
+
+    assert config.direct_inject is False
+    assert config.direct_serial_device is None
