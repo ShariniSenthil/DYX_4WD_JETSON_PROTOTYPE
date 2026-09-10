@@ -1003,6 +1003,52 @@ Sep-07 day median is **-87.261 m**. So log_15-before is ~210 mm low and log_47/4
    base or a VRS/MAC mountpoint (13.68 km is long for single-base integer fixing);
    close the antenna gap (`sao` with antenna type, base 1006/1007/1008/1033).
 
+## 2026-09-10 — Direct Mosaic-H USB2 RTCM injection is now the production correction path
+
+**Supersedes the correction-transport description in "RTK — confirmed live and working" above for
+current architecture** (that section's NTRIP-client/lifecycle/bug content is otherwise still
+accurate — this is additive, not a retraction). Full detail:
+`docs/RTCM_DIRECT_INJECTION_AB_REVIEW_PLAN.md` (see its STATUS section), summarized in `HANDOFF.md`'s
+2026-09-10 entry. Branch `feat/rtcm-direct-gnss-uart`.
+
+An A/B-selectable transport now exists beside the legacy path, and both sides are individually
+field-validated (Phase 5/6 PASS, 2026-09-10):
+
+```text
+Legacy A-side (still available, still passes): NTRIP → Jetson → MAVROS/PX4 → mosaic-H
+Production B-side (this rover's active profile): NTRIP → Jetson → direct Mosaic-H native USB2
+```
+
+- Mosaic-H receiver serial `3804732`. USB mapping: `if02 → /dev/ttyACM1 → USB1` (diagnostics),
+  `if04 → /dev/ttyACM2 → USB2` (production). Stable device path:
+  `/dev/serial/by-id/usb-Septentrio_Septentrio_USB_Device_3804732-if04`. **`/dev/ttyACM0` is the
+  Pixhawk FCU and must never be treated as the Mosaic-H.** This is a second logical serial port the
+  receiver exposes over its own USB cable, not a separate wired UART.
+- **This rover's active persisted RTK profile now runs `direct_inject = true`** against that device
+  at 230400 baud, `desired_state` persisted `RUNNING` — direct USB2 is this rover's effective
+  production correction path today. The software/schema factory default for a brand-new profile is
+  still `direct_inject = false`; do not assume that default describes this rover.
+- Backend startup reconciles from persisted `desired_state`, so a normal
+  `ros2 launch rover_bringup rover.launch.py` restores RTK automatically once RTK has been explicitly
+  STARTed once — gated only on the pre-existing MAVROS-readiness check, which applies to direct mode
+  too (accepted, not a defect: MAVROS is part of the same production launch).
+- ⚠ **Changing any direct-injection field on a running profile forces persisted `desired_state` to
+  `STOPPED`** (existing safety lifecycle contract) — RTK does not resume until an operator issues an
+  explicit START again. A stationary direct-mode test once looked like a USB fault (no RTK, receiver
+  stuck 3D lock) for exactly this reason; it was the STOPPED state from a prior profile edit, not
+  hardware. See `HANDOFF.md` 2026-09-10 for the full incident.
+- B-side field result: RTK FIXED ~113 s after `RUNNING`, `853` frames / `80524` bytes written,
+  `0` write failures / CRC failures / invalid headers, `/mavros/gps_rtk/send_rtcm` silent throughout
+  (proves exclusive routing, no dual RTCM path).
+- **Accuracy boundary, do not skip:** this closes correction transport and RTK acquisition only. It
+  does not prove surveyed absolute accuracy and does **not** solve the ~150-210 mm wrong-but-RTK-FIXED
+  ambiguity behavior in the 2026-09-08/2026-09-09 sections above — that failure mode reports a clean
+  `fix_type`/`eph` in both the correct and wrong state regardless of which transport delivered the
+  correction. No A/B field accuracy comparison (Phase 7) has been run.
+- Frontend (`DYX_GCS_Frontend`) cannot yet display/change `direct_inject` or select a USB device; its
+  PATCH builder only sends changed fields, so editing other profile fields does not clobber the
+  persisted direct-USB settings. Not a blocker for the current production profile.
+
 ## Repo status (2026-08-31)
 
 - **`WORKING_STATUS_24_06_2026.txt`** — stale (2026-06-24), architecture it

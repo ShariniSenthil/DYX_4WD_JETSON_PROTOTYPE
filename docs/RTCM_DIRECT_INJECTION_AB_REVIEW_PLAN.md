@@ -5,11 +5,189 @@
 **Verified branch HEAD:** `0a5fac60a56d95ae2da8a8f5938fa539caaa7274`  
 **Parent:** `97cd7e4f6b1f7b0963eb9605e017be985ce63421`  
 **Source branch at review start:** `feat/rtk-injection-v2` — same HEAD as the new branch  
-**Document purpose:** Code-review plan only. **No implementation in this document has been applied.**  
-**Revised 2026-09-10:** every "current code" excerpt below was re-derived from source at the
-verified HEAD. Earlier revisions quoted a `_publish_candidates()` function that does not exist and
-several wrong API names; those are corrected in place. Two deploy-breaking omissions (profile-store
-schema-version gate, MAVROS readiness gate in direct mode) are now addressed in §10.3 and §6.8.
+**Document purpose:** Originally a code-review plan only, with no implementation applied. **That is
+no longer current — see the STATUS section immediately below.** The phase-by-phase design content
+(§§1–33) is retained unedited as the implementation record; a "PROPOSED — NOT APPLIED" label on a
+code excerpt below describes the state of the plan at authoring time, not the current repository.
+Phase and acceptance-criteria sections carry inline status annotations pointing back to STATUS.  
+**Revised 2026-09-10 (pre-implementation pass):** every "current code" excerpt below was re-derived
+from source at the verified HEAD. Earlier revisions quoted a `_publish_candidates()` function that
+does not exist and several wrong API names; those are corrected in place. Two deploy-breaking
+omissions (profile-store schema-version gate, MAVROS readiness gate in direct mode) are now
+addressed in §10.3 and §6.8.  
+**Revised again 2026-09-10 (post field-validation pass):** Phases 1–6 have been implemented and
+field-validated. See STATUS below for the final verified architecture, hardware identity, persisted
+production profile state, the root cause of an initial false-negative field result, B-side PASS
+evidence, and what remains explicitly open (Phase 7 / accuracy).
+
+---
+
+# STATUS — 2026-09-10: Phases 1–6 implemented and field-validated (PASS)
+
+**This section is authoritative for current state.** The phase-by-phase content that follows (§§1–33)
+is retained unedited as the implementation design record; where it says "PROPOSED — NOT APPLIED" that
+describes the plan at authoring time, not the repository today.
+
+## Final verified architecture
+
+Two correction routes exist side by side, exactly as designed in §1/§4:
+
+```text
+Legacy A-side (already closed, see below):
+    NTRIP → Jetson → MAVROS/PX4 → mosaic-H
+
+Production B-side (this session's subject — PASS):
+    NTRIP → Jetson → direct Mosaic-H native USB2
+```
+
+## Hardware
+
+- Mosaic-H receiver serial number: `3804732`.
+- USB interface mapping: `if02 → /dev/ttyACM1 → USB1` (diagnostics, still available) and
+  `if04 → /dev/ttyACM2 → USB2` (production correction path).
+- **Production stable device path:**
+  `/dev/serial/by-id/usb-Septentrio_Septentrio_USB_Device_3804732-if04`.
+- `/dev/ttyACM0` is the Pixhawk FCU and must never be treated as the Mosaic-H.
+- Receiver USB2 persistent config was verified as `DataInOut, USB2, RTCMv3, none, (on)` and saved
+  Current → Boot.
+
+⚠ **§18 below describes a discrete wired UART to a second mosaic-H COM. That is not what was built or
+verified.** What was verified is the receiver's own **native USB2 CDC-ACM interface** (`if04`) — a
+second logical serial port the receiver already exposes over the same USB cable, not a separate
+physical wire. The "separate COM, don't combine PX4 TX and Jetson TX" safety intent in §18 is
+satisfied (USB2 is logically and electrically independent of the port PX4's driver uses); read "COM"
+there as "the receiver's USB2 logical port," not a wired UART.
+
+## Persisted rover profile state (production)
+
+Active profile 1 now owns direct injection as its production startup path:
+
+- `direct_inject = true`
+- `direct_serial_device = /dev/serial/by-id/usb-Septentrio_Septentrio_USB_Device_3804732-if04`
+- direct serial API baud = `230400`
+- desired lifecycle state after successful explicit START = `RUNNING`
+- latest observed persisted runtime revision = `8`
+
+The software/schema **factory default for a brand-new profile remains `direct_inject = false`**
+(§10.2's `DEFAULT_DIRECT_INJECT = False` is unchanged and correct) — a fresh database still
+initializes to `STOPPED`. But this rover's one active, persisted profile has been switched to direct
+USB2, so direct USB2 is now this rover's effective production correction path, not a still-optional
+alternative.
+
+## Startup/reconcile behavior — verified from source
+
+On backend startup: `rtk_backend_lifecycle.start()` → `runtime.start()` →
+`control.reconcile_runtime()`. `reconcile_runtime()` reads the persisted `desired_state`; if
+`RUNNING`, it calls `runtime_service.request_start()`. Normal backend shutdown physically stops/reaps
+the RTK runtime but does **not** change persisted operator intent. So after RTK has been explicitly
+STARTed once with `desired_state` persisted as `RUNNING`, a normal
+`ros2 launch rover_bringup rover.launch.py` restores RTK automatically — no repeat operator START
+needed. A fresh database still initializes to `STOPPED`.
+
+One accepted architectural detail, unchanged by this session (already documented at §6.8/§10.3/Phase
+6 below): `RtkManagerCore._maybe_launch()` still gates worker spawning on MAVROS readiness even in
+`direct_inject=true` mode. This does not route RTCM through MAVROS — it only means the direct-USB
+worker waits for MAVROS to become ready. Accepted as non-blocking because MAVROS is part of the same
+production launch and normally ready within seconds. **No patch was requested or made for this.**
+
+## Why the first B-side attempt appeared broken — root cause, not a defect
+
+The first stationary direct-mode test showed no `/mavros/gps_rtk/send_rtcm` traffic (expected — direct
+mode doesn't use that topic) but the receiver also stayed at 3D lock, never reaching RTK. This was
+**not a USB2 problem.** The profile's transport-field change had correctly forced persisted
+`desired_state = STOPPED`, per the safety lifecycle contract in §22 — RTK had simply never been
+explicitly STARTed again after the profile edit. Confirmed at the time: `rtk_runtime_state.desired_state
+= STOPPED`, revision `7`, no RTK worker node running, nothing holding `/dev/ttyACM2`, USB permissions
+correct, `flash` in `dialout`. After issuing the normal backend/GCS RTK START (`desired_state →
+RUNNING`), the direct worker spawned and the B-side test proceeded successfully. **Recorded here so
+this incident is not later misdiagnosed as a USB/serial failure** — it is §22's stop/start contract
+working as designed, field-confirmed.
+
+## B-side field validation — PASS
+
+RTK FIXED was achieved and held entirely through `Jetson NTRIP → parser → SerialRtcmSink → USB2 →
+Mosaic-H`, observed approximately 113 s after `desired_state` became `RUNNING`:
+
+| Time | Fix | Sats | Horizontal accuracy |
+|---|---|---:|---:|
+| 17:12:39 | `6 / RTK FIXED` | 9 | 24 mm |
+| 17:12:54 | `6 / RTK FIXED` | 11 | 15 mm |
+
+(The legacy `eph` field showed large stale values during this test and must not be used as the
+position-accuracy authority here — see the accuracy boundary below.)
+
+Transport counters at the later sample: `frames_written_total = 853`, `bytes_written_total = 80524`,
+`write_failures_total = 0`, `crc_failures = 0`, `invalid_headers = 0`. Roughly 395 additional RTCM
+frames arrived over ~15 s (~26 frames/s) with no transport errors.
+
+Validated checklist (all PASS):
+
+1. NTRIP/parser valid RTCM
+2. worker in `direct_serial` mode
+3. `SerialRtcmSink` opens USB2
+4. written frame/byte counters increase
+5. write/delivery errors zero
+6. permissions/no competing process
+7. Mosaic-H consumes corrections, transitions 3D → RTK FIXED
+8. end-to-end B-side transport/acquisition
+
+`/mavros/gps_rtk/send_rtcm` remained silent throughout direct mode, proving exclusive routing with no
+dual RTCM path.
+
+**Not exercised in this session** — Phase 6's own "also deliberately test" fault-injection list
+(§27): live unplug/reconnect of the direct serial cable while running, and flipping `direct_inject` on
+an already-running worker and observing old-sink-release-before-new-sink-open. The stop/start contract
+above was confirmed via the profile-edit path (revision 7→8), which is a different trigger than an
+in-place fault. Treat those specific Phase 6 sub-tests as still open if anyone needs them signed off.
+
+## A-side — already closed (unchanged this session)
+
+Legacy MAVROS/PX4 A-side had already passed: `state = HEALTHY`, `injection_mode = mavros_px4`,
+`direct_inject = false`, effective frame limit `720`, `valid_frames = 1341`, `delivery_frames = 1341`,
+`published_frames = 1341`, delivery/publish errors `0`, oversize drops `0`, MAVROS subscribers `1`.
+Both transport paths are now individually validated.
+
+## Accuracy boundary — read before citing this session as an accuracy result
+
+**This closes correction transport and RTK acquisition only.** Do not claim, and do not read this
+document as claiming:
+
+- RTK FIXED proves surveyed absolute accuracy;
+- 15 mm receiver `h_acc` proves 15 mm truth error;
+- direct USB solves wrong ambiguity selection;
+- direct USB solves the previously observed ~150–210 mm wrong-but-RTK-FIXED position behavior
+  documented in this repo's `CLAUDE.md` (2026-09-08/09 sections).
+
+This matches invariant §1.9 and Phase 7 (§27) below, and is unchanged — direct injection was never
+proposed as a fix for that failure mode, only for correction-transport robustness.
+
+**There is no Phase 7 result in this document.** A surveyed/revisited-point accuracy comparison
+between A-side and B-side has not been performed. Do not read Phase 6's PASS as a Phase 7 PASS.
+
+## Frontend status
+
+No frontend patch is required for the current production profile. The live `DYX_GCS_Frontend` editor
+predates the direct fields, and its PATCH builder only sends fields actually changed — editing
+caster/mountpoint/password/etc. does not overwrite the backend's persisted direct-USB fields. Known
+limitations, not blockers for the existing production profile: the frontend cannot currently display
+or change `direct_inject`, cannot select a USB device, and creating a brand-new profile without direct
+fields still gets the backend default `direct_inject=false`. Future UI enhancement.
+
+## Phase completion status
+
+| Phase | Scope | Status |
+|---|---|---|
+| 1 | config/persistence/API | **Complete** |
+| 2 | `SerialRtcmSink` | **Complete** |
+| 3 | exclusive routing | **Complete** |
+| 4 | health/status/hardening | **Complete** |
+| 5 | A-side field validation | **PASS / closed** |
+| 6 | B-side direct USB2 field validation | **PASS / closed** |
+| 7 | A/B field accuracy comparison (survey truth) | **Not performed** — see accuracy boundary above |
+
+Current production correction route: `NTRIP → Jetson → Mosaic-H USB2`. Persisted `RUNNING` means a
+normal rover backend restart restores it automatically once the existing MAVROS-readiness gate clears
+(see above).
 
 ---
 
@@ -1573,17 +1751,21 @@ NTRIP → parser → MAVROS → PX4 → mosaic-H
 
 ## 17.2 Direct test configuration
 
-Replace the device with the actual stable Jetson device identity.
+**Filled in with the actual verified Jetson device identity (2026-09-10) — no longer a placeholder.**
+See STATUS above for how it was determined (Mosaic-H serial `3804732`, USB2 interface `if04`).
 
 ```json
 {
   "direct_inject": true,
-  "direct_serial_device": "/dev/serial/by-id/REPLACE_WITH_ACTUAL_MOSAIC_CORRECTION_UART",
+  "direct_serial_device": "/dev/serial/by-id/usb-Septentrio_Septentrio_USB_Device_3804732-if04",
   "direct_serial_baud": 230400,
   "direct_serial_write_timeout_sec": 1.0,
   "direct_serial_reopen_sec": 1.0
 }
 ```
+
+This is now the production profile's persisted configuration, not a test-only example — see STATUS
+above.
 
 Result:
 
@@ -1596,6 +1778,14 @@ No RTCM should be published through the legacy injection topic in this mode.
 ---
 
 # 18. mosaic-H / physical-port contract
+
+⚠ **As verified 2026-09-10 (see STATUS at the top of this document), the "SEPARATE mosaic-H correction
+COM" below is the receiver's own native USB2 CDC-ACM interface (`if04`, `/dev/ttyACM2`) — a second
+logical serial port the mosaic-H already exposes over its single USB cable — not a discrete wired
+UART as the port-contract language below was originally written to describe.** The safety intent
+(never combine PX4's input with the Jetson's direct-injection output on one receiver RX) is still what
+was verified and is still satisfied; only the physical mechanism differs from what this section
+originally assumed.
 
 The software patch assumes the following hardware contract.
 
@@ -2310,6 +2500,9 @@ GNSS solution remains separate
 
 ## Phase 5 — Jetson hardware dry run, A-side first
 
+**STATUS: COMPLETE — PASS (2026-09-10). See STATUS section at the top of this document for the
+verified counters.**
+
 Deploy new code with:
 
 ```text
@@ -2333,6 +2526,13 @@ Do not enable direct mode until this passes.
 ---
 
 ## Phase 6 — B-side stationary receiver test
+
+**STATUS: COMPLETE — PASS (2026-09-10). See the STATUS section at the top of this document for the
+verified architecture, hardware identity, persisted profile state, and evidence (fix/sats/accuracy
+table, transport counters). The "also deliberately test" fault-injection block below (unplug/reconnect,
+flip-while-running) was NOT exercised this session — see STATUS for exactly what was and wasn't
+covered. Do not read this Phase 6 PASS as also covering Phase 7 (accuracy) — it does not; see the
+accuracy boundary in STATUS.**
 
 Configure mosaic-H dedicated correction COM persistently.
 
@@ -2377,6 +2577,10 @@ be observed once so nobody rediscovers it during a field session.
 ---
 
 ## Phase 7 — A/B field comparison
+
+**STATUS: NOT PERFORMED.** Phases 5 and 6 (transport/acquisition) are PASS; this phase (accuracy) has
+not been run. Do not infer a Phase 7 result from the Phase 6 PASS — see the accuracy boundary in the
+STATUS section at the top of this document.
 
 Use the same:
 
@@ -2424,32 +2628,56 @@ Do not compare absolute coordinates between runs without accounting for normal G
 
 # 28. Acceptance criteria
 
-The A/B implementation is ready for production field evaluation only when all are true:
+The A/B implementation is ready for production field evaluation only when all are true.
 
-- [ ] `direct_inject` defaults to `false`.
-- [ ] Existing profiles migrate to `false` automatically.
-- [ ] **A copy of the Jetson's real RTK database opens on the new schema version** — the accepted
-      `user_version` set includes the old version (§10.3).
-- [ ] **Changing `direct_inject` on a running profile forces a controlled worker stop/start** (§22).
-- [ ] `false` does not open the direct serial device.
-- [ ] `false` retains the current MAVROS RTCM topic.
-- [ ] `false` retains the current legacy max-frame behavior.
-- [ ] `true` never publishes correction data through MAVROS.
-- [ ] `true` accepts complete valid RTCM3 frames up to 1029 B.
-- [ ] `true` writes exact frame bytes, in order, without mutation.
-- [ ] Partial serial writes are completed correctly.
-- [ ] Serial timeout/disconnect cannot cause a hidden MAVROS fallback.
-- [ ] Only one RTK worker/injection authority exists.
-- [ ] Direct serial resources close on worker shutdown.
-- [ ] Health identifies the active injection mode.
-- [ ] Direct serial delivery failure makes the correction path unhealthy.
-- [ ] NTRIP/GGA/TLS behavior is regression-tested.
-- [ ] Receiver RTK solution remains reported independently from correction transport health.
-- [ ] A-side rollback requires only configuration + controlled worker restart/reconcile.
-- [ ] No current MAVROS/PX4 correction code has been deleted.
-- [ ] `python3-serial` is installed on the Jetson and the device is accessible to the worker user (§14).
-- [ ] The serial device is opened exclusively (§7.4).
-- [ ] Documentation and status output do **not** claim the B-side removes the MAVROS dependency (§6.8).
+**Status key (added 2026-09-10):** `[x]` = confirmed by the 2026-09-10 field session (see STATUS at
+the top of this document) or a direct, unambiguous consequence of its results; `[ ]` retained with an
+explicit reason = implemented but not independently re-exercised against live hardware this session —
+do not read an unchecked item as failing, only as not yet field-evidenced.
+
+- [x] `direct_inject` defaults to `false`. — confirmed: factory default for a new profile is unchanged (STATUS).
+- [ ] Existing profiles migrate to `false` automatically. — not exercised this session.
+- [x] **A copy of the Jetson's real RTK database opens on the new schema version** — the accepted
+      `user_version` set includes the old version (§10.3). — confirmed: the live Jetson profile's
+      persisted revision advanced 7→8 during this session on the real production database (STATUS).
+- [x] **Changing `direct_inject` on a running profile forces a controlled worker stop/start** (§22). —
+      field-confirmed; see STATUS, "why the first B-side attempt appeared broken."
+- [x] `false` does not open the direct serial device. — A-side PASS (STATUS).
+- [x] `false` retains the current MAVROS RTCM topic. — A-side PASS (STATUS).
+- [x] `false` retains the current legacy max-frame behavior. — A-side PASS, effective 720 B limit
+      confirmed (STATUS).
+- [x] `true` never publishes correction data through MAVROS. — B-side PASS: MAVROS RTCM topic
+      remained silent throughout direct mode (STATUS).
+- [ ] `true` accepts complete valid RTCM3 frames up to 1029 B. — not independently re-measured against
+      live hardware this session (Phase 2/3 unit-test coverage only).
+- [ ] `true` writes exact frame bytes, in order, without mutation. — not independently re-verified at
+      the byte level this session (unit-test coverage only).
+- [ ] Partial serial writes are completed correctly. — unit-test coverage only, not field-exercised.
+- [ ] Serial timeout/disconnect cannot cause a hidden MAVROS fallback. — exclusivity confirmed under
+      normal operation this session (no MAVROS traffic during a successful direct-mode run); the
+      disconnect/reconnect fault injection itself was not exercised — see STATUS.
+- [x] Only one RTK worker/injection authority exists. — confirmed: no dual routing observed during the
+      B-side PASS run (STATUS).
+- [ ] Direct serial resources close on worker shutdown. — not exercised this session.
+- [ ] Health identifies the active injection mode. — implemented (Phase 4); status-payload content was
+      not specifically queried in this field session.
+- [ ] Direct serial delivery failure makes the correction path unhealthy. — not exercised; zero write
+      failures occurred during this session's PASS run.
+- [x] NTRIP/GGA/TLS behavior is regression-tested. — both the A-side and B-side PASS runs exercised the
+      same live NTRIP/GGA/TLS client upstream of the sink split.
+- [ ] Receiver RTK solution remains reported independently from correction transport health. — design
+      invariant per §13.2/§26; not specifically re-queried this session.
+- [ ] A-side rollback requires only configuration + controlled worker restart/reconcile. — not
+      exercised this session (the production profile was not rolled back to A-side after the B-side
+      PASS).
+- [x] No current MAVROS/PX4 correction code has been deleted. — confirmed: A-side is unchanged and
+      still independently PASS (STATUS).
+- [x] `python3-serial` is installed on the Jetson and the device is accessible to the worker user
+      (§14). — confirmed: the worker opened `/dev/ttyACM2` and wrote frames successfully (STATUS).
+- [ ] The serial device is opened exclusively (§7.4). — not fault-tested this session (no attempt was
+      made to open a second competing writer against the same device).
+- [x] Documentation and status output do **not** claim the B-side removes the MAVROS dependency (§6.8).
+      — confirmed by this revision's own accuracy-boundary and MAVROS-readiness-gate framing above.
 
 ---
 

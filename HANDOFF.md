@@ -763,3 +763,66 @@ Key conclusions:
   - 2 × dual-channel Sabertooth controllers
   - Sabertooth controlled through duplicated PX4 PWM left/right actuator outputs; no dedicated Sabertooth PX4 driver found.
 - Next GNSS investigation: mosaic-H SBF PVT/RTK status, ambiguity/correction/base-reference state, fields discarded before `sensor_gps`, and what receiver state is cleared by power cycle.
+
+---
+
+## 2026-09-10 — Direct Mosaic-H USB2 RTCM injection: field-validated, Phase 6 PASS
+
+Branch `feat/rtcm-direct-gnss-uart`. Full detail, phase-by-phase status, and the acceptance
+checklist live in `docs/RTCM_DIRECT_INJECTION_AB_REVIEW_PLAN.md` (see its STATUS section at the top);
+this is the handoff-level summary.
+
+**What this closes:** an A/B-selectable correction transport was added beside the existing
+MAVROS/PX4 injection path, and both sides are now individually field-validated:
+
+```text
+Legacy A-side (already closed):    NTRIP → Jetson → MAVROS/PX4 → mosaic-H
+Production B-side (this session):  NTRIP → Jetson → direct Mosaic-H native USB2
+```
+
+- Mosaic-H receiver serial `3804732`. USB mapping: `if02 → /dev/ttyACM1 → USB1` (diagnostics),
+  `if04 → /dev/ttyACM2 → USB2` (production). Stable path:
+  `/dev/serial/by-id/usb-Septentrio_Septentrio_USB_Device_3804732-if04`. `/dev/ttyACM0` is the
+  Pixhawk and must never be treated as the Mosaic-H. Receiver USB2 persistent config verified
+  (`DataInOut, USB2, RTCMv3, none, (on)`), saved Current → Boot.
+- **This rover's active persisted profile now runs `direct_inject = true`** at 230400 baud against
+  that device, with `desired_state` persisted `RUNNING` (revision `8` observed) — direct USB2 is this
+  rover's effective production path today, even though the software's factory default for a
+  brand-new profile is still `direct_inject = false`.
+- Backend startup reconciles from persisted `desired_state`: after one explicit operator START with
+  `RUNNING` persisted, a normal `ros2 launch rover_bringup rover.launch.py` restores RTK
+  automatically, gated only on the pre-existing MAVROS-readiness check (`RtkManagerCore._maybe_launch()`
+  waits for MAVROS regardless of injection mode — accepted, not a defect, since MAVROS is part of the
+  same production launch and normally ready within seconds).
+- **The first B-side attempt looked broken (no RTK, receiver stuck at 3D) and was not a USB/serial
+  fault.** The profile's transport-field edit had correctly forced persisted `desired_state = STOPPED`
+  per the existing safety lifecycle contract — RTK had simply never been re-started after the edit.
+  Confirmed at the time: revision `7`, `desired_state=STOPPED`, no worker running, nothing holding
+  `/dev/ttyACM2`, permissions and `dialout` membership correct. Issuing the normal RTK START
+  (`desired_state → RUNNING`) fixed it. Recorded so nobody re-diagnoses this as a hardware fault.
+- **B-side field result: RTK FIXED reached ~113 s after RUNNING**, `6/RTK FIXED` at 9 sats/24 mm then
+  11 sats/15 mm accuracy over the next 15 s; `frames_written_total=853`, `bytes_written_total=80524`,
+  `write_failures_total=0`, `crc_failures=0`, `invalid_headers=0`, ~26 frames/s. `/mavros/gps_rtk/
+  send_rtcm` stayed silent throughout — confirms exclusive routing, no dual RTCM path.
+- **A-side, already closed:** `state=HEALTHY`, `valid_frames=delivery_frames=published_frames=1341`,
+  zero delivery/publish errors, zero oversize drops, 1 MAVROS subscriber.
+- Not exercised this session: live unplug/reconnect fault injection on the direct serial cable, and
+  flipping `direct_inject` on an already-running worker. The stop/start contract was confirmed via
+  the profile-edit path above, which is a different trigger.
+
+**Accuracy boundary — do not skip this if picking the RTK work back up.** This closes correction
+transport and RTK acquisition only. It does **not** prove surveyed absolute accuracy, does not mean
+15 mm `h_acc` is 15 mm truth error, and does **not** solve the previously observed ~150–210 mm
+wrong-but-RTK-FIXED ambiguity behavior documented above in §T2 and in `CLAUDE.md`'s 2026-09-08/09
+sections. No Phase 7 (A/B field accuracy comparison against a surveyed/revisited point) has been run.
+If T2/T6 above are ever picked back up, this session's PASS is not evidence either way for them.
+
+**Frontend:** no patch required for the current production profile — the live `DYX_GCS_Frontend`
+editor predates the direct fields and its PATCH builder only sends changed fields, so it cannot
+overwrite the persisted direct-USB settings. It cannot display/change `direct_inject` or select a USB
+device yet, and a brand-new profile created through it still gets `direct_inject=false` by default.
+Future UI work, not a blocker.
+
+Phase status: 1 (persistence/API) complete · 2 (`SerialRtcmSink`) complete · 3 (exclusive routing)
+complete · 4 (health/status) complete · 5 (A-side field validation) **PASS** · 6 (B-side direct USB2
+field validation) **PASS** · 7 (A/B accuracy comparison) **not performed**.
