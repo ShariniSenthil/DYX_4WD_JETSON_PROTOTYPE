@@ -696,12 +696,10 @@ class RPPController(Node):
         self.declare_parameter(
             "legacy_pivot_stationary_violation_debounce_sec", 0.10
         )
-        # Offer the post-pivot runtime reanchor on every leg, not just the
-        # C->P1 entry leg. A pivot walks the rover 300-600 mm off the line it
-        # is about to drive; only the entry leg used to rebuild its line from
-        # the post-pivot position, and it is the only leg that lands inside
-        # the 30 mm marking latch. Set False to restore entry-leg-only.
-        self.declare_parameter("post_pivot_reanchor_all_legs", False
+        # Compatibility-only legacy switch. Production geometry is fixed:
+        # C->P1 is built once at START and later legs remain on /nav_path.
+        # Post-pivot path regeneration is not a control authority.
+        self.declare_parameter("post_pivot_reanchor_all_legs", False)
 
         self.local_frame = str(self.get_parameter("local_frame").value).strip()
         self.cruise_speed = float(self.get_parameter("cruise_speed_mps").value)
@@ -5437,41 +5435,24 @@ class RPPController(Node):
             return True
 
         if result.directive is LegacyAlignmentDirective.REANCHOR_ZERO:
-            if first_approach:
-                success = bool(self.reanchor_c_to_p1_after_pivot())
-            else:
-                success = bool(
-                    self.reanchor_runtime_path_after_pivot(goal_x, goal_y)
-                )
-            if success:
-                self.legacy_alignment.ack_reanchor_completed()
-                self.reset_terminal_native_pivot()
-                self._reset_precision_regulator("PIVOT_COMPLETE_RECAPTURE_ARMED")
-                self.publish_stop()
-                return True
-            if not first_approach:
-                # Nothing to reanchor to (goal already inside
-                # waypoint_tolerance, or the path build declined). Fall back
-                # to the pre-existing /nav_path behaviour for this leg
-                # instead of stopping the mission: this feature may only ever
-                # improve on the old path, never halt where it used to drive.
-                self.legacy_alignment.ack_reanchor_completed()
-                self.segment_runtime_reanchored = True
-                self.publish_stop()
-                self.get_logger().warn(
-                    "POST-PIVOT LEG REANCHOR DECLINED / "
-                    "CONTINUING ON /nav_path | "
-                    f"goal=P{self.segment_goal_number} | "
-                    f"xtrack="
-                    f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
-                )
-                return True
-            self.legacy_alignment.enter_safety_hold("REANCHOR_FAILED")
+            # Compatibility handshake only. The legacy lifecycle still has a
+            # REANCHOR_ZERO state, but production control must never move the
+            # path underneath the rover.
+            #
+            # C->P1 keeps the runtime geometry locked at START.
+            # P1->Pn keeps the fixed mission /nav_path geometry.
+            self.legacy_alignment.ack_reanchor_completed()
+            self.reset_terminal_native_pivot()
+            self._reset_precision_regulator(
+                "PIVOT_COMPLETE_FIXED_GEOMETRY"
+            )
             self.publish_stop()
-            self.get_logger().error(
-                "C-PRIME REANCHOR FAILED / LOCAL SAFETY HOLD | "
-                f"heading={math.degrees(path_heading_error):+.1f}deg | "
-                f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
+            self.get_logger().warn(
+                "POST-PIVOT FIXED GEOMETRY / REANCHOR BYPASSED | "
+                f"goal=P{self.segment_goal_number} | "
+                f"first_approach={first_approach} | "
+                f"xtrack="
+                f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
             )
             return True
 
@@ -5528,14 +5509,13 @@ class RPPController(Node):
             )
             return False
 
-        # NON_PIVOT_CAPTURE preserves the previous aligned-start Phase B path,
-        # including immediate C->P1 reanchor when no native carrier latched.
+        # C->P1 runtime geometry is constructed once at START. An aligned
+        # entry does not move its start point to the current rover pose.
         if (
             result.phase is LegacyAlignmentPhase.NON_PIVOT_CAPTURE
             and previous_phase is LegacyAlignmentPhase.ENTRY
             and first_approach
         ):
-            self.reanchor_c_to_p1_after_pivot()
             if self.c_line_bearing is not None:
                 path_bearing = self.c_line_bearing
                 path_heading_error = self.normalize_angle(

@@ -765,10 +765,13 @@ def test_failed_reanchor_is_local_safety_hold():
         assert later.phase is LegacyAlignmentPhase.SAFETY_HOLD
         assert later.directive is LegacyAlignmentDirective.SAFETY_HOLD
     adapter = _method_source("_run_legacy_segment_alignment")
-    fail = adapter.index("REANCHOR_FAILED")
-    assert "enter_safety_hold" in adapter
-    assert "ack_reanchor_completed" in adapter
-    assert adapter.index("ack_reanchor_completed") < fail
+    block = adapter.split("REANCHOR_ZERO", 1)[1].split(
+        "COMPLETE_ZERO", 1
+    )[0]
+    assert "ack_reanchor_completed" in block
+    assert "reanchor_c_to_p1_after_pivot" not in block
+    assert "reanchor_runtime_path_after_pivot" not in block
+    assert "REANCHOR_FAILED" not in block
 
 
 def test_failed_reanchor_later_semantic_geometry_remains_unchanged():
@@ -855,29 +858,19 @@ def test_later_leg_reanchor_is_offered_once_per_leg():
     assert nxt.reanchor_requested is False
 
 
-def test_declined_later_leg_reanchor_never_stops_the_mission():
-    """A later-leg reanchor that declines must fall back to /nav_path.
 
-    The entry leg keeps its strict REANCHOR_FAILED -> SAFETY_HOLD contract,
-    but this feature may only ever improve on the previous path -- it must
-    never halt a leg that used to drive. Guarded at the source level because
-    the branch lives in the ROS adapter, not the ROS-free lifecycle.
-    """
+def test_reanchor_directive_is_ack_only_and_never_mutates_geometry():
     adapter = _method_source("_run_legacy_segment_alignment")
-    block = adapter.split("REANCHOR_ZERO", 1)[1].split("COMPLETE_ZERO", 1)[0]
-    assert "reanchor_runtime_path_after_pivot" in block
-    assert "reanchor_c_to_p1_after_pivot" in block
+    block = adapter.split("REANCHOR_ZERO", 1)[1].split(
+        "COMPLETE_ZERO", 1
+    )[0]
 
-    fallback_at = block.index("if not first_approach:")
-    safety_at = block.index("enter_safety_hold")
-    # The non-entry fallback must be reached before the safety hold, so a
-    # declined later-leg reanchor can never fall through to it.
-    assert fallback_at < safety_at
+    assert "ack_reanchor_completed" in block
+    assert "PIVOT_COMPLETE_FIXED_GEOMETRY" in block
+    assert "reanchor_c_to_p1_after_pivot" not in block
+    assert "reanchor_runtime_path_after_pivot" not in block
+    assert "segment_runtime_reanchored = True" not in block
 
-    fallback = block[fallback_at:safety_at]
-    assert "ack_reanchor_completed" in fallback
-    assert "segment_runtime_reanchored = True" in fallback
-    assert "enter_safety_hold" not in fallback
 
 
 def test_later_leg_path_selection_prefers_the_reanchored_line():
@@ -894,9 +887,11 @@ def test_later_leg_path_selection_prefers_the_reanchored_line():
     )[0]
 
 
-def test_post_pivot_reanchor_all_legs_is_declared_and_launched():
-    assert _declared_defaults()["post_pivot_reanchor_all_legs"] is True
-    assert "post_pivot_reanchor_all_legs" in LAUNCH_SOURCE
+
+def test_post_pivot_reanchor_all_legs_is_default_off_and_launched_off():
+    assert _declared_defaults()["post_pivot_reanchor_all_legs"] is False
+    assert '"post_pivot_reanchor_all_legs": False' in LAUNCH_SOURCE
+
 
 
 def test_runtime_line_legs_deny_navpath_guidance_bearing_authority():
@@ -1011,3 +1006,13 @@ def test_restart_only_parameter_sets_are_refused_not_silently_ignored():
     assert "PRECISION_FEATURE_GATES" in NODE_SOURCE.split(
         "_RUNTIME_SETTABLE_EXEMPT", 1
     )[1][:200]
+
+
+def test_c_to_p1_geometry_is_not_reanchored_by_alignment_adapter():
+    adapter = _method_source("_run_legacy_segment_alignment")
+    assert "self.reanchor_c_to_p1_after_pivot()" not in adapter
+
+    reanchor_block = adapter.split("REANCHOR_ZERO", 1)[1].split(
+        "COMPLETE_ZERO", 1
+    )[0]
+    assert "reanchor_runtime_path_after_pivot" not in reanchor_block
