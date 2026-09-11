@@ -121,6 +121,7 @@ class TrajectoryGenerator(Node):
     # behaviour. Backend defaults are patched to the same values below.
     EXTENSION_TRIGGER_DISTANCE_M = 3.0
     EXTENSION_DISTANCE_M = 4.0
+    START_APPROACH_DISTANCE_M = 3.0
 
     # Extension is a row-end manoeuvre, not a generic short-segment rule.
     # The short transfer must be sideways relative to the incoming row and
@@ -1988,20 +1989,21 @@ class TrajectoryGenerator(Node):
     def _calculate_dummy_point(
         self,
         *,
-        row_endpoint: tuple[
+        new_row_first: tuple[
             float,
             float,
         ],
-        incoming_direction: tuple[
+        new_row_second: tuple[
             float,
             float,
         ],
     ) -> tuple[float, float]:
+        """Place the 4 m dummy behind the first point of the next row."""
         if self.dummy_point_distance_m is None:
             raise ValueError("Dummy-point distance unavailable")
 
-        direction_x = incoming_direction[0]
-        direction_y = incoming_direction[1]
+        direction_x = new_row_second[0] - new_row_first[0]
+        direction_y = new_row_second[1] - new_row_first[1]
 
         direction_length = math.hypot(
             direction_x,
@@ -2010,16 +2012,69 @@ class TrajectoryGenerator(Node):
 
         if direction_length < self.minimum_segment_length_m:
             raise ValueError(
-                "Cannot determine incoming row heading for extension point"
+                "Cannot determine next-row heading for extension point"
             )
 
         unit_x = direction_x / direction_length
-
         unit_y = direction_y / direction_length
 
         return (
-            row_endpoint[0] + unit_x * self.dummy_point_distance_m,
-            row_endpoint[1] + unit_y * self.dummy_point_distance_m,
+            new_row_first[0] - unit_x * self.dummy_point_distance_m,
+            new_row_first[1] - unit_y * self.dummy_point_distance_m,
+        )
+
+    def _calculate_start_dummy_point(
+        self,
+        marking_points: list[tuple[float, float]],
+    ) -> tuple[float, float]:
+        """Place the one-time 3 m straight approach dummy before P1."""
+        if len(marking_points) < 2:
+            raise ValueError("At least two marking points are required")
+
+        first_marking = marking_points[0]
+        second_marking = marking_points[1]
+
+        start_direction = (
+            second_marking[0] - first_marking[0],
+            second_marking[1] - first_marking[1],
+        )
+
+        # If P1 -> P2 is itself the first short row transfer, infer the
+        # heading into P1 from the opposite of the following row direction.
+        if (
+            len(marking_points) >= 3
+            and self._distance(first_marking, second_marking)
+            <= self.EXTENSION_TRIGGER_DISTANCE_M
+        ):
+            (
+                is_row_transition,
+                inferred_incoming,
+                _transfer_angle,
+                _reversal_angle,
+            ) = self._extension_transition_geometry(
+                marking_points=marking_points,
+                index=0,
+            )
+
+            if is_row_transition and inferred_incoming is not None:
+                start_direction = inferred_incoming
+
+        direction_length = math.hypot(
+            start_direction[0],
+            start_direction[1],
+        )
+
+        if direction_length < self.minimum_segment_length_m:
+            raise ValueError(
+                "Cannot determine first-row heading for start approach"
+            )
+
+        unit_x = start_direction[0] / direction_length
+        unit_y = start_direction[1] / direction_length
+
+        return (
+            first_marking[0] - unit_x * self.START_APPROACH_DISTANCE_M,
+            first_marking[1] - unit_y * self.START_APPROACH_DISTANCE_M,
         )
 
     def _generate_navigation_path(
@@ -2031,7 +2086,7 @@ class TrajectoryGenerator(Node):
         list[int],
         int,
     ]:
-        """Build the fixed surveyed mission path beginning at P1."""
+        """Build the fixed mission path with optional alignment dummies."""
 
         navigation_points: list[tuple[float, float]] = []
         point_types: list[int] = []
@@ -2039,19 +2094,49 @@ class TrajectoryGenerator(Node):
         dummy_count = 0
 
         first_marking = marking_points[0]
-        self._append_point(
-            points=navigation_points,
-            point_types=point_types,
-            marking_indices=marking_indices,
-            point=first_marking,
-            point_type=self.POINT_TYPE_MARKING,
-            marking_index=0,
-        )
 
-        self.get_logger().warn(
-            "FIXED SURVEY TRAJECTORY: /nav_path begins at P1; "
-            "fresh current C->P1 is owned by RPP after START/ARM"
-        )
+        if self.extension_mode == "ENABLE":
+            start_dummy_point = self._calculate_start_dummy_point(marking_points)
+
+            self._append_point(
+                points=navigation_points,
+                point_types=point_types,
+                marking_indices=marking_indices,
+                point=start_dummy_point,
+                point_type=self.POINT_TYPE_DUMMY_ALIGNMENT,
+                marking_index=-1,
+            )
+            self._append_interpolated_segment(
+                points=navigation_points,
+                point_types=point_types,
+                marking_indices=marking_indices,
+                start=start_dummy_point,
+                end=first_marking,
+                final_type=self.POINT_TYPE_MARKING,
+                final_marking_index=0,
+            )
+
+            dummy_count += 1
+            self.get_logger().warn(
+                "START APPROACH: "
+                f"3.000 m straight dummy -> P1 | "
+                f"Dummy=({start_dummy_point[0]:.3f}, "
+                f"{start_dummy_point[1]:.3f})"
+            )
+        else:
+            self._append_point(
+                points=navigation_points,
+                point_types=point_types,
+                marking_indices=marking_indices,
+                point=first_marking,
+                point_type=self.POINT_TYPE_MARKING,
+                marking_index=0,
+            )
+
+            self.get_logger().warn(
+                "FIXED SURVEY TRAJECTORY: extension disabled; "
+                "/nav_path begins at P1"
+            )
 
         for index in range(len(marking_points) - 1):
             current_marking = marking_points[index]
@@ -2072,13 +2157,13 @@ class TrajectoryGenerator(Node):
             use_dummy = (
                 self.extension_mode == "ENABLE"
                 and self.row_transition_threshold_m is not None
-                and transition_distance < self.row_transition_threshold_m
+                and transition_distance <= self.row_transition_threshold_m
             )
 
             if use_dummy:
                 (
                     use_dummy,
-                    incoming_direction,
+                    _incoming_direction,
                     transfer_angle,
                     reversal_angle,
                 ) = self._extension_transition_geometry(
@@ -2087,23 +2172,23 @@ class TrajectoryGenerator(Node):
                 )
 
             if use_dummy:
-                assert incoming_direction is not None
                 assert transfer_angle is not None
                 assert reversal_angle is not None
 
+                following_marking = marking_points[index + 2]
                 dummy_point = self._calculate_dummy_point(
-                    row_endpoint=current_marking,
-                    incoming_direction=incoming_direction,
+                    new_row_first=next_marking,
+                    new_row_second=following_marking,
                 )
 
-                clearance_from_current = self._distance(
-                    current_marking,
+                clearance_from_next = self._distance(
+                    next_marking,
                     dummy_point,
                 )
-                if clearance_from_current < self.minimum_dummy_clearance_m:
+                if clearance_from_next < self.minimum_dummy_clearance_m:
                     raise ValueError(
                         "Calculated dummy point is "
-                        "too close to the row endpoint"
+                        "too close to the next-row first point"
                     )
 
                 self._append_interpolated_segment(
@@ -2131,9 +2216,9 @@ class TrajectoryGenerator(Node):
                     f"{index + 1} -> "
                     f"{index + 2} | "
                     f"gap={transition_distance:.3f} m | "
-                    f"Dummy=({dummy_point[0]:.3f}, "
+                    f"4.000 m next-row Dummy=({dummy_point[0]:.3f}, "
                     f"{dummy_point[1]:.3f}) | "
-                    f"incoming_heading_extended_from=P{index + 1} | "
+                    f"straight_into=P{index + 2} | "
                     f"transfer_angle={transfer_angle:.1f}deg | "
                     f"row_reversal={reversal_angle:.1f}deg"
                 )
