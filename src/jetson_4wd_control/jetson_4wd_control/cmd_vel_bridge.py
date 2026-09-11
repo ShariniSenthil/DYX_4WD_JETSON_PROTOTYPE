@@ -2,7 +2,7 @@
 
 RPP input (restart-only selection; default A):
     B: /rpp/command (rpp_interfaces/RppCommand)
-        Patch 2 staging only: all commands rejected; zero output, yaw ignored.
+        validated horizontal velocity + authoritative absolute ENU yaw.
     A: /rpp/velocity_ned (geometry_msgs/Vector3Stamped)
         vector.x = North velocity [m/s]
         vector.y = East velocity [m/s]
@@ -11,8 +11,9 @@ RPP input (restart-only selection; default A):
 PX4 output:
     /mavros/setpoint_raw/local
 
-This bridge publishes only horizontal velocity vectors. It does not publish
-AttitudeTarget messages and it does not use local-position yaw-rate fields.
+Mode A publishes horizontal velocity with yaw ignored. Mode B publishes
+horizontal velocity plus authoritative absolute ENU yaw. This bridge never
+publishes AttitudeTarget or an active yaw-rate setpoint.
 
 With PX4 rover parameters RD_TRANS_DRV_TRN=45 and RD_TRANS_TRN_DRV=12,
 PX4 performs its native differential pivot above 45 degrees and changes back
@@ -62,6 +63,9 @@ class CmdVelBridge(Node):
         | PositionTarget.IGNORE_AFZ
         | PositionTarget.IGNORE_YAW
         | PositionTarget.IGNORE_YAW_RATE
+    )
+    TYPE_MASK_VELOCITY_YAW = (
+        TYPE_MASK_VELOCITY_ONLY & ~PositionTarget.IGNORE_YAW
     )
 
     def __init__(self) -> None:
@@ -155,7 +159,7 @@ class CmdVelBridge(Node):
             )
             self.get_logger().warn(
                 "Bridge startup contract: B / EXPLICIT_YAW | "
-                "Patch 2 staging: all atomic commands rejected; actuation disabled"
+                "Patch 4 validated atomic velocity+yaw forwarding active"
             )
         else:
             self.create_subscription(
@@ -203,6 +207,8 @@ class CmdVelBridge(Node):
 
         self.latest_north = 0.0
         self.latest_east = 0.0
+        self.latest_yaw_enu = 0.0
+        self.latest_yaw_valid = False
         self.latest_command_time = None
 
         self.connected = False
@@ -285,13 +291,66 @@ class CmdVelBridge(Node):
         self.latest_east = east
         self.latest_command_time = self.get_clock().now()
 
-    def _rpp_command_callback(self, message: RppCommand) -> None:
-        # Phase 4 must explicitly implement B validation and yaw forwarding.
-        # Until then reject EVERY atomic command, even one claiming valid yaw.
-        # Never refresh freshness or route its velocity through _rpp_callback.
+    def _clear_b_command(self, reason: str) -> None:
         self.latest_north = 0.0
         self.latest_east = 0.0
+        self.latest_yaw_enu = 0.0
+        self.latest_yaw_valid = False
         self.latest_command_time = None
+        self.get_logger().error(f"Rejected RPP atomic command: {reason}")
+
+    def _rpp_command_callback(self, message: RppCommand) -> None:
+        try:
+            north = float(message.velocity_north_mps)
+            east = float(message.velocity_east_mps)
+        except (AttributeError, TypeError, ValueError):
+            self._clear_b_command("invalid velocity fields")
+            return
+
+        if not all(math.isfinite(value) for value in (north, east)):
+            self._clear_b_command("non-finite velocity")
+            return
+
+        horizontal_speed = math.hypot(north, east)
+        if horizontal_speed > self.maximum_speed:
+            scale = self.maximum_speed / horizontal_speed
+            north *= scale
+            east *= scale
+            self.get_logger().warn(
+                "Clamped RPP atomic command above 1.00 m/s | "
+                f"requested={horizontal_speed:.3f}m/s"
+            )
+        elif horizontal_speed <= self.COMMAND_EPSILON:
+            north = 0.0
+            east = 0.0
+
+        horizontal_speed = math.hypot(north, east)
+        yaw_valid = bool(message.yaw_valid)
+
+        if yaw_valid:
+            try:
+                yaw_enu = float(message.yaw_enu_rad)
+            except (AttributeError, TypeError, ValueError):
+                self._clear_b_command("invalid explicit yaw field")
+                return
+
+            if not math.isfinite(yaw_enu):
+                self._clear_b_command("non-finite explicit yaw")
+                return
+
+        else:
+            yaw_enu = 0.0
+            if horizontal_speed > self.COMMAND_EPSILON:
+                self._clear_b_command(
+                    "moving command requires finite authoritative yaw"
+                )
+                return
+
+        self.latest_north = north
+        self.latest_east = east
+        self.latest_yaw_enu = yaw_enu
+        self.latest_yaw_valid = yaw_valid
+        self.latest_command_time = self.get_clock().now()
 
     def _state_callback(self, message: State) -> None:
         self.connected = bool(message.connected)
@@ -331,13 +390,32 @@ class CmdVelBridge(Node):
         self,
         north: float,
         east: float,
+        *,
+        yaw_enu_rad: float = 0.0,
+        yaw_valid: bool = False,
     ) -> None:
+        yaw_active = bool(yaw_valid) and self.rpp_explicit_yaw_enabled
+        if not all(math.isfinite(value) for value in (north, east)):
+            north = 0.0
+            east = 0.0
+            yaw_active = False
+
+        if yaw_active and not math.isfinite(float(yaw_enu_rad)):
+            north = 0.0
+            east = 0.0
+            yaw_active = False
+
         message = PositionTarget()
         message.header.stamp = self.get_clock().now().to_msg()
         message.coordinate_frame = self.FRAME_LOCAL_NED
-        message.type_mask = self.TYPE_MASK_VELOCITY_ONLY
+        message.type_mask = (
+            self.TYPE_MASK_VELOCITY_YAW
+            if yaw_active
+            else self.TYPE_MASK_VELOCITY_ONLY
+        )
 
-        # MAVROS ROS fields are ENU: x=East, y=North.
+        # MAVROS ROS fields are ENU: x=East, y=North. Absolute yaw is also
+        # supplied in ROS ENU; MAVROS owns the ENU->NED conversion.
         message.velocity.x = float(east)
         message.velocity.y = float(north)
         message.velocity.z = 0.0
@@ -348,7 +426,8 @@ class CmdVelBridge(Node):
         message.acceleration_or_force.x = 0.0
         message.acceleration_or_force.y = 0.0
         message.acceleration_or_force.z = 0.0
-        message.yaw = 0.0
+        message.yaw = float(yaw_enu_rad) if yaw_active else 0.0
+        # IGNORE_YAW_RATE remains set in both masks. Keep the field zero.
         message.yaw_rate = 0.0
 
         self.setpoint_pub.publish(message)
@@ -356,6 +435,8 @@ class CmdVelBridge(Node):
     def _control_loop(self) -> None:
         north = 0.0
         east = 0.0
+        yaw_enu = 0.0
+        yaw_valid = False
 
         heartbeat_healthy = self._heartbeat_healthy()
         self._publish_heartbeat_health(heartbeat_healthy)
@@ -377,13 +458,38 @@ class CmdVelBridge(Node):
         else:
             north = self.latest_north
             east = self.latest_east
+            if self.rpp_explicit_yaw_enabled:
+                yaw_enu = self.latest_yaw_enu
+                yaw_valid = self.latest_yaw_valid
             reason = (
-                "publishing_rpp_velocity_vector"
-                if math.hypot(north, east) > self.COMMAND_EPSILON
-                else "publishing_rpp_stop"
+                "publishing_rpp_explicit_yaw"
+                if yaw_valid
+                else (
+                    "publishing_rpp_velocity_vector"
+                    if math.hypot(north, east) > self.COMMAND_EPSILON
+                    else "publishing_rpp_stop"
+                )
             )
 
-        self._publish_local_velocity(north, east)
+        # In B mode a safety/inhibit boundary invalidates the entire atomic
+        # command. A fresh RPP command is required before motion/yaw can resume.
+        if (
+            self.rpp_explicit_yaw_enabled
+            and reason
+            not in {"publishing_rpp_explicit_yaw", "publishing_rpp_stop"}
+        ):
+            self.latest_north = 0.0
+            self.latest_east = 0.0
+            self.latest_yaw_enu = 0.0
+            self.latest_yaw_valid = False
+            self.latest_command_time = None
+
+        self._publish_local_velocity(
+            north,
+            east,
+            yaw_enu_rad=yaw_enu,
+            yaw_valid=yaw_valid,
+        )
 
         now = self.get_clock().now()
         if (now - self.last_log_time).nanoseconds >= 1_000_000_000:

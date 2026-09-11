@@ -1661,8 +1661,7 @@ class RPPController(Node):
             )
             self.get_logger().warn(
                 "RPP startup contract: B / EXPLICIT_YAW | "
-                "Patch 3 atomic velocity+yaw active; "
-                "bridge still rejects B; actuation disabled"
+                "atomic velocity+yaw transport active"
             )
         else:
             self.velocity_pub = self.create_publisher(

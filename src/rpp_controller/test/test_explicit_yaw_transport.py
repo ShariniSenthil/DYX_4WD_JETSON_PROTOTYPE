@@ -1,4 +1,4 @@
-"""Patch-3 RPP yaw propagation tests; bridge remains Patch-2 fail-closed."""
+"""Patch-4 atomic explicit-yaw transport and bridge safety tests."""
 
 import ast
 import math
@@ -201,7 +201,7 @@ def test_exactly_one_command_publisher_and_subscription(enabled):
     for node in (controller, consumer):
         assert any(label in line for line in node.logs)
         if enabled:
-            assert any("actuation disabled" in line for line in node.logs)
+            assert not any("actuation disabled" in line for line in node.logs)
     # Catch additional command publisher/subscription sites outside selection.
     for path, operation in ((RPP, "create_publisher"), (BRIDGE, "create_subscription")):
         sites = [n for n in ast.walk(ast.parse(path.read_text()))
@@ -357,24 +357,147 @@ def test_a_bridge_preserves_enu_mask_stream_rate_and_timeout():
     assert_stop(node)
 
 
-@pytest.mark.parametrize("yaw_valid,yaw", [(False, 0.0), (True, 1.2),
-                                          (True, math.nan), (True, math.inf)])
-def test_b_rejects_every_command_even_valid_yaw_and_clears_cached_motion(yaw_valid, yaw):
+@pytest.mark.parametrize(
+    "yaw",
+    [0.0, math.pi / 2.0, math.pi, -math.pi / 2.0],
+)
+def test_b_forwards_cardinal_explicit_yaw_with_yaw_rate_ignored(yaw):
     node = bridge(True)
     make_ready(node)
-    node._control_loop()
-    assert_stop(node)
-    node.latest_north, node.latest_east = 0.3, 0.4
-    node.latest_command_time = node.get_clock().now()
     msg = Atomic()
     msg.velocity_north_mps, msg.velocity_east_mps = 0.3, 0.4
-    msg.yaw_valid, msg.yaw_enu_rad = yaw_valid, yaw
+    msg.yaw_valid, msg.yaw_enu_rad = True, yaw
     node.subscriptions[0].callback(msg)
+    node._control_loop()
+
+    out = node.setpoint_pub.messages[-1]
+    assert (out.velocity.x, out.velocity.y, out.velocity.z) == (0.4, 0.3, 0.0)
+    assert out.type_mask == 2503
+    assert out.type_mask & Target.IGNORE_YAW == 0
+    assert out.type_mask & Target.IGNORE_YAW_RATE
+    assert out.yaw == yaw
+    assert out.yaw_rate == 0.0
+
+
+def test_b_zero_without_yaw_is_accepted_as_no_yaw_stop():
+    node = bridge(True)
+    make_ready(node)
+    msg = Atomic()
+    msg.velocity_north_mps = msg.velocity_east_mps = 0.0
+    msg.yaw_valid = False
+    msg.yaw_enu_rad = math.nan
+    node.subscriptions[0].callback(msg)
+
+    assert node.latest_command_time is not None
+    assert node.latest_yaw_valid is False
+    node._control_loop()
+    assert_stop(node)
+
+
+def test_b_zero_with_valid_yaw_is_transport_ready_for_patch5_hold():
+    node = bridge(True)
+    make_ready(node)
+    msg = Atomic()
+    msg.velocity_north_mps = msg.velocity_east_mps = 0.0
+    msg.yaw_valid, msg.yaw_enu_rad = True, 1.2
+    node.subscriptions[0].callback(msg)
+    node._control_loop()
+
+    out = node.setpoint_pub.messages[-1]
+    assert (out.velocity.x, out.velocity.y, out.velocity.z) == (0.0, 0.0, 0.0)
+    assert out.type_mask == 2503
+    assert out.yaw == 1.2
+    assert out.yaw_rate == 0.0
+
+
+@pytest.mark.parametrize(
+    "yaw_valid,yaw,north,east",
+    [
+        (False, 0.0, 0.3, 0.4),
+        (True, math.nan, 0.3, 0.4),
+        (True, math.inf, 0.3, 0.4),
+        (True, 1.2, math.nan, 0.4),
+        (True, 1.2, 0.3, math.inf),
+    ],
+)
+def test_b_invalid_moving_command_clears_previous_motion_and_yaw(
+    yaw_valid,
+    yaw,
+    north,
+    east,
+):
+    node = bridge(True)
+    make_ready(node)
+
+    good = Atomic()
+    good.velocity_north_mps, good.velocity_east_mps = 0.3, 0.4
+    good.yaw_valid, good.yaw_enu_rad = True, 0.6
+    node.subscriptions[0].callback(good)
+    assert node.latest_command_time is not None
+    assert node.latest_yaw_valid is True
+
+    bad = Atomic()
+    bad.velocity_north_mps, bad.velocity_east_mps = north, east
+    bad.yaw_valid, bad.yaw_enu_rad = yaw_valid, yaw
+    node.subscriptions[0].callback(bad)
+
     assert node.latest_north == node.latest_east == 0.0
+    assert node.latest_yaw_enu == 0.0
+    assert node.latest_yaw_valid is False
     assert node.latest_command_time is None
-    for _ in range(3):
-        node._control_loop()
-        assert_stop(node)
+    node._control_loop()
+    assert_stop(node)
+
+
+@pytest.mark.parametrize(
+    "gate",
+    [
+        "emergency_stop",
+        "mission_disabled",
+        "backend_heartbeat_timeout",
+        "px4_disconnected",
+        "px4_disarmed",
+        "wrong_mode",
+        "command_timeout",
+    ],
+)
+def test_b_every_safety_gate_strips_cached_yaw_and_requires_fresh_command(gate):
+    node = bridge(True)
+    make_ready(node)
+
+    msg = Atomic()
+    msg.velocity_north_mps, msg.velocity_east_mps = 0.3, 0.4
+    msg.yaw_valid, msg.yaw_enu_rad = True, 0.7
+    node.subscriptions[0].callback(msg)
+
+    stale = Time()
+    stale.nanoseconds = -2_000_000_000
+
+    if gate == "emergency_stop":
+        node.emergency_stop = True
+    elif gate == "mission_disabled":
+        node.mission_enabled = False
+    elif gate == "backend_heartbeat_timeout":
+        node.latest_backend_heartbeat_time = stale
+    elif gate == "px4_disconnected":
+        node.connected = False
+    elif gate == "px4_disarmed":
+        node.armed = False
+    elif gate == "wrong_mode":
+        node.mode = "MANUAL"
+    elif gate == "command_timeout":
+        command_stale = Time()
+        command_stale.nanoseconds = -300_000_000
+        node.latest_command_time = command_stale
+    else:
+        raise AssertionError(gate)
+
+    node._control_loop()
+    assert_stop(node)
+    assert node.latest_north == node.latest_east == 0.0
+    assert node.latest_yaw_enu == 0.0
+    assert node.latest_yaw_valid is False
+    assert node.latest_command_time is None
 
 
 @pytest.mark.parametrize("rpp_mode", [False, True])
