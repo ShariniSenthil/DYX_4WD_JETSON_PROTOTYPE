@@ -2014,6 +2014,7 @@ class RPPController(Node):
         self.terminal_native_pivot_true_bearing = None
         self.terminal_native_pivot_request_bearing = None  # legacy, unused
         self.terminal_native_pivot_reason = ""
+        self._pivot_hold_fallback_context = None
 
         # Straight-segment acceleration state. It is reset by every literal
         # zero, every new segment goal, mission disable and native pivot.
@@ -5427,11 +5428,13 @@ class RPPController(Node):
                     # heading target until this pivot finishes and reanchors.
                     self.c_line_reanchored_after_pivot = False
             else:
-                self.publish_stop()
+                self.publish_pivot_hold("NATIVE_CARRIER_INACTIVE")
             return True
 
         if result.directive is LegacyAlignmentDirective.HOLD_ZERO:
-            self.publish_stop()
+            self.publish_pivot_hold(
+                f"HOLD_ZERO/{result.transition_reason or result.phase.value}"
+            )
             return True
 
         if result.directive is LegacyAlignmentDirective.REANCHOR_ZERO:
@@ -7121,6 +7124,50 @@ class RPPController(Node):
         self._reset_precision_regulator("LITERAL_STOP")
         self.publish_velocity_ned(0.0, 0.0)
         self._record_rpp_debug_command(0.0, 0.0, 0.0)
+
+    def publish_pivot_hold(self, context):
+        """Hold zero translation without surrendering the pivot yaw target.
+
+        A stationary pivot and a stop are the same wire command apart from
+        yaw_valid, so a bare publish_stop() inside an active pivot makes PX4
+        fall back to bearing = vehicle_yaw and abandon the target mid-turn.
+        Safety stops must keep calling publish_stop(); only in-pivot holds
+        belong here. Falls back to a literal stop whenever the latched pivot
+        bearing is unusable, so this can never invent a heading.
+        """
+        true_bearing = self.terminal_native_pivot_true_bearing
+        usable = (
+            self.rpp_explicit_yaw_enabled
+            and true_bearing is not None
+            and math.isfinite(float(true_bearing))
+        )
+
+        if usable:
+            message = Vector3Stamped()
+            message.header.stamp = self.get_clock().now().to_msg()
+            message.header.frame_id = "map_ned"
+            message.vector.x = 0.0
+            message.vector.y = 0.0
+            message.vector.z = 0.0
+            self._reset_precision_regulator("PIVOT_HOLD")
+            if self.velocity_pub.publish_zero_with_yaw(
+                message,
+                float(true_bearing),
+            ):
+                self._record_rpp_debug_command(0.0, 0.0, 0.0)
+                self._pivot_hold_fallback_context = None
+                return True
+
+        if self._pivot_hold_fallback_context != context:
+            self._pivot_hold_fallback_context = context
+            self.get_logger().warn(
+                "PIVOT HOLD FELL BACK TO LITERAL STOP / YAW TARGET LOST | "
+                f"context={context} | "
+                f"explicitYaw={self.rpp_explicit_yaw_enabled} | "
+                f"latchedBearing={true_bearing}"
+            )
+        self.publish_stop()
+        return False
 
     @staticmethod
     def _publish_float64(publisher, value):
