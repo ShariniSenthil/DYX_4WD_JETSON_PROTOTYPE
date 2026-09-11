@@ -1,4 +1,4 @@
-"""Patch-4 atomic explicit-yaw transport and bridge safety tests."""
+"""Patch-5 zero-translation pivot plus explicit-yaw safety tests."""
 
 import ast
 import math
@@ -267,7 +267,7 @@ def test_b_generic_moving_missing_or_nonfinite_yaw_fails_closed(yaw):
     assert any("WITHOUT FINITE EXPLICIT YAW" in line for line in node.logs)
 
 
-def test_b_zero_translation_remains_yaw_invalid_in_patch3():
+def test_b_generic_zero_translation_remains_yaw_invalid_in_patch5():
     node, env = rpp(True)
     node.MAXIMUM_MOVING_SPEED_MPS = 1.0
     node.reset_speed_profiles = lambda: None
@@ -309,7 +309,7 @@ def test_every_generic_moving_call_site_supplies_owning_yaw():
     ]
 
     # The only generic publication allowed to omit yaw is publish_stop():
-    # literal zero is still yaw_valid=false until Patch 5.
+    # literal stop remains yaw_valid=false; Patch 5 uses a dedicated pivot API.
     assert len(without_yaw) == 1
     stop_call = without_yaw[0]
     assert len(stop_call.args) >= 2
@@ -564,3 +564,100 @@ def test_real_ros_rejects_single_and_mixed_runtime_toggle(path, owner, enabled):
     finally:
         node.destroy_node()
         rclpy.shutdown(context=context)
+
+def test_patch5_adapter_zero_yaw_api_is_atomic_and_exact():
+    node, _ = rpp(True)
+    msg = Vector()
+    msg.header.frame_id = "map_ned"
+    assert node.velocity_pub.publish_zero_with_yaw(msg, 1.2) is True
+    command, = node.publishers[0].messages
+    assert (command.velocity_north_mps, command.velocity_east_mps) == (0.0, 0.0)
+    assert command.yaw_valid is True
+    assert command.yaw_enu_rad == 1.2
+
+
+@pytest.mark.parametrize("yaw", [None, math.nan, math.inf, -math.inf])
+def test_patch5_zero_yaw_api_rejects_invalid_yaw_to_no_yaw_stop(yaw):
+    node, _ = rpp(True)
+    msg = Vector()
+    assert node.velocity_pub.publish_zero_with_yaw(msg, yaw) is False
+    command, = node.publishers[0].messages
+    assert (command.velocity_north_mps, command.velocity_east_mps) == (0.0, 0.0)
+    assert command.yaw_valid is False
+    assert command.yaw_enu_rad == 0.0
+
+
+def test_patch5_zero_yaw_api_rejects_nonzero_translation():
+    node, _ = rpp(True)
+    msg = Vector()
+    msg.vector.x = 0.01
+    assert node.velocity_pub.publish_zero_with_yaw(msg, 1.2) is False
+    command, = node.publishers[0].messages
+    assert (command.velocity_north_mps, command.velocity_east_mps) == (0.0, 0.0)
+    assert command.yaw_valid is False
+
+
+def _patch5_pivot_deps(node):
+    node.MAXIMUM_MOVING_SPEED_MPS = 1.0
+    node.cruise_speed = 1.0
+    node.segment_alignment_speed = 1.0
+    node.current_yaw = 0.0
+    node.command_slew_speed = 0.0
+    node.command_slew_last_time = None
+    node.terminal_native_pivot_true_bearing = 0.25
+    node.legacy_alignment = NS(phase=NS(value="NATIVE_PIVOT"))
+    node.reset_speed_profiles = lambda: None
+    node.reset_acceleration_profile = lambda: None
+    node.reset_deceleration_profile = lambda: None
+    node.acceleration_speed_limit = lambda v: v
+    node.command_speed_slew_limit = lambda v: v
+    node.publish_motion_profile_monitor = lambda v: None
+    node.ground_xtrack = lambda v: v
+    node.normalize_angle = lambda v: math.atan2(math.sin(v), math.cos(v))
+    node.log_control = lambda *a, **kw: None
+
+
+def test_patch5_b_pivot_is_zero_translation_with_exact_true_bearing():
+    node, env = rpp(True)
+    _patch5_pivot_deps(node)
+    execute([method(RPP, "RPPController", "_publish_legacy_native_carrier")], env)
+    result = env["_publish_legacy_native_carrier"](
+        node, math.radians(60.0), 0.8, 0.01, "", 2.0, 3.0,
+        "PX4 PIVOT KEEPER / NATIVE TURN HELD",
+    )
+    assert result == (0.0, 0.0, 0.0)
+    command, = node.publishers[0].messages
+    assert (command.velocity_north_mps, command.velocity_east_mps) == (0.0, 0.0)
+    assert command.yaw_valid is True
+    assert command.yaw_enu_rad == 0.25
+    assert command.yaw_enu_rad != pytest.approx(math.radians(60.0))
+
+
+def test_patch5_a_pivot_preserves_legacy_60deg_carrier_vector():
+    node, env = rpp(False)
+    _patch5_pivot_deps(node)
+    execute([method(RPP, "RPPController", "publish_velocity_ned")], env)
+    node.publish_velocity_ned = env["publish_velocity_ned"].__get__(node)
+    execute([method(RPP, "RPPController", "_publish_legacy_native_carrier")], env)
+    request = math.radians(60.0)
+    north, east, speed = env["_publish_legacy_native_carrier"](
+        node, request, 0.8, 0.01, "", 2.0, 3.0,
+        "PX4 PIVOT KEEPER / NATIVE TURN HELD",
+    )
+    assert speed == 1.0
+    assert north == pytest.approx(math.sin(request))
+    assert east == pytest.approx(math.cos(request))
+    message, = node.publishers[0].messages
+    assert message.vector.x == pytest.approx(math.sin(request))
+    assert message.vector.y == pytest.approx(math.cos(request))
+    assert message.vector.z == 0.0
+
+
+def test_patch5_has_no_yaw_rate_or_vector_reconstruction_in_pivot_transport():
+    pivot = ast.unparse(method(RPP, "RPPController", "_publish_legacy_native_carrier"))
+    adapter = ast.unparse(class_ast(RPP, "_ExplicitYawStagingPublisher"))
+    assert "publish_zero_with_yaw" in pivot
+    assert "terminal_native_pivot_true_bearing" in pivot
+    assert "yaw_enu_rad=request_bearing" in pivot
+    assert "atan2" not in adapter
+    assert "yaw_rate" not in adapter

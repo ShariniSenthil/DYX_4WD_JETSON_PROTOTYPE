@@ -82,7 +82,7 @@ TERMINAL_FLOOR_SPEED_MPS = 0.15
 TERMINAL_STOP_MODE = "radial20"
 
 # Restart-only command transport authority shared by RPP and the bridge.
-RPP_EXPLICIT_YAW_ENABLED = True
+RPP_EXPLICIT_YAW_ENABLED = False
 
 
 def generate_launch_description() -> LaunchDescription:

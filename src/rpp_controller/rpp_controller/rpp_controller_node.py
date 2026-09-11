@@ -5239,6 +5239,53 @@ class RPPController(Node):
         goal_distance,
         status_prefix,
     ):
+        if self.rpp_explicit_yaw_enabled:
+            true_bearing = self.terminal_native_pivot_true_bearing
+            if true_bearing is None or not math.isfinite(float(true_bearing)):
+                raise RuntimeError(
+                    "explicit-yaw pivot lacks finite latched true bearing"
+                )
+
+            # Patch 5 B: true zero-translation absolute-yaw pivot.
+            self.reset_speed_profiles()
+            self.command_slew_speed = 0.0
+            self.command_slew_last_time = None
+
+            message = Vector3Stamped()
+            message.header.stamp = self.get_clock().now().to_msg()
+            message.header.frame_id = "map_ned"
+            message.vector.x = 0.0
+            message.vector.y = 0.0
+            message.vector.z = 0.0
+            if not self.velocity_pub.publish_zero_with_yaw(
+                message,
+                float(true_bearing),
+            ):
+                raise RuntimeError(
+                    "B-side zero-translation explicit-yaw pivot rejected"
+                )
+
+            self.publish_motion_profile_monitor(0.0)
+            north = east = speed = 0.0
+            self.log_control(
+                mode_prefix
+                + status_prefix
+                + " ZERO TRANSLATION + EXPLICIT YAW"
+                + f" | target_bearing={math.degrees(true_bearing):.1f}deg"
+                + f" | true_error={math.degrees(true_error):+.1f}deg"
+                + f" | xtrack="
+                + f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
+                + f" | phase={self.legacy_alignment.phase.value}",
+                target_distance,
+                goal_distance,
+                true_error,
+                speed,
+                north,
+                east,
+            )
+            return north, east, speed
+
+        # A / LEGACY_VELOCITY: preserve the existing carrier path exactly.
         speed = self.segment_alignment_speed
         north = speed * math.sin(request_bearing)
         east = speed * math.cos(request_bearing)
@@ -10341,6 +10388,44 @@ class _ExplicitYawStagingPublisher:
         command.yaw_enu_rad = 0.0
         command.yaw_valid = False
         self._publisher.publish(command)
+
+    def publish_zero_with_yaw(self, velocity_message, yaw_enu_rad):
+        """Publish intentional zero translation with authoritative ENU yaw.
+
+        Used only by the Patch-5 B-side pivot. Generic/safety zero publication
+        still goes through publish(), where yaw_valid is false.
+        """
+        try:
+            north = float(velocity_message.vector.x)
+            east = float(velocity_message.vector.y)
+        except (AttributeError, TypeError, ValueError):
+            self.publish(velocity_message)
+            return False
+
+        if not all(math.isfinite(value) for value in (north, east)):
+            self.publish(velocity_message)
+            return False
+        if math.hypot(north, east) > 1.0e-9:
+            self.publish(velocity_message)
+            return False
+
+        try:
+            yaw = float(yaw_enu_rad)
+        except (TypeError, ValueError):
+            self.publish(velocity_message)
+            return False
+        if not math.isfinite(yaw):
+            self.publish(velocity_message)
+            return False
+
+        command = self._command_type()
+        command.header = velocity_message.header
+        command.velocity_north_mps = 0.0
+        command.velocity_east_mps = 0.0
+        command.yaw_enu_rad = yaw
+        command.yaw_valid = True
+        self._publisher.publish(command)
+        return True
 
     def publish_with_yaw(self, velocity_message, yaw_enu_rad):
         """Publish moving N/E velocity with exact owning ENU yaw.
