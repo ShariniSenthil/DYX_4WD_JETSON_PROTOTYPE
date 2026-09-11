@@ -299,7 +299,7 @@ class Settings:
     @property
     def default_dummy_point_distance_m(self) -> float:
         """Default navigation-only dummy-point distance."""
-        return 3.5
+        return 4.0
 
     @property
     def trajectory_prepare_timeout_seconds(self) -> float:
@@ -439,7 +439,7 @@ def load_settings() -> Settings:
         ),
         extension_trigger_distance_m=_read_float(
             "DYX_EXTENSION_TRIGGER_DISTANCE_M",
-            2.0,
+            3.0,
             minimum=0.1,
         ),
         telemetry_broadcast_hz=_read_float(

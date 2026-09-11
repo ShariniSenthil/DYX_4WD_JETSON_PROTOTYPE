@@ -115,6 +115,20 @@ class TrajectoryGenerator(Node):
     POINT_TYPE_DUMMY_ALIGNMENT = 1
     POINT_TYPE_MARKING = 2
 
+    # Production extension rule.
+    # The trajectory generator intentionally owns these values so an older
+    # frontend/metadata file cannot silently restore the legacy 2.0 m / 3.5 m
+    # behaviour. Backend defaults are patched to the same values below.
+    EXTENSION_TRIGGER_DISTANCE_M = 3.0
+    EXTENSION_DISTANCE_M = 4.0
+
+    # Extension is a row-end manoeuvre, not a generic short-segment rule.
+    # The short transfer must be sideways relative to the incoming row and
+    # the following row must reverse direction (serpentine/U-turn geometry).
+    ROW_TRANSFER_MIN_ANGLE_DEG = 45.0
+    ROW_TRANSFER_MAX_ANGLE_DEG = 135.0
+    ROW_REVERSAL_MIN_ANGLE_DEG = 135.0
+
     LATITUDE_HEADERS = (
         "latitude",
         "lat",
@@ -889,14 +903,12 @@ class TrajectoryGenerator(Node):
 
                 self.extension_mode = str(metadata["extension_mode"]).strip().upper()
 
-                self.row_transition_threshold_m = float(
-                    metadata["row_transition_threshold_m"]
-                )
-
-                dummy_value = metadata.get("dummy_point_distance_m")
+                self.row_transition_threshold_m = self.EXTENSION_TRIGGER_DISTANCE_M
 
                 self.dummy_point_distance_m = (
-                    float(dummy_value) if dummy_value is not None else None
+                    self.EXTENSION_DISTANCE_M
+                    if self.extension_mode == "ENABLE"
+                    else None
                 )
 
                 self.mission_id = str(metadata["mission_id"])
@@ -1896,14 +1908,91 @@ class TrajectoryGenerator(Node):
                 marking_index=(final_marking_index if is_final else -1),
             )
 
+    @staticmethod
+    def _angle_between_vectors_deg(
+        first: tuple[float, float],
+        second: tuple[float, float],
+    ) -> float:
+        first_length = math.hypot(first[0], first[1])
+        second_length = math.hypot(second[0], second[1])
+
+        if first_length <= 0.0 or second_length <= 0.0:
+            raise ValueError("Cannot calculate extension angle from zero vector")
+
+        cosine = (
+            first[0] * second[0] + first[1] * second[1]
+        ) / (first_length * second_length)
+        cosine = max(-1.0, min(1.0, cosine))
+        return math.degrees(math.acos(cosine))
+
+    def _extension_transition_geometry(
+        self,
+        *,
+        marking_points: list[tuple[float, float]],
+        index: int,
+    ) -> tuple[bool, tuple[float, float] | None, float | None, float | None]:
+        """Return whether this short gap is a true row-end transition.
+
+        Interior row end:
+            incoming heading = previous marking -> current marking.
+
+        First marking row end:
+            there is no previous surveyed marking, so infer incoming heading
+            as the reverse of next marking -> following marking. This gives
+            the requested P1-heading behaviour for a serpentine mission.
+
+        Short points on one straight bearing therefore never create an
+        extension point.
+        """
+
+        following_index = index + 2
+        if following_index >= len(marking_points):
+            return False, None, None, None
+
+        current = marking_points[index]
+        next_marking = marking_points[index + 1]
+        following = marking_points[following_index]
+
+        transfer = (
+            next_marking[0] - current[0],
+            next_marking[1] - current[1],
+        )
+        outgoing = (
+            following[0] - next_marking[0],
+            following[1] - next_marking[1],
+        )
+
+        if index > 0:
+            previous = marking_points[index - 1]
+            incoming = (
+                current[0] - previous[0],
+                current[1] - previous[1],
+            )
+        else:
+            # P1 has no previous surveyed point. In a serpentine row turn,
+            # P2 -> P3 runs opposite to the heading into P1.
+            incoming = (-outgoing[0], -outgoing[1])
+
+        transfer_angle = self._angle_between_vectors_deg(incoming, transfer)
+        reversal_angle = self._angle_between_vectors_deg(incoming, outgoing)
+
+        use_extension = (
+            self.ROW_TRANSFER_MIN_ANGLE_DEG
+            <= transfer_angle
+            <= self.ROW_TRANSFER_MAX_ANGLE_DEG
+            and reversal_angle >= self.ROW_REVERSAL_MIN_ANGLE_DEG
+        )
+
+        return use_extension, incoming, transfer_angle, reversal_angle
+
     def _calculate_dummy_point(
         self,
         *,
-        new_row_first: tuple[
+        row_endpoint: tuple[
             float,
             float,
         ],
-        new_row_second: tuple[
+        incoming_direction: tuple[
             float,
             float,
         ],
@@ -1911,9 +2000,8 @@ class TrajectoryGenerator(Node):
         if self.dummy_point_distance_m is None:
             raise ValueError("Dummy-point distance unavailable")
 
-        direction_x = new_row_second[0] - new_row_first[0]
-
-        direction_y = new_row_second[1] - new_row_first[1]
+        direction_x = incoming_direction[0]
+        direction_y = incoming_direction[1]
 
         direction_length = math.hypot(
             direction_x,
@@ -1922,7 +2010,7 @@ class TrajectoryGenerator(Node):
 
         if direction_length < self.minimum_segment_length_m:
             raise ValueError(
-                "Cannot determine new-row " "direction from duplicate points"
+                "Cannot determine incoming row heading for extension point"
             )
 
         unit_x = direction_x / direction_length
@@ -1930,8 +2018,8 @@ class TrajectoryGenerator(Node):
         unit_y = direction_y / direction_length
 
         return (
-            new_row_first[0] - unit_x * self.dummy_point_distance_m,
-            new_row_first[1] - unit_y * self.dummy_point_distance_m,
+            row_endpoint[0] + unit_x * self.dummy_point_distance_m,
+            row_endpoint[1] + unit_y * self.dummy_point_distance_m,
         )
 
     def _generate_navigation_path(
@@ -1988,20 +2076,24 @@ class TrajectoryGenerator(Node):
             )
 
             if use_dummy:
-                following_index = index + 2
-                if following_index >= len(marking_points):
-                    raise ValueError(
-                        "A short transition was "
-                        "detected before the final "
-                        "marking point, but there is "
-                        "no following point to determine "
-                        "the next-row direction"
-                    )
+                (
+                    use_dummy,
+                    incoming_direction,
+                    transfer_angle,
+                    reversal_angle,
+                ) = self._extension_transition_geometry(
+                    marking_points=marking_points,
+                    index=index,
+                )
 
-                following_marking = marking_points[following_index]
+            if use_dummy:
+                assert incoming_direction is not None
+                assert transfer_angle is not None
+                assert reversal_angle is not None
+
                 dummy_point = self._calculate_dummy_point(
-                    new_row_first=(next_marking),
-                    new_row_second=(following_marking),
+                    row_endpoint=current_marking,
+                    incoming_direction=incoming_direction,
                 )
 
                 clearance_from_current = self._distance(
@@ -2011,9 +2103,7 @@ class TrajectoryGenerator(Node):
                 if clearance_from_current < self.minimum_dummy_clearance_m:
                     raise ValueError(
                         "Calculated dummy point is "
-                        "too close to the previous-row "
-                        "endpoint. Change the frontend "
-                        "dummy-point distance."
+                        "too close to the row endpoint"
                     )
 
                 self._append_interpolated_segment(
@@ -2043,8 +2133,9 @@ class TrajectoryGenerator(Node):
                     f"gap={transition_distance:.3f} m | "
                     f"Dummy=({dummy_point[0]:.3f}, "
                     f"{dummy_point[1]:.3f}) | "
-                    f"direction={index + 2} -> "
-                    f"{index + 3}"
+                    f"incoming_heading_extended_from=P{index + 1} | "
+                    f"transfer_angle={transfer_angle:.1f}deg | "
+                    f"row_reversal={reversal_angle:.1f}deg"
                 )
             else:
                 self._append_interpolated_segment(
