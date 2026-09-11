@@ -11,7 +11,7 @@ mission_manager owns only:
   * START/PAUSE/RESUME/NEXT/SKIP/STOP/CLEAR
   * hard E-stop and soft mission-enable gate
   * PX4 OFFBOARD/arming orchestration; STOP disarms but never requests MANUAL
-  * RTK pre-check and runtime RTK pause/recovery indication
+  * RTK pre-check, runtime FLOAT warning and RTK recovery indication
   * exact radial marking validation and stationary verification
   * spray request/result handshake
   * COMPLETED/FAILED/SKIPPED state
@@ -79,9 +79,9 @@ class MissionManager(Node):
     SAFETY_PUBLISH_HZ = 2.0
 
     FCU_STATE_STALE_SEC = 3.0
-    GPS_FIX_STALE_SEC = 2.0
+    GPS_FIX_STALE_SEC = 10.0
     RTK_STATUS_STALE_SEC = 15.0
-    MAX_RTK_CORRECTION_AGE_SEC = 15.0
+    MAX_RTK_CORRECTION_AGE_SEC = 20.0
     OFFBOARD_STREAM_SETTLE_SEC = 0.60
     SERVICE_DISCOVERY_TIMEOUT_SEC = 3.0
     SERVICE_RESPONSE_TIMEOUT_SEC = 5.0
@@ -614,6 +614,11 @@ class MissionManager(Node):
         self._last_rtk_health_rx_monotonic: Optional[float] = None
         self._rtk_correction_age_sec: Optional[float] = None
         self._last_rtk_age_rx_monotonic: Optional[float] = None
+
+        # Fresh RTK FLOAT is warning-only once a mission is already RUNNING.
+        # This latch prevents repeated warning events at the control-loop rate.
+        self._rtk_float_warning_active = False
+
         self._backend_heartbeat_healthy = False
 
         self._start_stage = "IDLE"
@@ -1625,13 +1630,57 @@ class MissionManager(Node):
         )
 
     def _monitor_runtime_rtk(self) -> None:
-        """Pause a RUNNING mission only when RTK FIXED is actually lost.
+        """Keep fresh RTK FLOAT warning-only while a mission is RUNNING.
 
-        Fresh fix_type=6 keeps running. FLOAT, lower fix types, or stale GPSRAW
-        disable motion and pause. Correction-age/health remain monitor-only.
+        Runtime policy:
+          * fresh fix_type=6: continue normally;
+          * fresh fix_type=5 (RTK FLOAT): continue motion and notify once;
+          * stale GPSRAW or fix_type < 5: preserve the existing pause behavior.
+
+        START/RESUME/NEXT still use _rtk_motion_ok(), so they continue to
+        require a fresh RTK FIXED solution before granting motion authority.
+        Correction-age/health remain monitor-only.
         """
+        if self._state != "RUNNING":
+            self._rtk_float_warning_active = False
+            return
+
+        gps_age = self._age(self._last_gps_fix_rx_monotonic)
+
+        # Fresh RTK FLOAT is degraded accuracy, not a runtime stop condition.
+        if gps_age <= self.GPS_FIX_STALE_SEC and self._gps_fix_type == 5:
+            if not self._rtk_float_warning_active:
+                self._rtk_float_warning_active = True
+                self._last_message = (
+                    "RTK FLOAT (fix_type=5); mission continuing - "
+                    "position accuracy degraded"
+                )
+                self._emit_system_event(
+                    "RTK_FLOAT",
+                    self._last_message,
+                )
+                self._publish_status(force=True)
+            return
+
+        # One recovery event when FLOAT returns to a fresh FIXED solution.
+        if gps_age <= self.GPS_FIX_STALE_SEC and self._gps_fix_type == 6:
+            if self._rtk_float_warning_active:
+                self._rtk_float_warning_active = False
+                self._last_message = (
+                    "RTK FIXED recovered; mission continuing normally"
+                )
+                self._emit_system_event(
+                    "RTK_RECOVERED",
+                    self._last_message,
+                )
+                self._publish_status(force=True)
+            return
+
+        # Severe GNSS loss keeps the existing fail-safe pause behavior.
+        self._rtk_float_warning_active = False
         ok, reason = self._rtk_motion_ok()
-        if self._state == "RUNNING" and not ok:
+
+        if not ok:
             self._pause_reason = "RTK_LOST"
             self._resume_available = False
             self._state = "PAUSED"
