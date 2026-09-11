@@ -701,7 +701,7 @@ class RPPController(Node):
         # is about to drive; only the entry leg used to rebuild its line from
         # the post-pivot position, and it is the only leg that lands inside
         # the 30 mm marking latch. Set False to restore entry-leg-only.
-        self.declare_parameter("post_pivot_reanchor_all_legs", True)
+        self.declare_parameter("post_pivot_reanchor_all_legs", False
 
         self.local_frame = str(self.get_parameter("local_frame").value).strip()
         self.cruise_speed = float(self.get_parameter("cruise_speed_mps").value)
