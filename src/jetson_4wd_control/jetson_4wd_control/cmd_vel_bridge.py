@@ -222,6 +222,17 @@ class CmdVelBridge(Node):
         self.last_heartbeat_health = None
         self.last_log_time = self.get_clock().now()
 
+        # Phase-0 dropout instrumentation. The 1 Hz summary below cannot
+        # observe a transient: at 50 Hz a one-cycle reason change is sampled
+        # with probability 0.02. Mid-pivot yaw loss and stream stalls are both
+        # transients, so they are edge-logged here instead.
+        self._previous_reason = None
+        self._previous_reason_time = self.get_clock().now()
+        self._previous_yaw_valid = False
+        self._previous_loop_time = None
+        self._late_cycle_count = 0
+        self._yaw_drop_count = 0
+
         self._publish_heartbeat_health(False, force=True)
         self.timer = self.create_timer(
             1.0 / self.STREAM_HZ,
@@ -433,6 +444,21 @@ class CmdVelBridge(Node):
         self.setpoint_pub.publish(message)
 
     def _control_loop(self) -> None:
+        loop_time = self.get_clock().now()
+        if self._previous_loop_time is not None:
+            interval = (
+                loop_time - self._previous_loop_time
+            ).nanoseconds / 1e9
+            if interval > 2.0 / self.STREAM_HZ:
+                self._late_cycle_count += 1
+                self.get_logger().warn(
+                    "BRIDGE STREAM LATE | "
+                    f"interval={interval * 1000.0:.1f}ms "
+                    f"expected={1000.0 / self.STREAM_HZ:.1f}ms "
+                    f"lateCycles={self._late_cycle_count}"
+                )
+        self._previous_loop_time = loop_time
+
         north = 0.0
         east = 0.0
         yaw_enu = 0.0
@@ -490,6 +516,31 @@ class CmdVelBridge(Node):
             yaw_enu_rad=yaw_enu,
             yaw_valid=yaw_valid,
         )
+
+        if self._previous_yaw_valid and not yaw_valid:
+            self._yaw_drop_count += 1
+            self.get_logger().warn(
+                "EXPLICIT YAW DROPPED | "
+                f"reason={reason} "
+                f"previousReason={self._previous_reason} "
+                f"commandAge={self._age_seconds(self.latest_command_time):.3f}s "
+                f"vN={north:.3f} vE={east:.3f} "
+                f"yawDrops={self._yaw_drop_count}"
+            )
+        self._previous_yaw_valid = yaw_valid
+
+        if reason != self._previous_reason:
+            if self._previous_reason is not None:
+                dwell = (
+                    loop_time - self._previous_reason_time
+                ).nanoseconds / 1e9
+                self.get_logger().info(
+                    "BRIDGE REASON CHANGE | "
+                    f"{self._previous_reason} -> {reason} | "
+                    f"previousHeld={dwell:.3f}s"
+                )
+            self._previous_reason = reason
+            self._previous_reason_time = loop_time
 
         now = self.get_clock().now()
         if (now - self.last_log_time).nanoseconds >= 1_000_000_000:
