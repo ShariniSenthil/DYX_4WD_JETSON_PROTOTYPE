@@ -807,7 +807,7 @@ def generate_launch_description() -> LaunchDescription:
                         #
                         # Set False to restore entry-leg-only reanchoring
                         # without a code rollback.
-                        "post_pivot_reanchor_all_legs": True,
+                        "post_pivot_reanchor_all_legs": False,
                         "precision_pivot_recapture_xtrack_m": 0.020,
                         "precision_pivot_recapture_heading_deg": 2.0,
                         "precision_pivot_recapture_settle_sec": 0.20,
