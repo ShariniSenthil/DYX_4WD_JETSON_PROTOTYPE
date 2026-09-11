@@ -2014,7 +2014,7 @@ class RPPController(Node):
         self.terminal_native_pivot_true_bearing = None
         self.terminal_native_pivot_request_bearing = None  # legacy, unused
         self.terminal_native_pivot_reason = ""
-        self._pivot_hold_fallback_context = None
+        self._pivot_hold_outcome = None
 
         # Straight-segment acceleration state. It is reset by every literal
         # zero, every new segment goal, mission disable and native pivot.
@@ -5432,9 +5432,16 @@ class RPPController(Node):
             return True
 
         if result.directive is LegacyAlignmentDirective.HOLD_ZERO:
-            self.publish_pivot_hold(
-                f"HOLD_ZERO/{result.transition_reason or result.phase.value}"
-            )
+            # Deliberately a literal stop, not publish_pivot_hold(). HOLD_ZERO
+            # is the settle phase: the turn is already finished and the rover
+            # is waiting on the estimator. Holding the target here would leave
+            # a small residual yaw error, the FCU attitude gain would turn that
+            # into a rate demand above its rate deadband, and the FCU's
+            # stationary-pivot breakaway floor would then drive differential
+            # right through the settle window and defeat the gate. Surrendering
+            # the target lets PX4 hold current heading at zero error, which is
+            # what lets the chassis settle.
+            self.publish_stop()
             return True
 
         if result.directive is LegacyAlignmentDirective.REANCHOR_ZERO:
@@ -7129,11 +7136,16 @@ class RPPController(Node):
         """Hold zero translation without surrendering the pivot yaw target.
 
         A stationary pivot and a stop are the same wire command apart from
-        yaw_valid, so a bare publish_stop() inside an active pivot makes PX4
-        fall back to bearing = vehicle_yaw and abandon the target mid-turn.
-        Safety stops must keep calling publish_stop(); only in-pivot holds
-        belong here. Falls back to a literal stop whenever the latched pivot
-        bearing is unusable, so this can never invent a heading.
+        yaw_valid, so a bare publish_stop() while the turn is still running
+        makes PX4 fall back to bearing = vehicle_yaw and abandon the target
+        mid-rotation.
+
+        Scope is deliberately one call site: the inactive-NATIVE_CARRIER path,
+        where the turn is unfinished and the latch is still live. Settle-phase
+        holds must NOT come here - see the comment at the HOLD_ZERO directive.
+        Safety stops keep calling publish_stop(). Falls back to a literal stop
+        whenever the latched bearing is unusable, so it cannot invent a
+        heading.
         """
         true_bearing = self.terminal_native_pivot_true_bearing
         usable = (
@@ -7155,11 +7167,17 @@ class RPPController(Node):
                 float(true_bearing),
             ):
                 self._record_rpp_debug_command(0.0, 0.0, 0.0)
-                self._pivot_hold_fallback_context = None
+                if self._pivot_hold_outcome != ("held", context):
+                    self._pivot_hold_outcome = ("held", context)
+                    self.get_logger().warn(
+                        "PIVOT HOLD ACTIVE / YAW TARGET RETAINED | "
+                        f"context={context} | "
+                        f"bearing={math.degrees(float(true_bearing)):+.2f}deg"
+                    )
                 return True
 
-        if self._pivot_hold_fallback_context != context:
-            self._pivot_hold_fallback_context = context
+        if self._pivot_hold_outcome != ("fallback", context):
+            self._pivot_hold_outcome = ("fallback", context)
             self.get_logger().warn(
                 "PIVOT HOLD FELL BACK TO LITERAL STOP / YAW TARGET LOST | "
                 f"context={context} | "
