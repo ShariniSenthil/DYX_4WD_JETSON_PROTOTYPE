@@ -67,3 +67,14 @@ CLAUDE.md
 .claude/skills/rover-ship/SKILL.md
 PX4-Autopilot*
 .cursor/
+docs/DYX_4WD_GNSS_EKF2_Stale_Fusion_Position_Offset_Audit.md
+docs/production_risk_audit_ekf2_septentrio.md
+docs/config-receiver/2026-09-11_aux1_manual_raw.jsonl
+docs/config-receiver/2026-09-11_Full_Comparison_Against_September_10.md
+docs/config-receiver/2026-09-11_Mosaic_No_PX4_GPS_Cause.md
+docs/config-receiver/2026-09-11_px4_config_raw.txt
+docs/config-receiver/2026-09-11_px4_param_comparison.json
+docs/config-receiver/2026-09-11_receiver_config_raw.jsonl
+docs/config-receiver/2026-09-11_receiver_restoration_raw.jsonl
+docs/patches/apply_patch5_zero_translation_pivot_v2.py
+docs/patches/apply_patch5_zero_translation_pivot.py
