@@ -29,6 +29,21 @@ MISSION_METADATA_FILE = (
     "/home/flash/.local/share/" "dyx_rover/runtime/mission_metadata.json"
 )
 
+# Stable device identity for the Pixhawk FCU -- deliberately NOT a bare
+# /dev/ttyACM<N> path. ttyACM* numbering is assigned by USB enumeration
+# ORDER, which is not guaranteed stable across a reboot or a replug of ANY
+# device on the bus, not just the FCU itself. Confirmed 2026-09-11: after the
+# Mosaic-H receiver was unplugged and replugged during a field test, the
+# Pixhawk's number shifted from ttyACM0 to ttyACM2 and MAVROS silently opened
+# the Septentrio receiver instead -- no error, just permanently
+# connected: false, because it had the wrong device open, not a dead one.
+# The by-id symlink is derived from the device's own USB descriptor
+# (vendor/product/interface), not plug order, so it survives any other
+# device on the bus being replugged. This mirrors the same fix already
+# applied to the Mosaic-H's direct RTCM injection device
+# (see docs/RTCM_DIRECT_INJECTION_AB_REVIEW_PLAN.md).
+FCU_DEVICE_PATH = "/dev/serial/by-id/usb-Auterion_PX4_FMU_v6X.x_0-if00"
+
 # Field-test cruise speed. Forward line capture and normal xtrack recovery
 # target this value; the only planned reductions are the start ramp and the
 # final semantic-goal deceleration needed to stop. Every other speed below
@@ -79,7 +94,7 @@ def generate_launch_description() -> LaunchDescription:
             "/opt/ros/humble/setup.bash && "
             "ros2 launch mavros node.launch "
             "fcu_url:="
-            "/dev/ttyACM0:921600 "
+            f"{FCU_DEVICE_PATH}:921600 "
             "gcs_url:="
             "udp://:14550@192.168.3.105:14550 "
             "pluginlists_yaml:="
