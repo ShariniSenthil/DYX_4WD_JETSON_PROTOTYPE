@@ -131,20 +131,43 @@ def test_precision_publication_bypasses_competing_legacy_profiles():
     }.issubset(legacy_calls)
 
 
-def test_legacy_publisher_and_native_pivot_math_remain_byte_exact():
-    expected_hashes = {
-        "publish_velocity_ned": (
-            "006983971b3315179d85a6eeab703ca8093dbcae2634a19157b5b489b68f0627"
-        ),
-        "terminal_native_pivot_command": (
-            "ab1a69086a10d69a3719dea04fdfd772887dfec02ee318020c47e93b3e0cea00"
-        ),
-    }
-    for method_name, expected in expected_hashes.items():
-        digest = hashlib.sha256(
-            _method_source(method_name).encode("utf-8")
-        ).hexdigest()
-        assert digest == expected
+def test_legacy_publisher_mode_a_transport_remains_direct():
+    publication = _method("publish_velocity_ned")
+
+    legacy_calls = _called_attributes("publish_velocity_ned")
+    assert {
+        "acceleration_speed_limit",
+        "deceleration_speed_limit",
+        "command_speed_slew_limit",
+    }.issubset(legacy_calls)
+
+    selections = [
+        node
+        for node in publication.body
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "self.rpp_explicit_yaw_enabled"
+    ]
+    assert len(selections) == 1
+
+    selection = selections[0]
+    b_source = "\n".join(ast.unparse(node) for node in selection.body)
+    a_source = "\n".join(ast.unparse(node) for node in selection.orelse)
+
+    assert "publish_with_yaw(msg, yaw_enu_rad)" in b_source
+    assert "self.velocity_pub.publish(msg)" not in b_source
+
+    assert "self.velocity_pub.publish(msg)" in a_source
+    assert "publish_with_yaw" not in a_source
+
+
+def test_native_pivot_math_remains_byte_exact():
+    expected = (
+        "ab1a69086a10d69a3719dea04fdfd772887dfec02ee318020c47e93b3e0cea00"
+    )
+    digest = hashlib.sha256(
+        _method_source("terminal_native_pivot_command").encode("utf-8")
+    ).hexdigest()
+    assert digest == expected
 
 
 def test_native_pivot_carrier_remains_on_legacy_publication_path():

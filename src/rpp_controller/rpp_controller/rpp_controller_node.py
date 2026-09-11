@@ -1652,15 +1652,17 @@ class RPPController(Node):
         )
 
         if self.rpp_explicit_yaw_enabled:
-            # Keep both existing publication sites unchanged. This adapter owns
-            # only the atomic publisher and cannot publish a legacy command.
+            # Patch 3 carries the exact owning-call-site ENU yaw beside the
+            # final N/E velocity. The Patch-2 bridge still rejects every B
+            # command, so field actuation remains disabled until Patch 4.
             self.velocity_pub = _ExplicitYawStagingPublisher(
                 self.create_publisher(RppCommand, "/rpp/command", command_qos),
                 RppCommand,
             )
             self.get_logger().warn(
                 "RPP startup contract: B / EXPLICIT_YAW | "
-                "Patch 2 staging: zero velocity, yaw_valid=false; actuation disabled"
+                "Patch 3 atomic velocity+yaw active; "
+                "bridge still rejects B; actuation disabled"
             )
         else:
             self.velocity_pub = self.create_publisher(
@@ -4869,6 +4871,7 @@ class RPPController(Node):
             apply_acceleration=False,
             apply_deceleration=False,
             hard_speed_cap_mps=speed,
+            yaw_enu_rad=command_bearing,
         )
 
     def _publish_reanchor_debug(
@@ -5152,6 +5155,7 @@ class RPPController(Node):
                 east,
                 apply_acceleration=False,
                 apply_deceleration=False,
+                yaw_enu_rad=carrier_bearing,
             )
             return True
 
@@ -5187,6 +5191,7 @@ class RPPController(Node):
                 apply_acceleration=False,
                 apply_deceleration=False,
                 hard_speed_cap_mps=speed,
+                yaw_enu_rad=command_bearing,
             )
             return True
 
@@ -5243,6 +5248,7 @@ class RPPController(Node):
             east,
             apply_acceleration=False,
             apply_deceleration=False,
+            yaw_enu_rad=request_bearing,
         )
         carrier_error = self.normalize_angle(request_bearing - self.current_yaw)
         self.log_control(
@@ -5531,6 +5537,7 @@ class RPPController(Node):
                 east,
                 apply_acceleration=True,
                 apply_deceleration=False,
+                yaw_enu_rad=command_bearing,
             )
             self._record_published_translational_speed(speed)
         self.log_control(
@@ -6957,7 +6964,17 @@ class RPPController(Node):
         msg.vector.x = float(north)
         msg.vector.y = float(east)
         msg.vector.z = 0.0
-        self.velocity_pub.publish(msg)
+        if self.rpp_explicit_yaw_enabled:
+            if not self.velocity_pub.publish_with_yaw(msg, command_bearing):
+                self.get_logger().error(
+                    "B-SIDE PRECISION COMMAND LOST EXPLICIT YAW / IMMEDIATE ZERO"
+                )
+                self._reset_precision_regulator("EXPLICIT_YAW_COMMAND_REJECTED")
+                self._record_published_translational_speed(0.0)
+                self.publish_motion_profile_monitor(0.0)
+                return 0.0, 0.0, 0.0
+        else:
+            self.velocity_pub.publish(msg)
         self._record_published_translational_speed(output_speed)
         self._record_precision_tracking_metrics(output_speed)
         self.publish_motion_profile_monitor(output_speed)
@@ -6977,6 +6994,7 @@ class RPPController(Node):
         apply_deceleration=False,
         goal_distance=None,
         hard_speed_cap_mps=None,
+        yaw_enu_rad=None,
     ):
         if not all(math.isfinite(value) for value in (north, east)):
             self.get_logger().error("Rejected non-finite RPP velocity command")
@@ -7057,7 +7075,19 @@ class RPPController(Node):
         msg.vector.x = float(north)
         msg.vector.y = float(east)
         msg.vector.z = 0.0
-        self.velocity_pub.publish(msg)
+        if self.rpp_explicit_yaw_enabled:
+            if not self.velocity_pub.publish_with_yaw(msg, yaw_enu_rad):
+                self.get_logger().error(
+                    "B-SIDE MOVING COMMAND WITHOUT FINITE EXPLICIT YAW / "
+                    "IMMEDIATE ZERO"
+                )
+                self.reset_speed_profiles()
+                self.command_slew_speed = 0.0
+                self.command_slew_last_time = None
+                self.publish_motion_profile_monitor(0.0)
+                return 0.0, 0.0, 0.0
+        else:
+            self.velocity_pub.publish(msg)
         self.publish_motion_profile_monitor(output_speed)
         return north, east, output_speed
 
@@ -9675,6 +9705,7 @@ class RPPController(Node):
                 apply_acceleration=True,
                 apply_deceleration=False,
                 hard_speed_cap_mps=speed,
+                yaw_enu_rad=guidance_bearing,
             )
             self._record_published_translational_speed(published_speed)
             self.log_control(
@@ -10022,6 +10053,7 @@ class RPPController(Node):
                     apply_acceleration=True,
                     apply_deceleration=False,
                     hard_speed_cap_mps=self.xtrack_priority_speed,
+                    yaw_enu_rad=xtrack_guidance_bearing,
                 )
                 self._record_published_translational_speed(speed)
             self.log_control(
@@ -10155,6 +10187,7 @@ class RPPController(Node):
                 apply_deceleration=True,
                 goal_distance=along_remaining,
                 hard_speed_cap_mps=terminal_speed_cap,
+                yaw_enu_rad=guidance_bearing,
             )
             self._record_published_translational_speed(speed)
 
@@ -10262,6 +10295,7 @@ class RPPController(Node):
             north, east, speed = self.publish_velocity_ned(
                 north,
                 east,
+                yaw_enu_rad=guidance_bearing,
             )
             self._record_published_translational_speed(speed)
 
@@ -10288,15 +10322,19 @@ class RPPController(Node):
 
 
 class _ExplicitYawStagingPublisher:
-    """Adapt existing publication sites to atomic, stop-only Patch-2 output."""
+    """Fail-closed Patch-3 adapter for atomic velocity + owning ENU yaw."""
 
     def __init__(self, publisher, command_type):
         self._publisher = publisher
         self._command_type = command_type
 
     def publish(self, velocity_message):
-        # Phase 3 has not supplied owning-call-site yaw. Discard the vector:
-        # invalid yaw plus nonzero velocity could otherwise steer via PX4.
+        """Publish an atomic no-yaw stop.
+
+        This remains the behavior for every direct/legacy publication site
+        that has not explicitly supplied owning yaw. It is also the Patch-3
+        zero-command contract. Patch 5 will add intentional zero+yaw HOLD.
+        """
         command = self._command_type()
         command.header = velocity_message.header
         command.velocity_north_mps = 0.0
@@ -10304,6 +10342,46 @@ class _ExplicitYawStagingPublisher:
         command.yaw_enu_rad = 0.0
         command.yaw_valid = False
         self._publisher.publish(command)
+
+    def publish_with_yaw(self, velocity_message, yaw_enu_rad):
+        """Publish moving N/E velocity with exact owning ENU yaw.
+
+        Return False only when a nonzero command cannot be represented safely;
+        a no-yaw zero is published before False is returned.
+        """
+        try:
+            north = float(velocity_message.vector.x)
+            east = float(velocity_message.vector.y)
+        except (AttributeError, TypeError, ValueError):
+            self.publish(velocity_message)
+            return False
+
+        if not all(math.isfinite(value) for value in (north, east)):
+            self.publish(velocity_message)
+            return False
+
+        if math.hypot(north, east) <= 1.0e-9:
+            self.publish(velocity_message)
+            return True
+
+        try:
+            yaw = float(yaw_enu_rad)
+        except (TypeError, ValueError):
+            self.publish(velocity_message)
+            return False
+
+        if not math.isfinite(yaw):
+            self.publish(velocity_message)
+            return False
+
+        command = self._command_type()
+        command.header = velocity_message.header
+        command.velocity_north_mps = north
+        command.velocity_east_mps = east
+        command.yaw_enu_rad = yaw
+        command.yaw_valid = True
+        self._publisher.publish(command)
+        return True
 
 
 def main(args=None):

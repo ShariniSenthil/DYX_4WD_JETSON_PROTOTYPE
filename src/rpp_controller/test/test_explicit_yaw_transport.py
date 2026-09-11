@@ -1,4 +1,4 @@
-"""Patch-2 transport tests; ROS descriptor checks additionally run on Jetson."""
+"""Patch-3 RPP yaw propagation tests; bridge remains Patch-2 fail-closed."""
 
 import ast
 import math
@@ -227,16 +227,101 @@ def test_both_existing_rpp_publication_paths_use_selected_transport(enabled, pre
     node._publish_speed_debug = lambda *a, **kw: None
     name = "publish_precision_velocity_ned" if precision else "publish_velocity_ned"
     execute([method(RPP, "RPPController", name)], env)
-    args = (0.0, NS(requested_speed_mps=0.4)) if precision else (0.0, 0.4)
-    assert env[name](node, *args) == (0.0, 0.4, 0.4)
+
+    if precision:
+        result = env[name](node, 0.0, NS(requested_speed_mps=0.4))
+    else:
+        result = env[name](node, 0.0, 0.4, yaw_enu_rad=0.0)
+
+    assert result == (0.0, 0.4, 0.4)
     message, = node.publishers[0].messages
     assert message.header.frame_id == "map_ned"
     if enabled:
-        assert message.velocity_north_mps == message.velocity_east_mps == 0.0
-        assert message.yaw_valid is False
+        assert (message.velocity_north_mps, message.velocity_east_mps) == (0.0, 0.4)
+        assert message.yaw_valid is True
         assert message.yaw_enu_rad == 0.0
     else:
         assert (message.vector.x, message.vector.y, message.vector.z) == (0.0, 0.4, 0.0)
+
+
+@pytest.mark.parametrize("yaw", [None, math.nan, math.inf, -math.inf])
+def test_b_generic_moving_missing_or_nonfinite_yaw_fails_closed(yaw):
+    node, env = rpp(True)
+    node.MAXIMUM_MOVING_SPEED_MPS = 1.0
+    node.acceleration_speed_limit = node.command_speed_slew_limit = lambda v: v
+    node.reset_deceleration_profile = lambda: None
+    node.reset_speed_profiles = lambda: None
+    node.publish_motion_profile_monitor = lambda v: None
+    node.command_slew_speed = 0.0
+    node.command_slew_last_time = None
+    execute([method(RPP, "RPPController", "publish_velocity_ned")], env)
+
+    kwargs = {} if yaw is None else {"yaw_enu_rad": yaw}
+    result = env["publish_velocity_ned"](node, 0.3, 0.4, **kwargs)
+
+    assert result == (0.0, 0.0, 0.0)
+    message, = node.publishers[0].messages
+    assert (message.velocity_north_mps, message.velocity_east_mps) == (0.0, 0.0)
+    assert message.yaw_valid is False
+    assert message.yaw_enu_rad == 0.0
+    assert any("WITHOUT FINITE EXPLICIT YAW" in line for line in node.logs)
+
+
+def test_b_zero_translation_remains_yaw_invalid_in_patch3():
+    node, env = rpp(True)
+    node.MAXIMUM_MOVING_SPEED_MPS = 1.0
+    node.reset_speed_profiles = lambda: None
+    node.publish_motion_profile_monitor = lambda v: None
+    node.command_slew_speed = 0.0
+    node.command_slew_last_time = None
+    execute([method(RPP, "RPPController", "publish_velocity_ned")], env)
+
+    result = env["publish_velocity_ned"](
+        node,
+        0.0,
+        0.0,
+        yaw_enu_rad=1.2,
+    )
+
+    assert result == (0.0, 0.0, 0.0)
+    message, = node.publishers[0].messages
+    assert (message.velocity_north_mps, message.velocity_east_mps) == (0.0, 0.0)
+    assert message.yaw_valid is False
+    assert message.yaw_enu_rad == 0.0
+
+
+def test_every_generic_moving_call_site_supplies_owning_yaw():
+    tree = ast.parse(RPP.read_text())
+    calls = [
+        call
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "self"
+        and call.func.attr == "publish_velocity_ned"
+    ]
+
+    without_yaw = [
+        call
+        for call in calls
+        if not any(keyword.arg == "yaw_enu_rad" for keyword in call.keywords)
+    ]
+
+    # The only generic publication allowed to omit yaw is publish_stop():
+    # literal zero is still yaw_valid=false until Patch 5.
+    assert len(without_yaw) == 1
+    stop_call = without_yaw[0]
+    assert len(stop_call.args) >= 2
+    assert ast.literal_eval(stop_call.args[0]) == 0.0
+    assert ast.literal_eval(stop_call.args[1]) == 0.0
+
+
+def test_patch3_adapter_never_reconstructs_yaw_from_velocity():
+    adapter = ast.unparse(class_ast(RPP, "_ExplicitYawStagingPublisher"))
+    assert "atan2" not in adapter
+    assert "publish_with_yaw" in adapter
+    assert "yaw_valid = True" in adapter
 
 
 def make_ready(node):
