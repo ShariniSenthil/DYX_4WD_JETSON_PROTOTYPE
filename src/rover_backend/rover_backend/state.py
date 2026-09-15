@@ -355,6 +355,7 @@ class RoverState:
                 # True only after trajectory_generator has committed the
                 # fixed surveyed P1->Pn /nav_path.
                 "trajectory_ready": False,
+                "accepted_for_start": False,
                 "loaded": False,
                 "total_points": 0,
                 "navigation_point_count": 0,
@@ -570,9 +571,14 @@ class RoverState:
 
         mission["state"] = mission_state
 
+        mission["accepted_for_start"] = bool(
+            mission.get("accepted_for_start", False)
+        )
+
         if mission_state == "EMPTY":
             mission["ready"] = False
             mission["loaded"] = False
+            mission["accepted_for_start"] = False
 
         elif mission_state in {
             "LOADED",
@@ -1139,6 +1145,8 @@ class RoverState:
                 "state": ("LOADED" if retain_loaded_file else "EMPTY"),
                 "ready": False,
                 "loaded": bool(retain_loaded_file),
+                "accepted_for_start": False,
+                "trajectory_ready": False,
                 "total_points": total_points,
                 "navigation_point_count": 0,
                 "dummy_point_count": 0,

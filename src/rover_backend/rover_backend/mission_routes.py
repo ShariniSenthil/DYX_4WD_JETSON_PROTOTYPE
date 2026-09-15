@@ -8,7 +8,8 @@ Responsibilities of this module:
 
 - accept and authenticate frontend mission uploads;
 - validate and atomically replace the single active mission.csv;
-- request trajectory preparation after every successful upload;
+- request trajectory preparation after every successful upload (preview only);
+- confirm a generated preview for START via POST /load;
 - expose mission status and a bounded prepared-path preview;
 - download or delete the active mission.csv;
 - forward Start, Pause, Resume, Next Point, Skip Point, Stop and Clear
@@ -116,6 +117,32 @@ def _require_not_active(
             status_code=409,
             detail=(
                 f"Cannot {operation} while trajectory preparation " "is in progress."
+            ),
+        )
+
+
+def _require_not_driving(
+    *,
+    operation: str,
+) -> None:
+    state_name = _normalised_state()
+    safety = rover_state.section("safety")
+
+    if bool(safety.get("mission_enable", False)):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot {operation} while rover movement is enabled. "
+                "Stop the mission first."
+            ),
+        )
+
+    if state_name in ACTIVE_MISSION_STATES:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot {operation} while the mission is "
+                f"{state_name.lower()}. Stop the mission first."
             ),
         )
 
@@ -234,11 +261,16 @@ async def upload_mission(
             detail=str(error),
         ) from error
 
+    rover_state.update(
+        "mission",
+        accepted_for_start=False,
+    )
+
     # A valid upload always triggers trajectory calculation. The rover is not
     # started here; it remains in the safe non-driving condition until Start.
     try:
         _require_ros_bridge()
-        mission = await run_in_threadpool(ros_bridge.prepare_trajectory)
+        await run_in_threadpool(ros_bridge.prepare_trajectory)
     except HTTPException:
         rover_state.set_mission_state(
             "LOADED",
@@ -275,14 +307,66 @@ async def upload_mission(
             },
         ) from error
 
+    rover_state.update(
+        "mission",
+        accepted_for_start=False,
+    )
+
     return {
         "success": True,
         "message": (
             "Mission uploaded; trajectory preparation started and will "
-            "complete automatically when RTK is FIXED."
+            "complete automatically when RTK is FIXED. Load the mission "
+            "after reviewing the preview to enable START."
         ),
         "upload": metadata,
-        "mission": mission,
+        "mission": _mission_state(),
+    }
+
+
+@mission_router.post("/load")
+async def load_mission(
+    _session: AuthenticatedSession = Depends(require_auth),
+    _mutation: None = Depends(_serialize_mission_mutation),
+) -> dict[str, Any]:
+    """Confirm the uploaded preview so START may be enabled.
+
+    Does not accept a file and does not regenerate the trajectory.
+    """
+
+    _require_not_driving(operation="load the mission")
+
+    mission = _mission_state()
+
+    if mission.get("loaded") is not True:
+        raise HTTPException(
+            status_code=409,
+            detail="Upload a mission and wait for the preview before loading.",
+        )
+
+    if mission.get("trajectory_ready") is not True:
+        raise HTTPException(
+            status_code=409,
+            detail="Wait for the rover path preview before loading the mission.",
+        )
+
+    rover_state.update(
+        "mission",
+        accepted_for_start=True,
+        message=(
+            "Mission loaded. START will enable when the mission manager "
+            "is READY."
+        ),
+        error=None,
+    )
+
+    return {
+        "success": True,
+        "operation": "load",
+        "message": (
+            "Mission loaded. START is allowed once the rover reports READY."
+        ),
+        "mission": _mission_state(),
     }
 
 
@@ -474,6 +558,14 @@ async def start_mission(
     _session: AuthenticatedSession = Depends(require_auth),
     _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
+    if _mission_state().get("accepted_for_start") is not True:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Load the mission after reviewing the preview before starting."
+            ),
+        )
+
     return await _run_ros_operation(
         "start",
         ros_bridge.start_mission,

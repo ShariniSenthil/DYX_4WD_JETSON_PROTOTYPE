@@ -263,6 +263,8 @@ def build_mission_status_payload() -> dict[str, Any]:
         "state_lower": state_name.lower(),
         "loaded": bool(mission.get("loaded", False)),
         "ready": bool(mission.get("ready", False)),
+        "accepted_for_start": bool(mission.get("accepted_for_start", False)),
+        "trajectory_ready": bool(mission.get("trajectory_ready", False)),
         "total_points": max(
             0,
             _safe_int(
