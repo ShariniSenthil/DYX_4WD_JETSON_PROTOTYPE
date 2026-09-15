@@ -557,6 +557,8 @@ class RPPController(Node):
         self.declare_parameter("precision_lookahead_time_s", 0.90)
         self.declare_parameter("precision_xtrack_lookahead_gain", 0.0)
         self.declare_parameter("precision_moving_bearing_cone_deg", 30.0)
+        # Mode-B (explicit yaw) only. See explicit_yaw_command_slew_limit().
+        self.declare_parameter("precision_explicit_yaw_rate_limit_degps", 25.0)
 
         self.declare_parameter("precision_hardware_speed_ceiling_mps", 1.00)
         self.declare_parameter("precision_acceleration_mps2", 0.75)
@@ -1194,6 +1196,13 @@ class RPPController(Node):
             moving_bearing_cone_rad=math.radians(
                 float(self.get_parameter("precision_moving_bearing_cone_deg").value)
             ),
+        )
+        self.explicit_yaw_rate_limit_radps = math.radians(
+            float(
+                self.get_parameter(
+                    "precision_explicit_yaw_rate_limit_degps"
+                ).value
+            )
         )
         self.precision_minimum_moving_speed = float(
             self.get_parameter("precision_minimum_moving_speed_mps").value
@@ -2042,6 +2051,13 @@ class RPPController(Node):
         # after alignment and a sudden 0.40->terminal-profile transition.
         self.command_slew_speed = 0.0
         self.command_slew_last_time = None
+
+        # Mode-B (explicit yaw) command-slew state. None means "not yet
+        # seeded" -- explicit_yaw_command_slew_limit() seeds it from the
+        # actual current yaw on first use after a reset, rather than from a
+        # stale prior target. See explicit_yaw_command_slew_limit().
+        self.explicit_yaw_slew_value = None
+        self.explicit_yaw_slew_last_time = None
 
         now = self.get_clock().now()
         self.last_log_time = now
@@ -6383,6 +6399,49 @@ class RPPController(Node):
             )
         return self.command_slew_speed
 
+    def explicit_yaw_command_slew_limit(self, desired_yaw_enu_rad):
+        """Rate-limit the published explicit-yaw command (mode B only).
+
+        Measured 2026-09-12 field data (log_227, log_233): the moving-cone
+        clamp in guidance.py re-centers on the rover's *instantaneous* yaw
+        every cycle, so it can still step the reference by the full cone
+        width in one 50 ms tick. Under implicit yaw (mode A), PX4's own
+        ~1.0-1.2 s velocity-derived-heading lag incidentally smoothed that
+        step; explicit yaw removed the lag by design, and the residual
+        physical/estimator lag (measured ~0.6-0.75 s) is still close enough
+        to precision_lookahead_time_s (0.9 s) to sustain a marginally-stable
+        limit cycle in the commanded bearing -- confirmed from the same logs
+        by cross-correlation (0.94/0.96 corr at that lag) plus the outer
+        loop *attenuating* rather than amplifying its own reference
+        (amp_ratio 0.53-0.68), which rules out PX4-side overshoot as the
+        origin. This does not remove that delay; it stops the reference
+        itself from stepping faster than the plant can settle onto smoothly.
+        Seeded from the actual current yaw (not a stale prior target) the
+        first time it runs after a reset -- see the zero-command branch of
+        publish_velocity_ned() and start_acceleration_profile().
+        """
+        now = self.get_clock().now()
+        if self.explicit_yaw_slew_value is None:
+            self.explicit_yaw_slew_value = self.current_yaw
+            self.explicit_yaw_slew_last_time = now
+            dt = 1.0 / self.CONTROL_HZ
+        else:
+            dt = (now - self.explicit_yaw_slew_last_time).nanoseconds / 1e9
+            if not math.isfinite(dt) or dt <= 0.0:
+                dt = 1.0 / self.CONTROL_HZ
+            dt = min(dt, self.deceleration_max_dt_sec)
+        self.explicit_yaw_slew_last_time = now
+
+        max_change = self.explicit_yaw_rate_limit_radps * dt
+        error = self.normalize_angle(
+            desired_yaw_enu_rad - self.explicit_yaw_slew_value
+        )
+        limited_error = max(-max_change, min(max_change, error))
+        self.explicit_yaw_slew_value = self.normalize_angle(
+            self.explicit_yaw_slew_value + limited_error
+        )
+        return self.explicit_yaw_slew_value
+
     def _begin_precision_cycle(self):
         """Create the bounded timing/token authority for one control tick."""
 
@@ -7096,11 +7155,22 @@ class RPPController(Node):
 
             north = direction_north * output_speed
             east = direction_east * output_speed
+            if (
+                self.rpp_explicit_yaw_enabled
+                and yaw_enu_rad is not None
+                and math.isfinite(yaw_enu_rad)
+            ):
+                yaw_enu_rad = self.explicit_yaw_command_slew_limit(yaw_enu_rad)
         else:
             self.reset_speed_profiles()
             # Safety/30 mm zero is immediate and must not be ramped down.
             self.command_slew_speed = 0.0
             self.command_slew_last_time = None
+            # A literal stop owns no heading. The next moving command reseeds
+            # the yaw slew from actual current yaw, not a stale target -- see
+            # explicit_yaw_command_slew_limit().
+            self.explicit_yaw_slew_value = None
+            self.explicit_yaw_slew_last_time = None
             output_speed = 0.0
             north = 0.0
             east = 0.0

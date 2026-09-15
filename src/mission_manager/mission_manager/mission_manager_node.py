@@ -622,6 +622,7 @@ class MissionManager(Node):
         self._backend_heartbeat_healthy = False
 
         self._start_stage = "IDLE"
+        self._resume_stage = "IDLE"
         self._start_failed_stage: Optional[str] = None
         self._start_debug: dict[str, Any] = {}
         self._last_status_publish_monotonic = 0.0
@@ -1994,6 +1995,7 @@ class MissionManager(Node):
         self._last_error = None
         self._state = "EMPTY"
         self._start_stage = "IDLE"
+        self._resume_stage = "IDLE"
         self._start_failed_stage = None
         self._start_debug = {}
         self._auto_stop_pending = False
@@ -2265,9 +2267,11 @@ class MissionManager(Node):
     def _resume_service(
         self, _request: Trigger.Request, response: Trigger.Response
     ) -> Trigger.Response:
+        self._resume_stage = "PRECHECK"
         try:
             with self._lock:
                 if self._state != "PAUSED":
+                    self._resume_stage = "IDLE"
                     response.success = False
                     response.message = "Mission is not paused"
                     return response
@@ -2275,15 +2279,23 @@ class MissionManager(Node):
             self._require_motion_health(
                 require_ready_state=False, require_estop_released=True
             )
+
+            self._resume_stage = "ZERO_SETPOINT_SETTLE"
             with self._lock:
                 self._disable_motion_preserve_estop()
             time.sleep(self.OFFBOARD_STREAM_SETTLE_SEC)
+
+            self._resume_stage = "SWITCHING_OFFBOARD"
             if self._px4_mode != "OFFBOARD":
                 self._request_px4_mode("OFFBOARD")
             self._wait_for_vehicle_state(expected_mode="OFFBOARD")
+
+            self._resume_stage = "ARMING"
             if not self._px4_armed:
                 self._request_arm(True)
             self._wait_for_vehicle_state(expected_mode="OFFBOARD", expected_armed=True)
+
+            self._resume_stage = "FINAL_CHECK"
             with self._lock:
                 if self._emergency_stop:
                     raise RuntimeError(
@@ -2306,6 +2318,8 @@ class MissionManager(Node):
                 self._state = "RUNNING"
                 self._last_error = None
                 self._last_message = "Mission resumed"
+
+                self._resume_stage = "RUNNING"
                 self._reset_arrival_state()
                 self._publish_goal()
                 self._enable_motion()
@@ -2314,10 +2328,12 @@ class MissionManager(Node):
             response.message = "Mission resumed"
             return response
         except Exception as exc:
+            failed_stage = self._resume_stage
             with self._lock:
                 self._disable_motion_preserve_estop()
                 self._resume_available = False
-                self._last_message = f"Resume blocked: {exc}"
+                self._last_message = f"Resume blocked at {failed_stage}: {exc}"
+                self._resume_stage = "FAILED"
                 self._publish_status(force=True)
             response.success = False
             response.message = self._last_message
@@ -3530,6 +3546,7 @@ class MissionManager(Node):
             "marking_error_valid": self._marking_error_valid,
             "alignment_active": False,
             "start_stage": self._start_stage,
+            "resume_stage": self._resume_stage,
             "start_failed_stage": self._start_failed_stage,
             "start_debug": dict(self._start_debug),
         }

@@ -220,6 +220,7 @@ def test_both_existing_rpp_publication_paths_use_selected_transport(enabled, pre
     node.precision_minimum_moving_speed = 0.04
     node.precision_speed_config = NS(hardware_speed_ceiling_mps=1.0)
     node.acceleration_speed_limit = node.command_speed_slew_limit = lambda v: v
+    node.explicit_yaw_command_slew_limit = lambda v: v
     node.reset_deceleration_profile = lambda: None
     node.publish_motion_profile_monitor = lambda v: None
     node._record_published_translational_speed = lambda v: None
@@ -265,6 +266,53 @@ def test_b_generic_moving_missing_or_nonfinite_yaw_fails_closed(yaw):
     assert message.yaw_valid is False
     assert message.yaw_enu_rad == 0.0
     assert any("WITHOUT FINITE EXPLICIT YAW" in line for line in node.logs)
+
+
+def _bind_real_yaw_slew_limit(node, env):
+    execute([method(RPP, "RPPController", "explicit_yaw_command_slew_limit")], env)
+    real = env["explicit_yaw_command_slew_limit"]
+    node.explicit_yaw_command_slew_limit = lambda v: real(node, v)
+
+
+def test_explicit_yaw_slew_limit_caps_a_large_step_to_one_cycle_budget():
+    # Field-measured mechanism (2026-09-12, log_227/log_233): the guidance
+    # cone can still hand a large bearing jump to publish_velocity_ned in
+    # one cycle. The slew limiter must cap it to rate_limit * dt regardless
+    # of how large the requested jump is.
+    node, env = rpp(True)
+    _bind_real_yaw_slew_limit(node, env)
+    node.current_yaw = 0.0
+    node.CONTROL_HZ = 20.0
+    node.deceleration_max_dt_sec = 0.20
+    node.normalize_angle = lambda v: math.atan2(math.sin(v), math.cos(v))
+    node.explicit_yaw_rate_limit_radps = math.radians(25.0)
+    node.explicit_yaw_slew_value = None
+    node.explicit_yaw_slew_last_time = None
+
+    first = node.explicit_yaw_command_slew_limit(math.radians(90.0))
+
+    expected_step = math.radians(25.0) * (1.0 / 20.0)
+    assert first == pytest.approx(expected_step, abs=1e-9)
+    assert node.explicit_yaw_slew_value == pytest.approx(first)
+
+
+def test_explicit_yaw_slew_limit_seeds_from_actual_current_yaw_not_zero():
+    # A reset (post-stop/post-pivot) must not invent a heading -- the first
+    # commanded step is measured from wherever the rover actually is.
+    node, env = rpp(True)
+    _bind_real_yaw_slew_limit(node, env)
+    node.current_yaw = math.radians(120.0)
+    node.CONTROL_HZ = 20.0
+    node.deceleration_max_dt_sec = 0.20
+    node.normalize_angle = lambda v: math.atan2(math.sin(v), math.cos(v))
+    node.explicit_yaw_rate_limit_radps = math.radians(25.0)
+    node.explicit_yaw_slew_value = None
+    node.explicit_yaw_slew_last_time = None
+
+    first = node.explicit_yaw_command_slew_limit(math.radians(150.0))
+
+    expected = math.radians(120.0) + math.radians(25.0) * (1.0 / 20.0)
+    assert first == pytest.approx(expected, abs=1e-9)
 
 
 def test_b_generic_zero_translation_remains_yaw_invalid_in_patch5():

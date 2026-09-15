@@ -355,6 +355,7 @@ def build_mission_status_payload() -> dict[str, Any]:
         ),
         "current_point_spray_confirmed": mission.get("current_point_spray_confirmed"),
         "start_stage": str(mission.get("start_stage") or "IDLE").strip().upper(),
+        "resume_stage": str(mission.get("resume_stage") or "IDLE").strip().upper(),
         "start_failed_stage": mission.get("start_failed_stage"),
         "arrival_settle_elapsed_sec": (
             _finite_float(

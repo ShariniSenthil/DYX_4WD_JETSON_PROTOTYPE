@@ -26,6 +26,8 @@ from datetime import datetime
 from datetime import timezone
 from typing import Any
 from typing import Mapping
+from typing import cast
+from types import MappingProxyType
 
 MISSION_STATES = {
     "EMPTY",
@@ -392,6 +394,7 @@ class RoverState:
                 "spray_gates_mission_progress": False,
                 "current_point_spray_confirmed": None,
                 "start_stage": "IDLE",
+                "resume_stage": "IDLE",
                 "start_failed_stage": None,
                 "arrival_settle_elapsed_sec": 0.0,
                 "arrival_settle_required_sec": 0.30,
@@ -608,7 +611,12 @@ class RoverState:
         """Return a complete independent JSON-safe state snapshot."""
 
         with self._lock:
-            result = copy.deepcopy(self._state)
+            result = {}
+            for k, v in self._state.items():
+                if k in {"mission", "position"}:
+                    result[k] = cast(dict[str, Any], MappingProxyType(v))
+                else:
+                    result[k] = copy.deepcopy(v)
 
             result["revision"] = self._revision
 
@@ -625,6 +633,8 @@ class RoverState:
         with self._lock:
             self._validate_section_locked(section_name)
 
+            if section_name in {"mission", "position"}:
+                return cast(dict[str, Any], MappingProxyType(self._state[section_name]))
             return copy.deepcopy(self._state[section_name])
 
     def update(
@@ -637,19 +647,27 @@ class RoverState:
         with self._lock:
             self._validate_section_locked(section_name)
 
-            section = self._state[section_name]
-
-            for key, value in values.items():
-                if key == "updated_at":
-                    continue
-
-                section[key] = copy.deepcopy(value)
+            if section_name in {"mission", "position"}:
+                section = dict(self._state[section_name])
+                for key, value in values.items():
+                    if key == "updated_at":
+                        continue
+                    section[key] = copy.deepcopy(value)
+                self._state[section_name] = section
+            else:
+                section = self._state[section_name]
+                for key, value in values.items():
+                    if key == "updated_at":
+                        continue
+                    section[key] = copy.deepcopy(value)
 
             if section_name == "mission":
                 self._normalise_mission_locked()
 
             self._touch_locked(section_name)
 
+            if section_name in {"mission", "position"}:
+                return cast(dict[str, Any], MappingProxyType(section))
             return copy.deepcopy(section)
 
     def update_section(
@@ -690,6 +708,8 @@ class RoverState:
 
             self._revision += 1
 
+            if section_name in {"mission", "position"}:
+                return cast(dict[str, Any], MappingProxyType(self._state[section_name]))
             return copy.deepcopy(self._state[section_name])
 
     def replace_section(
@@ -1157,6 +1177,7 @@ class RoverState:
                 "spray_gates_mission_progress": False,
                 "current_point_spray_confirmed": None,
                 "start_stage": "IDLE",
+                "resume_stage": "IDLE",
                 "start_failed_stage": None,
                 "arrival_settle_elapsed_sec": 0.0,
                 "arrival_settle_required_sec": (

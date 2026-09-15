@@ -564,7 +564,32 @@ def generate_launch_description() -> LaunchDescription:
                         "precision_lookahead_max_m": 1.00,
                         "precision_lookahead_time_s": 0.90,
                         "precision_xtrack_lookahead_gain": 0.0,
-                        "precision_moving_bearing_cone_deg": 30.0,
+                        # Cut 30 -> 15 deg 2026-09-12: today's mode-B
+                        # (explicit-yaw) field logs (log_227, log_233) showed
+                        # a sustained 21-58 deg pp commanded-heading limit
+                        # cycle at ~1-1.5 s period while driving straight,
+                        # amplitude clustering right at ~1-2x this cone. Mode
+                        # A masked this because PX4's own ~1.0-1.2 s
+                        # velocity-derived-yaw lag damped the cone's per-cycle
+                        # step; explicit yaw removed that lag. This halves the
+                        # per-cycle correction authority as an interim
+                        # mitigation -- it reduces the oscillation's swing but
+                        # does not by itself remove the limit-cycle mechanism.
+                        # See precision_explicit_yaw_rate_limit_degps below
+                        # for the rate limiter added the same day to address
+                        # the mechanism directly. Re-measure swing pp
+                        # amplitude and period in the field before tuning
+                        # further.
+                        "precision_moving_bearing_cone_deg": 15.0,
+                        # Added 2026-09-12 alongside the cone cut above.
+                        # Rate-limits the published explicit yaw itself
+                        # (guidance.py's cone re-centers on instantaneous yaw
+                        # every cycle, so it can still step by the full cone
+                        # width in one tick). 25 deg/s is a first field-test
+                        # value, not yet measured against the swing directly
+                        # -- re-check log_227/log_233-style windows after
+                        # this lands and retune from there.
+                        "precision_explicit_yaw_rate_limit_degps": 25.0,
                         "precision_hardware_speed_ceiling_mps": 1.00,
                         "precision_acceleration_mps2": 0.75,
                         "precision_deceleration_mps2": 0.75,
