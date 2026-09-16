@@ -26,8 +26,6 @@ from datetime import datetime
 from datetime import timezone
 from typing import Any
 from typing import Mapping
-from typing import cast
-from types import MappingProxyType
 
 MISSION_STATES = {
     "EMPTY",
@@ -620,7 +618,11 @@ class RoverState:
             result = {}
             for k, v in self._state.items():
                 if k in {"mission", "position"}:
-                    result[k] = cast(dict[str, Any], MappingProxyType(v))
+                    # Shallow copy: cheap (mission/position are replaced
+                    # wholesale on every write, never mutated in place, so
+                    # this is a stable snapshot) and, unlike MappingProxyType,
+                    # JSON-serializable by FastAPI/pydantic.
+                    result[k] = dict(v)
                 else:
                     result[k] = copy.deepcopy(v)
 
@@ -640,7 +642,7 @@ class RoverState:
             self._validate_section_locked(section_name)
 
             if section_name in {"mission", "position"}:
-                return cast(dict[str, Any], MappingProxyType(self._state[section_name]))
+                return dict(self._state[section_name])
             return copy.deepcopy(self._state[section_name])
 
     def update(
@@ -673,7 +675,7 @@ class RoverState:
             self._touch_locked(section_name)
 
             if section_name in {"mission", "position"}:
-                return cast(dict[str, Any], MappingProxyType(section))
+                return dict(section)
             return copy.deepcopy(section)
 
     def update_section(
@@ -715,7 +717,7 @@ class RoverState:
             self._revision += 1
 
             if section_name in {"mission", "position"}:
-                return cast(dict[str, Any], MappingProxyType(self._state[section_name]))
+                return dict(self._state[section_name])
             return copy.deepcopy(self._state[section_name])
 
     def replace_section(
