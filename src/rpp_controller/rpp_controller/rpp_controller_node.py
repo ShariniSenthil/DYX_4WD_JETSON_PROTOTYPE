@@ -482,7 +482,7 @@ class RPPController(Node):
         )
         self.declare_parameter(
             "terminal_native_pivot_release_error_deg",
-            4.0,
+            6.0,
         )
         self.declare_parameter(
             "terminal_native_pivot_request_error_deg",
@@ -5644,8 +5644,9 @@ class RPPController(Node):
           (60deg) to the required turn side of the current yaw;
         - this keeps PX4's commanded vector error safely above its 45deg native
           turn-entry threshold, so PX4 remains in differential pivot;
-        - once the REAL segment heading error is <=4deg, release the carrier and
-          return the true line bearing for moving line capture.
+        - once the REAL segment heading error is <=6deg (matching PX4's own
+          RD_TRANS_TRN_DRV native turn-to-drive threshold), release the carrier
+          and return the true line bearing for moving line capture.
 
         The carrier bearing is recomputed every controller cycle. It is never a
         travel target and must not be used after pivot release.

@@ -506,7 +506,7 @@ def generate_launch_description() -> LaunchDescription:
                         "pivot_enter_angle_deg": 45.0,
                         "pivot_exit_angle_deg": 12.0,
                         # Fast post-pivot capture releases only after
-                        # terminal_native_pivot_release_error_deg=4.0 and
+                        # terminal_native_pivot_release_error_deg=6.0 and
                         # xtrack_priority_exit_m=0.008 remain valid for this
                         # hold time.
                         "alignment_hold_sec": 0.20,
@@ -897,7 +897,7 @@ def generate_launch_description() -> LaunchDescription:
                         "terminal_goal_intercept_distance_m": 0.90,
                         "terminal_goal_intercept_bearing_limit_deg": 22.0,
                         "terminal_native_pivot_enter_error_deg": 45.0,
-                        "terminal_native_pivot_release_error_deg": 4.0,
+                        "terminal_native_pivot_release_error_deg": 6.0,
                         # Deprecated compatibility parameter. It is no
                         # longer used to create a moving 60-degree vector;
                         # alignment now uses a zero-translation yaw-rate pivot.
