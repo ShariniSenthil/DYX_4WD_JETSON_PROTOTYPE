@@ -90,6 +90,7 @@ def _normalised_state() -> str:
 def _require_not_active(
     *,
     operation: str,
+    include_preparing: bool = True,
 ) -> None:
     state_name = _normalised_state()
     safety = rover_state.section("safety")
@@ -112,7 +113,7 @@ def _require_not_active(
             ),
         )
 
-    if state_name in CONTROL_CONFLICT_STATES:
+    if include_preparing and state_name in CONTROL_CONFLICT_STATES:
         raise HTTPException(
             status_code=409,
             detail=(
@@ -125,26 +126,7 @@ def _require_not_driving(
     *,
     operation: str,
 ) -> None:
-    state_name = _normalised_state()
-    safety = rover_state.section("safety")
-
-    if bool(safety.get("mission_enable", False)):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Cannot {operation} while rover movement is enabled. "
-                "Stop the mission first."
-            ),
-        )
-
-    if state_name in ACTIVE_MISSION_STATES:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Cannot {operation} while the mission is "
-                f"{state_name.lower()}. Stop the mission first."
-            ),
-        )
+    _require_not_active(operation=operation, include_preparing=False)
 
 
 def _require_ros_bridge() -> None:
@@ -307,11 +289,6 @@ async def upload_mission(
             },
         ) from error
 
-    rover_state.update(
-        "mission",
-        accepted_for_start=False,
-    )
-
     return {
         "success": True,
         "message": (
@@ -386,6 +363,11 @@ async def prepare_mission(
             status_code=409,
             detail=str(error),
         ) from error
+
+    rover_state.update(
+        "mission",
+        accepted_for_start=False,
+    )
 
     return await _run_ros_operation(
         "prepare",
