@@ -362,7 +362,7 @@ class RPPController(Node):
         self.declare_parameter("waypoint_tolerance_m", 0.03)
 
         self.declare_parameter("pivot_enter_angle_deg", 45.0)
-        self.declare_parameter("pivot_exit_angle_deg", 6.0)
+        self.declare_parameter("pivot_exit_angle_deg", 12.0)
         self.declare_parameter("alignment_hold_sec", 0.20)
         self.declare_parameter("maximum_yaw_rate_radps", 0.20)
         self.declare_parameter("minimum_yaw_rate_radps", 0.06)
@@ -482,7 +482,7 @@ class RPPController(Node):
         )
         self.declare_parameter(
             "terminal_native_pivot_release_error_deg",
-            4.0,
+            6.0,
         )
         self.declare_parameter(
             "terminal_native_pivot_request_error_deg",
@@ -691,7 +691,7 @@ class RPPController(Node):
         self.declare_parameter("precision_pivot_recenter_forward_cone_deg", 30.0)
         # Extra literal-zero hold after the measured native-pivot stop
         # certificate.  Independent of the default-off precision pivot FSM.
-        self.declare_parameter("legacy_pivot_post_settle_hold_sec", 0.20)
+        self.declare_parameter("legacy_pivot_post_settle_hold_sec", 1.00)
         # A lone speed/yaw-rate sample outside tolerance (GPS-antenna
         # lever-arm noise during residual yaw settling) must persist past
         # this window before the settle/hold dwell timers are discarded.
@@ -1513,7 +1513,6 @@ class RPPController(Node):
         self.legacy_alignment = LegacyAlignmentLifecycle(
             LegacyAlignmentConfig(
                 native_release_heading_rad=self.terminal_native_pivot_release_error,
-                settle_reentry_heading_rad=self.pivot_exit_angle,
                 stop_speed_mps=self.precision_pivot_config.stop_speed_tolerance_mps,
                 stop_yaw_rate_radps=(
                     self.precision_pivot_config.stop_yaw_rate_tolerance_radps
@@ -5658,19 +5657,9 @@ class RPPController(Node):
             true_bearing = self.terminal_native_pivot_true_bearing
             true_error = self.normalize_angle(true_bearing - self.current_yaw)
         else:
-            # Normal new-segment entry remains 45 deg. A rebound after a
-            # completed native pivot is allowed to re-enter at the configured
-            # 6 deg settle hysteresis threshold.
-            reentering_from_settle = (
-                self.legacy_alignment.phase is LegacyAlignmentPhase.PRE_PIVOT_STOP
-                and self.legacy_alignment.native_carrier_issued
-            )
-            entry_error = (
-                self.pivot_exit_angle
-                if reentering_from_settle
-                else self.terminal_native_pivot_enter_error
-            )
-            if abs(true_error) < entry_error:
+            # Enter stationary/native pivot only when heading error is >=45 deg.
+            # Once pivot is active, the existing <=4 deg release remains unchanged.
+            if abs(true_error) < self.terminal_native_pivot_enter_error:
                 return False, true_bearing, true_error
 
             self.terminal_native_pivot_active = True
@@ -5694,21 +5683,14 @@ class RPPController(Node):
             self.reset_terminal_native_pivot()
             return False, true_bearing, true_error
 
-        # Production B mode is pure absolute yaw. Keep the true
-        # segment bearing as the only yaw target; no synthetic +/-60 degree
-        # carrier enters the explicit-yaw command path.
-        if self.rpp_explicit_yaw_enabled:
-            self.terminal_native_pivot_request_bearing = true_bearing
-            return True, true_bearing, true_error
-
-        # Legacy A-mode rollback only: preserve the historical velocity-vector
-        # carrier used to request PX4 native turning.
         turn_sign = 1.0 if true_error > 0.0 else -1.0
         carrier_error = turn_sign * self.terminal_native_pivot_request_error
         request_bearing = self.normalize_angle(self.current_yaw + carrier_error)
 
         self.terminal_native_pivot_request_bearing = request_bearing
 
+        # Internal invariant: the carrier must always stay above PX4's
+        # 45-degree native pivot entry boundary.
         request_error = abs(self.normalize_angle(request_bearing - self.current_yaw))
         if request_error <= self.terminal_native_pivot_enter_error:
             raise RuntimeError("pivot keeper carrier fell below native pivot threshold")

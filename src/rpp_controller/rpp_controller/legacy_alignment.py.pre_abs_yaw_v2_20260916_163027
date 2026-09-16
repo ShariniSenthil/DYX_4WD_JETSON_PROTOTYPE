@@ -65,9 +65,6 @@ class LegacyAlignmentConfig:
     pivot_keeper_timeout_sec: float
     pre_pivot_timeout_sec: float
     stationary_violation_debounce_sec: float
-    # RPP releases the absolute-yaw target at 4 deg. If heading rebounds to
-    # this threshold before the stop certificate completes, re-enter pivot.
-    settle_reentry_heading_rad: float = math.radians(6.0)
     # A native pivot displaces the rover 300-600 mm off the line it was
     # about to drive (measured across 12 pivots in the Sep-1 P1 bags), most
     # of it the GPS antenna swinging through its lever-arm arc. Reanchoring
@@ -94,22 +91,11 @@ class LegacyAlignmentConfig:
             "pivot_keeper_timeout_sec",
             "pre_pivot_timeout_sec",
             "stationary_violation_debounce_sec",
-            "settle_reentry_heading_rad",
         )
         for name in finite_fields:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and > 0")
-
-        if not (
-            self.native_release_heading_rad
-            < self.settle_reentry_heading_rad
-            < self.pivot_enter_rad
-        ):
-            raise ValueError(
-                "pivot heading thresholds must satisfy "
-                "native_release < settle_reentry < pivot_enter"
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,12 +365,8 @@ class LegacyAlignmentLifecycle:
         sample: LegacyAlignmentInput,
     ) -> LegacyAlignmentResult:
         heading_abs = abs(sample.path_heading_error_rad)
-        if heading_abs >= self.config.settle_reentry_heading_rad:
-            return self._enter_pre_pivot_stop(
-                previous,
-                sample,
-                "SETTLE_REENTER_PIVOT",
-            )
+        if heading_abs >= self.config.pivot_enter_rad:
+            return self._enter_pre_pivot_stop(previous, sample, "SETTLE_ESCALATE_GE45")
         if not self._chassis_stationary_debounced(sample):
             self.reset_dwell_timers()
             return self._result(

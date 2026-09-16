@@ -488,8 +488,8 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         # PX4 native rover alignment:
                         # pivot begins at >=45deg,
-                        # PX4 TURN->DRIVE threshold is 6deg; RPP holds zero translation
-                        # and true absolute yaw until its 4deg release.
+                        # straight drive begins at <=12deg after 0.20s stable confirmation,
+                        # no 6deg gate.
                         # Normal line correction remains +/-12deg.
                         # Post-pivot C->P1 line re-anchor removes the
                         # displacement created during the native pivot.
@@ -504,9 +504,9 @@ def generate_launch_description() -> LaunchDescription:
                         "segment_alignment_max_cross_track_m": 0.60,
                         "terminal_line_entry_cross_track_m": 0.03,
                         "pivot_enter_angle_deg": 45.0,
-                        "pivot_exit_angle_deg": 6.0,
+                        "pivot_exit_angle_deg": 12.0,
                         # Fast post-pivot capture releases only after
-                        # terminal_native_pivot_release_error_deg=4.0 and
+                        # terminal_native_pivot_release_error_deg=6.0 and
                         # xtrack_priority_exit_m=0.008 remain valid for this
                         # hold time.
                         "alignment_hold_sec": 0.20,
@@ -897,13 +897,12 @@ def generate_launch_description() -> LaunchDescription:
                         "terminal_goal_intercept_distance_m": 0.90,
                         "terminal_goal_intercept_bearing_limit_deg": 22.0,
                         "terminal_native_pivot_enter_error_deg": 45.0,
-                        "terminal_native_pivot_release_error_deg": 4.0,
+                        "terminal_native_pivot_release_error_deg": 6.0,
                         # Deprecated compatibility parameter. It is no
                         # longer used to create a moving 60-degree vector;
-                        # production B mode uses zero translation + true absolute yaw.
+                        # alignment now uses a zero-translation yaw-rate pivot.
                         "terminal_native_pivot_request_error_deg": 60.0,
                         "segment_pivot_keeper_timeout_sec": 10.0,
-                        "legacy_pivot_post_settle_hold_sec": 0.20,
                         "segment_fast_capture_max_cross_track_m": 0.05,
                         "terminal_close_recovery_distance_m": 0.08,
                         "terminal_unready_hold_along_m": 0.05,
