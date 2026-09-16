@@ -264,6 +264,14 @@ def build_mission_status_payload() -> dict[str, Any]:
         "loaded": bool(mission.get("loaded", False)),
         "ready": bool(mission.get("ready", False)),
         "accepted_for_start": bool(mission.get("accepted_for_start", False)),
+        # Derived, never stored separately -- cannot disagree with
+        # accepted_for_start/mission_id.
+        "staged": bool(mission.get("accepted_for_start", False)),
+        "staged_id": (
+            mission.get("mission_id")
+            if bool(mission.get("accepted_for_start", False))
+            else None
+        ),
         "trajectory_ready": bool(mission.get("trajectory_ready", False)),
         "total_points": max(
             0,

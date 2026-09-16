@@ -575,8 +575,13 @@ class RoverState:
 
         if mission_state == "EMPTY":
             mission["ready"] = False
-            mission["loaded"] = False
-            mission["accepted_for_start"] = False
+            # A genuine unload has no retained mission_id. EMPTY with a
+            # mission_id still set means the file/staging are retained (e.g.
+            # ros_bridge already remaps a post-Stop manager EMPTY away from
+            # here) -- don't clear loaded/accepted_for_start out from under it.
+            if not mission.get("mission_id"):
+                mission["loaded"] = False
+                mission["accepted_for_start"] = False
 
         elif mission_state in {
             "LOADED",
@@ -1124,6 +1129,11 @@ class RoverState:
                     "row_transition_threshold_m",
                     "execution_mode",
                     "uploaded_at",
+                    # Clearing the generated ROS trajectory/progress is not an
+                    # un-stage: the file and the operator's Load approval are
+                    # both still retained here, only the geometry needs a
+                    # fresh /prepare.
+                    "accepted_for_start",
                 ):
                     retained_values[key] = copy.deepcopy(mission.get(key))
 

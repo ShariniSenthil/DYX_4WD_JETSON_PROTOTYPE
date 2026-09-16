@@ -80,7 +80,16 @@ class ExecutionModeRequest(BaseModel):
 
 
 def _mission_state() -> dict[str, Any]:
-    return rover_state.section("mission")
+    mission = rover_state.section("mission")
+
+    # Derived, never stored separately -- cannot disagree with
+    # accepted_for_start/mission_id. Kept in sync with
+    # system_routes.build_mission_status_payload().
+    staged = bool(mission.get("accepted_for_start", False))
+    mission["staged"] = staged
+    mission["staged_id"] = mission.get("mission_id") if staged else None
+
+    return mission
 
 
 def _normalised_state() -> str:
@@ -352,7 +361,14 @@ async def prepare_mission(
     _session: AuthenticatedSession = Depends(require_auth),
     _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
-    """Re-read the stored mission.csv and prepare the trajectory again."""
+    """Re-read the stored mission.csv and prepare the trajectory again.
+
+    Staging (accepted_for_start) is owned by upload/load/delete, not by
+    generate. Re-preparing the same already-loaded mission.csv does not
+    un-stage it -- the operator already confirmed this mission_id via
+    /load; regenerating its geometry (e.g. after mission_manager dropped
+    READY on Stop/Complete) is not new content requiring re-confirmation.
+    """
 
     _require_not_active(operation="prepare the mission")
 
@@ -363,11 +379,6 @@ async def prepare_mission(
             status_code=409,
             detail=str(error),
         ) from error
-
-    rover_state.update(
-        "mission",
-        accepted_for_start=False,
-    )
 
     return await _run_ros_operation(
         "prepare",

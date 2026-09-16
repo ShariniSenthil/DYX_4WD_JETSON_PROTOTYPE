@@ -2459,11 +2459,26 @@ class RoverBackendRosNode(Node):
         # briefly reports EMPTY. That EMPTY is an internal snapshot boundary,
         # not a user-visible unload. Keep PREPARING until the new complete
         # snapshot becomes READY.
+        retained_mission = rover_state.section("mission")
+        retained_mission_id = retained_mission.get("mission_id")
+        retained_staged = bool(retained_mission.get("accepted_for_start", False))
+
         effective_state_name = state_name
         if preparation_in_progress and state_name == "EMPTY":
             effective_state_name = "PREPARING"
         elif preparation_in_progress and state_name == "READY" and not manager_ready:
             effective_state_name = "PREPARING"
+        elif state_name == "EMPTY" and retained_mission_id and retained_staged:
+            # mission_manager goes EMPTY on every Stop/Complete cleanup even
+            # though mission.csv (and the operator's Load approval) are still
+            # retained. That is "idle after stop", not "no mission" -- publish
+            # it as such so state.py's EMPTY branch never clears
+            # loaded/accepted_for_start for a mission that is still staged.
+            effective_state_name = (
+                "COMPLETED"
+                if retained_mission.get("state") == "COMPLETED"
+                else "LOADED"
+            )
 
         completed = max(
             0,
@@ -3642,6 +3657,9 @@ class RoverBackendRosNode(Node):
 
         trajectory_generator owns the asynchronous RTK wait and publishes
         READY only after the path has actually been generated.
+
+        Deliberately does not touch accepted_for_start. Staging belongs to
+        upload/load/delete, not to generate -- do not "fix" this to clear it.
         """
         with self._runtime_lock:
             self._trajectory_ready = False
