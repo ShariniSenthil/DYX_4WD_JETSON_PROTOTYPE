@@ -2137,12 +2137,14 @@ class MissionManager(Node):
             self._start_stage = "SWITCHING_OFFBOARD"
             if self._px4_mode != "OFFBOARD":
                 self._request_px4_mode("OFFBOARD")
-
-            # FIRST: confirm OFFBOARD while still disarmed.
-            self._wait_for_vehicle_state(
-                expected_mode="OFFBOARD",
-                expected_armed=False,
-            )
+                # SET_MODE is COMMAND_ACK-confirmed by PX4 before this service
+                # call returns -- that IS the confirmation. Don't also wait for
+                # /mavros/state to catch up on PX4's ~1 Hz HEARTBEAT.
+                # _monitor_runtime_px4_control() re-checks this against real
+                # telemetry every control tick once RUNNING and will pause the
+                # mission within one heartbeat if this is ever wrong.
+                with self._lock:
+                    self._px4_mode = "OFFBOARD"
 
             # Keep the existing zero PositionTarget stream active while PX4
             # settles in OFFBOARD. Only after this do we send ARM.
@@ -2155,12 +2157,9 @@ class MissionManager(Node):
 
             self._start_stage = "ARMING"
             self._request_arm(True)
-
-            # SECOND: mission cannot run until BOTH are confirmed.
-            self._wait_for_vehicle_state(
-                expected_mode="OFFBOARD",
-                expected_armed=True,
-            )
+            # Same reasoning: CommandBool.success is itself COMMAND_ACK-backed.
+            with self._lock:
+                self._px4_armed = True
 
             self._start_stage = "FINAL_CHECK"
             with self._lock:
@@ -2288,12 +2287,14 @@ class MissionManager(Node):
             self._resume_stage = "SWITCHING_OFFBOARD"
             if self._px4_mode != "OFFBOARD":
                 self._request_px4_mode("OFFBOARD")
-            self._wait_for_vehicle_state(expected_mode="OFFBOARD")
+                with self._lock:
+                    self._px4_mode = "OFFBOARD"
 
             self._resume_stage = "ARMING"
             if not self._px4_armed:
                 self._request_arm(True)
-            self._wait_for_vehicle_state(expected_mode="OFFBOARD", expected_armed=True)
+                with self._lock:
+                    self._px4_armed = True
 
             self._resume_stage = "FINAL_CHECK"
             with self._lock:
@@ -2371,11 +2372,13 @@ class MissionManager(Node):
 
             if self._px4_mode != "OFFBOARD":
                 self._request_px4_mode("OFFBOARD")
-            self._wait_for_vehicle_state(expected_mode="OFFBOARD")
+                with self._lock:
+                    self._px4_mode = "OFFBOARD"
 
             if not self._px4_armed:
                 self._request_arm(True)
-            self._wait_for_vehicle_state(expected_mode="OFFBOARD", expected_armed=True)
+                with self._lock:
+                    self._px4_armed = True
 
             with self._lock:
                 if self._emergency_stop:
