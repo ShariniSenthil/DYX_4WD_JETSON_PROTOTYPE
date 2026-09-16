@@ -5,8 +5,6 @@ legs) and the patches that came out of it. Three landed, one was reverted. No
 field run was possible this session, so **everything applied here is unverified
 in the field** — that is stated per patch, with what to watch for.
 
-Datasets:
-
 - `~/Documents/QGroundControl Daily/Logs/4WD/Madhavaram/Sep_03/evening_run_2/`
   (`Bags/` and `Ulogs/` side by side, all 8 bundles and all 8 ulogs present)
 - `~/Documents/QGroundControl Daily/Logs/4WD/Madhavaram/Sep_04/Run_01/` — five
