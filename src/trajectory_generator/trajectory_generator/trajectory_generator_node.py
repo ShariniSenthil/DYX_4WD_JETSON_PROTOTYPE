@@ -59,6 +59,7 @@ import math
 import os
 import struct
 import threading
+import time
 
 from pathlib import Path as FilePath
 from typing import Any
@@ -2186,9 +2187,11 @@ class TrajectoryGenerator(Node):
         for x, y in points:
             pose = PoseStamped()
 
-            pose.header.stamp = stamp
-            pose.header.frame_id = self.frame_id
-
+            # Per-pose header is redundant: every consumer of /nav_path
+            # (rpp_controller_node.py:3736,4249) reads only the parent
+            # Path.header.frame_id set above, never pose.header. Skipping
+            # it avoids two extra attribute-setting rclpy message calls per
+            # interpolated point (thousands per mission at 5cm spacing).
             pose.pose.position.x = float(x)
 
             pose.pose.position.y = float(y)
@@ -2522,6 +2525,8 @@ class TrajectoryGenerator(Node):
             try:
                 # PREPARE creates only fixed surveyed mission geometry.
                 # RPP captures fresh current C at START after ARM.
+                _generation_started_monotonic = time.monotonic()
+
                 marking_points = self._convert_markings_to_local()
 
                 (
@@ -2543,6 +2548,15 @@ class TrajectoryGenerator(Node):
                 navigation_path = self._build_path(
                     navigation_points,
                     stamp,
+                )
+
+                _generation_elapsed_ms = (
+                    time.monotonic() - _generation_started_monotonic
+                ) * 1000.0
+                self.get_logger().info(
+                    "PATH GENERATION | "
+                    f"points={len(navigation_points)} "
+                    f"elapsed={_generation_elapsed_ms:.1f}ms"
                 )
 
                 signature = self._make_signature(
