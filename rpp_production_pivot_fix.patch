@@ -1,0 +1,112 @@
+diff --git a/src/rpp_controller/rpp_controller/rpp_controller_node.py b/src/rpp_controller/rpp_controller/rpp_controller_node.py
+--- a/src/rpp_controller/rpp_controller/rpp_controller_node.py
++++ b/src/rpp_controller/rpp_controller/rpp_controller_node.py
+@@
+         if result.directive in {MotionDirective.PIVOT, MotionDirective.REALIGN}:
+             # REALIGN holds zero once heading enters tolerance so measured
+             # speed/yaw-rate evidence can accumulate without carrier chatter.
+             if (
+                 result.directive is MotionDirective.REALIGN
+                 and abs(heading_error)
+                 <= self.precision_pivot_config.release_heading_tolerance_rad
+             ):
+                 self.publish_stop()
+                 return True
+-            carrier_bearing, true_error = self.precision_pivot_carrier_command(
+-                path_bearing,
+-                "PRECISION-PIVOT-FSM",
+-            )
+-            speed = self.segment_alignment_speed
+-            north = speed * math.sin(carrier_bearing)
+-            east = speed * math.cos(carrier_bearing)
+-            self.publish_velocity_ned(
+-                north,
+-                east,
+-                apply_acceleration=False,
+-                apply_deceleration=False,
+-                yaw_enu_rad=carrier_bearing,
+-            )
++
++            # Production explicit-yaw pivot:
++            #
++            # RPP owns maneuver state / release certification only.
++            # PX4 owns yaw dynamics (RO_YAW_P -> yaw-rate controller).
++            #
++            # Never create a translational carrier during a stationary pivot.
++            # Sending the final absolute segment yaw with literal zero
++            # translation lets the already-tuned PX4 controller use its full
++            # yaw-rate authority for large errors and naturally taper as the
++            # heading error closes.
++            if not self.rpp_explicit_yaw_enabled:
++                self.publish_stop()
++                self.get_logger().error(
++                    "PRECISION PIVOT REQUIRES EXPLICIT-YAW TRANSPORT / HOLD"
++                )
++                return True
++
++            self.reset_speed_profiles()
++            self.command_slew_speed = 0.0
++            self.command_slew_last_time = None
++
++            message = Vector3Stamped()
++            message.header.stamp = self.get_clock().now().to_msg()
++            message.header.frame_id = "map_ned"
++            message.vector.x = 0.0
++            message.vector.y = 0.0
++            message.vector.z = 0.0
++
++            if not self.velocity_pub.publish_zero_with_yaw(
++                message,
++                float(path_bearing),
++            ):
++                self.publish_stop()
++                self.get_logger().error(
++                    "PRECISION PIVOT EXPLICIT-YAW PUBLISH FAILED / HOLD"
++                )
++                return True
++
++            self.publish_motion_profile_monitor(0.0)
+             return True
+
+         if result.directive is MotionDirective.RECAPTURE:
+             # Position and measured release have been certified before this
+-            # re-anchor/translation point.  P1 is never re-anchored earlier.
++            # translation point. Mission geometry remains fixed; a pivot may
++            # not move the path underneath the rover.
+             if first_approach and not self.precision_pivot_reanchor_complete:
+                 if not self.precision_pivot_release_certified:
+                     self.publish_stop()
+                     return True
+-                self.reanchor_c_to_p1_after_pivot()
+                 self.precision_pivot_reanchor_complete = True
+                 self.reset_terminal_native_pivot()
+                 self.publish_stop()
+                 return True
+diff --git a/src/rover_bringup/launch/rover.launch.py b/src/rover_bringup/launch/rover.launch.py
+--- a/src/rover_bringup/launch/rover.launch.py
++++ b/src/rover_bringup/launch/rover.launch.py
+@@
+-                        "precision_lookahead_time_s": 0.90,
++                        # Faster moving steering response. 0.60 s keeps
++                        # projection guidance predictive while removing the
++                        # sluggish 0.90 s steering horizon seen in field logs.
++                        "precision_lookahead_time_s": 0.60,
+@@
+-                        # Phase-3 measured pivot/recenter FSM. Default-OFF
+-                        # preserves the production native keeper and adapter.
+-                        "precision_pivot_enabled": False,
++                        # Production pivot authority. The verified FSM owns
++                        # brake/stop/pivot/settle/recapture state, while PX4
++                        # remains the sole yaw-dynamics controller.
++                        "precision_pivot_enabled": True,
+@@
+                         "precision_pivot_stop_speed_tolerance_mps": 0.060,
+-                        "precision_pivot_stop_yaw_rate_tolerance_radps": 0.050,
++                        # Require residual rotation below ~1.43 deg/s before
++                        # the final release certificate is allowed to settle.
++                        "precision_pivot_stop_yaw_rate_tolerance_radps": 0.025,
+                         "precision_pivot_telemetry_timeout_sec": 0.25,
+                         "precision_pivot_stop_settle_sec": 0.20,
+-                        "precision_pivot_heading_tolerance_deg": 2.0,
++                        "precision_pivot_heading_tolerance_deg": 1.5,
+                         "precision_pivot_release_settle_sec": 0.20,

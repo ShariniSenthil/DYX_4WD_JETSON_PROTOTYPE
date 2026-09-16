@@ -5245,54 +5245,6 @@ class RPPController(Node):
             and math.isfinite(self.current_speed_mps)
         )
 
-    def _explicit_pivot_profile_bearing(self, true_bearing, true_error):
-        """Shape the zero-translation explicit-yaw pivot reference.
-
-        PX4 remains the only yaw dynamics controller. RPP only shapes the
-        absolute-yaw reference so a large/mid-size pivot keeps useful yaw
-        authority, then smoothly converges back to the real segment bearing
-        before the release threshold.
-
-        The profile reuses existing production thresholds:
-          - terminal_native_pivot_release_error: final true-yaw region
-          - pivot_enter_angle: full-carrier region starts here
-          - terminal_native_pivot_request_error: maximum carrier lead
-        """
-        true_bearing = self.normalize_angle(float(true_bearing))
-        true_error = self.normalize_angle(float(true_error))
-        error_abs = abs(true_error)
-
-        release_error = max(
-            1.0e-6,
-            float(self.terminal_native_pivot_release_error),
-        )
-        full_error = max(
-            release_error + 1.0e-6,
-            float(self.pivot_enter_angle),
-        )
-        carrier_error = max(
-            full_error,
-            float(self.terminal_native_pivot_request_error),
-        )
-
-        if error_abs <= release_error:
-            requested_error = error_abs
-        elif error_abs >= full_error:
-            requested_error = carrier_error
-        else:
-            ratio = (error_abs - release_error) / (full_error - release_error)
-            ratio = max(0.0, min(1.0, ratio))
-            blend = ratio * ratio * (3.0 - 2.0 * ratio)
-            requested_error = error_abs + blend * (carrier_error - error_abs)
-
-        requested_error = max(
-            error_abs,
-            min(carrier_error, requested_error),
-        )
-        turn_sign = 1.0 if true_error >= 0.0 else -1.0
-        return self.normalize_angle(
-            self.current_yaw + turn_sign * requested_error
-        )
     def _publish_legacy_native_carrier(
         self,
         request_bearing,
@@ -5310,13 +5262,7 @@ class RPPController(Node):
                     "explicit-yaw pivot lacks finite latched true bearing"
                 )
 
-            # Smart production pivot reference: zero translation is preserved.
-            # PX4 still owns the complete yaw-control dynamics.
-            command_bearing = self._explicit_pivot_profile_bearing(
-                true_bearing,
-                true_error,
-            )
-
+            # Patch 5 B: true zero-translation absolute-yaw pivot.
             self.reset_speed_profiles()
             self.command_slew_speed = 0.0
             self.command_slew_last_time = None
@@ -5329,7 +5275,7 @@ class RPPController(Node):
             message.vector.z = 0.0
             if not self.velocity_pub.publish_zero_with_yaw(
                 message,
-                float(command_bearing),
+                float(true_bearing),
             ):
                 raise RuntimeError(
                     "B-side zero-translation explicit-yaw pivot rejected"
@@ -5341,8 +5287,7 @@ class RPPController(Node):
                 mode_prefix
                 + status_prefix
                 + " ZERO TRANSLATION + EXPLICIT YAW"
-                + f" | command_bearing={math.degrees(command_bearing):.1f}deg"
-                + f" | final_bearing={math.degrees(true_bearing):.1f}deg"
+                + f" | target_bearing={math.degrees(true_bearing):.1f}deg"
                 + f" | true_error={math.degrees(true_error):+.1f}deg"
                 + f" | xtrack="
                 + f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"

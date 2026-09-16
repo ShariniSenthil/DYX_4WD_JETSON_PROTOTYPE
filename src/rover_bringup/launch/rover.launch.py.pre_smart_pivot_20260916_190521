@@ -562,7 +562,7 @@ def generate_launch_description() -> LaunchDescription:
                         "precision_speed_control_enabled": False,
                         "precision_lookahead_min_m": 0.20,
                         "precision_lookahead_max_m": 1.00,
-                        "precision_lookahead_time_s": 0.65,
+                        "precision_lookahead_time_s": 0.90,
                         "precision_xtrack_lookahead_gain": 0.0,
                         # Cut 30 -> 15 deg 2026-09-12: today's mode-B
                         # (explicit-yaw) field logs (log_227, log_233) showed
@@ -580,7 +580,7 @@ def generate_launch_description() -> LaunchDescription:
                         # the mechanism directly. Re-measure swing pp
                         # amplitude and period in the field before tuning
                         # further.
-                        "precision_moving_bearing_cone_deg": 18.0,
+                        "precision_moving_bearing_cone_deg": 15.0,
                         # Added 2026-09-12 alongside the cone cut above.
                         # Rate-limits the published explicit yaw itself
                         # (guidance.py's cone re-centers on instantaneous yaw
@@ -897,7 +897,7 @@ def generate_launch_description() -> LaunchDescription:
                         "terminal_goal_intercept_distance_m": 0.90,
                         "terminal_goal_intercept_bearing_limit_deg": 22.0,
                         "terminal_native_pivot_enter_error_deg": 45.0,
-                        "terminal_native_pivot_release_error_deg": 2.0,
+                        "terminal_native_pivot_release_error_deg": 4.0,
                         # Deprecated compatibility parameter. It is no
                         # longer used to create a moving 60-degree vector;
                         # production B mode uses zero translation + true absolute yaw.
