@@ -30,6 +30,7 @@ import io
 import json
 import math
 import os
+import re
 import tempfile
 import threading
 import uuid
@@ -107,11 +108,60 @@ class MissionStore:
         self,
         mission_file: Path,
         metadata_file: Path,
+        archive_directory: Path | None = None,
     ) -> None:
         self.mission_file = mission_file
         self.metadata_file = metadata_file
-
+        self.archive_directory = (
+            archive_directory
+            if archive_directory is not None
+            else metadata_file.parent / "mission_archive"
+        )
         self._lock = threading.RLock()
+
+    _MISSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+    def _archive_path(self, mission_id: str) -> Path:
+        value = str(mission_id or "").strip()
+        if not self._MISSION_ID_PATTERN.fullmatch(value):
+            raise MissionValidationError("The mission ID is invalid.")
+        path = self.archive_directory / value
+        if path.is_symlink():
+            raise MissionValidationError("The archived mission path is invalid.")
+        return path
+
+    def _load_archive_unlocked(self, mission_id: str) -> tuple[dict[str, Any], bytes]:
+        archive_path = self._archive_path(mission_id)
+        metadata_path = archive_path / "metadata.json"
+        csv_path = archive_path / "mission.csv"
+        if not metadata_path.is_file() or not csv_path.is_file():
+            raise MissionValidationError("The archived mission was not found.")
+        try:
+            metadata_value = json.loads(metadata_path.read_text(encoding="utf-8"))
+            mission_bytes = csv_path.read_bytes()
+        except (OSError, json.JSONDecodeError) as error:
+            raise MissionValidationError("The archived mission is invalid.") from error
+        if not isinstance(metadata_value, dict):
+            raise MissionValidationError("Archived mission metadata is invalid.")
+        expected_checksum = str(metadata_value.get("checksum_sha256", "")).strip()
+        if not expected_checksum or expected_checksum != self._sha256(mission_bytes):
+            raise MissionValidationError("Archived mission checksum verification failed.")
+        extension_mode = str(metadata_value.get("extension_mode", "")).strip().upper()
+        validated = self.validate(
+            raw_bytes=mission_bytes,
+            filename="mission.csv",
+            extension_mode=extension_mode,
+            dummy_point_distance_m=metadata_value.get("dummy_point_distance_m"),
+        )
+        try:
+            total_points = int(metadata_value.get("total_points"))
+        except (TypeError, ValueError) as error:
+            raise MissionValidationError("Archived mission point count is invalid.") from error
+        if total_points != len(validated.points):
+            raise MissionValidationError("Archived mission point count verification failed.")
+        metadata_value["points"] = self._validated_point_metadata(validated)
+        metadata_value["mission_id"] = str(metadata_value.get("mission_id") or mission_id)
+        return dict(metadata_value), mission_bytes
 
     @staticmethod
     def _validated_point_metadata(
@@ -897,6 +947,142 @@ class MissionStore:
 
             return self.mission_file.read_bytes()
 
+    def archive_active_mission(
+        self,
+        *,
+        completion_report: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Durably archive the active mission before clearing its active slot.
+
+        The archive is written atomically and checksum verified.  If the
+        active artifacts cannot be removed afterwards, ``delete`` restores
+        them and this method raises, so a completed mission is never lost.
+        """
+
+        with self._lock:
+            metadata = self.load_metadata()
+            if metadata is None:
+                return None
+            mission_id = str(metadata.get("mission_id") or "").strip()
+            archive_path = self._archive_path(mission_id)
+            mission_bytes = self.mission_file.read_bytes()
+
+            archive_metadata: dict[str, Any] = dict(metadata)
+            archive_metadata.update(
+                {
+                    "archive_schema_version": 1,
+                    "archived_at": utc_now_iso(),
+                    "source": "COMPLETED_MISSION_ARCHIVE",
+                }
+            )
+            if completion_report is not None:
+                archive_metadata["completion"] = {
+                    "report_id": completion_report.get("report_id"),
+                    "mission_run_id": completion_report.get("mission_run_id"),
+                    "state": completion_report.get("state"),
+                    "termination": completion_report.get("termination"),
+                    "summary": completion_report.get("summary"),
+                }
+
+            # A previous retry may have created the archive already. Verify it
+            # and make the operation idempotent rather than overwriting it.
+            if archive_path.exists():
+                existing, existing_bytes = self._load_archive_unlocked(mission_id)
+                if existing.get("checksum_sha256") != metadata.get("checksum_sha256"):
+                    raise RuntimeError("An archived mission ID has a different checksum.")
+                if existing_bytes != mission_bytes:
+                    raise RuntimeError("An archived mission ID has different mission data.")
+            else:
+                self.archive_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                temporary_directory = Path(
+                    tempfile.mkdtemp(prefix=f".{mission_id}.", dir=str(self.archive_directory))
+                )
+                try:
+                    self._atomic_write_bytes(temporary_directory / "mission.csv", mission_bytes)
+                    self._atomic_write_json(temporary_directory / "metadata.json", archive_metadata)
+                    os.replace(temporary_directory, archive_path)
+                    self._fsync_directory(self.archive_directory)
+                except Exception:
+                    try:
+                        for child in temporary_directory.iterdir():
+                            child.unlink(missing_ok=True)
+                        temporary_directory.rmdir()
+                    except OSError:
+                        pass
+                    raise
+
+            self.delete()
+            return archive_metadata
+
+    def list_archived_missions(self) -> list[dict[str, Any]]:
+        """Return checksum-verified completed mission summaries, newest first."""
+
+        summaries: list[dict[str, Any]] = []
+        with self._lock:
+            if not self.archive_directory.is_dir():
+                return summaries
+            for child in self.archive_directory.iterdir():
+                if not child.is_dir() or not self._MISSION_ID_PATTERN.fullmatch(child.name):
+                    continue
+                try:
+                    metadata, _ = self._load_archive_unlocked(child.name)
+                except MissionValidationError:
+                    continue
+                summaries.append(
+                    {
+                        "mission_id": metadata.get("mission_id", child.name),
+                        "original_filename": metadata.get("original_filename", "mission.csv"),
+                        "coordinate_mode": metadata.get("coordinate_mode"),
+                        "extension_mode": metadata.get("extension_mode"),
+                        "dummy_point_distance_m": metadata.get("dummy_point_distance_m"),
+                        "total_points": metadata.get("total_points", 0),
+                        "uploaded_at": metadata.get("uploaded_at"),
+                        "archived_at": metadata.get("archived_at"),
+                        "checksum_sha256": metadata.get("checksum_sha256"),
+                    }
+                )
+        summaries.sort(key=lambda value: str(value.get("archived_at") or value.get("uploaded_at") or ""), reverse=True)
+        return summaries
+
+    def restore_archived_mission(self, mission_id: str) -> dict[str, Any]:
+        """Restore a verified completed mission into the active mission slot."""
+
+        with self._lock:
+            metadata, mission_bytes = self._load_archive_unlocked(mission_id)
+            active_metadata = dict(metadata)
+            active_metadata.pop("archive_schema_version", None)
+            active_metadata.pop("archived_at", None)
+            active_metadata.pop("source", None)
+            active_metadata.pop("completion", None)
+            active_metadata["active_filename"] = self.mission_file.name
+            previous_mission = self.mission_file.read_bytes() if self.mission_file.is_file() else None
+            previous_metadata = self.metadata_file.read_bytes() if self.metadata_file.is_file() else None
+            try:
+                self._atomic_write_bytes(self.mission_file, mission_bytes)
+                self._atomic_write_json(self.metadata_file, active_metadata)
+            except Exception:
+                self._restore_previous_file(self.mission_file, previous_mission)
+                self._restore_previous_file(self.metadata_file, previous_metadata)
+                raise
+
+        rover_state.load_mission(
+            mission_id=str(active_metadata["mission_id"]),
+            filename=str(active_metadata["active_filename"]),
+            checksum_sha256=str(active_metadata["checksum_sha256"]),
+            coordinate_mode=str(active_metadata["coordinate_mode"]),
+            extension_mode=str(active_metadata["extension_mode"]),
+            dummy_point_distance_m=active_metadata.get("dummy_point_distance_m"),
+            row_transition_threshold_m=float(
+                active_metadata.get(
+                    "row_transition_threshold_m",
+                    settings.row_transition_threshold_m,
+                )
+            ),
+            total_points=int(active_metadata["total_points"]),
+            uploaded_at=str(active_metadata.get("uploaded_at") or utc_now_iso()),
+        )
+        return active_metadata
+
     def delete(
         self,
     ) -> bool:
@@ -977,4 +1163,5 @@ class MissionStore:
 mission_store = MissionStore(
     mission_file=settings.mission_file,
     metadata_file=(settings.mission_metadata_file),
+    archive_directory=settings.mission_archive_directory,
 )

@@ -659,6 +659,7 @@ class MissionReportStore:
                 "complete": False,
                 "trajectory_cleared": False,
                 "active_artifacts_deleted": False,
+                "active_mission_archived": False,
                 "error": None,
                 "updated_at": generated_at,
             }
@@ -932,6 +933,7 @@ class MissionReportStore:
                 "mission_id": current.get("mission_id"),
                 "termination": current.get("termination"),
                 "cleanup_complete": False,
+                "active_mission_archived": False,
                 "error": error,
                 "report_url": None,
                 "download_url": None,
@@ -964,6 +966,7 @@ class MissionReportStore:
             "mission_id": report.get("mission_id"),
             "termination": report.get("termination"),
             "cleanup_complete": bool(cleanup.get("complete", False)),
+            "active_mission_archived": bool(cleanup.get("active_mission_archived", False)),
             "error": error,
             "report_url": "/api/mission/report",
             "download_url": ("/api/mission/report/download" if is_terminal else None),
@@ -1121,6 +1124,7 @@ class MissionReportStore:
         trajectory_cleared: bool,
         active_artifacts_deleted: bool,
         error: str | None,
+        active_mission_archived: bool = False,
     ) -> dict[str, Any]:
         updated = self._canonical_persisted_report(copy.deepcopy(report))
         updated["cleanup"] = {
@@ -1128,6 +1132,7 @@ class MissionReportStore:
             "complete": bool(complete),
             "trajectory_cleared": bool(trajectory_cleared),
             "active_artifacts_deleted": bool(active_artifacts_deleted),
+            "active_mission_archived": bool(active_mission_archived),
             "error": error,
             "updated_at": utc_now_iso(),
         }

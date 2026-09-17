@@ -62,6 +62,7 @@ from rover_backend.mission_report import MissionReportError
 from rover_backend.mission_report import StaleMissionTerminalEvent
 from rover_backend.mission_report import mission_report_store
 from rover_backend.mission_store import mission_store
+from rover_backend.mission_store import MissionValidationError
 from rover_backend.rtk_mavros_readiness import (
     evaluate_mavros_rtcm_readiness,
 )
@@ -3246,19 +3247,20 @@ class RoverBackendRosNode(Node):
             trajectory_cleared = True
 
             try:
-                mission_store.delete()
-            except RuntimeError as error:
+                mission_store.archive_active_mission(completion_report=report)
+            except (MissionValidationError, OSError, RuntimeError) as error:
                 reason = (
                     "Terminal report was preserved and the trajectory was "
-                    f"cleared, but active mission artifacts could not be deleted: {error}"
+                    f"cleared, but the completed mission could not be archived: {error}"
                 )
                 try:
                     mission_report_store.update_cleanup(
                         report,
-                        status="ARTIFACT_DELETE_FAILED",
+                        status="ARCHIVE_FAILED",
                         complete=False,
                         trajectory_cleared=trajectory_cleared,
                         active_artifacts_deleted=False,
+                        active_mission_archived=False,
                         error=reason,
                     )
                 except MissionReportError:
@@ -3269,13 +3271,24 @@ class RoverBackendRosNode(Node):
                 self.get_logger().error(reason)
                 return
 
+            # Keep a display-only terminal marker after the active slot is
+            # cleared. The frontend uses it to retain the final path until a
+            # new upload or an explicit clear.
+            rover_state.update(
+                "mission",
+                terminal_cleanup_status="ARCHIVED",
+                terminal_cleanup_error=None,
+                message="Mission completed and archived; active slot is ready for another mission.",
+            )
+
             try:
                 mission_report_store.update_cleanup(
                     report,
-                    status="READY",
+                    status="ARCHIVED",
                     complete=True,
                     trajectory_cleared=True,
                     active_artifacts_deleted=True,
+                    active_mission_archived=True,
                     error=None,
                 )
             except MissionReportError:

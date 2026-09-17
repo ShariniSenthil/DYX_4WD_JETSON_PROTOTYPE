@@ -216,6 +216,7 @@ class Settings:
 
     mission_file: Path
     mission_metadata_file: Path
+    mission_archive_directory: Path
     runtime_directory: Path
     mission_report_file: Path
 
@@ -327,6 +328,11 @@ def load_settings() -> Settings:
         home_directory / "rover_ws" / "missions" / "mission.csv",
     )
 
+    mission_archive_directory = _read_path(
+        "DYX_MISSION_ARCHIVE_DIRECTORY",
+        data_directory / "mission_archive",
+    )
+
     database_file = _read_path(
         "DYX_DATABASE_FILE",
         data_directory / "backend.sqlite3",
@@ -426,6 +432,7 @@ def load_settings() -> Settings:
             "DYX_MISSION_METADATA_FILE",
             runtime_directory / "mission_metadata.json",
         ),
+        mission_archive_directory=mission_archive_directory,
         runtime_directory=runtime_directory,
         mission_report_file=_read_path(
             "DYX_MISSION_REPORT_FILE",
@@ -469,6 +476,7 @@ def load_settings() -> Settings:
         settings.database_file.parent,
         settings.mission_file.parent,
         settings.mission_metadata_file.parent,
+        settings.mission_archive_directory,
         settings.runtime_directory,
         settings.mission_report_file.parent,
     }

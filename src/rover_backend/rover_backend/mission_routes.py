@@ -10,6 +10,7 @@ Responsibilities of this module:
 - validate and atomically replace the single active mission.csv;
 - request trajectory preparation after every successful upload (preview only);
 - confirm a generated preview for START via POST /load;
+- archive completed missions and restore/start them by mission_id;
 - expose mission status and a bounded prepared-path preview;
 - download or delete the active mission.csv;
 - forward Start, Pause, Resume, Next Point, Skip Point, Stop and Clear
@@ -77,6 +78,12 @@ async def _serialize_mission_mutation() -> AsyncIterator[None]:
 
 class ExecutionModeRequest(BaseModel):
     execution_mode: str
+
+
+class MissionIdRequest(BaseModel):
+    """Optional mission identity used by restore/load/start retries."""
+
+    mission_id: str | None = None
 
 
 def _mission_state() -> dict[str, Any]:
@@ -312,6 +319,7 @@ async def upload_mission(
 
 @mission_router.post("/load")
 async def load_mission(
+    request: MissionIdRequest | None = None,
     _session: AuthenticatedSession = Depends(require_auth),
     _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
@@ -323,6 +331,13 @@ async def load_mission(
     _require_not_driving(operation="load the mission")
 
     mission = _mission_state()
+
+    requested_id = str(request.mission_id).strip() if request and request.mission_id else None
+    if requested_id and requested_id != str(mission.get("mission_id") or ""):
+        raise HTTPException(
+            status_code=409,
+            detail="The requested mission is not the currently loaded mission. Restore it first.",
+        )
 
     if mission.get("loaded") is not True:
         raise HTTPException(
@@ -356,8 +371,88 @@ async def load_mission(
     }
 
 
+@mission_router.post("/restore")
+async def restore_mission(
+    request: MissionIdRequest,
+    _session: AuthenticatedSession = Depends(require_auth),
+    _mutation: None = Depends(_serialize_mission_mutation),
+) -> dict[str, Any]:
+    """Restore a completed mission by its archived mission ID and prepare it."""
+
+    _require_not_active(operation="restore a completed mission")
+    mission_id = str(request.mission_id or "").strip()
+    if not mission_id:
+        raise HTTPException(status_code=422, detail="mission_id is required.")
+
+    current_id = str(_mission_state().get("mission_id") or "")
+    current_loaded = bool(_mission_state().get("loaded", False))
+    if current_loaded and current_id and current_id != mission_id:
+        raise HTTPException(
+            status_code=409,
+            detail="A different mission is currently loaded. Upload, clear, or delete it first.",
+        )
+
+    try:
+        metadata = await run_in_threadpool(mission_store.restore_archived_mission, mission_id)
+    except MissionValidationError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except (OSError, RuntimeError) as error:
+        raise HTTPException(status_code=500, detail=f"The archived mission could not be restored: {error}") from error
+
+    rover_state.update("mission", accepted_for_start=False)
+    try:
+        _require_ros_bridge()
+        await run_in_threadpool(ros_bridge.prepare_trajectory)
+    except HTTPException:
+        rover_state.set_mission_state(
+            "LOADED",
+            message="Archived mission restored; trajectory preparation is waiting for the ROS bridge.",
+            error=None,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "success": False,
+                "mission_restored": True,
+                "message": "The archived mission was restored, but trajectory preparation could not start.",
+                "mission": _mission_state(),
+            },
+        )
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "success": False,
+                "mission_restored": True,
+                "message": str(error),
+                "mission": _mission_state(),
+            },
+        ) from error
+
+    return {
+        "success": True,
+        "operation": "restore",
+        "message": "Archived mission restored; review the generated preview, then load and start it.",
+        "restore": metadata,
+        "mission": _mission_state(),
+    }
+
+
+@mission_router.get("/history")
+def mission_history(
+    _session: AuthenticatedSession = Depends(require_auth),
+) -> dict[str, Any]:
+    """List checksum-verified missions completed on this rover."""
+
+    return {
+        "success": True,
+        "missions": mission_store.list_archived_missions(),
+    }
+
+
 @mission_router.post("/prepare")
 async def prepare_mission(
+    request: MissionIdRequest | None = None,
     _session: AuthenticatedSession = Depends(require_auth),
     _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
@@ -373,12 +468,16 @@ async def prepare_mission(
     _require_not_active(operation="prepare the mission")
 
     try:
-        await run_in_threadpool(mission_store.load_metadata)
+        metadata = await run_in_threadpool(mission_store.load_metadata)
     except MissionValidationError as error:
         raise HTTPException(
             status_code=409,
             detail=str(error),
         ) from error
+
+    requested_id = str(request.mission_id).strip() if request and request.mission_id else None
+    if requested_id and (not metadata or requested_id != str(metadata.get("mission_id") or "")):
+        raise HTTPException(status_code=409, detail="The requested mission is not currently loaded.")
 
     return await _run_ros_operation(
         "prepare",
@@ -548,10 +647,40 @@ async def set_execution_mode(
 
 @mission_router.post("/start")
 async def start_mission(
+    request: MissionIdRequest | None = None,
     _session: AuthenticatedSession = Depends(require_auth),
     _mutation: None = Depends(_serialize_mission_mutation),
 ) -> dict[str, Any]:
-    if _mission_state().get("accepted_for_start") is not True:
+    mission = _mission_state()
+    requested_id = str(request.mission_id).strip() if request and request.mission_id else None
+    if requested_id and requested_id != str(mission.get("mission_id") or ""):
+        # A completed mission no longer occupies the active slot.  Accepting
+        # its archived ID here makes retries deterministic while still
+        # requiring a fresh trajectory preparation and READY preview.
+        _require_not_driving(operation="restore a mission for start")
+        if mission.get("loaded") is True:
+            raise HTTPException(
+                status_code=409,
+                detail="A different mission is currently loaded. Restore it after clearing the active mission.",
+            )
+        try:
+            await run_in_threadpool(mission_store.restore_archived_mission, requested_id)
+            _require_ros_bridge()
+            await run_in_threadpool(ros_bridge.prepare_trajectory)
+        except MissionValidationError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except HTTPException:
+            raise
+        except (OSError, RuntimeError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        mission = _mission_state()
+        if mission.get("trajectory_ready") is not True:
+            raise HTTPException(
+                status_code=409,
+                detail="The archived mission was restored. Wait for its path preview, then load it before starting.",
+            )
+        rover_state.update("mission", accepted_for_start=True)
+    if mission.get("accepted_for_start") is not True:
         raise HTTPException(
             status_code=409,
             detail=(
