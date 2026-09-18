@@ -79,6 +79,8 @@ class RadialStopConfig:
     terminal_guidance_distance_m: float = 0.75
     conservative_decel_mps2: float = 0.30
     brake_margin_m: float = 0.010
+    minimum_actuatable_speed_mps: float = 0.15
+    minimum_speed_stop_lead_m: float = 0.035
     stationary_window_sec: float = 0.50
     stationary_displacement_m: float = 0.005
     stationary_yaw_rate_radps: float = 0.050
@@ -92,6 +94,8 @@ class RadialStopConfig:
             "terminal_guidance_distance_m",
             "conservative_decel_mps2",
             "brake_margin_m",
+            "minimum_actuatable_speed_mps",
+            "minimum_speed_stop_lead_m",
             "stationary_window_sec",
             "stationary_displacement_m",
             "stationary_yaw_rate_radps",
@@ -107,6 +111,8 @@ class RadialStopConfig:
             "radial_tolerance_m",
             "terminal_guidance_distance_m",
             "conservative_decel_mps2",
+            "minimum_actuatable_speed_mps",
+            "minimum_speed_stop_lead_m",
             "stationary_window_sec",
             "stationary_displacement_m",
             "stationary_yaw_rate_radps",
@@ -121,6 +127,14 @@ class RadialStopConfig:
             raise ValueError("brake_margin_m must be non-negative")
         if self.brake_margin_m > self.radial_tolerance_m:
             raise ValueError("brake_margin_m must not exceed radial_tolerance_m")
+        if self.minimum_speed_stop_lead_m <= self.radial_tolerance_m:
+            raise ValueError(
+                "minimum_speed_stop_lead_m must exceed radial_tolerance_m"
+            )
+        if self.minimum_speed_stop_lead_m >= self.terminal_guidance_distance_m:
+            raise ValueError(
+                "minimum_speed_stop_lead_m must be below terminal guidance distance"
+            )
         if self.terminal_guidance_distance_m <= self.radial_tolerance_m:
             raise ValueError(
                 "terminal_guidance_distance_m must exceed radial_tolerance_m"
@@ -644,15 +658,12 @@ class TerminalStopRegulator:
         stop_distance_m: float,
         effective_braking_speed_mps: float,
     ) -> RadialStopOutput:
-        effective_remaining = max(
-            0.0,
-            sample.along_remaining_m - self.config.brake_margin_m,
-        )
-        profile_speed = math.sqrt(
-            2.0 * self.config.conservative_decel_mps2 * effective_remaining
-        )
-        command = min(sample.tracking_speed_command_mps, profile_speed)
-        if command <= 0.0:
+        # Field logs show sub-0.15m/s commands stall/twitch the drivetrain.
+        # Zero at the measured coast lead; otherwise keep an actuatable floor.
+        if (
+            sample.along_remaining_m <= self.config.minimum_speed_stop_lead_m
+            and abs(sample.cross_error_m) <= self.config.radial_tolerance_m
+        ):
             self._enter_zero_latch(sample)
             return self._zero_output(
                 previous,
@@ -661,6 +672,16 @@ class TerminalStopRegulator:
                 stop_distance_m=stop_distance_m,
                 effective_braking_speed_mps=effective_braking_speed_mps,
             )
+
+        effective_remaining = max(
+            0.0,
+            sample.along_remaining_m - self.config.brake_margin_m,
+        )
+        profile_speed = math.sqrt(
+            2.0 * self.config.conservative_decel_mps2 * effective_remaining
+        )
+        requested = min(sample.tracking_speed_command_mps, profile_speed)
+        command = max(self.config.minimum_actuatable_speed_mps, requested)
         return RadialStopOutput(
             previous_state=previous,
             state=self._state,

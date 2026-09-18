@@ -149,7 +149,7 @@ def generate_launch_description() -> LaunchDescription:
                         # Bridge preserves the RPP ramp and only clamps
                         # commands above this production safety maximum.
                         "maximum_speed_mps": (1.00),
-                        ("maximum_yaw_rate_" "radps"): 0.20,
+                        ("maximum_yaw_rate_" "radps"): 0.35,
                     }
                 ],
             ),
@@ -473,7 +473,8 @@ def generate_launch_description() -> LaunchDescription:
                         #   release heading            = <=4 deg stable for 0.30 s
                         "segment_alignment_speed_mps": CRUISE_SPEED_MPS,
                         "segment_alignment_recovery_speed_mps": CRUISE_SPEED_MPS,
-                        "xtrack_priority_speed_mps": CRUISE_SPEED_MPS,
+                        # Post-pivot fixed-path recapture and global recovery cap.
+                        "xtrack_priority_speed_mps": 0.20,
                         "decel_profile_speed_1_mps": CRUISE_SPEED_MPS,
                         "decel_profile_speed_2_mps": CRUISE_SPEED_MPS,
                         "decel_profile_speed_3_mps": CRUISE_SPEED_MPS,
@@ -510,9 +511,14 @@ def generate_launch_description() -> LaunchDescription:
                         # xtrack_priority_exit_m=0.008 remain valid for this
                         # hold time.
                         "alignment_hold_sec": 0.20,
-                        "maximum_yaw_rate_radps": 0.20,
-                        "minimum_yaw_rate_radps": 0.06,
-                        "pivot_yaw_kp": 1.00,
+                        # Stationary pivot: strong ~20deg/s authority.
+                        "maximum_yaw_rate_radps": 0.35,
+                        "minimum_yaw_rate_radps": 0.10,
+                        "pivot_yaw_kp": 1.50,
+                        # Moving steering: soft near points, stronger at cruise.
+                        "moving_yaw_rate_min_radps": 0.06,
+                        "moving_yaw_rate_max_radps": 0.16,
+                        "moving_yaw_kp": 0.80,
                         "alignment_reentry_goal_distance_m": 0.60,
                         # Hardened speed arbitration:
                         # - post-pivot line capture and global xtrack recovery are capped
@@ -723,6 +729,8 @@ def generate_launch_description() -> LaunchDescription:
                         # creep retry, which is a controller change, not a
                         # tuning value.
                         "radial_stop_brake_margin_m": 0.003,
+                        "radial_stop_minimum_actuatable_speed_mps": 0.15,
+                        "radial_stop_minimum_speed_stop_lead_m": 0.035,
                         "radial_stop_stationary_window_sec": 0.50,
                         "radial_stop_stationary_displacement_m": 0.005,
                         "radial_stop_stationary_yaw_rate_radps": 0.050,

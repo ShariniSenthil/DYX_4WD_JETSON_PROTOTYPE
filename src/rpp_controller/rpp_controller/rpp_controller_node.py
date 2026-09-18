@@ -364,9 +364,13 @@ class RPPController(Node):
         self.declare_parameter("pivot_enter_angle_deg", 45.0)
         self.declare_parameter("pivot_exit_angle_deg", 6.0)
         self.declare_parameter("alignment_hold_sec", 0.20)
-        self.declare_parameter("maximum_yaw_rate_radps", 0.20)
-        self.declare_parameter("minimum_yaw_rate_radps", 0.06)
-        self.declare_parameter("pivot_yaw_kp", 1.00)
+        # Stationary pivot authority. Moving steering has separate limits below.
+        self.declare_parameter("maximum_yaw_rate_radps", 0.35)
+        self.declare_parameter("minimum_yaw_rate_radps", 0.10)
+        self.declare_parameter("pivot_yaw_kp", 1.50)
+        self.declare_parameter("moving_yaw_rate_min_radps", 0.06)
+        self.declare_parameter("moving_yaw_rate_max_radps", 0.16)
+        self.declare_parameter("moving_yaw_kp", 0.80)
         self.declare_parameter(
             "alignment_reentry_goal_distance_m",
             0.60,
@@ -657,6 +661,8 @@ class RPPController(Node):
         # 35-50 mm coast overshoot, and changing one term at a time keeps the
         # next run's result attributable.
         self.declare_parameter("radial_stop_brake_margin_m", 0.003)
+        self.declare_parameter("radial_stop_minimum_actuatable_speed_mps", 0.15)
+        self.declare_parameter("radial_stop_minimum_speed_stop_lead_m", 0.035)
         self.declare_parameter("radial_stop_stationary_window_sec", 0.50)
         self.declare_parameter("radial_stop_stationary_displacement_m", 0.005)
         self.declare_parameter("radial_stop_stationary_yaw_rate_radps", 0.050)
@@ -948,6 +954,13 @@ class RPPController(Node):
             self.get_parameter("minimum_yaw_rate_radps").value
         )
         self.pivot_yaw_kp = float(self.get_parameter("pivot_yaw_kp").value)
+        self.moving_yaw_rate_min = float(
+            self.get_parameter("moving_yaw_rate_min_radps").value
+        )
+        self.moving_yaw_rate_max = float(
+            self.get_parameter("moving_yaw_rate_max_radps").value
+        )
+        self.moving_yaw_kp = float(self.get_parameter("moving_yaw_kp").value)
         self.alignment_reentry_goal_distance = float(
             self.get_parameter("alignment_reentry_goal_distance_m").value
         )
@@ -1392,6 +1405,12 @@ class RPPController(Node):
             ),
             brake_margin_m=float(
                 self.get_parameter("radial_stop_brake_margin_m").value
+            ),
+            minimum_actuatable_speed_mps=float(
+                self.get_parameter("radial_stop_minimum_actuatable_speed_mps").value
+            ),
+            minimum_speed_stop_lead_m=float(
+                self.get_parameter("radial_stop_minimum_speed_stop_lead_m").value
             ),
             stationary_window_sec=float(
                 self.get_parameter("radial_stop_stationary_window_sec").value
@@ -3132,6 +3151,17 @@ class RPPController(Node):
             )
         if not math.isfinite(self.pivot_yaw_kp) or self.pivot_yaw_kp <= 0.0:
             raise ValueError("pivot_yaw_kp must be finite and > 0")
+        if not (
+            math.isfinite(self.moving_yaw_rate_min)
+            and math.isfinite(self.moving_yaw_rate_max)
+            and 0.0 < self.moving_yaw_rate_min <= self.moving_yaw_rate_max
+            <= self.maximum_yaw_rate
+        ):
+            raise ValueError(
+                "moving yaw-rate limits require 0 < min <= max <= pivot maximum"
+            )
+        if not math.isfinite(self.moving_yaw_kp) or self.moving_yaw_kp <= 0.0:
+            raise ValueError("moving_yaw_kp must be finite and > 0")
         if self.heading_full_speed >= self.heading_min_speed:
             raise ValueError(
                 "heading_full_speed_deg must be less than " "heading_min_speed_deg"
@@ -3301,8 +3331,19 @@ class RPPController(Node):
     def normalize_angle(angle):
         return math.atan2(math.sin(angle), math.cos(angle))
 
-    def explicit_yaw_rate_command(self, target_yaw_enu_rad):
-        """Generate Jetson-owned signed ENU yaw-rate from wrapped yaw error."""
+    def explicit_yaw_rate_command(
+        self,
+        target_yaw_enu_rad,
+        *,
+        stationary_pivot=False,
+        translational_speed_mps=0.0,
+    ):
+        """Generate Jetson-owned ENU yaw-rate with separate pivot/moving authority.
+
+        Stationary pivots get the strong pivot envelope. Moving steering gets a
+        speed-dependent cap: deliberately soft near a semantic point and more
+        authority at cruise. PX4 remains the low-level physical yaw-rate tracker.
+        """
         if (
             self.current_yaw is None
             or not math.isfinite(float(self.current_yaw))
@@ -3314,11 +3355,28 @@ class RPPController(Node):
         yaw_error = self.normalize_angle(
             float(target_yaw_enu_rad) - float(self.current_yaw)
         )
-        requested = self.pivot_yaw_kp * yaw_error
-        return max(
-            -self.maximum_yaw_rate,
-            min(self.maximum_yaw_rate, requested),
+        error_abs = abs(yaw_error)
+        if error_abs <= 1.0e-9:
+            return 0.0
+
+        turn_sign = 1.0 if yaw_error > 0.0 else -1.0
+        if stationary_pivot:
+            requested_mag = abs(self.pivot_yaw_kp * yaw_error)
+            commanded_mag = min(
+                self.maximum_yaw_rate,
+                max(self.minimum_yaw_rate, requested_mag),
+            )
+            return turn_sign * commanded_mag
+
+        speed = max(0.0, float(translational_speed_mps))
+        cruise = max(1.0e-6, float(self.cruise_speed))
+        speed_ratio = max(0.0, min(1.0, speed / cruise))
+        moving_cap = self.moving_yaw_rate_min + speed_ratio * (
+            self.moving_yaw_rate_max - self.moving_yaw_rate_min
         )
+        requested_mag = abs(self.moving_yaw_kp * yaw_error)
+        commanded_mag = min(moving_cap, requested_mag)
+        return turn_sign * commanded_mag
 
     @staticmethod
     def ground_xtrack(value):
@@ -5332,7 +5390,11 @@ class RPPController(Node):
             # Jetson full-authority pivot:
             # zero translation + exact final yaw + signed RPP yaw-rate.
             command_bearing = self.normalize_angle(float(true_bearing))
-            yaw_rate_enu = self.explicit_yaw_rate_command(command_bearing)
+            yaw_rate_enu = self.explicit_yaw_rate_command(
+                command_bearing,
+                stationary_pivot=True,
+                translational_speed_mps=0.0,
+            )
 
             self.reset_speed_profiles()
             self.command_slew_speed = 0.0
@@ -5562,7 +5624,8 @@ class RPPController(Node):
             self.reset_speed_profiles()
             self.command_slew_speed = 0.0
             self.command_slew_last_time = None
-            self.xtrack_priority_active = False
+            # Certified pivot -> slow fixed-path recapture before normal tracking.
+            self.xtrack_priority_active = True
             self.xtrack_priority_inside_since = None
             self.reset_xtrack_damping_state()
             self._reset_precision_regulator("PIVOT_SETTLE_HOLD_COMPLETE")
@@ -5573,7 +5636,7 @@ class RPPController(Node):
             )
             self.publish_stop()
             self.get_logger().warn(
-                "PIVOT SETTLE HOLD COMPLETE / RELEASING TO PATH TRACKING | "
+                "PIVOT SETTLE HOLD COMPLETE / FIXED-PATH RECAPTURE ARMED | "
                 f"heading={math.degrees(path_heading_error):+.1f}deg | "
                 f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
             )
@@ -7153,7 +7216,11 @@ class RPPController(Node):
         msg.vector.z = 0.0
         if self.rpp_explicit_yaw_enabled:
             try:
-                yaw_rate_enu = self.explicit_yaw_rate_command(command_bearing)
+                yaw_rate_enu = self.explicit_yaw_rate_command(
+                    command_bearing,
+                    stationary_pivot=False,
+                    translational_speed_mps=output_speed,
+                )
             except (TypeError, ValueError):
                 self.get_logger().error(
                     "B-SIDE PRECISION COMMAND LOST YAW-RATE / IMMEDIATE ZERO"
@@ -7294,7 +7361,11 @@ class RPPController(Node):
                 self.velocity_pub.publish(msg)
             else:
                 try:
-                    yaw_rate_enu = self.explicit_yaw_rate_command(yaw_enu_rad)
+                    yaw_rate_enu = self.explicit_yaw_rate_command(
+                        yaw_enu_rad,
+                        stationary_pivot=False,
+                        translational_speed_mps=output_speed,
+                    )
                 except (TypeError, ValueError):
                     self.get_logger().error(
                         "B-SIDE MOVING COMMAND WITHOUT FINITE YAW-RATE / "
@@ -7363,7 +7434,9 @@ class RPPController(Node):
             self._reset_precision_regulator("PIVOT_HOLD")
             try:
                 yaw_rate_enu = self.explicit_yaw_rate_command(
-                    float(true_bearing)
+                    float(true_bearing),
+                    stationary_pivot=True,
+                    translational_speed_mps=0.0,
                 )
             except (TypeError, ValueError):
                 yaw_rate_enu = None

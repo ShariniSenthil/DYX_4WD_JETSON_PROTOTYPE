@@ -655,7 +655,11 @@ def _patch5_pivot_deps(node):
     node.segment_alignment_speed = 1.0
     node.current_yaw = 0.0
     node.maximum_yaw_rate = 0.20
+    node.minimum_yaw_rate = 0.06
     node.pivot_yaw_kp = 1.0
+    node.moving_yaw_rate_min = 0.06
+    node.moving_yaw_rate_max = 0.16
+    node.moving_yaw_kp = 0.80
     node.command_slew_speed = 0.0
     node.command_slew_last_time = None
     node.terminal_native_pivot_true_bearing = 0.25
