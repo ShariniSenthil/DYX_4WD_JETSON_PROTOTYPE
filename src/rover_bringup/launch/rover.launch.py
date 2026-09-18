@@ -473,8 +473,7 @@ def generate_launch_description() -> LaunchDescription:
                         #   release heading            = <=4 deg stable for 0.30 s
                         "segment_alignment_speed_mps": CRUISE_SPEED_MPS,
                         "segment_alignment_recovery_speed_mps": CRUISE_SPEED_MPS,
-                        # Post-pivot fixed-path recapture and global recovery cap.
-                        "xtrack_priority_speed_mps": 0.20,
+                        "xtrack_priority_speed_mps": CRUISE_SPEED_MPS,
                         "decel_profile_speed_1_mps": CRUISE_SPEED_MPS,
                         "decel_profile_speed_2_mps": CRUISE_SPEED_MPS,
                         "decel_profile_speed_3_mps": CRUISE_SPEED_MPS,
@@ -511,14 +510,13 @@ def generate_launch_description() -> LaunchDescription:
                         # xtrack_priority_exit_m=0.008 remain valid for this
                         # hold time.
                         "alignment_hold_sec": 0.20,
-                        # Stationary pivot: strong ~20deg/s authority.
+                        # Stationary pivot stays exactly on d1d982 behavior.
                         "maximum_yaw_rate_radps": 0.35,
                         "minimum_yaw_rate_radps": 0.10,
                         "pivot_yaw_kp": 1.50,
-                        # Moving steering: soft near points, stronger at cruise.
-                        "moving_yaw_rate_min_radps": 0.06,
-                        "moving_yaw_rate_max_radps": 0.16,
-                        "moving_yaw_kp": 0.80,
+                        # Moving steering restored to 102d103 behavior.
+                        "moving_yaw_rate_max_radps": 0.20,
+                        "moving_yaw_kp": 1.00,
                         "alignment_reentry_goal_distance_m": 0.60,
                         # Hardened speed arbitration:
                         # - post-pivot line capture and global xtrack recovery are capped

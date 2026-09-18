@@ -364,13 +364,13 @@ class RPPController(Node):
         self.declare_parameter("pivot_enter_angle_deg", 45.0)
         self.declare_parameter("pivot_exit_angle_deg", 6.0)
         self.declare_parameter("alignment_hold_sec", 0.20)
-        # Stationary pivot authority. Moving steering has separate limits below.
+        # Stationary pivot authority from d1d982.
         self.declare_parameter("maximum_yaw_rate_radps", 0.35)
         self.declare_parameter("minimum_yaw_rate_radps", 0.10)
         self.declare_parameter("pivot_yaw_kp", 1.50)
-        self.declare_parameter("moving_yaw_rate_min_radps", 0.06)
-        self.declare_parameter("moving_yaw_rate_max_radps", 0.16)
-        self.declare_parameter("moving_yaw_kp", 0.80)
+        # Moving yaw restored to the 102d103 behavior.
+        self.declare_parameter("moving_yaw_rate_max_radps", 0.20)
+        self.declare_parameter("moving_yaw_kp", 1.00)
         self.declare_parameter(
             "alignment_reentry_goal_distance_m",
             0.60,
@@ -954,9 +954,6 @@ class RPPController(Node):
             self.get_parameter("minimum_yaw_rate_radps").value
         )
         self.pivot_yaw_kp = float(self.get_parameter("pivot_yaw_kp").value)
-        self.moving_yaw_rate_min = float(
-            self.get_parameter("moving_yaw_rate_min_radps").value
-        )
         self.moving_yaw_rate_max = float(
             self.get_parameter("moving_yaw_rate_max_radps").value
         )
@@ -3152,13 +3149,12 @@ class RPPController(Node):
         if not math.isfinite(self.pivot_yaw_kp) or self.pivot_yaw_kp <= 0.0:
             raise ValueError("pivot_yaw_kp must be finite and > 0")
         if not (
-            math.isfinite(self.moving_yaw_rate_min)
-            and math.isfinite(self.moving_yaw_rate_max)
-            and 0.0 < self.moving_yaw_rate_min <= self.moving_yaw_rate_max
-            <= self.maximum_yaw_rate
+            math.isfinite(self.moving_yaw_rate_max)
+            and 0.0 < self.moving_yaw_rate_max <= self.maximum_yaw_rate
         ):
             raise ValueError(
-                "moving yaw-rate limits require 0 < min <= max <= pivot maximum"
+                "moving_yaw_rate_max_radps must satisfy "
+                "0 < moving max <= pivot maximum"
             )
         if not math.isfinite(self.moving_yaw_kp) or self.moving_yaw_kp <= 0.0:
             raise ValueError("moving_yaw_kp must be finite and > 0")
@@ -3368,15 +3364,13 @@ class RPPController(Node):
             )
             return turn_sign * commanded_mag
 
-        speed = max(0.0, float(translational_speed_mps))
-        cruise = max(1.0e-6, float(self.cruise_speed))
-        speed_ratio = max(0.0, min(1.0, speed / cruise))
-        moving_cap = self.moving_yaw_rate_min + speed_ratio * (
-            self.moving_yaw_rate_max - self.moving_yaw_rate_min
+        # 102d103 moving-yaw behavior:
+        # proportional yaw error with a fixed +/-0.20 rad/s ceiling.
+        requested = self.moving_yaw_kp * yaw_error
+        return max(
+            -self.moving_yaw_rate_max,
+            min(self.moving_yaw_rate_max, requested),
         )
-        requested_mag = abs(self.moving_yaw_kp * yaw_error)
-        commanded_mag = min(moving_cap, requested_mag)
-        return turn_sign * commanded_mag
 
     @staticmethod
     def ground_xtrack(value):
@@ -5624,8 +5618,7 @@ class RPPController(Node):
             self.reset_speed_profiles()
             self.command_slew_speed = 0.0
             self.command_slew_last_time = None
-            # Certified pivot -> slow fixed-path recapture before normal tracking.
-            self.xtrack_priority_active = True
+            self.xtrack_priority_active = False
             self.xtrack_priority_inside_since = None
             self.reset_xtrack_damping_state()
             self._reset_precision_regulator("PIVOT_SETTLE_HOLD_COMPLETE")
@@ -5636,7 +5629,7 @@ class RPPController(Node):
             )
             self.publish_stop()
             self.get_logger().warn(
-                "PIVOT SETTLE HOLD COMPLETE / FIXED-PATH RECAPTURE ARMED | "
+                "PIVOT SETTLE HOLD COMPLETE / RELEASING TO PATH TRACKING | "
                 f"heading={math.degrees(path_heading_error):+.1f}deg | "
                 f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
             )
