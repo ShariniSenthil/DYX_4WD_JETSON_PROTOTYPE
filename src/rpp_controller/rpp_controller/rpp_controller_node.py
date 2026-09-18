@@ -3302,7 +3302,7 @@ class RPPController(Node):
         return math.atan2(math.sin(angle), math.cos(angle))
 
     def explicit_yaw_rate_command(self, target_yaw_enu_rad):
-        \"\"\"Generate Jetson-owned signed ENU yaw-rate from wrapped yaw error.\"\"\"
+        """Generate Jetson-owned signed ENU yaw-rate from wrapped yaw error."""
         if (
             self.current_yaw is None
             or not math.isfinite(float(self.current_yaw))
@@ -10623,14 +10623,14 @@ class RPPController(Node):
 
 
 class _ExplicitYawStagingPublisher:
-    \"\"\"Fail-closed adapter for atomic velocity + ENU yaw + ENU yaw-rate.\"\"\"
+    """Fail-closed adapter for atomic velocity + ENU yaw + ENU yaw-rate."""
 
     def __init__(self, publisher, command_type):
         self._publisher = publisher
         self._command_type = command_type
 
     def publish(self, velocity_message):
-        \"\"\"Publish an atomic no-yaw/no-yaw-rate safety stop.\"\"\"
+        """Publish an atomic no-yaw/no-yaw-rate safety stop."""
         command = self._command_type()
         command.header = velocity_message.header
         command.velocity_north_mps = 0.0
@@ -10646,7 +10646,7 @@ class _ExplicitYawStagingPublisher:
         yaw_enu_rad,
         yaw_rate_enu_radps,
     ):
-        \"\"\"Publish zero translation with authoritative yaw and yaw-rate.\"\"\"
+        """Publish zero translation with authoritative yaw and yaw-rate."""
         try:
             north = float(velocity_message.vector.x)
             east = float(velocity_message.vector.y)
@@ -10687,7 +10687,7 @@ class _ExplicitYawStagingPublisher:
         yaw_enu_rad,
         yaw_rate_enu_radps,
     ):
-        \"\"\"Publish moving N/E velocity with exact yaw and signed yaw-rate.\"\"\"
+        """Publish moving N/E velocity with exact yaw and signed yaw-rate."""
         try:
             north = float(velocity_message.vector.x)
             east = float(velocity_message.vector.y)
