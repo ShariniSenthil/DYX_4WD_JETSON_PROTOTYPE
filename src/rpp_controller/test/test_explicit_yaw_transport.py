@@ -43,6 +43,9 @@ class Message:
         self.velocity = NS(x=0.0, y=0.0, z=0.0)
         self.position = NS(x=0.0, y=0.0, z=0.0)
         self.acceleration_or_force = NS(x=0.0, y=0.0, z=0.0)
+        self.yaw_enu_rad = 0.0
+        self.yaw_rate_enu_radps = 0.0
+        self.yaw_valid = False
 
 
 class Vector(Message):
@@ -409,22 +412,23 @@ def test_a_bridge_preserves_enu_mask_stream_rate_and_timeout():
     "yaw",
     [0.0, math.pi / 2.0, math.pi, -math.pi / 2.0],
 )
-def test_b_forwards_cardinal_explicit_yaw_with_yaw_rate_ignored(yaw):
+def test_b_forwards_cardinal_explicit_yaw_with_active_yaw_rate(yaw):
     node = bridge(True)
     make_ready(node)
     msg = Atomic()
     msg.velocity_north_mps, msg.velocity_east_mps = 0.3, 0.4
     msg.yaw_valid, msg.yaw_enu_rad = True, yaw
+    msg.yaw_rate_enu_radps = 0.12
     node.subscriptions[0].callback(msg)
     node._control_loop()
 
     out = node.setpoint_pub.messages[-1]
     assert (out.velocity.x, out.velocity.y, out.velocity.z) == (0.4, 0.3, 0.0)
-    assert out.type_mask == 2503
+    assert out.type_mask == 455
     assert out.type_mask & Target.IGNORE_YAW == 0
-    assert out.type_mask & Target.IGNORE_YAW_RATE
+    assert out.type_mask & Target.IGNORE_YAW_RATE == 0
     assert out.yaw == yaw
-    assert out.yaw_rate == 0.0
+    assert out.yaw_rate == pytest.approx(0.12)
 
 
 def test_b_zero_without_yaw_is_accepted_as_no_yaw_stop():
@@ -453,7 +457,7 @@ def test_b_zero_with_valid_yaw_is_transport_ready_for_patch5_hold():
 
     out = node.setpoint_pub.messages[-1]
     assert (out.velocity.x, out.velocity.y, out.velocity.z) == (0.0, 0.0, 0.0)
-    assert out.type_mask == 2503
+    assert out.type_mask == 455
     assert out.yaw == 1.2
     assert out.yaw_rate == 0.0
 
@@ -617,7 +621,7 @@ def test_patch5_adapter_zero_yaw_api_is_atomic_and_exact():
     node, _ = rpp(True)
     msg = Vector()
     msg.header.frame_id = "map_ned"
-    assert node.velocity_pub.publish_zero_with_yaw(msg, 1.2) is True
+    assert node.velocity_pub.publish_zero_with_yaw(msg, 1.2, 0.15) is True
     command, = node.publishers[0].messages
     assert (command.velocity_north_mps, command.velocity_east_mps) == (0.0, 0.0)
     assert command.yaw_valid is True
@@ -628,7 +632,7 @@ def test_patch5_adapter_zero_yaw_api_is_atomic_and_exact():
 def test_patch5_zero_yaw_api_rejects_invalid_yaw_to_no_yaw_stop(yaw):
     node, _ = rpp(True)
     msg = Vector()
-    assert node.velocity_pub.publish_zero_with_yaw(msg, yaw) is False
+    assert node.velocity_pub.publish_zero_with_yaw(msg, yaw, 0.15) is False
     command, = node.publishers[0].messages
     assert (command.velocity_north_mps, command.velocity_east_mps) == (0.0, 0.0)
     assert command.yaw_valid is False
@@ -639,7 +643,7 @@ def test_patch5_zero_yaw_api_rejects_nonzero_translation():
     node, _ = rpp(True)
     msg = Vector()
     msg.vector.x = 0.01
-    assert node.velocity_pub.publish_zero_with_yaw(msg, 1.2) is False
+    assert node.velocity_pub.publish_zero_with_yaw(msg, 1.2, 0.15) is False
     command, = node.publishers[0].messages
     assert (command.velocity_north_mps, command.velocity_east_mps) == (0.0, 0.0)
     assert command.yaw_valid is False
@@ -650,6 +654,8 @@ def _patch5_pivot_deps(node):
     node.cruise_speed = 1.0
     node.segment_alignment_speed = 1.0
     node.current_yaw = 0.0
+    node.maximum_yaw_rate = 0.20
+    node.pivot_yaw_kp = 1.0
     node.command_slew_speed = 0.0
     node.command_slew_last_time = None
     node.terminal_native_pivot_true_bearing = 0.25
@@ -668,6 +674,8 @@ def _patch5_pivot_deps(node):
 def test_patch5_b_pivot_is_zero_translation_with_exact_true_bearing():
     node, env = rpp(True)
     _patch5_pivot_deps(node)
+    execute([method(RPP, "RPPController", "explicit_yaw_rate_command")], env)
+    node.explicit_yaw_rate_command = env["explicit_yaw_rate_command"].__get__(node)
     execute([method(RPP, "RPPController", "_publish_legacy_native_carrier")], env)
     result = env["_publish_legacy_native_carrier"](
         node, math.radians(60.0), 0.8, 0.01, "", 2.0, 3.0,
@@ -679,6 +687,7 @@ def test_patch5_b_pivot_is_zero_translation_with_exact_true_bearing():
     assert command.yaw_valid is True
     assert command.yaw_enu_rad == 0.25
     assert command.yaw_enu_rad != pytest.approx(math.radians(60.0))
+    assert command.yaw_rate_enu_radps == pytest.approx(0.20)
 
 
 def test_patch5_a_pivot_preserves_legacy_60deg_carrier_vector():
@@ -701,11 +710,11 @@ def test_patch5_a_pivot_preserves_legacy_60deg_carrier_vector():
     assert message.vector.z == 0.0
 
 
-def test_patch5_has_no_yaw_rate_or_vector_reconstruction_in_pivot_transport():
+def test_full_authority_pivot_has_signed_yaw_rate_and_no_vector_reconstruction():
     pivot = ast.unparse(method(RPP, "RPPController", "_publish_legacy_native_carrier"))
     adapter = ast.unparse(class_ast(RPP, "_ExplicitYawStagingPublisher"))
     assert "publish_zero_with_yaw" in pivot
     assert "terminal_native_pivot_true_bearing" in pivot
-    assert "yaw_enu_rad=request_bearing" in pivot
+    assert "explicit_yaw_rate_command" in pivot
     assert "atan2" not in adapter
-    assert "yaw_rate" not in adapter
+    assert "yaw_rate_enu_radps" in adapter
