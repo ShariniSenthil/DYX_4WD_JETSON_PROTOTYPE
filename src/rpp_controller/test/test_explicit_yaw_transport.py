@@ -150,13 +150,13 @@ def rpp(enabled=None):
     return node, env
 
 
-def test_launch_has_one_false_authority_passed_identically_to_both_nodes():
+def test_launch_has_one_true_authority_passed_identically_to_both_nodes():
     tree = ast.parse(LAUNCH.read_text())
     assignments = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
                    and any(isinstance(t, ast.Name)
                            and t.id == "RPP_EXPLICIT_YAW_ENABLED" for t in n.targets)]
     assert len(assignments) == 1
-    assert ast.literal_eval(assignments[0].value) is False
+    assert ast.literal_eval(assignments[0].value) is True
     wired = []
     for call in ast.walk(tree):
         if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
@@ -215,10 +215,40 @@ def test_exactly_one_command_publisher_and_subscription(enabled):
         assert len(sites) == 2
 
 
+def _bind_real_yaw_rate_command(node, env):
+    execute([method(RPP, "RPPController", "explicit_yaw_rate_command")], env)
+    real = env["explicit_yaw_rate_command"]
+
+    node.current_yaw = 0.0
+    node.maximum_yaw_rate = 0.45
+    node.minimum_yaw_rate = 0.06
+    node.pivot_yaw_kp = 1.80
+    node.moving_yaw_rate_max = 0.18
+    node.moving_yaw_kp = 0.85
+    node.normalize_angle = lambda v: math.atan2(math.sin(v), math.cos(v))
+
+    def bound(
+        target_yaw_enu_rad,
+        *,
+        stationary_pivot=False,
+        translational_speed_mps=0.0,
+    ):
+        return real(
+            node,
+            target_yaw_enu_rad,
+            stationary_pivot=stationary_pivot,
+            translational_speed_mps=translational_speed_mps,
+        )
+
+    node.explicit_yaw_rate_command = bound
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("precision", [False, True])
 def test_both_existing_rpp_publication_paths_use_selected_transport(enabled, precision):
     node, env = rpp(enabled)
+    if enabled:
+        _bind_real_yaw_rate_command(node, env)
     node.MAXIMUM_MOVING_SPEED_MPS = node.cruise_speed = 1.0
     node.precision_minimum_moving_speed = 0.04
     node.precision_speed_config = NS(hardware_speed_ceiling_mps=1.0)
@@ -251,6 +281,7 @@ def test_both_existing_rpp_publication_paths_use_selected_transport(enabled, pre
 @pytest.mark.parametrize("yaw", [None, math.nan, math.inf, -math.inf])
 def test_b_generic_moving_missing_or_nonfinite_yaw_fails_closed(yaw):
     node, env = rpp(True)
+    _bind_real_yaw_rate_command(node, env)
     node.MAXIMUM_MOVING_SPEED_MPS = 1.0
     node.acceleration_speed_limit = node.command_speed_slew_limit = lambda v: v
     node.reset_deceleration_profile = lambda: None
@@ -268,7 +299,10 @@ def test_b_generic_moving_missing_or_nonfinite_yaw_fails_closed(yaw):
     assert (message.velocity_north_mps, message.velocity_east_mps) == (0.0, 0.0)
     assert message.yaw_valid is False
     assert message.yaw_enu_rad == 0.0
-    assert any("WITHOUT FINITE EXPLICIT YAW" in line for line in node.logs)
+    # Missing/non-finite yaw is rejected before the atomic publisher:
+    # explicit_yaw_rate_command() cannot produce a finite yaw-rate without a
+    # finite target yaw, so this is the expected fail-closed diagnostic.
+    assert any("WITHOUT FINITE YAW-RATE" in line for line in node.logs)
 
 
 def _bind_real_yaw_slew_limit(node, env):
@@ -366,6 +400,28 @@ def test_every_generic_moving_call_site_supplies_owning_yaw():
     assert len(stop_call.args) >= 2
     assert ast.literal_eval(stop_call.args[0]) == 0.0
     assert ast.literal_eval(stop_call.args[1]) == 0.0
+
+
+def test_production_c_to_p1_post_pivot_reanchor_is_active_only_for_entry_leg():
+    launch_tree = ast.parse(LAUNCH.read_text())
+    all_leg_values = []
+    for dictionary in ast.walk(launch_tree):
+        if not isinstance(dictionary, ast.Dict):
+            continue
+        for key, value in zip(dictionary.keys, dictionary.values):
+            if (
+                isinstance(key, ast.Constant)
+                and key.value == "post_pivot_reanchor_all_legs"
+            ):
+                all_leg_values.append(ast.literal_eval(value))
+    assert all_leg_values == [False]
+
+    adapter = ast.unparse(
+        method(RPP, "RPPController", "_run_legacy_segment_alignment")
+    )
+    assert "reanchor_c_to_p1_after_pivot" in adapter
+    assert "C->P1 POST-PIVOT REANCHOR ACTIVE" in adapter
+    assert "POST-PIVOT LATER-LEG FIXED GEOMETRY" in adapter
 
 
 def test_patch3_adapter_never_reconstructs_yaw_from_velocity():

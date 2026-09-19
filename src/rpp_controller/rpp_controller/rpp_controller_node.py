@@ -5611,22 +5611,62 @@ class RPPController(Node):
             return True
 
         if result.directive is LegacyAlignmentDirective.REANCHOR_ZERO:
-            # Compatibility handshake only. The legacy lifecycle still has a
-            # REANCHOR_ZERO state, but production control must never move the
-            # path underneath the rover.
-            #
-            # C->P1 keeps the runtime geometry locked at START.
-            # P1->Pn keeps the fixed mission /nav_path geometry.
+            # Production policy:
+            # - C->P1: after a certified stationary pivot, rebuild C'->P1 from
+            #   the rover's measured post-pivot local-odometry position.
+            # - P1->Pn: keep fixed mission geometry. Launch keeps
+            #   post_pivot_reanchor_all_legs=False, so later legs normally
+            #   never request this directive.
+            if first_approach:
+                reanchored = self.reanchor_c_to_p1_after_pivot()
+                if not reanchored:
+                    already_at_goal = (
+                        goal_distance is not None
+                        and math.isfinite(float(goal_distance))
+                        and float(goal_distance) <= self.waypoint_tolerance
+                    )
+                    if not already_at_goal:
+                        self.legacy_alignment.enter_safety_hold(
+                            "C_TO_P1_POST_PIVOT_REANCHOR_FAILED"
+                        )
+                        self.reset_terminal_native_pivot()
+                        self._reset_precision_regulator(
+                            "C_TO_P1_POST_PIVOT_REANCHOR_FAILED"
+                        )
+                        self.publish_stop()
+                        self.get_logger().error(
+                            "C->P1 POST-PIVOT REANCHOR FAILED / SAFETY HOLD | "
+                            f"goal_distance={goal_distance:.3f}m | "
+                            f"xtrack="
+                            f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
+                        )
+                        return True
+
+                self.legacy_alignment.ack_reanchor_completed()
+                self.reset_terminal_native_pivot()
+                self._reset_precision_regulator(
+                    "C_TO_P1_POST_PIVOT_REANCHOR_COMPLETE"
+                )
+                self.publish_stop()
+                self.get_logger().warn(
+                    "C->P1 POST-PIVOT REANCHOR ACTIVE / HOLD ZERO | "
+                    f"reanchored={reanchored} | "
+                    f"goal_distance={goal_distance:.3f}m"
+                )
+                return True
+
+            # Defensive later-leg compatibility path. With
+            # post_pivot_reanchor_all_legs=False this should not normally be
+            # requested, but if it is, do not move the mission geometry.
             self.legacy_alignment.ack_reanchor_completed()
             self.reset_terminal_native_pivot()
             self._reset_precision_regulator(
-                "PIVOT_COMPLETE_FIXED_GEOMETRY"
+                "POST_PIVOT_LATER_LEG_FIXED_GEOMETRY"
             )
             self.publish_stop()
             self.get_logger().warn(
-                "POST-PIVOT FIXED GEOMETRY / REANCHOR BYPASSED | "
+                "POST-PIVOT LATER-LEG FIXED GEOMETRY / REANCHOR BYPASSED | "
                 f"goal=P{self.segment_goal_number} | "
-                f"first_approach={first_approach} | "
                 f"xtrack="
                 f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
             )
