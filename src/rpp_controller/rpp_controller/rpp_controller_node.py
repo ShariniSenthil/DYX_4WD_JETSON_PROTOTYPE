@@ -9965,6 +9965,34 @@ class RPPController(Node):
             nav_lookahead_index,
             nav_goal_index,
         ) = nav_solution
+
+        # Separate pivot authority from moving path-tracking authority.
+        #
+        # path_bearing:
+        #   Dense/interpolated /nav_path tangent used while driving.
+        #
+        # pivot_path_bearing:
+        #   Fixed semantic segment bearing used for stationary pivot/alignment.
+        #   Interpolation points must never become pivot targets.
+        if first_approach and self.c_line_bearing is not None:
+            pivot_path_bearing = self.c_line_bearing
+        elif self.target_path_bearing is not None:
+            pivot_path_bearing = self.target_path_bearing
+        else:
+            semantic_delta_east = goal_x - self.current_x
+            semantic_delta_north = goal_y - self.current_y
+
+            if (
+                math.hypot(semantic_delta_east, semantic_delta_north)
+                > self.WAYPOINT_CHANGE_EPSILON_M
+            ):
+                pivot_path_bearing = math.atan2(
+                    semantic_delta_north,
+                    semantic_delta_east,
+                )
+            else:
+                pivot_path_bearing = path_bearing
+
         mode_prefix += (
             f"{path_label} {nav_cursor_index}->{nav_lookahead_index}/"
             f"{nav_goal_index} / "
@@ -9986,6 +10014,12 @@ class RPPController(Node):
             delta_east,
         )
         path_heading_error = self.normalize_angle(path_bearing - self.current_yaw)
+
+        # Stationary pivot error is intentionally calculated against the
+        # semantic marking-segment bearing, not the interpolated path tangent.
+        pivot_heading_error = self.normalize_angle(
+            pivot_path_bearing - self.current_yaw
+        )
 
         precision_guidance = None
         if self.precision_guidance_enabled or self.precision_speed_control_enabled:
@@ -10267,7 +10301,7 @@ class RPPController(Node):
         if (
             not self.segment_alignment_active
             and goal_distance > self.terminal_goal_intercept_distance
-            and abs(path_heading_error) >= self.pivot_enter_angle
+            and abs(pivot_heading_error) >= self.pivot_enter_angle
         ):
             self.segment_alignment_active = True
             self._reset_legacy_alignment_lifecycle("MID_LEG_ALIGNMENT_REENTRY")
@@ -10319,7 +10353,7 @@ class RPPController(Node):
 
             if self.precision_pivot_enabled:
                 self._run_precision_pivot_alignment(
-                    path_bearing=path_bearing,
+                    path_bearing=pivot_path_bearing,
                     alignment_guidance_bearing=alignment_guidance_bearing,
                     alignment_cross_track=alignment_cross_track,
                     target_x=target_x,
@@ -10329,8 +10363,8 @@ class RPPController(Node):
                 return
 
             if self._run_legacy_segment_alignment(
-                path_bearing=path_bearing,
-                path_heading_error=path_heading_error,
+                path_bearing=pivot_path_bearing,
+                path_heading_error=pivot_heading_error,
                 alignment_guidance_bearing=alignment_guidance_bearing,
                 alignment_cross_track=alignment_cross_track,
                 target_x=target_x,

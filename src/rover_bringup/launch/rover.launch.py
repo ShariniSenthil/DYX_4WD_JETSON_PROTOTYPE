@@ -69,7 +69,7 @@ FCU_DEVICE_PATH = "/dev/serial/by-id/usb-Auterion_PX4_FMU_v6X.x_0-if00"
 # UNVERIFIED from data. 1.00 m/s also sits exactly at cmd_vel_bridge's
 # non-overridable ABSOLUTE_MAXIMUM_SPEED_MPS ceiling, i.e. zero headroom.
 # Watch the first run closely and be ready to drop this back down.
-CRUISE_SPEED_MPS = 1.00
+CRUISE_SPEED_MPS = 0.60
 TERMINAL_FLOOR_SPEED_MPS = 0.15
 
 # Single source of truth for which terminal-stop authority is active.
@@ -375,7 +375,7 @@ def generate_launch_description() -> LaunchDescription:
                         # the old 0.50m setting -- already past the 0.5m
                         # theoretical target, so expect roughly ~1.05-1.15m /
                         # ~2.5-2.7s to reach cruise at this new 1.00m setting.
-                        "acceleration_distance_m": 1.00,
+                        "acceleration_distance_m": 0.20,
                         # Bootstrap ceiling exists only to prevent drivetrain
                         # deadlock; the profile itself starts from literal zero.
                         #
@@ -434,7 +434,7 @@ def generate_launch_description() -> LaunchDescription:
                         # steering authority collapsed: cross-track walked
                         # ~4 cm over the final 0.6 m and the rover crossed the
                         # goal plane beside the point rather than on it.
-                        "deceleration_enabled": True,
+                        "deceleration_enabled": False,
                         "deceleration_distance_m": 1.00,
                         "deceleration_floor_speed_mps": TERMINAL_FLOOR_SPEED_MPS,
                         "deceleration_max_progress_jump_m": 0.10,
@@ -503,10 +503,10 @@ def generate_launch_description() -> LaunchDescription:
                         "segment_alignment_reentry_cross_track_m": 0.08,
                         "segment_alignment_max_cross_track_m": 0.60,
                         "terminal_line_entry_cross_track_m": 0.03,
-                        "pivot_enter_angle_deg": 45.0,
+                        "pivot_enter_angle_deg": 15.0,
                         "pivot_exit_angle_deg": 4.0,
                         # Fast post-pivot capture releases only after
-                        # terminal_native_pivot_release_error_deg=4.0 and
+                        # terminal_native_pivot_release_error_deg=1.5 and
                         # xtrack_priority_exit_m=0.008 remain valid for this
                         # hold time.
                         "alignment_hold_sec": 0.20,
@@ -516,7 +516,7 @@ def generate_launch_description() -> LaunchDescription:
                         "pivot_yaw_kp": 1.80,
                         # Moving steering restored to 102d103 behavior.
                         "moving_yaw_rate_max_radps": 0.18,
-                        "moving_yaw_kp": 0.85,
+                        "moving_yaw_kp": 1.00,
                         "alignment_reentry_goal_distance_m": 0.60,
                         # Hardened speed arbitration:
                         # - post-pivot line capture and global xtrack recovery are capped
@@ -909,7 +909,7 @@ def generate_launch_description() -> LaunchDescription:
                         "terminal_exact_target_start_distance_m": 0.06,
                         "terminal_goal_intercept_distance_m": 0.90,
                         "terminal_goal_intercept_bearing_limit_deg": 22.0,
-                        "terminal_native_pivot_enter_error_deg": 45.0,
+                        "terminal_native_pivot_enter_error_deg": 15.0,
                         "terminal_native_pivot_release_error_deg": 1.5,
                         # Deprecated compatibility parameter. It is no
                         # longer used to create a moving 60-degree vector;
