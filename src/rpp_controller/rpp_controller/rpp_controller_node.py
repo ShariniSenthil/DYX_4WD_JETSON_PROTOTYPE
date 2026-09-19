@@ -362,15 +362,15 @@ class RPPController(Node):
         self.declare_parameter("waypoint_tolerance_m", 0.03)
 
         self.declare_parameter("pivot_enter_angle_deg", 45.0)
-        self.declare_parameter("pivot_exit_angle_deg", 6.0)
+        self.declare_parameter("pivot_exit_angle_deg", 4.0)
         self.declare_parameter("alignment_hold_sec", 0.20)
         # Stationary pivot authority from d1d982.
-        self.declare_parameter("maximum_yaw_rate_radps", 0.35)
-        self.declare_parameter("minimum_yaw_rate_radps", 0.10)
-        self.declare_parameter("pivot_yaw_kp", 1.50)
+        self.declare_parameter("maximum_yaw_rate_radps", 0.45)
+        self.declare_parameter("minimum_yaw_rate_radps", 0.06)
+        self.declare_parameter("pivot_yaw_kp", 1.80)
         # Moving yaw restored to the 102d103 behavior.
-        self.declare_parameter("moving_yaw_rate_max_radps", 0.20)
-        self.declare_parameter("moving_yaw_kp", 1.00)
+        self.declare_parameter("moving_yaw_rate_max_radps", 0.18)
+        self.declare_parameter("moving_yaw_kp", 0.85)
         self.declare_parameter(
             "alignment_reentry_goal_distance_m",
             0.60,
@@ -486,7 +486,7 @@ class RPPController(Node):
         )
         self.declare_parameter(
             "terminal_native_pivot_release_error_deg",
-            4.0,
+            1.5,
         )
         self.declare_parameter(
             "terminal_native_pivot_request_error_deg",
@@ -562,7 +562,7 @@ class RPPController(Node):
         self.declare_parameter("precision_xtrack_lookahead_gain", 0.0)
         self.declare_parameter("precision_moving_bearing_cone_deg", 30.0)
         # Mode-B (explicit yaw) only. See explicit_yaw_command_slew_limit().
-        self.declare_parameter("precision_explicit_yaw_rate_limit_degps", 25.0)
+        self.declare_parameter("precision_explicit_yaw_rate_limit_degps", 10.0)
 
         self.declare_parameter("precision_hardware_speed_ceiling_mps", 1.00)
         self.declare_parameter("precision_acceleration_mps2", 0.75)
@@ -663,6 +663,11 @@ class RPPController(Node):
         self.declare_parameter("radial_stop_brake_margin_m", 0.003)
         self.declare_parameter("radial_stop_minimum_actuatable_speed_mps", 0.15)
         self.declare_parameter("radial_stop_minimum_speed_stop_lead_m", 0.035)
+        self.declare_parameter("radial_stop_corrective_creep_speed_mps", 0.25)
+        self.declare_parameter("radial_stop_corrective_creep_pulse_sec", 0.10)
+        self.declare_parameter("radial_stop_corrective_creep_max_along_m", 0.060)
+        self.declare_parameter("radial_stop_corrective_creep_max_cross_m", 0.010)
+        self.declare_parameter("radial_stop_corrective_creep_max_attempts", 3)
         self.declare_parameter("radial_stop_stationary_window_sec", 0.50)
         self.declare_parameter("radial_stop_stationary_displacement_m", 0.005)
         self.declare_parameter("radial_stop_stationary_yaw_rate_radps", 0.050)
@@ -1408,6 +1413,21 @@ class RPPController(Node):
             ),
             minimum_speed_stop_lead_m=float(
                 self.get_parameter("radial_stop_minimum_speed_stop_lead_m").value
+            ),
+            corrective_creep_speed_mps=float(
+                self.get_parameter("radial_stop_corrective_creep_speed_mps").value
+            ),
+            corrective_creep_pulse_sec=float(
+                self.get_parameter("radial_stop_corrective_creep_pulse_sec").value
+            ),
+            corrective_creep_max_along_m=float(
+                self.get_parameter("radial_stop_corrective_creep_max_along_m").value
+            ),
+            corrective_creep_max_cross_m=float(
+                self.get_parameter("radial_stop_corrective_creep_max_cross_m").value
+            ),
+            corrective_creep_max_attempts=int(
+                self.get_parameter("radial_stop_corrective_creep_max_attempts").value
             ),
             stationary_window_sec=float(
                 self.get_parameter("radial_stop_stationary_window_sec").value

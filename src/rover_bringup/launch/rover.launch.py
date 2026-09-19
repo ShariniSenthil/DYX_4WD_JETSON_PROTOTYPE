@@ -149,7 +149,7 @@ def generate_launch_description() -> LaunchDescription:
                         # Bridge preserves the RPP ramp and only clamps
                         # commands above this production safety maximum.
                         "maximum_speed_mps": (1.00),
-                        ("maximum_yaw_rate_" "radps"): 0.35,
+                        ("maximum_yaw_rate_" "radps"): 0.45,
                     }
                 ],
             ),
@@ -274,7 +274,7 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         "local_frame": "map",
                         # Exact marking acceptance for P1/P2/P3/...
-                        "marking_tolerance_m": 0.03,
+                        "marking_tolerance_m": 0.02,
                         # Marking must remain inside 30 mm AND stationary
                         # continuously before spray is requested.
                         "arrival_settle_sec": 0.30,
@@ -504,19 +504,19 @@ def generate_launch_description() -> LaunchDescription:
                         "segment_alignment_max_cross_track_m": 0.60,
                         "terminal_line_entry_cross_track_m": 0.03,
                         "pivot_enter_angle_deg": 45.0,
-                        "pivot_exit_angle_deg": 6.0,
+                        "pivot_exit_angle_deg": 4.0,
                         # Fast post-pivot capture releases only after
                         # terminal_native_pivot_release_error_deg=4.0 and
                         # xtrack_priority_exit_m=0.008 remain valid for this
                         # hold time.
                         "alignment_hold_sec": 0.20,
                         # Stationary pivot stays exactly on d1d982 behavior.
-                        "maximum_yaw_rate_radps": 0.35,
-                        "minimum_yaw_rate_radps": 0.10,
-                        "pivot_yaw_kp": 1.50,
+                        "maximum_yaw_rate_radps": 0.45,
+                        "minimum_yaw_rate_radps": 0.06,
+                        "pivot_yaw_kp": 1.80,
                         # Moving steering restored to 102d103 behavior.
-                        "moving_yaw_rate_max_radps": 0.20,
-                        "moving_yaw_kp": 1.00,
+                        "moving_yaw_rate_max_radps": 0.18,
+                        "moving_yaw_kp": 0.85,
                         "alignment_reentry_goal_distance_m": 0.60,
                         # Hardened speed arbitration:
                         # - post-pivot line capture and global xtrack recovery are capped
@@ -593,7 +593,7 @@ def generate_launch_description() -> LaunchDescription:
                         # value, not yet measured against the swing directly
                         # -- re-check log_227/log_233-style windows after
                         # this lands and retune from there.
-                        "precision_explicit_yaw_rate_limit_degps": 25.0,
+                        "precision_explicit_yaw_rate_limit_degps": 10.0,
                         "precision_hardware_speed_ceiling_mps": 1.00,
                         "precision_acceleration_mps2": 0.75,
                         "precision_deceleration_mps2": 0.75,
@@ -729,6 +729,14 @@ def generate_launch_description() -> LaunchDescription:
                         "radial_stop_brake_margin_m": 0.003,
                         "radial_stop_minimum_actuatable_speed_mps": 0.15,
                         "radial_stop_minimum_speed_stop_lead_m": 0.035,
+                        # Forward-only stop/settle/re-measure correction.
+                        # Retry is allowed only while still short of the
+                        # goal plane and with <=10 mm cross-track error.
+                        "radial_stop_corrective_creep_speed_mps": 0.25,
+                        "radial_stop_corrective_creep_pulse_sec": 0.10,
+                        "radial_stop_corrective_creep_max_along_m": 0.060,
+                        "radial_stop_corrective_creep_max_cross_m": 0.010,
+                        "radial_stop_corrective_creep_max_attempts": 3,
                         "radial_stop_stationary_window_sec": 0.50,
                         "radial_stop_stationary_displacement_m": 0.005,
                         "radial_stop_stationary_yaw_rate_radps": 0.050,
@@ -806,7 +814,6 @@ def generate_launch_description() -> LaunchDescription:
                         "precision_pivot_realign_timeout_sec": 9.0,
                         "precision_pivot_recapture_timeout_sec": 8.0,
                         "post_pivot_capture_speed_mps": 0.20,
-                        "legacy_pivot_post_settle_hold_sec": 1.00,
                         # A lone speed/yaw-rate sample outside tolerance
                         # (GPS-antenna lever-arm noise during residual yaw
                         # settling) no longer discards earned dwell
@@ -891,7 +898,7 @@ def generate_launch_description() -> LaunchDescription:
                         "heading_full_speed_deg": 2.0,
                         "heading_min_speed_deg": 4.0,
                         # Strict 30 mm circular stop gate for marking AND extension.
-                        "waypoint_tolerance_m": 0.03,
+                        "waypoint_tolerance_m": 0.02,
                         "marking_final_creep_cross_track_m": 0.025,
                         "terminal_capture_gate_cross_track_m": 0.025,
                         "terminal_capture_gate_heading_deg": 4.0,
@@ -903,7 +910,7 @@ def generate_launch_description() -> LaunchDescription:
                         "terminal_goal_intercept_distance_m": 0.90,
                         "terminal_goal_intercept_bearing_limit_deg": 22.0,
                         "terminal_native_pivot_enter_error_deg": 45.0,
-                        "terminal_native_pivot_release_error_deg": 2.0,
+                        "terminal_native_pivot_release_error_deg": 1.5,
                         # Deprecated compatibility parameter. It is no
                         # longer used to create a moving 60-degree vector;
                         # production B mode uses zero translation + true absolute yaw.

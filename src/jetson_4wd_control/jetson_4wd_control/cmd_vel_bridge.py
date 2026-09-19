@@ -91,7 +91,7 @@ class CmdVelBridge(Node):
 
         # Bridge-side safety ceiling for Jetson yaw-rate commands.
         # PX4 RO_YAW_RATE_LIM remains the final FCU hard ceiling.
-        self.declare_parameter("maximum_yaw_rate_radps", 0.20)
+        self.declare_parameter("maximum_yaw_rate_radps", 0.45)
 
         self.command_timeout_sec = float(
             self.get_parameter("command_timeout_sec").value
