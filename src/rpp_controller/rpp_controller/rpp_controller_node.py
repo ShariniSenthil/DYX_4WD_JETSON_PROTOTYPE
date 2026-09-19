@@ -9966,32 +9966,12 @@ class RPPController(Node):
             nav_goal_index,
         ) = nav_solution
 
-        # Separate pivot authority from moving path-tracking authority.
+        # Stationary pivot follows the active interpolated /nav_path tangent.
         #
-        # path_bearing:
-        #   Dense/interpolated /nav_path tangent used while driving.
-        #
-        # pivot_path_bearing:
-        #   Fixed semantic segment bearing used for stationary pivot/alignment.
-        #   Interpolation points must never become pivot targets.
-        if first_approach and self.c_line_bearing is not None:
-            pivot_path_bearing = self.c_line_bearing
-        elif self.target_path_bearing is not None:
-            pivot_path_bearing = self.target_path_bearing
-        else:
-            semantic_delta_east = goal_x - self.current_x
-            semantic_delta_north = goal_y - self.current_y
-
-            if (
-                math.hypot(semantic_delta_east, semantic_delta_north)
-                > self.WAYPOINT_CHANGE_EPSILON_M
-            ):
-                pivot_path_bearing = math.atan2(
-                    semantic_delta_north,
-                    semantic_delta_east,
-                )
-            else:
-                pivot_path_bearing = path_bearing
+        # The same path_bearing used for trajectory tracking is also used for
+        # pivot/alignment. The rover therefore faces the current interpolated
+        # trajectory direction rather than the direct bearing to P1/P2/P3/etc.
+        pivot_path_bearing = path_bearing
 
         mode_prefix += (
             f"{path_label} {nav_cursor_index}->{nav_lookahead_index}/"

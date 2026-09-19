@@ -516,7 +516,7 @@ def generate_launch_description() -> LaunchDescription:
                         "pivot_yaw_kp": 1.80,
                         # Moving steering restored to 102d103 behavior.
                         "moving_yaw_rate_max_radps": 0.18,
-                        "moving_yaw_kp": 1.00,
+                        "moving_yaw_kp": 0.85,
                         "alignment_reentry_goal_distance_m": 0.60,
                         # Hardened speed arbitration:
                         # - post-pivot line capture and global xtrack recovery are capped
