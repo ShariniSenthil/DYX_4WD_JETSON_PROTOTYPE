@@ -70,7 +70,7 @@ FCU_DEVICE_PATH = "/dev/serial/by-id/usb-Auterion_PX4_FMU_v6X.x_0-if00"
 # non-overridable ABSOLUTE_MAXIMUM_SPEED_MPS ceiling, i.e. zero headroom.
 # Watch the first run closely and be ready to drop this back down.
 CRUISE_SPEED_MPS = 1.00
-TERMINAL_FLOOR_SPEED_MPS = 0.25
+TERMINAL_FLOOR_SPEED_MPS = 0.15
 
 # Single source of truth for which terminal-stop authority is active.
 # rpp_controller and mission_manager each independently declare and validate
