@@ -518,8 +518,8 @@ def generate_launch_description() -> LaunchDescription:
                         # low-speed steering conditioning.
                         "moving_yaw_rate_max_radps": 0.18,
                         "moving_yaw_kp": 0.85,
-                        "moving_yaw_deadband_enter_deg": 0.20,
-                        "moving_yaw_deadband_exit_deg": 0.40,
+                        "moving_yaw_deadband_enter_deg": 0.50,
+                        "moving_yaw_deadband_exit_deg": 1.00,
                         "moving_yaw_rate_slew_radps2": 0.60,
                         "moving_alignment_min_speed_mps": min(
                             0.40, CRUISE_SPEED_MPS
