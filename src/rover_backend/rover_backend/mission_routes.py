@@ -544,13 +544,28 @@ def loaded_path(
         }
 
     if push_enabled():
+        # No live snapshot. Say WHY, so a client can tell "still assembling"
+        # (keep waiting) from "invalid" (a new preparation is required) from
+        # a genuinely empty path. The real point count is reported so pending
+        # assembly is never mistaken for an empty path.
+        display = trajectory_snapshot.display_state(mission)
+        try:
+            expected_count = max(0, int(mission.get("navigation_point_count") or 0))
+        except (TypeError, ValueError):
+            expected_count = 0
         return {
             "snapshot": None,
             "success": True,
             "frame_id": None,
-            "navigation_point_count": 0,
+            "navigation_point_count": expected_count,
             "preview_truncated": False,
             "points": [],
+            "snapshot_state": display["state"],
+            "snapshot_reason": display["reason"],
+            "requires_reprepare": display["requires_reprepare"],
+            "assembling": display["state"] == "assembling",
+            "server_instance_id": display["server_instance_id"],
+            "seq": display["seq"],
         }
 
     return {

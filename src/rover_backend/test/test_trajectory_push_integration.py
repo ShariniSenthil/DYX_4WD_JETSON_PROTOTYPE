@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -203,8 +204,15 @@ def test_rejected_origin_cannot_reappear_through_legacy_rest_fallback(context, m
     )
     context["trajectory_snapshot"].feed_origin(13.001, 80.0)
     route = production_function("mission_routes.py", "loaded_path", context)
-    assert route()["points"] == []
-    assert route()["navigation_point_count"] == 0
+    response = route()
+    assert response["points"] == []
+    # The real count is reported (an empty list with count 0 reads as a failed
+    # path); the state says WHY there are no points: re-prepare is required.
+    assert response["navigation_point_count"] == 180
+    assert response["snapshot_state"] == "invalid"
+    assert response["snapshot_reason"] == "prepared_origin_changed"
+    assert response["requires_reprepare"] is True
+    assert response["assembling"] is False
     # Explicit rollback retains the original bounded-preview response.
     monkeypatch.setenv("DYX_TRAJECTORY_PUSH", "off")
     assert route()["points"] == legacy
@@ -234,3 +242,64 @@ def test_route_revokes_preview_even_when_bridge_never_dispatches(context, operat
     with pytest.raises(RuntimeError, match="bridge unavailable"):
         asyncio.run(route())
     assert service.live_payload() is None
+
+
+def test_realtime_loop_expires_pending_snapshot_without_clients_or_rest(context):
+    service = context["trajectory_snapshot"]
+    now = [100.0]
+    service._clock = lambda: now[0]
+    service.feed_types([0] * len(Fixture().types))
+    events = []
+    service.add_listener(events.append)
+    now[0] += service.assembly_timeout_s + 1
+
+    async def run_iteration():
+        stop = asyncio.Event()
+        changed = asyncio.Event()
+
+        async def no_clients():
+            stop.set()
+            changed.set()
+            return []
+
+        context.update({
+            "asyncio": asyncio,
+            "_stop_event": stop,
+            "_state_change_event": changed,
+            "settings": SimpleNamespace(telemetry_broadcast_hz=1),
+            "_all_socket_records": no_clients,
+            "LOGGER": Mock(),
+        })
+        broadcast = production_function("realtime.py", "_broadcast_loop", context)
+        await asyncio.wait_for(broadcast(), timeout=1)
+        context["LOGGER"].exception.assert_not_called()
+
+    asyncio.run(run_iteration())
+    assert len(events) == 1
+    assert events[0]["payload"]["reason"] == "snapshot_assembly_timeout"
+    assert events[0]["payload"]["requires_reprepare"] is True
+
+
+def test_timeout_check_does_not_wait_for_projection_lock(context):
+    service = context["trajectory_snapshot"]
+    # Hold the lock in this thread while the periodic check runs elsewhere.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with service._lock:
+            future = executor.submit(service.check_timeout)
+            future.result(timeout=1)
+
+
+def test_pending_snapshot_reports_real_count_and_assembling_not_an_empty_path(context):
+    """READY can reach the backend before its path: that is pending, not empty."""
+    fresh = TrajectorySnapshotService(projector=fake_projector)
+    fixture = Fixture()
+    fixture.inputs()["origin"](fresh)
+    fixture.inputs()["status"](fresh)  # READY status, no path components yet
+    context["trajectory_snapshot"] = fresh
+    context["rover_state"].update("mission", navigation_point_count=180)
+    response = production_function("mission_routes.py", "loaded_path", context)()
+    assert response["points"] == []
+    assert response["navigation_point_count"] == 180  # never 0 while a path is expected
+    assert response["snapshot_state"] == "assembling"
+    assert response["assembling"] is True
+    assert response["requires_reprepare"] is False

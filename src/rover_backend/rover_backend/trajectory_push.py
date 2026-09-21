@@ -40,6 +40,24 @@ EVENT_CLEARED = "trajectory_path_cleared"
 XY_DECIMALS = 4
 LATLON_DECIMALS = 9
 
+# Reasons a snapshot cannot become valid again without a new preparation. They
+# are reported as "invalid / re-prepare required"; every other reason is
+# ordinary lifecycle or a still-assembling snapshot ("pending").
+HARD_INVALID_REASONS = frozenset(
+    {
+        "prepared_origin_unavailable",
+        "prepared_origin_invalid",
+        "prepared_origin_changed",
+        "coordinate_mode_unavailable",
+        "snapshot_projection_failed",
+        "snapshot_assembly_timeout",
+    }
+)
+
+# A READY generator whose snapshot has not verified within this time is no
+# longer "loading": it is reported invalid so the operator can re-prepare.
+ASSEMBLY_TIMEOUT_S = 10.0
+
 Point = tuple[float, float]
 Projector = Callable[[float, float, float, float], tuple[float, float]]
 Listener = Callable[[dict[str, Any]], None]
@@ -67,12 +85,17 @@ class TrajectorySnapshotService:
         self._nav_stamp: tuple[int, int] | None = None
         self._blocked_nav_stamp: tuple[int, int] | None = None
         self._suspended = False
+        self._invalid_reason: str | None = None
+        self._assembling_since: float | None = None
+        self._clock: Callable[[], float] = time.monotonic
+        self.assembly_timeout_s = ASSEMBLY_TIMEOUT_S
 
         self._seq = 0
         self._components_version = 0
         self._verified: tuple[int, str] | None = None
         self._live: dict[str, Any] | None = None
         self._live_key: tuple[Any, ...] | None = None
+        self._last_clear_key: tuple[Any, ...] | None = None
 
     # ------------------------------------------------------------------ setup
     def set_projector(self, projector: Projector) -> None:
@@ -99,10 +122,13 @@ class TrajectorySnapshotService:
             self._nav_stamp = None
             self._blocked_nav_stamp = None
             self._suspended = False
+            self._invalid_reason = None
+            self._assembling_since = None
             self._components_version += 1
             self._verified = None
             self._live = None
             self._live_key = None
+            self._last_clear_key = None
 
     # ------------------------------------------------------------- read access
     def live_payload(self, mission: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -136,6 +162,9 @@ class TrajectorySnapshotService:
             self._verified = None
             self._components_version += 1
             self._suspended = suspend
+            self._invalid_reason = None
+            self._assembling_since = None
+            self._last_clear_key = None
             events = self._clear_locked(reason)
         self._dispatch(events)
 
@@ -158,6 +187,62 @@ class TrajectorySnapshotService:
             if event["event"] == EVENT_CLEARED:
                 return self._live is None
             return self.live_payload(mission) is payload
+
+    def display_state(self, mission: dict[str, Any] | None = None) -> dict[str, Any]:
+        """What a client without a live path should be told.
+
+        ``live``       a verified path exists (see ``live_payload``)
+        ``assembling`` READY/preparing but the snapshot is not verified yet
+        ``invalid``    it cannot become valid without a new preparation
+        ``idle``       nothing expected (no mission / generator not ready)
+        ``disabled``   push turned off; callers use the legacy preview
+        """
+
+        def state(name: str, reason: str | None = None) -> dict[str, Any]:
+            return {
+                "state": name,
+                "reason": reason,
+                "requires_reprepare": name == "invalid",
+                # Lets a client order a delayed poll against events it applied.
+                "server_instance_id": self.server_instance_id,
+                "seq": self._seq,
+            }
+
+        if not push_enabled():
+            return state("disabled")
+        self.check_timeout()
+        with self._lock:
+            if self.live_payload(mission) is not None:
+                return state("live")
+            if self._suspended:
+                return state("assembling", "preparation_invalidated")
+            if self._invalid_reason:
+                return state("invalid", self._invalid_reason)
+            if self._assembling_since is not None:
+                return state("assembling", "snapshot_pending")
+            return state("idle")
+
+    def check_timeout(self) -> None:
+        """Advance overdue assembly even when no client is polling the path."""
+        if not push_enabled():
+            return
+        # Projection may hold this lock for a large path. A periodic check can
+        # wait for the next tick; it must not delay telemetry delivery.
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            events = []
+            if (
+                not self._suspended
+                and self._live is None
+                and self._invalid_reason is None
+                and self._assembling_since is not None
+                and self._clock() - self._assembling_since > self.assembly_timeout_s
+            ):
+                events = self._reject_locked("snapshot_assembly_timeout")
+        finally:
+            self._lock.release()
+        self._dispatch(events)
 
     # ------------------------------------------------------------------ feeds
     def feed_nav(
@@ -204,7 +289,10 @@ class TrajectorySnapshotService:
         with self._lock:
             if source == "navigation_path":
                 if self._blocked_nav_stamp is not None:
-                    if stamp is None or stamp <= self._blocked_nav_stamp:
+                    # Reject only the exact stale retained message (or one with
+                    # no stamp to prove otherwise). Do NOT order by time: a
+                    # clock step backwards must not block every later path.
+                    if stamp is None or stamp == self._blocked_nav_stamp:
                         return
                     self._blocked_nav_stamp = None
                 self._nav_stamp = stamp
@@ -236,12 +324,17 @@ class TrajectorySnapshotService:
         self._seq += 1
         return self._seq
 
-    def _clear_locked(self, reason: str) -> list[dict[str, Any]]:
+    def _clear_locked(self, reason: str, *, force: bool = False) -> list[dict[str, Any]]:
         live = self._live
         self._live = None
         self._live_key = None
-        if live is None:
+        status = self._status or {}
+        mission_id = live.get("mission_id") if live else status.get("mission_id")
+        signature = live.get("signature") if live else status.get("path_signature")
+        key = (mission_id, signature, reason)
+        if live is None and (not force or key == self._last_clear_key):
             return []
+        self._last_clear_key = key
         return [
             {
                 "event": EVENT_CLEARED,
@@ -249,15 +342,36 @@ class TrajectorySnapshotService:
                     "schema_version": SCHEMA_VERSION,
                     "server_instance_id": self.server_instance_id,
                     "seq": self._next_seq(),
-                    "mission_id": live.get("mission_id"),
-                    "signature": live.get("signature"),
+                    "mission_id": mission_id,
+                    "signature": signature,
                     "reason": reason,
+                    "requires_reprepare": reason in HARD_INVALID_REASONS,
                 },
             }
         ]
 
+    def _reject_locked(self, reason: str) -> list[dict[str, Any]]:
+        """Clear and remember that this snapshot needs a new preparation."""
+
+        self._invalid_reason = reason
+        if reason != "snapshot_assembly_timeout":
+            self._assembling_since = None
+        # A soft clear may already have removed _live. Clients still need a
+        # newer event when that pending state becomes invalid.
+        return self._clear_locked(reason, force=True)
+
+    def _pending_locked(self, reason: str | None = None) -> list[dict[str, Any]]:
+        """Not verifiable yet: assembling (bounded by ``assembly_timeout_s``)."""
+
+        if self._assembling_since is None:
+            self._assembling_since = self._clock()
+        if self._clock() - self._assembling_since > self.assembly_timeout_s:
+            return self._reject_locked("snapshot_assembly_timeout")
+        return self._clear_locked(reason) if reason else []
+
     def _evaluate_locked(self, *, source_cleared: bool = False) -> list[dict[str, Any]]:
         if self._suspended:
+            self._assembling_since = None
             return self._clear_locked("preparation_invalidated")
         status = self._status
         ready = bool(
@@ -266,32 +380,41 @@ class TrajectorySnapshotService:
             and status.get("ready")
         )
         if not ready:
+            self._invalid_reason = None
+            self._assembling_since = None
             return self._clear_locked("generator_not_ready")
+        # Re-derived on every evaluation, so a condition that heals (e.g. the
+        # origin returns to the prepared one) stops being reported invalid.
+        self._invalid_reason = None
         if source_cleared:
-            return self._clear_locked("source_cleared")
+            return self._pending_locked("source_cleared")
 
         # A geometry signature covers local coordinates, not their geographic
         # origin. Never reproject a GPS path using a newer, unrelated origin.
         if status.get("coordinate_mode") == "gps":
             localization = status.get("localization")
             if not isinstance(localization, dict):
-                return self._clear_locked("prepared_origin_unavailable")
+                return self._reject_locked("prepared_origin_unavailable")
             try:
                 prepared_origin = (
                     float(localization["origin_latitude_deg"]),
                     float(localization["origin_longitude_deg"]),
                 )
             except (KeyError, TypeError, ValueError):
-                return self._clear_locked("prepared_origin_unavailable")
+                return self._reject_locked("prepared_origin_unavailable")
             if not all(math.isfinite(v) for v in prepared_origin):
-                return self._clear_locked("prepared_origin_invalid")
+                return self._reject_locked("prepared_origin_invalid")
+            if self._origin is None:
+                # The backend has not received gp_origin yet (e.g. just
+                # restarted): pending, not a mismatch.
+                return self._pending_locked()
             if prepared_origin != self._origin:
-                return self._clear_locked("prepared_origin_changed")
+                return self._reject_locked("prepared_origin_changed")
         elif status.get("coordinate_mode") == "local":
             if self._local_origin is not None and self._origin != self._local_origin:
-                return self._clear_locked("prepared_origin_changed")
+                return self._reject_locked("prepared_origin_changed")
         else:
-            return self._clear_locked("coordinate_mode_unavailable")
+            return self._reject_locked("coordinate_mode_unavailable")
 
         pending = self._pending
         nav = pending.navigation_path
@@ -300,19 +423,19 @@ class TrajectorySnapshotService:
         indices = pending.marking_indices
         signature = pending.path_signature
         if any(v is None for v in (nav, markings, types, indices, signature)):
-            return self._clear_locked("snapshot_incomplete")
+            return self._pending_locked("snapshot_incomplete")
         if self._origin is None:
-            return []
+            return self._pending_locked()
 
         count = len(nav)
         if not (count == len(types) == len(indices)):
-            return self._clear_locked("snapshot_count_mismatch")
+            return self._pending_locked("snapshot_count_mismatch")
         try:
             status_count = int(status.get("navigation_point_count"))
         except (TypeError, ValueError):
-            return self._clear_locked("status_count_invalid")
+            return self._pending_locked("status_count_invalid")
         if status_count != count or status.get("path_signature") != signature:
-            return self._clear_locked("status_snapshot_mismatch")
+            return self._pending_locked("status_snapshot_mismatch")
 
         verified = (self._components_version, signature)
         if self._verified != verified:
@@ -321,7 +444,7 @@ class TrajectorySnapshotService:
             )
             if not decision.can_install:
                 LOGGER.warning("trajectory snapshot rejected: %s", decision.reason)
-                return self._clear_locked("snapshot_signature_mismatch")
+                return self._pending_locked("snapshot_signature_mismatch")
             self._verified = verified
 
         key = (status.get("mission_id"), signature, self._origin)
@@ -330,9 +453,11 @@ class TrajectorySnapshotService:
 
         payload = self._build_payload_locked(status, nav, signature)
         if payload is None:
-            return self._clear_locked("snapshot_projection_failed")
+            return self._reject_locked("snapshot_projection_failed")
         self._live = payload
         self._live_key = key
+        self._last_clear_key = None
+        self._assembling_since = None
         if status.get("coordinate_mode") == "local":
             self._local_origin = self._origin
         return [{"event": EVENT_PATH, "payload": payload}]

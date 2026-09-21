@@ -695,6 +695,9 @@ async def _broadcast_loop() -> None:
 
     while not stop_event.is_set():
         try:
+            # Check even without path polling or connected clients. Keep the
+            # snapshot lock (which can be held by projection) off the ASGI loop.
+            await asyncio.to_thread(trajectory_snapshot.check_timeout)
             records = await _all_socket_records()
 
             if records:

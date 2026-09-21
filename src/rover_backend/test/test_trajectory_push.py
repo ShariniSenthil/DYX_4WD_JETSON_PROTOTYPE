@@ -234,7 +234,7 @@ def test_origin_change_invalidates_instead_of_reprojecting_old_geometry(service)
     assert paths(service)[-1]["payload"]["seq"] > clears(service)[0]["payload"]["seq"]
 
 
-def test_projection_failure_emits_nothing_and_does_not_raise():
+def test_projection_failure_emits_invalid_clear_and_does_not_raise():
     def bad(*_a):
         raise ValueError("bad origin")
 
@@ -243,7 +243,11 @@ def test_projection_failure_emits_nothing_and_does_not_raise():
     svc.add_listener(events.append)
     for feed in Fixture().inputs().values():
         feed(svc)
-    assert not events and svc.live_payload() is None
+    assert svc.live_payload() is None
+    assert len(events) == 1
+    assert events[0]["event"] == EVENT_CLEARED
+    assert events[0]["payload"]["reason"] == "snapshot_projection_failed"
+    assert events[0]["payload"]["requires_reprepare"] is True
 
 
 def test_long_path_is_sent_whole_not_truncated(service):
@@ -406,3 +410,201 @@ def test_disabled_flag_never_serves_previously_cached_payload(service, monkeypat
         feed(service)
     monkeypatch.setenv("DYX_TRAJECTORY_PUSH", "0")
     assert service.live_payload() is None
+
+
+# --- pending vs invalid display contract -----------------------------------
+
+
+def status_first(svc, fx):
+    """READY status + origin arrive before any path component."""
+    fx.inputs()["origin"](svc)
+    fx.inputs()["status"](svc)
+
+
+def test_pending_assembly_is_reported_assembling_then_times_out_as_invalid(service):
+    fx = Fixture()
+    now = [100.0]
+    service._clock = lambda: now[0]
+    mission = {"loaded": True, "trajectory_ready": True, "mission_id": "m1"}
+    status_first(service, fx)
+    pending = service.display_state(mission)
+    assert (pending["state"], pending["reason"], pending["requires_reprepare"]) == (
+        "assembling", "snapshot_pending", False,
+    )
+    now[0] += service.assembly_timeout_s - 0.5
+    assert service.display_state(mission)["state"] == "assembling"
+    now[0] += 1.0  # past the bound: no longer "loading" forever
+    timed_out = service.display_state(mission)
+    assert (timed_out["state"], timed_out["reason"], timed_out["requires_reprepare"]) == (
+        "invalid", "snapshot_assembly_timeout", True,
+    )
+    # a late, complete snapshot still heals it
+    for name in ("nav", "wp", "types", "idx", "sig"):
+        fx.inputs()[name](service)
+    assert service.display_state(mission)["state"] == "live"
+
+
+def test_origin_not_yet_known_is_pending_not_invalid(service):
+    fx = Fixture()
+    for name in ("nav", "wp", "types", "idx", "sig", "status"):
+        fx.inputs()[name](service)
+    assert not service.events
+    assert service.display_state()["state"] == "assembling"
+    fx.inputs()["origin"](service)
+    assert service.display_state()["state"] == "live" and len(paths(service)) == 1
+
+
+def test_origin_change_is_invalid_and_reprepare_required_then_heals(service):
+    fx = Fixture()
+    for feed in fx.inputs().values():
+        feed(service)
+    service.feed_origin(ORIGIN[0] + 0.001, ORIGIN[1])
+    cleared = clears(service)[0]["payload"]
+    assert cleared["reason"] == "prepared_origin_changed"
+    assert cleared["requires_reprepare"] is True
+    state = service.display_state()
+    assert (state["state"], state["reason"], state["requires_reprepare"]) == (
+        "invalid", "prepared_origin_changed", True,
+    )
+    assert state["server_instance_id"] == service.server_instance_id
+    assert state["seq"] == clears(service)[0]["payload"]["seq"]
+    service.feed_origin(*ORIGIN)  # the condition healed: valid again, no re-prepare needed
+    assert service.display_state()["state"] == "live"
+    assert len(paths(service)) == 2
+
+
+def test_ordinary_lifecycle_clears_do_not_require_reprepare(service):
+    fx = Fixture()
+    for feed in fx.inputs().values():
+        feed(service)
+    service.feed_status(fx.status(ready=False, state="PREPARING"))
+    assert clears(service)[0]["payload"]["requires_reprepare"] is False
+    assert service.display_state()["state"] == "idle"
+
+
+def test_invalidate_reports_assembling_not_invalid_and_resets_state(service):
+    fx = Fixture()
+    for feed in fx.inputs().values():
+        feed(service)
+    service.feed_origin(ORIGIN[0] + 0.001, ORIGIN[1])
+    assert service.display_state()["state"] == "invalid"
+    service.invalidate("prepare_requested")
+    assert service.display_state()["state"] == "assembling"  # preparing again
+    service.resume()
+    assert service.display_state()["state"] == "idle"
+
+
+def test_display_state_is_disabled_when_push_is_off(monkeypatch):
+    monkeypatch.setenv("DYX_TRAJECTORY_PUSH", "0")
+    svc = TrajectorySnapshotService(projector=fake_projector)
+    assert svc.display_state()["state"] == "disabled"
+
+
+# --- stale retained navigation message vs. clock behaviour ------------------
+
+
+def test_timeout_emits_new_invalid_clear_without_rest_polling(service):
+    now = [100.0]
+    service._clock = lambda: now[0]
+    fx = Fixture()
+    for feed in fx.inputs().values():
+        feed(service)
+    service.feed_types([0] * len(fx.types))
+    soft = clears(service)[-1]["payload"]
+    assert soft["requires_reprepare"] is False
+    now[0] += service.assembly_timeout_s + 1
+    service.check_timeout()
+    invalid = clears(service)[-1]["payload"]
+    assert invalid["seq"] > soft["seq"]
+    assert invalid["reason"] == "snapshot_assembly_timeout"
+    assert invalid["requires_reprepare"] is True
+    assert invalid["mission_id"] == "m1"
+    count = len(service.events)
+    service.check_timeout()
+    service.feed_types([0] * len(fx.types))
+    assert len(service.events) == count  # no repeating or reset timeout
+    assert service.display_state()["seq"] == invalid["seq"]
+    fx.inputs()["types"](service)
+    assert service.live_payload()["seq"] > invalid["seq"]
+
+
+def test_hard_rejection_after_soft_clear_emits_new_sequence(service):
+    fx = Fixture()
+    for feed in fx.inputs().values():
+        feed(service)
+    service.feed_types([0] * len(fx.types))
+    soft = clears(service)[-1]["payload"]
+    service.feed_origin(ORIGIN[0] + 0.001, ORIGIN[1])
+    invalid = clears(service)[-1]["payload"]
+    assert invalid["seq"] > soft["seq"]
+    assert invalid["reason"] == "prepared_origin_changed"
+    assert invalid["requires_reprepare"] is True
+    count = len(service.events)
+    service.feed_status(fx.status())
+    assert len(service.events) == count
+
+
+def test_timeout_before_first_path_emits_identity_and_cancels_on_prepare(service):
+    now = [100.0]
+    service._clock = lambda: now[0]
+    status_first(service, Fixture())
+    now[0] += service.assembly_timeout_s + 1
+    service.check_timeout()
+    invalid = clears(service)[-1]["payload"]
+    assert invalid["mission_id"] == "m1"
+    assert invalid["requires_reprepare"] is True
+    service.invalidate("prepare_requested")
+    now[0] += 100
+    count = len(service.events)
+    service.check_timeout()
+    assert len(service.events) == count
+
+
+def prepared_with_stamp(svc, fx, stamp):
+    svc.feed_nav(fx.nav, stamp)
+    for name in ("wp", "types", "idx", "sig", "origin", "status"):
+        fx.inputs()[name](svc)
+
+
+def test_stale_retained_nav_with_the_same_stamp_is_rejected_after_invalidate(service):
+    fx = Fixture()
+    prepared_with_stamp(service, fx, (1000, 5))
+    assert len(paths(service)) == 1
+    service.invalidate("prepare_requested")
+    service.resume()
+    service.feed_nav(fx.nav, (1000, 5))  # the old retained message again
+    assert service._pending.navigation_path is None
+    assert len(paths(service)) == 1  # nothing re-emitted from stale data
+
+
+def test_new_nav_with_a_stamp_that_moved_backwards_is_accepted(service):
+    fx = Fixture()
+    prepared_with_stamp(service, fx, (2000, 0))
+    service.invalidate("prepare_requested")
+    service.resume()
+    fresh = Fixture(y_offset=1.0)
+    prepared_with_stamp(service, fresh, (1500, 0))  # wall clock stepped back
+    assert service._nav_stamp == (1500, 0)
+    assert paths(service)[-1]["payload"]["signature"] == fresh.signature
+
+
+def test_unstamped_nav_stays_blocked_until_a_different_stamp_arrives(service):
+    fx = Fixture()
+    prepared_with_stamp(service, fx, (10, 0))
+    service.invalidate("prepare_requested")
+    service.resume()
+    service.feed_nav(fx.nav)  # cannot be proven fresh
+    assert service._pending.navigation_path is None
+    service.feed_nav(fx.nav, (11, 0))
+    assert service._pending.navigation_path is not None
+
+
+def test_blocking_is_lifted_after_a_fresh_message(service):
+    fx = Fixture()
+    prepared_with_stamp(service, fx, (50, 0))
+    service.invalidate("prepare_requested")
+    service.resume()
+    service.feed_nav(fx.nav, (60, 0))
+    assert service._blocked_nav_stamp is None
+    service.feed_nav(fx.nav, (50, 0))  # equal to the old blocked stamp, but no longer blocked
+    assert service._pending.navigation_path is not None
