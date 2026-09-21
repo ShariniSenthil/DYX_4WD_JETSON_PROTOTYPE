@@ -56,6 +56,7 @@ from rover_backend.state import rover_state
 from rover_backend.state import utc_now_iso
 from rover_backend.system_routes import build_mission_status_payload
 from rover_backend.system_routes import build_telemetry_payload
+from rover_backend.trajectory_push import trajectory_snapshot
 
 LOGGER = logging.getLogger(__name__)
 
@@ -114,6 +115,37 @@ def notify_authoritative_state_changed() -> None:
     except RuntimeError:
         # The ASGI loop is shutting down.
         return
+
+
+_trajectory_emit_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _on_trajectory_event(event: dict[str, Any]) -> None:
+    """Snapshot listener (ROS thread): hand the event to the Socket.IO loop."""
+
+    loop = _event_loop
+    if loop is None or loop.is_closed():
+        return
+    try:
+        loop.call_soon_threadsafe(_schedule_trajectory_emit, event)
+    except RuntimeError:
+        # The ASGI loop is shutting down.
+        return
+
+
+def _schedule_trajectory_emit(event: dict[str, Any]) -> None:
+    task = asyncio.ensure_future(sio.emit(event["event"], event["payload"]))
+    _trajectory_emit_tasks.add(task)
+
+    def _done(finished: asyncio.Task[Any]) -> None:
+        _trajectory_emit_tasks.discard(finished)
+        if not finished.cancelled() and finished.exception() is not None:
+            LOGGER.error(
+                "trajectory event emit failed: %s",
+                finished.exception(),
+            )
+
+    task.add_done_callback(_done)
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +335,16 @@ async def connect(
         safety,
         to=sid,
     )
+
+    # Only a complete, verified snapshot is replayed; while the backend is
+    # still assembling (e.g. just restarted) nothing partial is sent.
+    live_trajectory = trajectory_snapshot.live_payload()
+    if live_trajectory is not None:
+        await sio.emit(
+            "trajectory_path",
+            live_trajectory,
+            to=sid,
+        )
 
     await sio.emit(
         "socket_ready",
@@ -778,6 +820,7 @@ async def start_realtime() -> None:
             return
 
         _event_loop = asyncio.get_running_loop()
+        trajectory_snapshot.add_listener(_on_trajectory_event)
 
         _stop_event = asyncio.Event()
         _state_change_event = asyncio.Event()
@@ -847,6 +890,8 @@ async def stop_realtime() -> None:
             frontend_connected=False,
             socket_clients=0,
         )
+
+        trajectory_snapshot.remove_listener(_on_trajectory_event)
 
         _broadcast_task = None
         _stop_event = None

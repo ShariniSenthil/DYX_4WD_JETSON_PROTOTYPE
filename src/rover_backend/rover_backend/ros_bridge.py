@@ -52,7 +52,9 @@ from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Bool
 from std_msgs.msg import Float32
 from std_msgs.msg import Float64
+from std_msgs.msg import Int32MultiArray
 from std_msgs.msg import String
+from std_msgs.msg import UInt8MultiArray
 from std_msgs.msg import UInt64
 from mission_manager_interfaces.srv import ReleaseEmergencyStop
 from std_srvs.srv import Trigger
@@ -68,6 +70,7 @@ from rover_backend.rtk_mavros_readiness import (
 )
 from rover_backend.state import rover_state
 from rover_backend.state import utc_now_iso
+from rover_backend.trajectory_push import trajectory_snapshot
 
 LOGGER = logging.getLogger(__name__)
 
@@ -253,6 +256,16 @@ def _px4_enu_to_geodetic(
         math.degrees(latitude),
         math.degrees(longitude),
     )
+
+
+trajectory_snapshot.set_projector(
+    lambda origin_lat, origin_lon, east_m, north_m: _px4_enu_to_geodetic(
+        origin_latitude_deg=origin_lat,
+        origin_longitude_deg=origin_lon,
+        east_m=east_m,
+        north_m=north_m,
+    )
+)
 
 
 def _reliable_qos(
@@ -673,6 +686,29 @@ class RoverBackendRosNode(Node):
             retained_qos,
         )
 
+        # Remaining retained components of the generator's path snapshot. They
+        # are only consumed by trajectory_push (verified frontend push).
+        self.create_subscription(
+            UInt8MultiArray,
+            "/trajectory_generator/path_types",
+            self._path_types_callback,
+            retained_qos,
+        )
+
+        self.create_subscription(
+            Int32MultiArray,
+            "/trajectory_generator/marking_indices",
+            self._marking_indices_callback,
+            retained_qos,
+        )
+
+        self.create_subscription(
+            String,
+            "/trajectory_generator/path_signature",
+            self._path_signature_callback,
+            retained_qos,
+        )
+
         self.create_subscription(
             String,
             "/mission_manager/status",
@@ -1036,6 +1072,8 @@ class RoverBackendRosNode(Node):
         with self._runtime_lock:
             self._px4_origin_latitude_deg = latitude
             self._px4_origin_longitude_deg = longitude
+
+        self._snapshot_feed("feed_origin", latitude, longitude)
 
         rover_state.update(
             "mission",
@@ -2276,6 +2314,8 @@ class RoverBackendRosNode(Node):
         if payload is None:
             return
 
+        self._snapshot_feed("feed_status", payload)
+
         state_name = str(payload.get("state", "")).strip().upper()
 
         ready = bool(payload.get("ready", False))
@@ -2358,6 +2398,7 @@ class RoverBackendRosNode(Node):
         message: NavPath,
     ) -> None:
         self._mark_ros_message()
+        self._snapshot_feed("feed_nav", self._path_points(message))
 
         # The full path stays in ROS. API state stores only a bounded preview.
         preview_limit = 2000
@@ -2391,11 +2432,52 @@ class RoverBackendRosNode(Node):
         message: NavPath,
     ) -> None:
         self._mark_ros_message()
+        self._snapshot_feed("feed_waypoints", self._path_points(message))
 
         rover_state.update(
             "mission",
             total_points=len(message.poses),
         )
+
+    def _path_types_callback(
+        self,
+        message: UInt8MultiArray,
+    ) -> None:
+        self._snapshot_feed("feed_types", [int(value) for value in message.data])
+
+    def _marking_indices_callback(
+        self,
+        message: Int32MultiArray,
+    ) -> None:
+        self._snapshot_feed("feed_indices", [int(value) for value in message.data])
+
+    def _path_signature_callback(
+        self,
+        message: String,
+    ) -> None:
+        self._snapshot_feed("feed_signature", str(message.data).strip())
+
+    @staticmethod
+    def _path_points(message: NavPath) -> list[tuple[float, float]] | None:
+        """(east, north) list, or None when any point is non-finite."""
+
+        points: list[tuple[float, float]] = []
+        for pose in message.poses:
+            east_m = float(pose.pose.position.x)
+            north_m = float(pose.pose.position.y)
+            if not (math.isfinite(east_m) and math.isfinite(north_m)):
+                return None
+            points.append((east_m, north_m))
+        return points
+
+    @staticmethod
+    def _snapshot_feed(method: str, *arguments: Any) -> None:
+        """Feed the frontend snapshot service; never let it break a ROS callback."""
+
+        try:
+            getattr(trajectory_snapshot, method)(*arguments)
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("trajectory snapshot %s failed", method)
 
     def _mission_status_callback(
         self,

@@ -49,6 +49,8 @@ from rover_backend.mission_store import mission_store
 from rover_backend.ros_bridge import RosServiceOutcomeUnknownError
 from rover_backend.ros_bridge import ros_bridge
 from rover_backend.state import rover_state
+from rover_backend.trajectory_push import legacy_points
+from rover_backend.trajectory_push import trajectory_snapshot
 
 mission_router = APIRouter(
     prefix="/api/mission",
@@ -509,11 +511,35 @@ def _clear_and_delete_active_mission() -> bool:
 def loaded_path(
     _session: AuthenticatedSession = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Return the bounded navigation-path preview maintained by ros_bridge."""
+    """Return the loaded navigation path.
+
+    When the verified generator snapshot is live, the FULL path is returned
+    (same object the Socket.IO push carries, identified by ``snapshot``).
+    Otherwise the legacy bounded preview from ros_bridge is returned with
+    ``snapshot: null``; a client must never let that truncated preview
+    replace a full path it already holds.
+    """
 
     mission = _mission_state()
 
+    live = trajectory_snapshot.live_payload()
+    if live is not None:
+        return {
+            "success": True,
+            "frame_id": mission.get("path_frame_id"),
+            "navigation_point_count": live["count"],
+            "preview_truncated": False,
+            "points": legacy_points(live),
+            "snapshot": {
+                "server_instance_id": live["server_instance_id"],
+                "seq": live["seq"],
+                "mission_id": live["mission_id"],
+                "signature": live["signature"],
+            },
+        }
+
     return {
+        "snapshot": None,
         "success": True,
         "frame_id": mission.get("path_frame_id"),
         "navigation_point_count": mission.get(
