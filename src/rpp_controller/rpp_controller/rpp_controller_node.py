@@ -417,6 +417,12 @@ class RPPController(Node):
             "line_tracking_lookahead_xtrack_gain",
             1.0,
         )
+        # Straight-line steering neutral corridor. Cross-track noise inside
+        # +/-5 mm must not move the explicit-yaw target left/right.
+        self.declare_parameter(
+            "line_tracking_xtrack_deadband_m",
+            0.005,
+        )
         # /nav_path is generated at 50 mm spacing. The cursor advances through
         # those points without stopping; a farther point is selected only as
         # the RPP lookahead reference. Semantic /segment_goal still owns the
@@ -1005,6 +1011,9 @@ class RPPController(Node):
         )
         self.line_tracking_lookahead_xtrack_gain = float(
             self.get_parameter("line_tracking_lookahead_xtrack_gain").value
+        )
+        self.line_tracking_xtrack_deadband = float(
+            self.get_parameter("line_tracking_xtrack_deadband_m").value
         )
         # Derived time gain: reproduces line_tracking_lookahead_m exactly at
         # cruise_speed_mps (xtrack=0), so cruise-speed behaviour is unchanged.
@@ -2771,6 +2780,9 @@ class RPPController(Node):
             "line_tracking_lookahead_xtrack_gain": (
                 self.line_tracking_lookahead_xtrack_gain
             ),
+            "line_tracking_xtrack_deadband_m": (
+                self.line_tracking_xtrack_deadband
+            ),
             "nav_path_lookahead_m": self.nav_path_lookahead,
             "nav_path_point_reach_m": self.nav_path_point_reach,
             "alignment_release_accel_distance_m": (
@@ -3323,6 +3335,16 @@ class RPPController(Node):
         if self.line_tracking_lookahead_xtrack_gain < 0.0:
             raise ValueError(
                 "line_tracking_lookahead_xtrack_gain must be >= 0"
+            )
+        if not (
+            math.isfinite(self.line_tracking_xtrack_deadband)
+            and 0.0
+            <= self.line_tracking_xtrack_deadband
+            <= self.terminal_capture_gate_cross_track
+        ):
+            raise ValueError(
+                "line_tracking_xtrack_deadband_m must be finite, >= 0, "
+                "and <= terminal_capture_gate_cross_track_m"
             )
         if (
             self.terminal_goal_intercept_distance
@@ -8674,6 +8696,19 @@ class RPPController(Node):
             -math.sin(line_bearing) * delta_east + math.cos(line_bearing) * delta_north
         )
 
+        # Keep the measured cross-track untouched for telemetry/mission gates,
+        # but remove the +/-5 mm noise corridor from steering authority.
+        # Subtracting the corridor outside the band makes the correction
+        # continuous at the boundary (no steering step at 5 mm).
+        cross_track_excess = max(
+            0.0,
+            abs(signed_cross_track) - self.line_tracking_xtrack_deadband,
+        )
+        steering_cross_track = math.copysign(
+            cross_track_excess,
+            signed_cross_track,
+        )
+
         lookahead = (
             self.line_tracking_lookahead_speed_gain * abs(self.command_slew_speed)
             + self.line_tracking_lookahead_xtrack_gain * abs(signed_cross_track)
@@ -8684,7 +8719,7 @@ class RPPController(Node):
         )
 
         correction = -math.atan2(
-            signed_cross_track,
+            steering_cross_track,
             lookahead,
         )
         correction = max(

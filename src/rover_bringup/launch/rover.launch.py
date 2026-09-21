@@ -550,6 +550,9 @@ def generate_launch_description() -> LaunchDescription:
                         "line_tracking_lookahead_min_m": 0.35,
                         "line_tracking_lookahead_max_m": 0.80,
                         "line_tracking_lookahead_xtrack_gain": 1.0,
+                        # Ignore +/-5 mm cross-track noise for steering only.
+                        # Actual xtrack telemetry and waypoint gates are unchanged.
+                        "line_tracking_xtrack_deadband_m": 0.005,
                         "nav_path_lookahead_m": 0.55,
                         # Gate-1 accepted in four forward/reverse field runs.
                         # Geometry is installed by default but cannot change
