@@ -492,8 +492,8 @@ def generate_launch_description() -> LaunchDescription:
                         # PX4 TURN->DRIVE threshold is 6deg; RPP holds zero translation
                         # and true absolute yaw until its 4deg release.
                         # Normal line correction remains +/-12deg.
-                        # Post-pivot C->P1 line re-anchor removes the
-                        # displacement created during the native pivot.
+                        # Post-pivot geometry remains fixed; reanchor is
+                        # intentionally bypassed for C->P1 and later legs.
                         # Predictive xtrack recovery remains continuous
                         # through the final 1.00m. Exact P1 is stop/marking only.
                         "segment_alignment_deadband_enter_cross_track_m": 0.08,

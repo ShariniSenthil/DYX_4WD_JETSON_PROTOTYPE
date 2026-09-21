@@ -27,7 +27,7 @@ NODE_TREE = ast.parse(NODE_SOURCE)
 DEG4 = math.radians(4.0)
 YAW_30DPS = math.radians(30.0)
 YAW_98DPS = math.radians(98.0)
-NATIVE_HASH = "ab1a69086a10d69a3719dea04fdfd772887dfec02ee318020c47e93b3e0cea00"
+NATIVE_HASH = "1211c6999c8f414c1c9799acdd4c4340d5100fd2de0b07caa1ae27f11abcae5c"
 
 
 def _controller_method(name: str) -> ast.FunctionDef:
@@ -597,7 +597,7 @@ def test_native_carrier_publish_clears_stale_reanchor_flag_not_bearing():
 def test_legacy_param_and_precision_gate_remain_field_safe():
     defaults = _declared_defaults()
     assert defaults["precision_pivot_enabled"] is False
-    assert defaults["legacy_pivot_post_settle_hold_sec"] == 1.00
+    assert defaults["legacy_pivot_post_settle_hold_sec"] == 0.20
     assert defaults["legacy_pivot_stationary_violation_debounce_sec"] == 0.10
     assert defaults["post_pivot_capture_speed_mps"] == 0.20
     assert defaults["acceleration_distance_m"] == 0.20
@@ -605,7 +605,7 @@ def test_legacy_param_and_precision_gate_remain_field_safe():
     assert defaults["cruise_speed_mps"] == 1.00
     assert defaults["waypoint_tolerance_m"] == 0.03
     assert '"precision_pivot_enabled": False' in LAUNCH_SOURCE
-    assert '"legacy_pivot_post_settle_hold_sec": 1.00' in LAUNCH_SOURCE
+    assert '"legacy_pivot_post_settle_hold_sec": 0.20' in LAUNCH_SOURCE
     assert "RD_MAX_THR_YAW_R" not in NODE_SOURCE
     assert "RO_YAW_RATE_TH" not in NODE_SOURCE
     assert "RO_YAW_RATE_LIM" not in NODE_SOURCE
@@ -869,7 +869,8 @@ def test_reanchor_directive_is_ack_only_and_never_mutates_geometry():
     )[0]
 
     assert "ack_reanchor_completed" in block
-    assert "PIVOT_COMPLETE_FIXED_GEOMETRY" in block
+    assert "C_TO_P1_POST_PIVOT_FIXED_GEOMETRY" in block
+    assert "POST_PIVOT_LATER_LEG_FIXED_GEOMETRY" in block
     assert "reanchor_c_to_p1_after_pivot" not in block
     assert "reanchor_runtime_path_after_pivot" not in block
     assert "segment_runtime_reanchored = True" not in block
@@ -1019,3 +1020,53 @@ def test_c_to_p1_geometry_is_not_reanchored_by_alignment_adapter():
         "COMPLETE_ZERO", 1
     )[0]
     assert "reanchor_runtime_path_after_pivot" not in reanchor_block
+
+def test_mid_leg_reentry_is_suppressed_during_intentional_xtrack_recovery():
+    """V3 regression: 15deg path error must not interrupt 22deg recovery."""
+    method = _controller_method("suppress_mid_leg_alignment_reentry")
+    namespace = {"math": math}
+    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
+    exec(compile(module, str(NODE_PATH), "exec"), namespace)
+    guard = namespace["suppress_mid_leg_alignment_reentry"]
+
+    class Dummy:
+        MAX_MOVING_HEADING_ERROR_RAD = math.radians(30.0)
+        xtrack_priority_enter = 0.015
+        xtrack_priority_active = False
+
+    dummy = Dummy()
+
+    assert guard(dummy, math.radians(15.1), 0.40) is True
+    assert guard(dummy, math.radians(22.0), 0.40) is True
+
+    dummy.xtrack_priority_active = True
+    assert guard(dummy, math.radians(20.0), 0.010) is True
+
+
+def test_mid_leg_reentry_guard_still_allows_real_alignment_failures():
+    """The guard must not disable stationary realignment globally."""
+    method = _controller_method("suppress_mid_leg_alignment_reentry")
+    namespace = {"math": math}
+    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
+    exec(compile(module, str(NODE_PATH), "exec"), namespace)
+    guard = namespace["suppress_mid_leg_alignment_reentry"]
+
+    class Dummy:
+        MAX_MOVING_HEADING_ERROR_RAD = math.radians(30.0)
+        xtrack_priority_enter = 0.015
+        xtrack_priority_active = False
+
+    dummy = Dummy()
+
+    assert guard(dummy, math.radians(31.0), 0.40) is False
+    assert guard(dummy, math.radians(20.0), 0.005) is False
+
+
+def test_control_loop_gates_mid_leg_alignment_reentry_with_recovery_guard():
+    control = _method_source("control_loop")
+    assert "alignment_reentry_suppressed = self.suppress_mid_leg_alignment_reentry(" in control
+    prefix = control.split(
+        'self._reset_legacy_alignment_lifecycle("MID_LEG_ALIGNMENT_REENTRY")',
+        1,
+    )[0]
+    assert "and not alignment_reentry_suppressed" in prefix[-1800:]

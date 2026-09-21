@@ -8646,6 +8646,31 @@ class RPPController(Node):
         ratio = (error_abs - self.heading_full_speed) / span
         return base_speed - ratio * (base_speed - recovery_speed)
 
+    def suppress_mid_leg_alignment_reentry(
+        self,
+        pivot_heading_error,
+        signed_cross_track,
+    ):
+        """Keep intentional moving xtrack recovery from re-triggering a pivot.
+
+        The global xtrack controller is allowed to steer away from the fixed
+        path bearing while it recaptures the line. A path-heading-only
+        re-entry test would therefore mistake its own recovery command for a
+        new alignment failure.
+
+        Suppression is bounded by MAX_MOVING_HEADING_ERROR_RAD: once the rover
+        escapes the existing moving-steering envelope, stationary alignment
+        is allowed to take over again.
+        """
+        recovery_needed = (
+            self.xtrack_priority_active
+            or abs(signed_cross_track) >= self.xtrack_priority_enter
+        )
+        inside_moving_envelope = (
+            abs(pivot_heading_error) <= self.MAX_MOVING_HEADING_ERROR_RAD
+        )
+        return recovery_needed and inside_moving_envelope
+
     def limit_moving_guidance_bearing(self, desired_bearing):
         """Keep moving recovery below the PX4 45-degree pivot threshold."""
         command_error = self.normalize_angle(desired_bearing - self.current_yaw)
@@ -10409,16 +10434,28 @@ class RPPController(Node):
         # Native ±60deg carrier is unchanged.  A genuine latch no longer
         # falls through into 1.00 m/s capture at the 4deg heading gate.
         # After native release the chassis must prove a measured stop,
-        # reanchor C->P1 to the actual post-pivot position once, hold
-        # literal zero for legacy_pivot_post_settle_hold_sec, then release
+        # keep the fixed mission geometry (post-pivot reanchor is bypassed),
+        # hold literal zero for legacy_pivot_post_settle_hold_sec, then release
         # straight into normal path tracking and the existing acceleration
         # ramp -- there is no moving recapture phase.  Aligned starts that
         # never latch a carrier keep the previous non-pivot capture path.
         # --------------------------------------------------------------
+        reentry_delta_east = self.current_x - target_x
+        reentry_delta_north = self.current_y - target_y
+        reentry_signed_cross_track = (
+            -math.sin(path_bearing) * reentry_delta_east
+            + math.cos(path_bearing) * reentry_delta_north
+        )
+        alignment_reentry_suppressed = self.suppress_mid_leg_alignment_reentry(
+            pivot_heading_error,
+            reentry_signed_cross_track,
+        )
+
         if (
             not self.segment_alignment_active
             and goal_distance > self.terminal_goal_intercept_distance
             and abs(pivot_heading_error) >= self.pivot_enter_angle
+            and not alignment_reentry_suppressed
         ):
             self.segment_alignment_active = True
             self._reset_legacy_alignment_lifecycle("MID_LEG_ALIGNMENT_REENTRY")
@@ -10435,7 +10472,8 @@ class RPPController(Node):
                 )
             self.get_logger().warn(
                 "SEGMENT ALIGNMENT RE-ENTERED | "
-                f"path_error={math.degrees(path_heading_error):+.1f}deg"
+                f"path_error={math.degrees(path_heading_error):+.1f}deg | "
+                f"xtrack={self.ground_xtrack(reentry_signed_cross_track) * 1000.0:+.1f}mm"
             )
 
         if self.segment_alignment_active:
