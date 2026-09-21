@@ -146,12 +146,13 @@ def test_brake_and_recenter_share_bounded_forward_cone_anchor_approach():
     assert "hard_speed_cap_mps=speed" in approach
 
 
-def test_p1_reanchor_occurs_only_after_release_certificate():
+def test_p1_recapture_waits_for_release_certificate_without_reanchor():
     source = _method_source("_run_precision_pivot_alignment")
     certificate = source.index("result.release_certificate.valid")
     guard = source.index("if not self.precision_pivot_release_certified")
-    reanchor = source.index("self.reanchor_c_to_p1_after_pivot()")
-    assert certificate < guard < reanchor
+    release = source.index("self.precision_pivot_reanchor_complete = True")
+    assert certificate < guard < release
+    assert "self.reanchor_c_to_p1_after_pivot()" not in source
 
 
 def test_semantic_anchor_latch_and_midleg_exception_are_explicit():

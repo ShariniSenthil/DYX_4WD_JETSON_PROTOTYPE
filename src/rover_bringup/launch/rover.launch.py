@@ -514,9 +514,16 @@ def generate_launch_description() -> LaunchDescription:
                         "maximum_yaw_rate_radps": 0.45,
                         "minimum_yaw_rate_radps": 0.06,
                         "pivot_yaw_kp": 1.80,
-                        # Moving steering restored to 102d103 behavior.
+                        # Keep tested moving-yaw authority and add
+                        # low-speed steering conditioning.
                         "moving_yaw_rate_max_radps": 0.18,
                         "moving_yaw_kp": 0.85,
+                        "moving_yaw_deadband_enter_deg": 0.5,
+                        "moving_yaw_deadband_exit_deg": 1.0,
+                        "moving_yaw_rate_slew_radps2": 0.60,
+                        "moving_alignment_min_speed_mps": min(
+                            0.40, CRUISE_SPEED_MPS
+                        ),
                         "alignment_reentry_goal_distance_m": 0.60,
                         # Hardened speed arbitration:
                         # - post-pivot line capture and global xtrack recovery are capped
@@ -559,10 +566,11 @@ def generate_launch_description() -> LaunchDescription:
                         "geometry_localization_jump_reset_m": 0.50,
                         "geometry_max_backward_jump_m": 0.10,
                         "geometry_max_forward_jump_m": 1.00,
-                        # Projection guidance is field-accepted and enabled
-                        # with the tested 0.90 s horizon. Longitudinal speed
-                        # regulation remains independently default-OFF.
-                        "precision_guidance_enabled": True,
+                        # Production straight marking legs use one steering
+                        # authority: line_guidance() on the fixed path tangent.
+                        # Precision geometry stays installed, but projection
+                        # guidance does not overwrite the straight-line bearing.
+                        "precision_guidance_enabled": False,
                         "precision_speed_control_enabled": False,
                         "precision_lookahead_min_m": 0.20,
                         "precision_lookahead_max_m": 1.00,

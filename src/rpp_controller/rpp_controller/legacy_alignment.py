@@ -412,8 +412,12 @@ class LegacyAlignmentLifecycle:
                 reset_native_carrier=True,
                 reason="SETTLE_CERTIFICATE_DWELL",
             )
+        # Production geometry is fixed. C->P1 is created once at
+        # mission START and is not rebuilt from the post-pivot pose.
+        # REANCHOR_ZERO is available only behind the explicit compatibility
+        # switch; rover.launch.py keeps that switch disabled.
         reanchor = (
-            (sample.first_approach or self.config.reanchor_all_legs)
+            self.config.reanchor_all_legs
             and not self.reanchor_complete
             and not sample.already_reanchored
             and self.native_carrier_issued

@@ -833,14 +833,17 @@ def test_reanchor_all_legs_false_restores_entry_leg_only_behaviour():
     assert done.directive is LegacyAlignmentDirective.COMPLETE_ZERO
 
 
-def test_entry_leg_reanchor_is_unaffected_by_the_all_legs_flag():
+def test_entry_leg_reanchor_requires_the_compatibility_flag():
     for flag in (True, False):
         driver, settled = _pivot_to_settle_certificate(
             first_approach=True,
             reanchor_all_legs=flag,
         )
-        assert settled.reanchor_requested is True, flag
-        assert settled.directive is LegacyAlignmentDirective.REANCHOR_ZERO
+        assert settled.reanchor_requested is flag
+        if flag:
+            assert settled.directive is LegacyAlignmentDirective.REANCHOR_ZERO
+        else:
+            assert settled.directive is LegacyAlignmentDirective.HOLD_ZERO
 
 
 def test_later_leg_reanchor_is_offered_once_per_leg():

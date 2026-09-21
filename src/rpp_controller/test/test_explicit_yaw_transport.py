@@ -225,6 +225,15 @@ def _bind_real_yaw_rate_command(node, env):
     node.pivot_yaw_kp = 1.80
     node.moving_yaw_rate_max = 0.18
     node.moving_yaw_kp = 0.85
+    node.moving_yaw_deadband_enter = math.radians(0.5)
+    node.moving_yaw_deadband_exit = math.radians(1.0)
+    node.moving_yaw_rate_slew = 0.60
+    node.moving_yaw_quiet = False
+    node.moving_yaw_rate_output = 0.0
+    node.moving_yaw_rate_last_time = None
+    node.last_commanded_yaw_rate_radps = 0.0
+    node.CONTROL_HZ = 20.0
+    node.deceleration_max_dt_sec = 0.10
     node.normalize_angle = lambda v: math.atan2(math.sin(v), math.cos(v))
 
     def bound(
@@ -402,7 +411,7 @@ def test_every_generic_moving_call_site_supplies_owning_yaw():
     assert ast.literal_eval(stop_call.args[1]) == 0.0
 
 
-def test_production_c_to_p1_post_pivot_reanchor_is_active_only_for_entry_leg():
+def test_production_c_to_p1_post_pivot_reanchor_is_disabled():
     launch_tree = ast.parse(LAUNCH.read_text())
     all_leg_values = []
     for dictionary in ast.walk(launch_tree):
@@ -419,9 +428,28 @@ def test_production_c_to_p1_post_pivot_reanchor_is_active_only_for_entry_leg():
     adapter = ast.unparse(
         method(RPP, "RPPController", "_run_legacy_segment_alignment")
     )
-    assert "reanchor_c_to_p1_after_pivot" in adapter
-    assert "C->P1 POST-PIVOT REANCHOR ACTIVE" in adapter
-    assert "POST-PIVOT LATER-LEG FIXED GEOMETRY" in adapter
+    assert "reanchor_c_to_p1_after_pivot" not in adapter
+    assert "C->P1 POST-PIVOT REANCHOR ACTIVE" not in adapter
+    assert "POST-PIVOT FIXED GEOMETRY" in adapter
+    assert "self.reanchor_c_to_p1_after_pivot()" not in RPP.read_text()
+
+
+def test_heading_speed_supervisor_is_full_at_2deg_and_capped_at_4deg():
+    env = {"math": math}
+    execute([method(RPP, "RPPController", "apply_heading_speed_limit")], env)
+    node = NS(
+        cruise_speed=0.60,
+        moving_alignment_min_speed=0.40,
+        heading_full_speed=math.radians(2.0),
+        heading_min_speed=math.radians(4.0),
+        normalize_angle=lambda value: math.atan2(math.sin(value), math.cos(value)),
+    )
+    fn = env["apply_heading_speed_limit"]
+    assert fn(node, 0.60, math.radians(0.0)) == pytest.approx(0.60)
+    assert fn(node, 0.60, math.radians(2.0)) == pytest.approx(0.60)
+    assert fn(node, 0.60, math.radians(3.0)) == pytest.approx(0.50)
+    assert fn(node, 0.60, math.radians(4.0)) == pytest.approx(0.40)
+    assert fn(node, 0.25, math.radians(4.0)) == pytest.approx(0.25)
 
 
 def test_patch3_adapter_never_reconstructs_yaw_from_velocity():
@@ -715,6 +743,10 @@ def _patch5_pivot_deps(node):
     node.pivot_yaw_kp = 1.0
     node.moving_yaw_rate_max = 0.20
     node.moving_yaw_kp = 1.00
+    node.moving_yaw_quiet = False
+    node.moving_yaw_rate_output = 0.0
+    node.moving_yaw_rate_last_time = None
+    node.last_commanded_yaw_rate_radps = 0.0
     node.command_slew_speed = 0.0
     node.command_slew_last_time = None
     node.terminal_native_pivot_true_bearing = 0.25

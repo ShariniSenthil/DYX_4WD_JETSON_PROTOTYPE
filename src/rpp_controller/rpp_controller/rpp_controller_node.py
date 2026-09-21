@@ -368,9 +368,15 @@ class RPPController(Node):
         self.declare_parameter("maximum_yaw_rate_radps", 0.45)
         self.declare_parameter("minimum_yaw_rate_radps", 0.06)
         self.declare_parameter("pivot_yaw_kp", 1.80)
-        # Moving yaw restored to the 102d103 behavior.
+        # Keep the tested proportional moving-yaw authority, but
+        # condition tiny left/right corrections so low-speed straight driving
+        # does not chatter the differential drivetrain.
         self.declare_parameter("moving_yaw_rate_max_radps", 0.18)
         self.declare_parameter("moving_yaw_kp", 0.85)
+        self.declare_parameter("moving_yaw_deadband_enter_deg", 0.5)
+        self.declare_parameter("moving_yaw_deadband_exit_deg", 1.0)
+        self.declare_parameter("moving_yaw_rate_slew_radps2", 0.60)
+        self.declare_parameter("moving_alignment_min_speed_mps", 0.40)
         self.declare_parameter(
             "alignment_reentry_goal_distance_m",
             0.60,
@@ -963,6 +969,18 @@ class RPPController(Node):
             self.get_parameter("moving_yaw_rate_max_radps").value
         )
         self.moving_yaw_kp = float(self.get_parameter("moving_yaw_kp").value)
+        self.moving_yaw_deadband_enter = math.radians(
+            float(self.get_parameter("moving_yaw_deadband_enter_deg").value)
+        )
+        self.moving_yaw_deadband_exit = math.radians(
+            float(self.get_parameter("moving_yaw_deadband_exit_deg").value)
+        )
+        self.moving_yaw_rate_slew = float(
+            self.get_parameter("moving_yaw_rate_slew_radps2").value
+        )
+        self.moving_alignment_min_speed = float(
+            self.get_parameter("moving_alignment_min_speed_mps").value
+        )
         self.alignment_reentry_goal_distance = float(
             self.get_parameter("alignment_reentry_goal_distance_m").value
         )
@@ -1985,6 +2003,13 @@ class RPPController(Node):
         self.alignment_inside_since = None
         self.alignment_release_x = None
         self.alignment_release_y = None
+
+        # Moving-yaw conditioning state. Literal zero resets this state so a
+        # new leg never inherits steering effort from the previous leg.
+        self.moving_yaw_quiet = False
+        self.moving_yaw_rate_output = 0.0
+        self.moving_yaw_rate_last_time = None
+        self.last_commanded_yaw_rate_radps = 0.0
 
         # Cross-track speed-cap recovery is shared by normal and terminal motion.
         self.xtrack_priority_active = False
@@ -3178,6 +3203,28 @@ class RPPController(Node):
             )
         if not math.isfinite(self.moving_yaw_kp) or self.moving_yaw_kp <= 0.0:
             raise ValueError("moving_yaw_kp must be finite and > 0")
+        if not (
+            0.0 <= self.moving_yaw_deadband_enter
+            < self.moving_yaw_deadband_exit
+            <= self.heading_full_speed
+        ):
+            raise ValueError(
+                "moving yaw deadband requires 0 <= enter < exit <= "
+                "heading_full_speed_deg"
+            )
+        if (
+            not math.isfinite(self.moving_yaw_rate_slew)
+            or self.moving_yaw_rate_slew <= 0.0
+        ):
+            raise ValueError("moving_yaw_rate_slew_radps2 must be finite and > 0")
+        if not (
+            math.isfinite(self.moving_alignment_min_speed)
+            and 0.0 < self.moving_alignment_min_speed <= self.cruise_speed
+        ):
+            raise ValueError(
+                "moving_alignment_min_speed_mps must satisfy "
+                "0 < value <= cruise_speed_mps"
+            )
         if self.heading_full_speed >= self.heading_min_speed:
             raise ValueError(
                 "heading_full_speed_deg must be less than " "heading_min_speed_deg"
@@ -3354,11 +3401,11 @@ class RPPController(Node):
         stationary_pivot=False,
         translational_speed_mps=0.0,
     ):
-        """Generate Jetson-owned ENU yaw-rate with separate pivot/moving authority.
+        """Generate Jetson-owned ENU yaw-rate.
 
-        Stationary pivots get the strong pivot envelope. Moving steering gets a
-        speed-dependent cap: deliberately soft near a semantic point and more
-        authority at cruise. PX4 remains the low-level physical yaw-rate tracker.
+        Stationary pivot behavior remains unchanged. Moving steering keeps the
+        tested proportional law and adds a small hysteresis plus yaw-rate slew
+        so tiny alternating heading errors cannot create left/right chatter.
         """
         if (
             self.current_yaw is None
@@ -3372,25 +3419,58 @@ class RPPController(Node):
             float(target_yaw_enu_rad) - float(self.current_yaw)
         )
         error_abs = abs(yaw_error)
-        if error_abs <= 1.0e-9:
-            return 0.0
 
-        turn_sign = 1.0 if yaw_error > 0.0 else -1.0
         if stationary_pivot:
+            self.moving_yaw_quiet = False
+            self.moving_yaw_rate_output = 0.0
+            self.moving_yaw_rate_last_time = None
+            if error_abs <= 1.0e-9:
+                self.last_commanded_yaw_rate_radps = 0.0
+                return 0.0
+            turn_sign = 1.0 if yaw_error > 0.0 else -1.0
             requested_mag = abs(self.pivot_yaw_kp * yaw_error)
             commanded_mag = min(
                 self.maximum_yaw_rate,
                 max(self.minimum_yaw_rate, requested_mag),
             )
-            return turn_sign * commanded_mag
+            command = turn_sign * commanded_mag
+            self.last_commanded_yaw_rate_radps = command
+            return command
 
-        # 102d103 moving-yaw behavior:
-        # proportional yaw error with a fixed +/-0.20 rad/s ceiling.
-        requested = self.moving_yaw_kp * yaw_error
-        return max(
-            -self.moving_yaw_rate_max,
-            min(self.moving_yaw_rate_max, requested),
-        )
+        if self.moving_yaw_quiet:
+            if error_abs >= self.moving_yaw_deadband_exit:
+                self.moving_yaw_quiet = False
+        elif error_abs <= self.moving_yaw_deadband_enter:
+            self.moving_yaw_quiet = True
+
+        if self.moving_yaw_quiet:
+            requested = 0.0
+        else:
+            requested = max(
+                -self.moving_yaw_rate_max,
+                min(self.moving_yaw_rate_max, self.moving_yaw_kp * yaw_error),
+            )
+
+        now = self.get_clock().now()
+        if self.moving_yaw_rate_last_time is None:
+            dt = 1.0 / self.CONTROL_HZ
+        else:
+            dt = (now - self.moving_yaw_rate_last_time).nanoseconds / 1e9
+            if not math.isfinite(dt) or dt <= 0.0:
+                dt = 1.0 / self.CONTROL_HZ
+            dt = min(dt, self.deceleration_max_dt_sec)
+        self.moving_yaw_rate_last_time = now
+
+        maximum_change = self.moving_yaw_rate_slew * dt
+        delta = requested - self.moving_yaw_rate_output
+        delta = max(-maximum_change, min(maximum_change, delta))
+        self.moving_yaw_rate_output += delta
+
+        if self.moving_yaw_quiet and abs(self.moving_yaw_rate_output) <= 1.0e-6:
+            self.moving_yaw_rate_output = 0.0
+
+        self.last_commanded_yaw_rate_radps = self.moving_yaw_rate_output
+        return self.moving_yaw_rate_output
 
     @staticmethod
     def ground_xtrack(value):
@@ -5266,13 +5346,13 @@ class RPPController(Node):
             return True
 
         if result.directive is MotionDirective.RECAPTURE:
-            # Position and measured release have been certified before this
-            # re-anchor/translation point.  P1 is never re-anchored earlier.
+            # C->P1 geometry is fixed from mission START. A certified pivot
+            # release may transition to moving recapture, but must not rebuild
+            # the entry line from the post-pivot pose.
             if first_approach and not self.precision_pivot_reanchor_complete:
                 if not self.precision_pivot_release_certified:
                     self.publish_stop()
                     return True
-                self.reanchor_c_to_p1_after_pivot()
                 self.precision_pivot_reanchor_complete = True
                 self.reset_terminal_native_pivot()
                 self.publish_stop()
@@ -5611,62 +5691,22 @@ class RPPController(Node):
             return True
 
         if result.directive is LegacyAlignmentDirective.REANCHOR_ZERO:
-            # Production policy:
-            # - C->P1: after a certified stationary pivot, rebuild C'->P1 from
-            #   the rover's measured post-pivot local-odometry position.
-            # - P1->Pn: keep fixed mission geometry. Launch keeps
-            #   post_pivot_reanchor_all_legs=False, so later legs normally
-            #   never request this directive.
-            if first_approach:
-                reanchored = self.reanchor_c_to_p1_after_pivot()
-                if not reanchored:
-                    already_at_goal = (
-                        goal_distance is not None
-                        and math.isfinite(float(goal_distance))
-                        and float(goal_distance) <= self.waypoint_tolerance
-                    )
-                    if not already_at_goal:
-                        self.legacy_alignment.enter_safety_hold(
-                            "C_TO_P1_POST_PIVOT_REANCHOR_FAILED"
-                        )
-                        self.reset_terminal_native_pivot()
-                        self._reset_precision_regulator(
-                            "C_TO_P1_POST_PIVOT_REANCHOR_FAILED"
-                        )
-                        self.publish_stop()
-                        self.get_logger().error(
-                            "C->P1 POST-PIVOT REANCHOR FAILED / SAFETY HOLD | "
-                            f"goal_distance={goal_distance:.3f}m | "
-                            f"xtrack="
-                            f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
-                        )
-                        return True
-
-                self.legacy_alignment.ack_reanchor_completed()
-                self.reset_terminal_native_pivot()
-                self._reset_precision_regulator(
-                    "C_TO_P1_POST_PIVOT_REANCHOR_COMPLETE"
-                )
-                self.publish_stop()
-                self.get_logger().warn(
-                    "C->P1 POST-PIVOT REANCHOR ACTIVE / HOLD ZERO | "
-                    f"reanchored={reanchored} | "
-                    f"goal_distance={goal_distance:.3f}m"
-                )
-                return True
-
-            # Defensive later-leg compatibility path. With
-            # post_pivot_reanchor_all_legs=False this should not normally be
-            # requested, but if it is, do not move the mission geometry.
+            # Defensive compatibility only. Production geometry is fixed:
+            # C->P1 is built once at mission START and later legs remain on
+            # /nav_path. Never move the path anchor because the chassis walked
+            # during a pivot.
             self.legacy_alignment.ack_reanchor_completed()
             self.reset_terminal_native_pivot()
-            self._reset_precision_regulator(
-                "POST_PIVOT_LATER_LEG_FIXED_GEOMETRY"
+            reason = (
+                "C_TO_P1_POST_PIVOT_FIXED_GEOMETRY"
+                if first_approach
+                else "POST_PIVOT_LATER_LEG_FIXED_GEOMETRY"
             )
+            self._reset_precision_regulator(reason)
             self.publish_stop()
             self.get_logger().warn(
-                "POST-PIVOT LATER-LEG FIXED GEOMETRY / REANCHOR BYPASSED | "
-                f"goal=P{self.segment_goal_number} | "
+                "POST-PIVOT FIXED GEOMETRY / REANCHOR BYPASSED | "
+                f"leg={'C->P1' if first_approach else f'P{self.segment_goal_number}'} | "
                 f"xtrack="
                 f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm"
             )
@@ -7399,6 +7439,10 @@ class RPPController(Node):
             # explicit_yaw_command_slew_limit().
             self.explicit_yaw_slew_value = None
             self.explicit_yaw_slew_last_time = None
+            self.moving_yaw_quiet = False
+            self.moving_yaw_rate_output = 0.0
+            self.moving_yaw_rate_last_time = None
+            self.last_commanded_yaw_rate_radps = 0.0
             output_speed = 0.0
             north = 0.0
             east = 0.0
@@ -7746,6 +7790,14 @@ class RPPController(Node):
             "command_speed_mps": None,
             "command_north_mps": None,
             "command_east_mps": None,
+            "command_yaw_rate_radps": self._finite_or_none(
+                self.last_commanded_yaw_rate_radps
+            ),
+            "measured_yaw_rate_radps": self._finite_or_none(
+                self.current_yaw_rate_radps
+            ),
+            "steering_state": "UNKNOWN",
+            "moving_yaw_quiet": bool(self.moving_yaw_quiet),
             "current_yaw_rad": self._finite_or_none(self.current_yaw),
             "current_yaw_deg": (
                 math.degrees(self.current_yaw)
@@ -7996,6 +8048,31 @@ class RPPController(Node):
             cross_track_side = "UNKNOWN"
             along_position = "UNKNOWN"
 
+        command_yaw_rate_radps = self._finite_or_none(
+            self.last_commanded_yaw_rate_radps
+        )
+        measured_yaw_rate_radps = self._finite_or_none(
+            self.current_yaw_rate_radps
+        )
+        if available:
+            abs_heading = abs(heading_error_rad)
+            abs_xtrack = abs(ground_xtrack_m)
+            if abs_heading >= self.pivot_enter_angle:
+                steering_state = "PIVOT_REQUIRED"
+            elif abs_heading >= self.heading_min_speed:
+                steering_state = "MOVING_ALIGN"
+            elif (
+                abs_heading > self.heading_full_speed
+                or abs_xtrack > self.xtrack_priority_exit
+            ):
+                steering_state = "FINE_ALIGN"
+            elif self.moving_yaw_quiet:
+                steering_state = "STRAIGHT_HOLD"
+            else:
+                steering_state = "STRAIGHT_TRACK"
+        else:
+            steering_state = "UNKNOWN"
+
         try:
             goal_number = max(0, int(self.segment_goal_number))
         except (TypeError, ValueError):
@@ -8009,6 +8086,10 @@ class RPPController(Node):
 
             "actual_speed_mps": actual_speed_mps,
             "command_speed_mps": command_speed_mps,
+            "command_yaw_rate_radps": command_yaw_rate_radps,
+            "measured_yaw_rate_radps": measured_yaw_rate_radps,
+            "steering_state": steering_state,
+            "moving_yaw_quiet": bool(self.moving_yaw_quiet),
 
             "current_yaw_rad": current_yaw_rad,
             "current_yaw_deg": (
@@ -8519,8 +8600,29 @@ class RPPController(Node):
         )
 
     def apply_heading_speed_limit(self, base_speed, heading_error):
-        """Heading changes direction only, never speed magnitude."""
-        return self.cruise_speed
+        """Coordinate forward speed with moving alignment.
+
+        <=2 deg: full requested speed.
+        2..4 deg: interpolate from cruise down to moving_alignment_min_speed.
+        >=4 deg: hold that moving-alignment cap until the existing >=15 deg
+        stationary-pivot gate takes ownership.
+
+        This is only an upper bound: it never raises the lower speed produced
+        by the existing 200 mm acceleration profile or terminal logic.
+        """
+        base_speed = max(0.0, min(float(base_speed), self.cruise_speed))
+        error_abs = abs(self.normalize_angle(heading_error))
+
+        if error_abs <= self.heading_full_speed:
+            return base_speed
+
+        recovery_speed = min(base_speed, self.moving_alignment_min_speed)
+        if error_abs >= self.heading_min_speed:
+            return recovery_speed
+
+        span = self.heading_min_speed - self.heading_full_speed
+        ratio = (error_abs - self.heading_full_speed) / span
+        return base_speed - ratio * (base_speed - recovery_speed)
 
     def limit_moving_guidance_bearing(self, desired_bearing):
         """Keep moving recovery below the PX4 45-degree pivot threshold."""
@@ -10695,7 +10797,13 @@ class RPPController(Node):
                 signed_cross_track = precision_guidance.signed_cross_track_m
         heading_error = self.normalize_angle(guidance_bearing - self.current_yaw)
 
-        speed = self.cruise_speed
+        # Straight-line supervisor: keep the existing 200 mm acceleration
+        # profile, but reduce the requested ceiling while heading is still
+        # outside the 2 deg full-speed band.
+        speed = self.apply_heading_speed_limit(
+            self.cruise_speed,
+            heading_error,
+        )
 
         if first_approach:
             status = (
