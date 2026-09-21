@@ -434,8 +434,8 @@ def generate_launch_description() -> LaunchDescription:
                         # steering authority collapsed: cross-track walked
                         # ~4 cm over the final 0.6 m and the rover crossed the
                         # goal plane beside the point rather than on it.
-                        "deceleration_enabled": False,
-                        "deceleration_distance_m": 1.00,
+                        "deceleration_enabled": True,
+                        "deceleration_distance_m": 0.20,
                         "deceleration_floor_speed_mps": TERMINAL_FLOOR_SPEED_MPS,
                         "deceleration_max_progress_jump_m": 0.10,
                         "deceleration_max_dt_sec": 0.10,
@@ -518,8 +518,8 @@ def generate_launch_description() -> LaunchDescription:
                         # low-speed steering conditioning.
                         "moving_yaw_rate_max_radps": 0.18,
                         "moving_yaw_kp": 0.85,
-                        "moving_yaw_deadband_enter_deg": 0.5,
-                        "moving_yaw_deadband_exit_deg": 1.0,
+                        "moving_yaw_deadband_enter_deg": 0.20,
+                        "moving_yaw_deadband_exit_deg": 0.40,
                         "moving_yaw_rate_slew_radps2": 0.60,
                         "moving_alignment_min_speed_mps": min(
                             0.40, CRUISE_SPEED_MPS

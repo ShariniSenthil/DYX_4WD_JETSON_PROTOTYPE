@@ -373,8 +373,8 @@ class RPPController(Node):
         # does not chatter the differential drivetrain.
         self.declare_parameter("moving_yaw_rate_max_radps", 0.18)
         self.declare_parameter("moving_yaw_kp", 0.85)
-        self.declare_parameter("moving_yaw_deadband_enter_deg", 0.5)
-        self.declare_parameter("moving_yaw_deadband_exit_deg", 1.0)
+        self.declare_parameter("moving_yaw_deadband_enter_deg", 0.20)
+        self.declare_parameter("moving_yaw_deadband_exit_deg", 0.40)
         self.declare_parameter("moving_yaw_rate_slew_radps2", 0.60)
         self.declare_parameter("moving_alignment_min_speed_mps", 0.40)
         self.declare_parameter(
