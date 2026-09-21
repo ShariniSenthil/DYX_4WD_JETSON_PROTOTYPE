@@ -464,16 +464,17 @@ def generate_launch_description() -> LaunchDescription:
                         # Recovery contract for field precision:
                         #   pivot carrier              = CRUISE_SPEED_MPS (no translational accel)
                         #   genuine native-pivot release holds zero through
-                        #   measured settle, reanchors C->P1 once, holds zero
-                        #   for 1.00 s more, then releases straight into the
-                        #   normal acceleration ramp (no moving recapture)
+                        #   measured settle, keeps fixed geometry (no reanchor),
+                        #   then releases into the normal acceleration ramp
                         #   aligned-start (no carrier latch) still uses 1.00 m/s
-                        #   global xtrack recovery      = 1.00 m/s
-                        #   xtrack engage/release      = 15 mm / 8 mm
+                        #   global large-xtrack recovery = 0.30 m/s max
+                        #   xtrack engage/release        = 80 mm / 40 mm
                         #   release heading            = <=4 deg stable for 0.30 s
                         "segment_alignment_speed_mps": CRUISE_SPEED_MPS,
                         "segment_alignment_recovery_speed_mps": CRUISE_SPEED_MPS,
-                        "xtrack_priority_speed_mps": CRUISE_SPEED_MPS,
+                        "xtrack_priority_speed_mps": min(
+                            0.30, CRUISE_SPEED_MPS
+                        ),
                         "decel_profile_speed_1_mps": CRUISE_SPEED_MPS,
                         "decel_profile_speed_2_mps": CRUISE_SPEED_MPS,
                         "decel_profile_speed_3_mps": CRUISE_SPEED_MPS,
@@ -865,8 +866,8 @@ def generate_launch_description() -> LaunchDescription:
                         # reliably through 50 mm interpolation samples without
                         # treating them as arrival/stop tolerances.
                         "nav_path_point_reach_m": 0.075,
-                        "xtrack_priority_enter_m": 0.015,
-                        "xtrack_priority_exit_m": 0.008,
+                        "xtrack_priority_enter_m": 0.080,
+                        "xtrack_priority_exit_m": 0.040,
                         "xtrack_priority_hold_sec": 0.30,
                         "xtrack_priority_lookahead_m": 0.55,
                         "xtrack_priority_correction_limit_deg": 22.0,
