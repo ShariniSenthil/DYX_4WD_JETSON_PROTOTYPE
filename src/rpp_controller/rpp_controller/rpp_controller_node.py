@@ -10251,10 +10251,14 @@ class RPPController(Node):
 
         # radial20 terminal authority: mutually exclusive with both the
         # Phase-5 branch above and the legacy 30 mm latch below, via
-        # self.terminal_stop_mode. Bearing stays owned by the guidance
-        # pipeline already resolved into path_bearing above (following_runtime_line
-        # authority is already correctly gated by the time path_bearing
-        # reaches this point) -- this branch only overrides speed magnitude.
+        # self.terminal_stop_mode.
+        #
+        # V5 authority split:
+        # - radial20 owns terminal speed/braking/zero/certification;
+        # - predictive terminal xtrack guidance owns steering all the way
+        #   to the fixed semantic-goal line;
+        # - the V4 xtrack speed cap may only LOWER radial20 speed while the
+        #   line is not yet recaptured. It can never override braking upward.
         if (
             self.radial20_active
             and goal_requires_precision_stop
@@ -10290,16 +10294,65 @@ class RPPController(Node):
                     0.0,
                 )
                 return
-            desired_goal_bearing = math.atan2(
-                goal_y - self.current_y,
-                goal_x - self.current_x,
-            )
-            guidance_bearing = self.terminal_bounded_guidance(
+            (
+                guidance_bearing,
+                terminal_signed_cross_track,
+                terminal_xtrack_rate,
+                terminal_predicted_cross_track,
+                terminal_applied_correction,
+                terminal_moving_away,
+                terminal_crossing_imminent,
+                terminal_crossing_projection,
+                terminal_xtrack_profile,
+                terminal_xtrack_lookahead,
+                terminal_xtrack_correction_limit,
+                terminal_xtrack_slew_rate,
+            ) = self.xtrack_priority_guidance(
                 path_bearing,
-                desired_goal_bearing,
-                goal_along_remaining,
+                goal_x,
+                goal_y,
+                terminal_mode=True,
             )
+
+            if not all(
+                math.isfinite(value)
+                for value in (
+                    guidance_bearing,
+                    terminal_signed_cross_track,
+                    terminal_xtrack_rate,
+                    terminal_predicted_cross_track,
+                    terminal_applied_correction,
+                    terminal_crossing_projection,
+                )
+            ):
+                self.publish_stop()
+                self.get_logger().error(
+                    "RADIAL20 TERMINAL XTRACK GUIDANCE NON-FINITE / SAFE HOLD"
+                )
+                return
+
+            (
+                terminal_xtrack_speed_cap_active,
+                terminal_xtrack_error_metric,
+                terminal_xtrack_release_elapsed,
+            ) = self.update_xtrack_speed_cap_state(
+                terminal_signed_cross_track,
+                terminal_predicted_cross_track,
+                path_heading_error,
+            )
+
+            (
+                guidance_bearing,
+                command_heading_error,
+            ) = self.limit_moving_guidance_bearing(guidance_bearing)
+
+            # radial20 remains the terminal speed/braking authority. The
+            # xtrack cap is allowed only to reduce that command while lateral
+            # recovery is still active; it can never increase radial20 speed.
             speed = radial_result.forward_speed_command_mps
+            if terminal_xtrack_speed_cap_active:
+                speed = min(speed, self.xtrack_priority_speed)
+
             north = speed * math.sin(guidance_bearing)
             east = speed * math.cos(guidance_bearing)
             north, east, published_speed = self.publish_velocity_ned(
@@ -10314,13 +10367,33 @@ class RPPController(Node):
             self.log_control(
                 mode_prefix
                 + "RADIAL20 TERMINAL "
-                + radial_result.state.value.upper(),
+                + radial_result.state.value.upper()
+                + " / PREDICTIVE XTRACK "
+                + terminal_xtrack_profile
+                + f" | xtrack="
+                + f"{self.ground_xtrack(terminal_signed_cross_track) * 1000.0:+.1f}mm"
+                + f" | rate="
+                + f"{self.ground_xtrack(terminal_xtrack_rate) * 1000.0:+.1f}mm/s"
+                + f" | predicted="
+                + f"{self.ground_xtrack(terminal_predicted_cross_track) * 1000.0:+.1f}mm"
+                + f" | crossing={terminal_crossing_imminent}"
+                + f" | moving_away={terminal_moving_away}"
+                + f" | correction="
+                + f"{math.degrees(terminal_applied_correction):+.1f}deg"
+                + f" | lookahead={terminal_xtrack_lookahead:.2f}m"
+                + f" | limit="
+                + f"{math.degrees(terminal_xtrack_correction_limit):.1f}deg"
+                + f" | slew="
+                + f"{math.degrees(terminal_xtrack_slew_rate):.1f}deg/s"
+                + f" | metric={terminal_xtrack_error_metric * 1000.0:.1f}mm"
+                + f" | cap_active={terminal_xtrack_speed_cap_active}"
+                + f" | release_hold={terminal_xtrack_release_elapsed:.2f}s",
                 goal_distance,
                 goal_distance,
-                path_heading_error,
+                command_heading_error,
                 published_speed,
-                0.0,
-                0.0,
+                north,
+                east,
             )
             return
 
