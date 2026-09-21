@@ -434,7 +434,7 @@ def test_production_c_to_p1_post_pivot_reanchor_is_disabled():
     assert "self.reanchor_c_to_p1_after_pivot()" not in RPP.read_text()
 
 
-def test_heading_speed_supervisor_is_full_at_2deg_and_capped_at_4deg():
+def test_heading_speed_supervisor_keeps_full_speed_through_fixed_4deg_boundary():
     env = {"math": math}
     execute([method(RPP, "RPPController", "apply_heading_speed_limit")], env)
     node = NS(
@@ -445,11 +445,19 @@ def test_heading_speed_supervisor_is_full_at_2deg_and_capped_at_4deg():
         normalize_angle=lambda value: math.atan2(math.sin(value), math.cos(value)),
     )
     fn = env["apply_heading_speed_limit"]
+
+    # Fixed coordination boundary: requested 0.60 m/s is retained through 4deg.
     assert fn(node, 0.60, math.radians(0.0)) == pytest.approx(0.60)
     assert fn(node, 0.60, math.radians(2.0)) == pytest.approx(0.60)
-    assert fn(node, 0.60, math.radians(3.0)) == pytest.approx(0.50)
-    assert fn(node, 0.60, math.radians(4.0)) == pytest.approx(0.40)
-    assert fn(node, 0.25, math.radians(4.0)) == pytest.approx(0.25)
+    assert fn(node, 0.60, math.radians(3.0)) == pytest.approx(0.60)
+    assert fn(node, 0.60, math.radians(4.0)) == pytest.approx(0.60)
+
+    # Immediately outside the 4deg envelope, use the existing alignment cap.
+    assert fn(node, 0.60, math.radians(4.01)) == pytest.approx(0.40)
+    assert fn(node, 0.60, math.radians(-4.01)) == pytest.approx(0.40)
+
+    # Never raise a lower speed from another authority/profile.
+    assert fn(node, 0.25, math.radians(5.0)) == pytest.approx(0.25)
 
 
 def test_patch3_adapter_never_reconstructs_yaw_from_velocity():

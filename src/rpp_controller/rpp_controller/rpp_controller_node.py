@@ -8622,29 +8622,24 @@ class RPPController(Node):
         )
 
     def apply_heading_speed_limit(self, base_speed, heading_error):
-        """Coordinate forward speed with moving alignment.
+        """Use one fixed 4-degree heading-speed coordination boundary.
 
-        <=2 deg: full requested speed.
-        2..4 deg: interpolate from cruise down to moving_alignment_min_speed.
-        >=4 deg: hold that moving-alignment cap until the existing >=15 deg
-        stationary-pivot gate takes ownership.
+        Up to and including heading_min_speed (configured as 4deg), preserve
+        the requested translational speed. Above that boundary, reduce only
+        to moving_alignment_min_speed until the existing stationary-alignment
+        authority takes ownership.
 
-        This is only an upper bound: it never raises the lower speed produced
-        by the existing 200 mm acceleration profile or terminal logic.
+        This does NOT reduce xtrack recovery steering authority and never
+        raises a lower speed already requested by acceleration, radial20,
+        terminal braking, or another upstream speed limit.
         """
         base_speed = max(0.0, min(float(base_speed), self.cruise_speed))
         error_abs = abs(self.normalize_angle(heading_error))
 
-        if error_abs <= self.heading_full_speed:
+        if error_abs <= self.heading_min_speed:
             return base_speed
 
-        recovery_speed = min(base_speed, self.moving_alignment_min_speed)
-        if error_abs >= self.heading_min_speed:
-            return recovery_speed
-
-        span = self.heading_min_speed - self.heading_full_speed
-        ratio = (error_abs - self.heading_full_speed) / span
-        return base_speed - ratio * (base_speed - recovery_speed)
+        return min(base_speed, self.moving_alignment_min_speed)
 
     def suppress_mid_leg_alignment_reentry(
         self,
