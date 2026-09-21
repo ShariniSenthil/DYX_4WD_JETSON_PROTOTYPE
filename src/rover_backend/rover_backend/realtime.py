@@ -134,7 +134,7 @@ def _on_trajectory_event(event: dict[str, Any]) -> None:
 
 
 def _schedule_trajectory_emit(event: dict[str, Any]) -> None:
-    task = asyncio.ensure_future(sio.emit(event["event"], event["payload"]))
+    task = asyncio.ensure_future(_emit_trajectory_event(event))
     _trajectory_emit_tasks.add(task)
 
     def _done(finished: asyncio.Task[Any]) -> None:
@@ -146,6 +146,18 @@ def _schedule_trajectory_emit(event: dict[str, Any]) -> None:
             )
 
     task.add_done_callback(_done)
+
+
+async def _emit_trajectory_event(event: dict[str, Any]) -> None:
+    # A ROS event may have been invalidated while queued for the ASGI loop.
+    if trajectory_snapshot.event_is_current(event, rover_state.section("mission")):
+        await sio.emit(event["event"], event["payload"])
+
+
+async def _replay_trajectory(sid: str) -> None:
+    live = trajectory_snapshot.live_payload(rover_state.section("mission"))
+    if live is not None:
+        await sio.emit("trajectory_path", live, to=sid)
 
 
 # ---------------------------------------------------------------------------
@@ -338,13 +350,7 @@ async def connect(
 
     # Only a complete, verified snapshot is replayed; while the backend is
     # still assembling (e.g. just restarted) nothing partial is sent.
-    live_trajectory = trajectory_snapshot.live_payload()
-    if live_trajectory is not None:
-        await sio.emit(
-            "trajectory_path",
-            live_trajectory,
-            to=sid,
-        )
+    await _replay_trajectory(sid)
 
     await sio.emit(
         "socket_ready",

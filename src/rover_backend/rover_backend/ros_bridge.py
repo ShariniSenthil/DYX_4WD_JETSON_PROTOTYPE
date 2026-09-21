@@ -70,7 +70,7 @@ from rover_backend.rtk_mavros_readiness import (
 )
 from rover_backend.state import rover_state
 from rover_backend.state import utc_now_iso
-from rover_backend.trajectory_push import trajectory_snapshot
+from rover_backend.trajectory_push import push_enabled, trajectory_snapshot
 
 LOGGER = logging.getLogger(__name__)
 
@@ -418,6 +418,7 @@ class RoverBackendRosNode(Node):
 
         if settings.backend_heartbeat_hz <= 0.0:
             raise ValueError("backend_heartbeat_hz must be greater than zero")
+        push_enabled()  # Validate the rollback setting before starting workers.
 
         self._command_lock = threading.RLock()
         self._runtime_lock = threading.RLock()
@@ -2314,8 +2315,6 @@ class RoverBackendRosNode(Node):
         if payload is None:
             return
 
-        self._snapshot_feed("feed_status", payload)
-
         state_name = str(payload.get("state", "")).strip().upper()
 
         ready = bool(payload.get("ready", False))
@@ -2392,13 +2391,18 @@ class RoverBackendRosNode(Node):
             "mission",
             **mission_updates,
         )
+        self._snapshot_feed("feed_status", payload)
 
     def _nav_path_callback(
         self,
         message: NavPath,
     ) -> None:
         self._mark_ros_message()
-        self._snapshot_feed("feed_nav", self._path_points(message))
+        if push_enabled():
+            self._snapshot_feed(
+                "feed_nav", self._path_points(message),
+                (int(message.header.stamp.sec), int(message.header.stamp.nanosec)),
+            )
 
         # The full path stays in ROS. API state stores only a bounded preview.
         preview_limit = 2000
@@ -2432,7 +2436,8 @@ class RoverBackendRosNode(Node):
         message: NavPath,
     ) -> None:
         self._mark_ros_message()
-        self._snapshot_feed("feed_waypoints", self._path_points(message))
+        if push_enabled():
+            self._snapshot_feed("feed_waypoints", self._path_points(message))
 
         rover_state.update(
             "mission",
@@ -2443,19 +2448,22 @@ class RoverBackendRosNode(Node):
         self,
         message: UInt8MultiArray,
     ) -> None:
-        self._snapshot_feed("feed_types", [int(value) for value in message.data])
+        if push_enabled():
+            self._snapshot_feed("feed_types", [int(value) for value in message.data])
 
     def _marking_indices_callback(
         self,
         message: Int32MultiArray,
     ) -> None:
-        self._snapshot_feed("feed_indices", [int(value) for value in message.data])
+        if push_enabled():
+            self._snapshot_feed("feed_indices", [int(value) for value in message.data])
 
     def _path_signature_callback(
         self,
         message: String,
     ) -> None:
-        self._snapshot_feed("feed_signature", str(message.data).strip())
+        if push_enabled():
+            self._snapshot_feed("feed_signature", str(message.data).strip())
 
     @staticmethod
     def _path_points(message: NavPath) -> list[tuple[float, float]] | None:
@@ -2475,6 +2483,8 @@ class RoverBackendRosNode(Node):
         """Feed the frontend snapshot service; never let it break a ROS callback."""
 
         try:
+            if not push_enabled():
+                return
             getattr(trajectory_snapshot, method)(*arguments)
         except Exception:  # noqa: BLE001
             LOGGER.exception("trajectory snapshot %s failed", method)
@@ -3756,6 +3766,7 @@ class RoverBackendRosNode(Node):
         Deliberately does not touch accepted_for_start. Staging belongs to
         upload/load/delete, not to generate -- do not "fix" this to clear it.
         """
+        trajectory_snapshot.invalidate("prepare_requested")
         with self._runtime_lock:
             self._trajectory_ready = False
             self._trajectory_error = None
@@ -3802,6 +3813,7 @@ class RoverBackendRosNode(Node):
             message=service_message or "Trajectory preparation accepted",
             error=None,
         )
+        self._snapshot_feed("resume")
 
         return rover_state.section("mission")
 
@@ -3879,6 +3891,7 @@ class RoverBackendRosNode(Node):
         return rover_state.section("mission")
 
     def clear_mission(self) -> dict[str, Any]:
+        trajectory_snapshot.invalidate("clear_requested")
         manager_ok, manager_message = self._manager_command("clear")
         trajectory_ok, trajectory_message = self._call_trigger(
             client=self._trajectory_clear_client,

@@ -50,6 +50,7 @@ from rover_backend.ros_bridge import RosServiceOutcomeUnknownError
 from rover_backend.ros_bridge import ros_bridge
 from rover_backend.state import rover_state
 from rover_backend.trajectory_push import legacy_points
+from rover_backend.trajectory_push import push_enabled
 from rover_backend.trajectory_push import trajectory_snapshot
 
 mission_router = APIRouter(
@@ -261,6 +262,7 @@ async def upload_mission(
             detail=str(error),
         ) from error
 
+    trajectory_snapshot.invalidate("mission_uploaded")
     rover_state.update(
         "mission",
         accepted_for_start=False,
@@ -401,6 +403,7 @@ async def restore_mission(
     except (OSError, RuntimeError) as error:
         raise HTTPException(status_code=500, detail=f"The archived mission could not be restored: {error}") from error
 
+    trajectory_snapshot.invalidate("mission_restored")
     rover_state.update("mission", accepted_for_start=False)
     try:
         _require_ros_bridge()
@@ -481,6 +484,7 @@ async def prepare_mission(
     if requested_id and (not metadata or requested_id != str(metadata.get("mission_id") or "")):
         raise HTTPException(status_code=409, detail="The requested mission is not currently loaded.")
 
+    trajectory_snapshot.invalidate("prepare_requested")
     return await _run_ros_operation(
         "prepare",
         ros_bridge.prepare_trajectory,
@@ -502,6 +506,7 @@ def _clear_and_delete_active_mission() -> bool:
     """Serialize manual trajectory clear and active-file deletion."""
 
     with mission_report_store.lifecycle_transaction():
+        trajectory_snapshot.invalidate("mission_deleted")
         if ros_bridge.running:
             ros_bridge.clear_mission()
         return mission_store.delete()
@@ -515,14 +520,14 @@ def loaded_path(
 
     When the verified generator snapshot is live, the FULL path is returned
     (same object the Socket.IO push carries, identified by ``snapshot``).
-    Otherwise the legacy bounded preview from ros_bridge is returned with
-    ``snapshot: null``; a client must never let that truncated preview
-    replace a full path it already holds.
+    With push enabled, pending/invalidated snapshots return no geometry. The
+    legacy preview is only used when the feature is disabled, so fallback
+    cannot resurrect a path that snapshot verification has just rejected.
     """
 
     mission = _mission_state()
 
-    live = trajectory_snapshot.live_payload()
+    live = trajectory_snapshot.live_payload(mission)
     if live is not None:
         return {
             "success": True,
@@ -536,6 +541,16 @@ def loaded_path(
                 "mission_id": live["mission_id"],
                 "signature": live["signature"],
             },
+        }
+
+    if push_enabled():
+        return {
+            "snapshot": None,
+            "success": True,
+            "frame_id": None,
+            "navigation_point_count": 0,
+            "preview_truncated": False,
+            "points": [],
         }
 
     return {
@@ -691,6 +706,7 @@ async def start_mission(
             )
         try:
             await run_in_threadpool(mission_store.restore_archived_mission, requested_id)
+            trajectory_snapshot.invalidate("mission_restored")
             _require_ros_bridge()
             await run_in_threadpool(ros_bridge.prepare_trajectory)
         except MissionValidationError as error:
@@ -801,6 +817,7 @@ async def clear_mission(
 ) -> dict[str, Any]:
     """Clear generated ROS paths and progress while retaining mission.csv."""
 
+    trajectory_snapshot.invalidate("clear_requested")
     return await _run_ros_operation(
         "clear",
         ros_bridge.clear_mission,

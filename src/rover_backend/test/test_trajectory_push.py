@@ -54,6 +54,11 @@ class Fixture:
             "mission_checksum": "abc",
             "path_signature": self.signature if signature is None else signature,
             "navigation_point_count": len(self.nav) if count is None else count,
+            "coordinate_mode": "gps",
+            "localization": {
+                "origin_latitude_deg": ORIGIN[0],
+                "origin_longitude_deg": ORIGIN[1],
+            },
         }
 
     def inputs(self):
@@ -209,17 +214,24 @@ def test_duplicate_feeds_do_not_reemit(service):
     assert len(paths(service)) == 1 and not clears(service)
 
 
-def test_origin_change_reprojects_with_new_seq_same_signature(service):
+def test_origin_change_invalidates_instead_of_reprojecting_old_geometry(service):
     fx = Fixture()
     for feed in fx.inputs().values():
         feed(service)
     service.feed_origin(ORIGIN[0], ORIGIN[1])
     assert len(paths(service)) == 1
     service.feed_origin(ORIGIN[0] + 0.001, ORIGIN[1])
+    assert len(paths(service)) == 1
+    assert len(clears(service)) == 1
+    assert service.live_payload() is None
+    # Delayed old READY status cannot re-admit the old projection.
+    service.feed_status(fx.status())
+    assert service.live_payload() is None
+    status = fx.status()
+    status["localization"]["origin_latitude_deg"] = ORIGIN[0] + 0.001
+    service.feed_status(status)
     assert len(paths(service)) == 2
-    first, second = (e["payload"] for e in paths(service))
-    assert second["seq"] > first["seq"] and second["signature"] == first["signature"]
-    assert second["lat"][0] != first["lat"][0]
+    assert paths(service)[-1]["payload"]["seq"] > clears(service)[0]["payload"]["seq"]
 
 
 def test_projection_failure_emits_nothing_and_does_not_raise():
@@ -271,3 +283,126 @@ def test_legacy_points_shape_matches_old_preview(service):
     assert len(points) == len(fx.nav)
     assert set(points[0]) == {"index", "x", "y", "latitude", "longitude", "projection"}
     assert [p["index"] for p in points[:3]] == [0, 1, 2]
+
+
+def test_new_origin_ready_can_arrive_before_origin_topic(service):
+    fx = Fixture()
+    for feed in fx.inputs().values():
+        feed(service)
+    status = fx.status()
+    status["localization"]["origin_latitude_deg"] += 0.001
+    service.feed_status(status)
+    assert service.live_payload() is None
+    service.feed_origin(ORIGIN[0] + 0.001, ORIGIN[1])
+    assert service.live_payload()["origin"]["lat"] == ORIGIN[0] + 0.001
+
+
+def test_restart_does_not_pair_retained_gps_path_with_unrelated_origin(service):
+    fx = Fixture()
+    for name, feed in fx.inputs().items():
+        if name != "origin":
+            feed(service)
+    service.feed_origin(ORIGIN[0] + 0.001, ORIGIN[1])
+    assert service.live_payload() is None
+    assert not paths(service)
+
+
+def test_local_path_origin_is_pinned_until_new_preparation(service):
+    fx = Fixture()
+    status = fx.status()
+    status.update(coordinate_mode="local", localization={"mode": "local_input"})
+    for name, feed in fx.inputs().items():
+        if name != "status":
+            feed(service)
+    service.feed_status(status)
+    assert service.live_payload() is not None
+    service.feed_origin(ORIGIN[0] + 0.001, ORIGIN[1])
+    service.feed_status(status)
+    assert service.live_payload() is None
+    service.feed_status(dict(status, state="PREPARING", ready=False))
+    service.feed_status(status)
+    assert service.live_payload()["origin"]["lat"] == ORIGIN[0] + 0.001
+
+
+@pytest.mark.parametrize("bad_origin", [None, {}, {"origin_latitude_deg": float("nan"), "origin_longitude_deg": 80}])
+def test_gps_origin_provenance_is_required(service, bad_origin):
+    fx = Fixture()
+    for name, feed in fx.inputs().items():
+        if name != "status":
+            feed(service)
+    status = fx.status()
+    status["localization"] = bad_origin
+    service.feed_status(status)
+    assert service.live_payload() is None
+
+
+def test_mismatched_new_ready_revokes_previous_live_snapshot(service):
+    for feed in Fixture().inputs().values():
+        feed(service)
+    service.feed_status(Fixture(y_offset=1).status(mission="m2"))
+    assert service.live_payload() is None
+    assert len(clears(service)) == 1
+
+
+def test_invalidation_suspends_until_successful_prepare_and_rejects_old_nav_stamp(service):
+    fx = Fixture()
+    for feed in fx.inputs().values():
+        feed(service)
+    service.feed_nav(fx.nav, (10, 0))
+    service.invalidate("prepare_requested")
+    for feed in fx.inputs().values():
+        feed(service)
+    service.feed_nav(fx.nav, (10, 0))
+    service.resume()
+    assert service.live_payload() is None
+    service.feed_nav(fx.nav, (11, 0))
+    assert service.live_payload() is not None
+    assert len(paths(service)) == 2
+
+
+@pytest.mark.parametrize("mission", [
+    {"mission_id": "m2", "loaded": True, "trajectory_ready": True},
+    {"mission_id": "m1", "loaded": True, "trajectory_ready": False},
+    {"mission_id": "m1", "loaded": False, "trajectory_ready": True},
+])
+def test_network_reads_require_current_mission_and_readiness(service, mission):
+    for feed in Fixture().inputs().values():
+        feed(service)
+    assert service.live_payload(mission) is None
+
+
+def test_queued_path_event_is_rejected_after_clear(service):
+    for feed in Fixture().inputs().values():
+        feed(service)
+    event = service.events[-1]
+    mission = {"mission_id": "m1", "loaded": True, "trajectory_ready": True}
+    assert service.event_is_current(event, mission)
+    service.invalidate("clear_requested")
+    assert not service.event_is_current(event, mission)
+    assert service.event_is_current(service.events[-1], mission)
+
+
+@pytest.mark.parametrize("value,enabled", [
+    (None, True), ("1", True), ("true", True), (" YES ", True), ("on", True),
+    ("0", False), ("false", False), (" NO ", False), ("off", False),
+])
+def test_feature_flag_uses_standard_boolean_values(monkeypatch, value, enabled):
+    if value is None:
+        monkeypatch.delenv("DYX_TRAJECTORY_PUSH", raising=False)
+    else:
+        monkeypatch.setenv("DYX_TRAJECTORY_PUSH", value)
+    assert trajectory_push.push_enabled() is enabled
+
+
+@pytest.mark.parametrize("value", ["", "disabled", "typo"])
+def test_feature_flag_rejects_invalid_configuration(monkeypatch, value):
+    monkeypatch.setenv("DYX_TRAJECTORY_PUSH", value)
+    with pytest.raises(RuntimeError, match="DYX_TRAJECTORY_PUSH"):
+        trajectory_push.push_enabled()
+
+
+def test_disabled_flag_never_serves_previously_cached_payload(service, monkeypatch):
+    for feed in Fixture().inputs().values():
+        feed(service)
+    monkeypatch.setenv("DYX_TRAJECTORY_PUSH", "0")
+    assert service.live_payload() is None
