@@ -528,6 +528,13 @@ def generate_launch_description() -> LaunchDescription:
                         "moving_yaw_deadband_enter_deg": 0.50,
                         "moving_yaw_deadband_exit_deg": 1.00,
                         "moving_yaw_rate_slew_radps2": 0.60,
+                        # Speed-scaled measured-yaw damping:
+                        # 0.20 at 0.60m/s -> 0.32 at 1.00m/s, bounded to
+                        # 0.08rad/s so damping cannot replace steering authority.
+                        "moving_yaw_damping_gain_min": 0.20,
+                        "moving_yaw_damping_gain_max": 0.32,
+                        "moving_yaw_rate_filter_alpha": 0.20,
+                        "moving_yaw_damping_limit_radps": 0.08,
                         # V4.2: no intermediate 0.40 m/s heading-speed tier.
                         # Xtrack recovery also runs at cruise; >=15deg path-heading
                         # error is handed to stationary pivot/alignment instead.
@@ -549,14 +556,13 @@ def generate_launch_description() -> LaunchDescription:
                         # /nav_path tangent and a path-distance lookahead.
                         "path_correction_limit_deg": 18.0,
                         "terminal_line_correction_limit_deg": 18.0,
+                        # Field-tuned reference: 0.55m lookahead at 0.60m/s.
+                        # At 0.8/1.0m/s the controller automatically looks
+                        # farther ahead instead of becoming more aggressive in time.
+                        "steering_reference_speed_mps": 0.60,
                         "line_tracking_lookahead_m": 0.55,
-                        # Speed-adaptive lookahead: reproduces the 0.55 m
-                        # value above exactly at cruise_speed_mps (1.00),
-                        # scales down toward the min during the accel/decel
-                        # ramps, and widens toward the max on large
-                        # cross-track deviations for a softer re-acquisition.
                         "line_tracking_lookahead_min_m": 0.35,
-                        "line_tracking_lookahead_max_m": 0.80,
+                        "line_tracking_lookahead_max_m": 0.90,
                         "line_tracking_lookahead_xtrack_gain": 1.0,
                         # Ignore +/-5 mm cross-track noise for steering only.
                         # Actual xtrack telemetry and waypoint gates are unchanged.
@@ -877,7 +883,9 @@ def generate_launch_description() -> LaunchDescription:
                         "xtrack_priority_exit_m": 0.008,
                         "xtrack_priority_hold_sec": 0.30,
                         "xtrack_priority_release_rate_mps": 0.010,
+                        # Keep 0.55m at 0.60m/s, scale toward 0.90m by 1.00m/s.
                         "xtrack_priority_lookahead_m": 0.55,
+                        "xtrack_priority_lookahead_max_m": 0.90,
                         "xtrack_priority_correction_limit_deg": 22.0,
                         "xtrack_prediction_time_sec": 0.25,
                         "xtrack_rate_filter_alpha": 0.20,

@@ -255,6 +255,10 @@ class RPPController(Node):
             0.55,
         )
         self.declare_parameter(
+            "xtrack_priority_lookahead_max_m",
+            0.90,
+        )
+        self.declare_parameter(
             "xtrack_priority_correction_limit_deg",
             22.0,
         )
@@ -380,6 +384,12 @@ class RPPController(Node):
         self.declare_parameter("moving_yaw_deadband_enter_deg", 0.50)
         self.declare_parameter("moving_yaw_deadband_exit_deg", 1.00)
         self.declare_parameter("moving_yaw_rate_slew_radps2", 0.60)
+        # Measured-yaw damping is intentionally bounded.  It removes residual
+        # chassis rotation without becoming a second steering controller.
+        self.declare_parameter("moving_yaw_damping_gain_min", 0.20)
+        self.declare_parameter("moving_yaw_damping_gain_max", 0.32)
+        self.declare_parameter("moving_yaw_rate_filter_alpha", 0.20)
+        self.declare_parameter("moving_yaw_damping_limit_radps", 0.08)
         self.declare_parameter("moving_alignment_min_speed_mps", 0.40)
         self.declare_parameter(
             "alignment_reentry_goal_distance_m",
@@ -395,27 +405,24 @@ class RPPController(Node):
             "terminal_line_alignment_distance_m",
             0.10,
         )
+        # 0.60 m/s is the field-tuned steering reference.  Lookahead grows
+        # with actual command speed instead of being re-normalized to whatever
+        # cruise speed is selected, so 0.8/1.0 m/s look farther ahead in time.
+        self.declare_parameter("steering_reference_speed_mps", 0.60)
         self.declare_parameter(
             "line_tracking_lookahead_m",
             0.55,
         )
         # Speed- and cross-track-adaptive lookahead for line_guidance().
-        # A fixed lookahead means the correction reacts far ahead in TIME at
-        # low speed (e.g. mid-accel-ramp) and close in time at cruise --
-        # inconsistent dynamic response across the speed range. Scaling with
-        # commanded speed keeps look-ahead TIME roughly constant instead
-        # (line_tracking_lookahead_m / cruise_speed_mps is used as that time
-        # gain, so behaviour at cruise is unchanged from today's tuning).
-        # The xtrack term widens the lookahead on large deviations so
-        # re-acquisition is a softer curve instead of saturating straight
-        # into the atan2 correction-limit clamp.
+        # 0.55 m at 0.60 m/s is the reference.  Higher selected cruise speeds
+        # automatically increase lookahead, capped by lookahead_max.
         self.declare_parameter(
             "line_tracking_lookahead_min_m",
             0.35,
         )
         self.declare_parameter(
             "line_tracking_lookahead_max_m",
-            0.80,
+            0.90,
         )
         self.declare_parameter(
             "line_tracking_lookahead_xtrack_gain",
@@ -872,6 +879,9 @@ class RPPController(Node):
         self.xtrack_priority_lookahead = float(
             self.get_parameter("xtrack_priority_lookahead_m").value
         )
+        self.xtrack_priority_lookahead_max = float(
+            self.get_parameter("xtrack_priority_lookahead_max_m").value
+        )
         self.xtrack_priority_correction_limit = math.radians(
             float(self.get_parameter("xtrack_priority_correction_limit_deg").value)
         )
@@ -991,6 +1001,18 @@ class RPPController(Node):
         self.moving_yaw_rate_slew = float(
             self.get_parameter("moving_yaw_rate_slew_radps2").value
         )
+        self.moving_yaw_damping_gain_min = float(
+            self.get_parameter("moving_yaw_damping_gain_min").value
+        )
+        self.moving_yaw_damping_gain_max = float(
+            self.get_parameter("moving_yaw_damping_gain_max").value
+        )
+        self.moving_yaw_rate_filter_alpha = float(
+            self.get_parameter("moving_yaw_rate_filter_alpha").value
+        )
+        self.moving_yaw_damping_limit = float(
+            self.get_parameter("moving_yaw_damping_limit_radps").value
+        )
         self.moving_alignment_min_speed = float(
             self.get_parameter("moving_alignment_min_speed_mps").value
         )
@@ -1007,6 +1029,9 @@ class RPPController(Node):
         self.terminal_line_alignment_distance = float(
             self.get_parameter("terminal_line_alignment_distance_m").value
         )
+        self.steering_reference_speed = float(
+            self.get_parameter("steering_reference_speed_mps").value
+        )
         self.line_tracking_lookahead = float(
             self.get_parameter("line_tracking_lookahead_m").value
         )
@@ -1022,10 +1047,10 @@ class RPPController(Node):
         self.line_tracking_xtrack_deadband = float(
             self.get_parameter("line_tracking_xtrack_deadband_m").value
         )
-        # Derived time gain: reproduces line_tracking_lookahead_m exactly at
-        # cruise_speed_mps (xtrack=0), so cruise-speed behaviour is unchanged.
+        # Preserve the field-tuned 0.55 m lookahead at 0.60 m/s, then grow
+        # lookahead with speed up to the configured maximum.
         self.line_tracking_lookahead_speed_gain = (
-            self.line_tracking_lookahead / self.cruise_speed
+            self.line_tracking_lookahead / self.steering_reference_speed
         )
         self.nav_path_lookahead = float(
             self.get_parameter("nav_path_lookahead_m").value
@@ -2025,6 +2050,7 @@ class RPPController(Node):
         self.moving_yaw_quiet = False
         self.moving_yaw_rate_output = 0.0
         self.moving_yaw_rate_last_time = None
+        self.filtered_moving_yaw_rate = 0.0
         self.last_commanded_yaw_rate_radps = 0.0
 
         # Cross-track speed-cap recovery is shared by normal and terminal motion.
@@ -2968,6 +2994,15 @@ class RPPController(Node):
             )
         if not (0.0 < self.xtrack_rate_filter_alpha <= 1.0):
             raise ValueError("xtrack_rate_filter_alpha must be in (0, 1]")
+        if not (
+            math.isfinite(self.xtrack_priority_lookahead_max)
+            and self.xtrack_priority_lookahead
+            <= self.xtrack_priority_lookahead_max
+        ):
+            raise ValueError(
+                "xtrack_priority_lookahead_max_m must be finite and >= "
+                "xtrack_priority_lookahead_m"
+            )
         if self.xtrack_neutral_crossing_band < self.xtrack_priority_enter:
             raise ValueError(
                 "xtrack_neutral_crossing_band_m must be >= " "xtrack_priority_enter_m"
@@ -3248,6 +3283,33 @@ class RPPController(Node):
         ):
             raise ValueError("moving_yaw_rate_slew_radps2 must be finite and > 0")
         if not (
+            math.isfinite(self.moving_yaw_damping_gain_min)
+            and math.isfinite(self.moving_yaw_damping_gain_max)
+            and 0.0 <= self.moving_yaw_damping_gain_min
+            <= self.moving_yaw_damping_gain_max
+        ):
+            raise ValueError(
+                "moving yaw damping requires finite 0 <= min_gain <= max_gain"
+            )
+        if not (0.0 < self.moving_yaw_rate_filter_alpha <= 1.0):
+            raise ValueError("moving_yaw_rate_filter_alpha must be in (0, 1]")
+        if not (
+            math.isfinite(self.moving_yaw_damping_limit)
+            and 0.0 < self.moving_yaw_damping_limit <= self.moving_yaw_rate_max
+        ):
+            raise ValueError(
+                "moving_yaw_damping_limit_radps must be finite, >0 and "
+                "<= moving_yaw_rate_max_radps"
+            )
+        if not (
+            math.isfinite(self.steering_reference_speed)
+            and 0.0 < self.steering_reference_speed
+            <= self.MAXIMUM_MOVING_SPEED_MPS
+        ):
+            raise ValueError(
+                "steering_reference_speed_mps must be finite and in (0, 1.0]"
+            )
+        if not (
             math.isfinite(self.moving_alignment_min_speed)
             and 0.0 < self.moving_alignment_min_speed <= self.cruise_speed
         ):
@@ -3464,6 +3526,7 @@ class RPPController(Node):
             self.moving_yaw_quiet = False
             self.moving_yaw_rate_output = 0.0
             self.moving_yaw_rate_last_time = None
+            self.filtered_moving_yaw_rate = 0.0
             if error_abs <= 1.0e-9:
                 self.last_commanded_yaw_rate_radps = 0.0
                 return 0.0
@@ -3477,19 +3540,64 @@ class RPPController(Node):
             self.last_commanded_yaw_rate_radps = command
             return command
 
+        measured_yaw_rate = self.current_yaw_rate_radps
+        if math.isfinite(float(measured_yaw_rate)):
+            alpha = self.moving_yaw_rate_filter_alpha
+            self.filtered_moving_yaw_rate = (
+                alpha * float(measured_yaw_rate)
+                + (1.0 - alpha) * self.filtered_moving_yaw_rate
+            )
+
         if self.moving_yaw_quiet:
             if error_abs >= self.moving_yaw_deadband_exit:
                 self.moving_yaw_quiet = False
         elif error_abs <= self.moving_yaw_deadband_enter:
             self.moving_yaw_quiet = True
 
-        if self.moving_yaw_quiet:
-            requested = 0.0
-        else:
-            requested = max(
-                -self.moving_yaw_rate_max,
-                min(self.moving_yaw_rate_max, self.moving_yaw_kp * yaw_error),
+        moving_speed = max(
+            0.0,
+            min(
+                abs(float(translational_speed_mps)),
+                self.MAXIMUM_MOVING_SPEED_MPS,
+            ),
+        )
+        if moving_speed <= self.steering_reference_speed:
+            damping_gain = self.moving_yaw_damping_gain_min * (
+                moving_speed / self.steering_reference_speed
             )
+        else:
+            speed_span = (
+                self.MAXIMUM_MOVING_SPEED_MPS - self.steering_reference_speed
+            )
+            speed_fraction = (
+                (moving_speed - self.steering_reference_speed) / speed_span
+                if speed_span > 1.0e-9
+                else 1.0
+            )
+            speed_fraction = max(0.0, min(1.0, speed_fraction))
+            damping_gain = (
+                self.moving_yaw_damping_gain_min
+                + speed_fraction
+                * (
+                    self.moving_yaw_damping_gain_max
+                    - self.moving_yaw_damping_gain_min
+                )
+            )
+
+        damping_term = damping_gain * self.filtered_moving_yaw_rate
+        damping_term = max(
+            -self.moving_yaw_damping_limit,
+            min(self.moving_yaw_damping_limit, damping_term),
+        )
+
+        proportional_request = (
+            0.0 if self.moving_yaw_quiet else self.moving_yaw_kp * yaw_error
+        )
+        requested = proportional_request - damping_term
+        requested = max(
+            -self.moving_yaw_rate_max,
+            min(self.moving_yaw_rate_max, requested),
+        )
 
         now = self.get_clock().now()
         if self.moving_yaw_rate_last_time is None:
@@ -7482,6 +7590,7 @@ class RPPController(Node):
             self.moving_yaw_quiet = False
             self.moving_yaw_rate_output = 0.0
             self.moving_yaw_rate_last_time = None
+            self.filtered_moving_yaw_rate = 0.0
             self.last_commanded_yaw_rate_radps = 0.0
             output_speed = 0.0
             north = 0.0
@@ -8427,7 +8536,17 @@ class RPPController(Node):
             hard_correction_limit = self.terminal_xtrack_away_correction_limit
         else:
             prediction_time = self.xtrack_prediction_time_sec
-            lookahead = self.xtrack_priority_lookahead
+            speed_scale = max(
+                1.0,
+                min(
+                    self.MAXIMUM_MOVING_SPEED_MPS / self.steering_reference_speed,
+                    abs(self.command_slew_speed) / self.steering_reference_speed,
+                ),
+            )
+            lookahead = min(
+                self.xtrack_priority_lookahead_max,
+                self.xtrack_priority_lookahead * speed_scale,
+            )
             correction_limit = self.xtrack_priority_correction_limit
             neutral_band = self.xtrack_neutral_crossing_band
             correction_slew_rate = self.xtrack_correction_slew_rate
