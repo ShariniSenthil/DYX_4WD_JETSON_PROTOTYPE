@@ -247,3 +247,67 @@ def test_gps_serpentine_source_topology_decisions():
         topology.metric_points[2][1]
         < topology.metric_points[1][1]
     )
+
+
+def test_gap_just_below_threshold_creates_dummy_when_angles_qualify():
+    topology = compile_metric_topology(
+        [
+            (0.0, 0.0),
+            (0.0, 2.999),
+            (1.0, 2.999),
+            (1.0, 0.0),
+        ],
+        extension_mode="ENABLE",
+        **COMMON,
+    )
+
+    assert topology.segments[0].distance_m == pytest.approx(2.999)
+    assert topology.segments[0].use_dummy is True
+
+
+def test_segment_just_below_minimum_is_rejected():
+    with pytest.raises(
+        ValueError,
+        match="too close",
+    ):
+        compile_metric_topology(
+            [
+                (0.0, 0.0),
+                (0.000999, 0.0),
+            ],
+            extension_mode="DISABLE",
+            **COMMON,
+        )
+
+
+def test_local_source_topology_preserves_metric_coordinates():
+    points = [
+        (10.0, -4.0),
+        (12.0, -4.0),
+        (12.0, -2.0),
+    ]
+
+    topology = compile_source_topology(
+        coordinate_mode="local",
+        raw_marking_points=points,
+        extension_mode="DISABLE",
+        **COMMON,
+    )
+
+    assert topology.metric_points == tuple(points)
+
+
+def test_unsupported_source_coordinate_mode_is_rejected():
+    with pytest.raises(
+        ValueError,
+        match="Unsupported coordinate mode",
+    ):
+        compile_source_topology(
+            coordinate_mode="unknown",
+            raw_marking_points=[
+                (0.0, 0.0),
+                (1.0, 0.0),
+            ],
+            extension_mode="DISABLE",
+            **COMMON,
+        )

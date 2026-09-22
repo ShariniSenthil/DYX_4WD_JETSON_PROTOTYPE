@@ -597,6 +597,8 @@ class TrajectoryGenerator(Node):
         # geometry. This has no live PX4/RTK/odom dependency and is NOT
         # runtime path authority. Final /nav_path remains PX4-frame placed.
         self.source_topology: MissionTopology | None = None
+        self.source_topology_mission_id: str | None = None
+        self.source_topology_checksum: str | None = None
         self.source_topology_compile_ms: float | None = None
 
         self.extension_mode: str | None = None
@@ -902,7 +904,19 @@ class TrajectoryGenerator(Node):
             # transaction. Never expose topology from the previous mission
             # while loading/validating the new mission.
             self.source_topology = None
+            self.source_topology_mission_id = None
+            self.source_topology_checksum = None
             self.source_topology_compile_ms = None
+
+            # Do not allow a failed replacement PREPARE to report the
+            # previous mission as though it were the mission that failed.
+            self.raw_coordinate_mode = None
+            self.raw_marking_points = []
+            self.extension_mode = None
+            self.dummy_point_distance_m = None
+            self.row_transition_threshold_m = None
+            self.mission_id = None
+            self.mission_checksum = None
 
             try:
                 (
@@ -965,6 +979,11 @@ class TrajectoryGenerator(Node):
                 self.source_topology_compile_ms = (
                     time.monotonic() - source_compile_started
                 ) * 1000.0
+
+                # Bind the compiled semantics to the exact uploaded mission.
+                # Part 2B must reject this topology if either identity differs.
+                self.source_topology_mission_id = self.mission_id
+                self.source_topology_checksum = self.mission_checksum
 
                 source_dummy_count = sum(
                     1
@@ -2296,7 +2315,13 @@ class TrajectoryGenerator(Node):
             "extension_mode": (self.extension_mode),
             "dummy_point_distance_m": (self.dummy_point_distance_m),
             "row_transition_threshold_m": (self.row_transition_threshold_m),
-            "source_topology_ready": self.source_topology is not None,
+            "source_topology_compiled": (
+                self.source_topology is not None
+                and self.source_topology_mission_id == self.mission_id
+                and self.source_topology_checksum == self.mission_checksum
+            ),
+            "source_topology_mission_id": self.source_topology_mission_id,
+            "source_topology_checksum": self.source_topology_checksum,
             "source_topology_segment_count": (
                 len(self.source_topology.segments)
                 if self.source_topology is not None
@@ -2420,6 +2445,8 @@ class TrajectoryGenerator(Node):
         self.raw_marking_points = []
 
         self.source_topology = None
+        self.source_topology_mission_id = None
+        self.source_topology_checksum = None
         self.source_topology_compile_ms = None
 
         self.extension_mode = None
