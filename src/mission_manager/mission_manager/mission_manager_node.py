@@ -643,6 +643,9 @@ class MissionManager(Node):
 
         self._start_stage = "IDLE"
         self._resume_stage = "IDLE"
+        # STOP progress for the UI only; never a safety input.
+        # IDLE -> HARD_STOP_ASSERTED -> DISARMING -> DISARM_CONFIRMED|DISARM_FAILED
+        self._stop_stage = "IDLE"
         self._start_failed_stage: Optional[str] = None
         self._start_debug: dict[str, Any] = {}
         self._last_status_publish_monotonic = 0.0
@@ -2030,6 +2033,8 @@ class MissionManager(Node):
         self._state = "EMPTY"
         self._start_stage = "IDLE"
         self._resume_stage = "IDLE"
+        # _stop_stage is left as set by the STOP contract (DISARM_CONFIRMED)
+        # so the terminal status still shows how STOP ended.
         self._start_failed_stage = None
         self._start_debug = {}
         self._auto_stop_pending = False
@@ -2063,6 +2068,8 @@ class MissionManager(Node):
         with self._lock:
             self._reset_point_timers()
             self._assert_emergency_stop()
+            self._stop_stage = "HARD_STOP_ASSERTED"
+            self._publish_status(force=True)
 
         if completed:
             self._emit_system_event(
@@ -2075,9 +2082,16 @@ class MissionManager(Node):
                 "Operator STOP requested before normal mission completion",
             )
 
+        with self._lock:
+            self._stop_stage = "DISARMING"
+            self._publish_status(force=True)
+
         disarm_confirmed, warnings = self._best_effort_px4_disarm_only()
 
         with self._lock:
+            self._stop_stage = (
+                "DISARM_CONFIRMED" if disarm_confirmed else "DISARM_FAILED"
+            )
             if completed:
                 if disarm_confirmed:
                     message = (
@@ -2237,6 +2251,7 @@ class MissionManager(Node):
                 self._last_error = None
                 self._last_message = f"Mission started in {self._execution_mode} mode"
                 self._start_stage = "RUNNING"
+                self._stop_stage = "IDLE"
                 self._publish_mission_complete(False)
                 self._publish_runtime_path()
                 self._publish_goal()
@@ -3624,6 +3639,7 @@ class MissionManager(Node):
             "alignment_active": False,
             "start_stage": self._start_stage,
             "resume_stage": self._resume_stage,
+            "stop_stage": self._stop_stage,
             "start_failed_stage": self._start_failed_stage,
             "start_debug": dict(self._start_debug),
         }

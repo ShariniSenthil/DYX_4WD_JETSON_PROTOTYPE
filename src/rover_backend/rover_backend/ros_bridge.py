@@ -2711,6 +2711,7 @@ class RoverBackendRosNode(Node):
             ),
             "start_stage": str(payload.get("start_stage") or "IDLE").strip().upper(),
             "resume_stage": str(payload.get("resume_stage") or "IDLE").strip().upper(),
+            "stop_stage": str(payload.get("stop_stage") or "IDLE").strip().upper(),
             "start_failed_stage": payload.get("start_failed_stage"),
             "arrival_settle_elapsed_sec": max(
                 0.0,

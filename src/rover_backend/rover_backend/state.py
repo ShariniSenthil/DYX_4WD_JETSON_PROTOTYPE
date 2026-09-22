@@ -394,6 +394,7 @@ class RoverState:
                 "current_point_spray_confirmed": None,
                 "start_stage": "IDLE",
                 "resume_stage": "IDLE",
+                "stop_stage": "IDLE",
                 "start_failed_stage": None,
                 "arrival_settle_elapsed_sec": 0.0,
                 "arrival_settle_required_sec": 0.30,
@@ -1198,6 +1199,7 @@ class RoverState:
                 "current_point_spray_confirmed": None,
                 "start_stage": "IDLE",
                 "resume_stage": "IDLE",
+                "stop_stage": "IDLE",
                 "start_failed_stage": None,
                 "arrival_settle_elapsed_sec": 0.0,
                 "arrival_settle_required_sec": (
