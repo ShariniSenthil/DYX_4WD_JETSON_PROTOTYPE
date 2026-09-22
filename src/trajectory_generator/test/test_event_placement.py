@@ -19,6 +19,7 @@ from test_placement_reference import _install_frame  # noqa: E402
 from test_prepare_lifecycle import _bind  # noqa: E402
 from test_prepare_lifecycle import _fake_generator  # noqa: E402
 from test_prepare_lifecycle import _TestClock  # noqa: E402
+from test_prepare_lifecycle import _TestTime  # noqa: E402
 from trajectory_generator.trajectory_generator_node import (  # noqa: E402
     TrajectoryGenerator,
 )
@@ -71,6 +72,7 @@ def _placement_generator():
     node._distance = TrajectoryGenerator._distance
     node._make_signature = TrajectoryGenerator._make_signature
     node.get_clock = lambda: _TestClock(1_000_000_000)
+    node.last_wait_log_time = _TestTime(0)
 
     events = []
     node.events = events

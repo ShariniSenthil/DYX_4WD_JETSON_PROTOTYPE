@@ -121,6 +121,11 @@ def _fake_generator():
     node.gp_origin_request_attempts = 0
 
     node.latest_gp_origin = None
+    node.mavros_connected = False
+    node._mavros_state_seen = False
+    node.fcu_session_generation = 0
+    node.gp_origin_session_generation = None
+    node.placed_session_generation = None
     node.latest_fused_global_fix = None
     node.latest_fused_global_time = None
     node.latest_local_odom = None
@@ -163,6 +168,8 @@ def _fake_generator():
     _bind(node, "_request_placement_if_waiting_locked")
     _bind(node, "_on_placement_kick")
     _bind(node, "_try_place_prepared_mission_locked")
+    _bind(node, "_advance_fcu_session_locked")
+    _bind(node, "_mavros_state_callback")
 
     node._placement_kick_timer = _FakeTimer()
     _bind(node, "_clear_prepared_state")

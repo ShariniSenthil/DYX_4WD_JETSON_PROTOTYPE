@@ -51,6 +51,12 @@ def _install_frame(
 
     node.get_clock = lambda: _TestClock(NOW_NS)
 
+    # Connected FCU session whose gp_origin was received in this session.
+    node.mavros_connected = True
+    node._mavros_state_seen = True
+    node.fcu_session_generation = 1
+    node.gp_origin_session_generation = 1
+
     node.latest_gp_origin = SimpleNamespace(
         position=SimpleNamespace(
             latitude=ORIGIN[0],

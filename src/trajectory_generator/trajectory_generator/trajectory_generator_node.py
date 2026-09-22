@@ -560,6 +560,16 @@ class TrajectoryGenerator(Node):
 
         self.mavros_connected = False
 
+        # FCU session ownership. The generation advances on every MAVROS
+        # connected/disconnected transition. A gp_origin is trusted only in
+        # the generation it was received in, and a placed GPS path only in
+        # the generation it was placed in, so an origin cached from a
+        # previous PX4 session can never satisfy a new placement.
+        self._mavros_state_seen = False
+        self.fcu_session_generation = 0
+        self.gp_origin_session_generation: int | None = None
+        self.placed_session_generation: int | None = None
+
         self.gp_origin_request_attempts = 0
 
         self.gp_origin_last_request_time = None
@@ -758,6 +768,7 @@ class TrajectoryGenerator(Node):
                 )
             )
             self.latest_gp_origin = message
+            self.gp_origin_session_generation = self.fcu_session_generation
 
             if origin_changed and (
                 self.ready or self.preparing or self.prepare_requested
@@ -789,6 +800,9 @@ class TrajectoryGenerator(Node):
     ) -> None:
         connected = bool(message.connected)
         with self._lock:
+            first_state = not self._mavros_state_seen
+            self._mavros_state_seen = True
+            changed = connected != self.mavros_connected
             just_connected = connected and not self.mavros_connected
             self.mavros_connected = connected
             if just_connected:
@@ -798,6 +812,63 @@ class TrajectoryGenerator(Node):
                 # previous session's attempts still apply.
                 self.gp_origin_request_attempts = 0
                 self.gp_origin_last_request_time = None
+
+            if changed:
+                self._advance_fcu_session_locked(
+                    connected=connected,
+                    # The first state report only establishes the session;
+                    # an origin that arrived just before it belongs to it.
+                    discard_origin=not first_state,
+                )
+
+    def _advance_fcu_session_locked(
+        self,
+        *,
+        connected: bool,
+        discard_origin: bool,
+    ) -> None:
+        """Start a new FCU session and stop trusting the previous one.
+
+        The surveyed source mission survives (COMPILED). A placed GPS path
+        is retracted and re-armed so it is placed again, once, against the
+        current session's gp_origin and frame evidence.
+        """
+
+        self.fcu_session_generation += 1
+
+        if discard_origin:
+            if self.latest_gp_origin is not None:
+                self.get_logger().warn(
+                    "FCU session changed "
+                    f"(connected={connected}); discarding cached PX4 "
+                    "gp_origin until the current session reports one"
+                )
+            self.latest_gp_origin = None
+            self.gp_origin_session_generation = None
+        elif self.latest_gp_origin is not None:
+            self.gp_origin_session_generation = self.fcu_session_generation
+
+        if self.raw_coordinate_mode != "gps":
+            return
+        if not self._source_topology_is_current():
+            return
+        if not (self.ready or self.prepare_requested):
+            return
+
+        if self.ready:
+            self._clear_prepared_state(publish_empty=True)
+
+        self.prepare_requested = True
+        self.preparing = True
+        self.last_error = None
+
+        self._publish_status(
+            state="PREPARING",
+            message=(
+                "FCU session changed; waiting for current-session "
+                "PX4 gp_origin before re-placing the surveyed mission"
+            ),
+        )
 
     def _maybe_request_gp_origin(self) -> None:
         """Actively (re-)request PX4's origin instead of waiting on a
@@ -1470,6 +1541,8 @@ class TrajectoryGenerator(Node):
         _rtk_diagnostic_status().
         """
 
+        if not self.mavros_connected:
+            return False, "PX4/MAVROS not connected"
         if self.latest_gp_origin is None:
             if self.localization_mode == "px4_origin":
                 return False, (
@@ -1478,6 +1551,8 @@ class TrajectoryGenerator(Node):
                     f"{self.GP_ORIGIN_REQUEST_MAX_ATTEMPTS} times)"
                 )
             return False, "PX4 gp_origin unavailable"
+        if self.gp_origin_session_generation != self.fcu_session_generation:
+            return False, "PX4 gp_origin is from a previous FCU session"
         if self.latest_fused_global_fix is None:
             return False, "PX4 fused global position unavailable"
         if self.latest_local_odom is None:
@@ -2366,6 +2441,11 @@ class TrajectoryGenerator(Node):
                 "mission_id": self.mission_id,
                 "mission_checksum": self.mission_checksum,
                 "path_signature": self.prepared_path_signature,
+                "fcu_session_generation": self.fcu_session_generation,
+                "gp_origin_session_generation": (
+                    self.gp_origin_session_generation
+                ),
+                "placed_session_generation": self.placed_session_generation,
                 "coordinate_mode": self.raw_coordinate_mode,
                 "extension_mode": self.extension_mode,
                 "dummy_point_distance_m": self.dummy_point_distance_m,
@@ -2543,6 +2623,11 @@ class TrajectoryGenerator(Node):
         if (
             self.ready
             and self.prepared_path_signature is not None
+            and (
+                self.raw_coordinate_mode != "gps"
+                or self.placed_session_generation
+                == self.fcu_session_generation
+            )
         ):
             return "PLACED"
 
@@ -2563,6 +2648,7 @@ class TrajectoryGenerator(Node):
         self.prepared_path_types = []
         self.prepared_marking_indices = []
         self.prepared_path_signature = None
+        self.placed_session_generation = None
 
         self.localization_shadow_summary = {
             "mode": self.localization_mode,
@@ -2784,6 +2870,8 @@ class TrajectoryGenerator(Node):
             self.prepared_marking_indices = marking_indices
 
             self.prepared_path_signature = signature
+
+            self.placed_session_generation = self.fcu_session_generation
 
             self.mission_waypoints_pub.publish(mission_path)
 
