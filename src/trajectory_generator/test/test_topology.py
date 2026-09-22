@@ -181,3 +181,69 @@ def test_gps_source_topology_is_repeatable():
     )
 
     assert first == second
+
+
+def test_gap_exactly_at_threshold_does_not_create_dummy():
+    topology = compile_metric_topology(
+        [
+            (0.0, 0.0),
+            (0.0, 3.0),
+            (1.0, 3.0),
+            (1.0, 0.0),
+        ],
+        extension_mode="ENABLE",
+        **COMMON,
+    )
+
+    assert topology.segments[0].distance_m == pytest.approx(3.0)
+    assert topology.segments[0].use_dummy is False
+
+
+def test_minimum_segment_length_exact_boundary_is_accepted():
+    topology = compile_metric_topology(
+        [
+            (0.0, 0.0),
+            (0.001, 0.0),
+        ],
+        extension_mode="DISABLE",
+        **COMMON,
+    )
+
+    assert topology.segments[0].distance_m == pytest.approx(0.001)
+
+
+def test_gps_serpentine_source_topology_decisions():
+    gps_points = [
+        (13.0000000, 80.0000000),
+        (13.0000000, 80.0000200),
+        (12.9999900, 80.0000200),
+        (12.9999900, 80.0000000),
+    ]
+
+    topology = compile_source_topology(
+        coordinate_mode="gps",
+        raw_marking_points=gps_points,
+        extension_mode="ENABLE",
+        **COMMON,
+    )
+
+    assert [
+        segment.use_dummy
+        for segment in topology.segments
+    ] == [
+        True,
+        True,
+        False,
+    ]
+
+    # Longitude increase must be East in the temporary survey-local frame.
+    assert topology.metric_points[1][0] > 0.0
+
+    # P1 -> P2 changes longitude only, so North displacement stays tiny.
+    assert abs(topology.metric_points[1][1]) < 0.01
+
+    # P2 -> P3 moves south.
+    assert (
+        topology.metric_points[2][1]
+        < topology.metric_points[1][1]
+    )

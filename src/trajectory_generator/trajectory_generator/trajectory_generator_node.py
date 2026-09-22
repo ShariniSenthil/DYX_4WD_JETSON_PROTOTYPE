@@ -89,7 +89,9 @@ from std_srvs.srv import Trigger
 from trajectory_generator.localization_frame import GeographicOrigin
 from trajectory_generator.localization_frame import project_geodetic_to_px4_ned
 from trajectory_generator.localization_frame import transform_ned_to_enu
+from trajectory_generator.topology import MissionTopology
 from trajectory_generator.topology import compile_metric_topology
+from trajectory_generator.topology import compile_source_topology
 
 
 class TrajectoryGenerator(Node):
@@ -591,6 +593,12 @@ class TrajectoryGenerator(Node):
 
         self.raw_marking_points: list[tuple[float, float]] = []
 
+        # Static mission topology compiled directly from uploaded survey
+        # geometry. This has no live PX4/RTK/odom dependency and is NOT
+        # runtime path authority. Final /nav_path remains PX4-frame placed.
+        self.source_topology: MissionTopology | None = None
+        self.source_topology_compile_ms: float | None = None
+
         self.extension_mode: str | None = None
 
         self.dummy_point_distance_m: float | None = None
@@ -890,6 +898,12 @@ class TrajectoryGenerator(Node):
         """Load mission.csv and request path preparation."""
 
         with self._lock:
+            # A PREPARE always establishes a new source compilation
+            # transaction. Never expose topology from the previous mission
+            # while loading/validating the new mission.
+            self.source_topology = None
+            self.source_topology_compile_ms = None
+
             try:
                 (
                     metadata,
@@ -916,6 +930,55 @@ class TrajectoryGenerator(Node):
                 self.mission_id = str(metadata["mission_id"])
 
                 self.mission_checksum = str(metadata["checksum_sha256"])
+
+                # Compile static mission semantics immediately from the
+                # uploaded survey geometry. No gp_origin, RTK, fused-global,
+                # local odometry, FCU state, or current rover pose is used.
+                #
+                # IMPORTANT:
+                # This source topology is NOT yet runtime path authority.
+                # The existing placed PX4-local geometry remains authoritative
+                # for dummy materialization and /nav_path publication.
+                source_compile_started = time.monotonic()
+
+                self.source_topology = compile_source_topology(
+                    coordinate_mode=coordinate_mode,
+                    raw_marking_points=raw_points,
+                    extension_mode=self.extension_mode,
+                    row_transition_threshold_m=(
+                        self.row_transition_threshold_m
+                    ),
+                    minimum_segment_length_m=(
+                        self.minimum_segment_length_m
+                    ),
+                    row_transfer_min_angle_deg=(
+                        self.ROW_TRANSFER_MIN_ANGLE_DEG
+                    ),
+                    row_transfer_max_angle_deg=(
+                        self.ROW_TRANSFER_MAX_ANGLE_DEG
+                    ),
+                    row_reversal_min_angle_deg=(
+                        self.ROW_REVERSAL_MIN_ANGLE_DEG
+                    ),
+                )
+
+                self.source_topology_compile_ms = (
+                    time.monotonic() - source_compile_started
+                ) * 1000.0
+
+                source_dummy_count = sum(
+                    1
+                    for segment in self.source_topology.segments
+                    if segment.use_dummy
+                )
+
+                self.get_logger().info(
+                    "SOURCE TOPOLOGY COMPILED | "
+                    f"segments={len(self.source_topology.segments)} "
+                    f"dummy_decisions={source_dummy_count} "
+                    f"elapsed={self.source_topology_compile_ms:.1f}ms "
+                    "runtime_authority=false"
+                )
 
                 self.prepare_requested = True
                 self.preparing = True
@@ -2233,6 +2296,22 @@ class TrajectoryGenerator(Node):
             "extension_mode": (self.extension_mode),
             "dummy_point_distance_m": (self.dummy_point_distance_m),
             "row_transition_threshold_m": (self.row_transition_threshold_m),
+            "source_topology_ready": self.source_topology is not None,
+            "source_topology_segment_count": (
+                len(self.source_topology.segments)
+                if self.source_topology is not None
+                else 0
+            ),
+            "source_topology_dummy_decision_count": (
+                sum(
+                    1
+                    for segment in self.source_topology.segments
+                    if segment.use_dummy
+                )
+                if self.source_topology is not None
+                else 0
+            ),
+            "source_topology_compile_ms": self.source_topology_compile_ms,
             "marking_point_count": len(
                 self.prepared_marking_points or self.raw_marking_points
             ),
@@ -2339,6 +2418,9 @@ class TrajectoryGenerator(Node):
 
         self.raw_coordinate_mode = None
         self.raw_marking_points = []
+
+        self.source_topology = None
+        self.source_topology_compile_ms = None
 
         self.extension_mode = None
         self.dummy_point_distance_m = None
