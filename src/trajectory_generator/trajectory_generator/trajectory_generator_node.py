@@ -2475,6 +2475,19 @@ class TrajectoryGenerator(Node):
 
         A placement/reference failure may move PLACED back to COMPILED
         without discarding the validated surveyed mission.
+
+        The phase must be interpreted together with the top-level state:
+
+            COMPILED + PREPARING
+                Valid source mission; placement is still waiting.
+
+            COMPILED + ERROR
+                Valid source mission retained, but automatic placement has
+                stopped. A new PREPARE is required before placement retries.
+
+        COMPILED therefore means only "valid source topology exists and no
+        placed signed path is currently installed". It does not by itself
+        imply that placement is active or will retry automatically.
         """
 
         if not self._source_topology_is_current():

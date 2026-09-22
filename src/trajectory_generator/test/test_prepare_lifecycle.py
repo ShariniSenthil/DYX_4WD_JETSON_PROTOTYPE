@@ -120,6 +120,7 @@ def _fake_generator():
     _bind(node, "_source_topology_is_current")
     _bind(node, "_trajectory_phase")
     _bind(node, "_build_status_payload")
+    _bind(node, "_log_waiting")
     _bind(node, "_clear_prepared_state")
     _bind(node, "_reset_all_runtime")
     _bind(node, "_set_error")
@@ -530,3 +531,271 @@ def test_full_clear_reports_uncompiled_phase():
     assert payload["trajectory_phase"] == "UNCOMPILED"
     assert payload["placement_ready"] is False
     assert payload["source_topology_compiled"] is False
+
+
+class _TestTime:
+    def __init__(self, nanoseconds):
+        self.nanoseconds = int(nanoseconds)
+
+    def __sub__(self, other):
+        return _TestTime(
+            self.nanoseconds - other.nanoseconds
+        )
+
+    def to_msg(self):
+        return ("stamp", self.nanoseconds)
+
+
+class _TestClock:
+    def __init__(self, nanoseconds):
+        self._now = _TestTime(nanoseconds)
+
+    def now(self):
+        return self._now
+
+
+def test_ready_without_signature_is_not_placed():
+    node = _fake_generator()
+
+    node._load_mission_source = lambda: _mission(
+        "mission-a",
+        "a" * 64,
+    )
+
+    assert _run_prepare(node).success is True
+
+    node.ready = True
+    node.prepared_path_signature = None
+
+    assert node._trajectory_phase() == "COMPILED"
+
+    payload = node._build_status_payload(
+        state="READY",
+        message="synthetic missing signature",
+    )
+
+    assert payload["trajectory_phase"] == "COMPILED"
+    assert payload["placement_ready"] is False
+
+
+def test_control_loop_local_success_reaches_placed_after_signature_publish():
+    node = _fake_generator()
+
+    node._load_mission_source = lambda: _mission(
+        "mission-a",
+        "a" * 64,
+    )
+
+    assert _run_prepare(node).success is True
+    assert node._trajectory_phase() == "COMPILED"
+
+    events = []
+
+    node.POINT_TYPE_PASS_THROUGH = (
+        TrajectoryGenerator.POINT_TYPE_PASS_THROUGH
+    )
+    node.POINT_TYPE_MARKING = (
+        TrajectoryGenerator.POINT_TYPE_MARKING
+    )
+
+    node._maybe_request_gp_origin = lambda: None
+
+    node._convert_markings_to_local = lambda: list(
+        node.raw_marking_points
+    )
+
+    node._generate_navigation_path = lambda markings: (
+        list(markings),
+        [
+            node.POINT_TYPE_MARKING
+            for _ in markings
+        ],
+        list(range(len(markings))),
+        0,
+    )
+
+    node.get_clock = lambda: _TestClock(
+        5_000_000_000
+    )
+
+    node._build_path = lambda points, stamp: (
+        tuple(points),
+        stamp,
+    )
+
+    node._make_signature = (
+        TrajectoryGenerator._make_signature
+    )
+
+    node.mission_waypoints_pub = SimpleNamespace(
+        publish=lambda message: events.append(
+            ("mission_waypoints", message)
+        )
+    )
+
+    node.nav_path_pub = SimpleNamespace(
+        publish=lambda message: events.append(
+            ("nav_path", message)
+        )
+    )
+
+    node._publish_path_metadata = (
+        lambda **kwargs: events.append(
+            ("metadata", kwargs)
+        )
+    )
+
+    node._publish_path_signature = (
+        lambda signature: events.append(
+            ("signature", signature)
+        )
+    )
+
+    node._publish_survey_targets = (
+        lambda signature, cleared=False: events.append(
+            (
+                "survey_targets",
+                signature,
+                cleared,
+            )
+        )
+    )
+
+    node._publish_ready = (
+        lambda value: events.append(
+            ("ready", bool(value))
+        )
+    )
+
+    node._publish_status = (
+        lambda **kwargs: events.append(
+            (
+                "status",
+                node._build_status_payload(**kwargs),
+            )
+        )
+    )
+
+    TrajectoryGenerator._control_loop(node)
+
+    assert node.prepare_requested is False
+    assert node.preparing is False
+    assert node.ready is True
+
+    assert node.prepared_path_signature is not None
+    assert node._trajectory_phase() == "PLACED"
+
+    event_names = [
+        event[0]
+        for event in events
+    ]
+
+    signature_index = event_names.index(
+        "signature"
+    )
+
+    ready_index = next(
+        index
+        for index, event in enumerate(events)
+        if event == ("ready", True)
+    )
+
+    assert signature_index < ready_index
+
+    ready_statuses = [
+        event[1]
+        for event in events
+        if event[0] == "status"
+        and event[1]["state"] == "READY"
+    ]
+
+    assert len(ready_statuses) == 1
+
+    ready_status = ready_statuses[0]
+
+    assert ready_status["ready"] is True
+    assert ready_status["trajectory_phase"] == "PLACED"
+    assert ready_status["placement_ready"] is True
+    assert (
+        ready_status["path_signature"]
+        == node.prepared_path_signature
+    )
+
+
+def test_control_loop_reference_wait_reports_compiled_preparing():
+    node = _fake_generator()
+
+    metadata = {
+        "mission_id": "mission-gps",
+        "checksum_sha256": "c" * 64,
+        "extension_mode": "DISABLE",
+    }
+
+    node._load_mission_source = lambda: (
+        metadata,
+        "gps",
+        [
+            (13.0000000, 80.0000000),
+            (13.0000000, 80.0000100),
+        ],
+    )
+
+    assert _run_prepare(node).success is True
+    assert node._trajectory_phase() == "COMPILED"
+
+    payloads = []
+    ready_values = []
+
+    node._maybe_request_gp_origin = lambda: None
+
+    node._reference_is_ready = lambda: (
+        False,
+        "PX4 gp_origin unavailable",
+    )
+
+    node.get_clock = lambda: _TestClock(
+        5_000_000_000
+    )
+
+    node.last_wait_log_time = _TestTime(0)
+
+    node._publish_ready = (
+        lambda value: ready_values.append(
+            bool(value)
+        )
+    )
+
+    node._publish_status = (
+        lambda **kwargs: payloads.append(
+            node._build_status_payload(**kwargs)
+        )
+    )
+
+    node._convert_markings_to_local = lambda: pytest.fail(
+        "placement must not run while reference is unavailable"
+    )
+
+    TrajectoryGenerator._control_loop(node)
+
+    assert node.prepare_requested is True
+    assert node.preparing is True
+    assert node.ready is False
+
+    assert node.rtk_ready_since is None
+    assert node._trajectory_phase() == "COMPILED"
+
+    assert ready_values[-1] is False
+
+    assert payloads
+
+    waiting = payloads[-1]
+
+    assert waiting["state"] == "PREPARING"
+    assert waiting["ready"] is False
+    assert waiting["trajectory_phase"] == "COMPILED"
+    assert waiting["placement_ready"] is False
+    assert waiting["source_topology_compiled"] is True
+    assert (
+        waiting["message"]
+        == "PX4 gp_origin unavailable"
+    )
