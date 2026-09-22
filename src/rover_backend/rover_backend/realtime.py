@@ -332,8 +332,8 @@ async def connect(
 
     # Give a newly connected frontend a complete state immediately instead
     # of waiting for the next periodic broadcast.
-    telemetry = build_telemetry_payload()
     mission = build_mission_status_payload()
+    telemetry = build_telemetry_payload(mission)
     safety = rover_state.section("safety")
 
     await sio.emit(
@@ -713,11 +713,11 @@ async def _broadcast_loop() -> None:
             records = await _all_socket_records()
 
             if records:
-                with timed(realtime_metrics, "build_telemetry_payload"):
-                    telemetry = build_telemetry_payload()
-
                 with timed(realtime_metrics, "build_mission_status_payload"):
                     mission = build_mission_status_payload()
+
+                with timed(realtime_metrics, "build_telemetry_payload"):
+                    telemetry = build_telemetry_payload(mission)
 
                 safety = rover_state.section("safety")
 

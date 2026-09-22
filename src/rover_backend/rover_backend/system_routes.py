@@ -27,6 +27,7 @@ from starlette.concurrency import run_in_threadpool
 from rover_backend.auth import AuthenticatedSession
 from rover_backend.auth import require_auth
 from rover_backend.config import settings
+from rover_backend.realtime_contract import telemetry_mission_projection
 from rover_backend.ros_bridge import RosServiceOutcomeUnknownError
 from rover_backend.ros_bridge import ros_bridge
 from rover_backend.state import rover_state
@@ -436,8 +437,16 @@ def build_mission_status_payload() -> dict[str, Any]:
     }
 
 
-def build_telemetry_payload() -> dict[str, Any]:
-    """Build the rover telemetry contract used by REST and Socket.IO."""
+def build_telemetry_payload(
+    mission_status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the rover telemetry contract used by REST and Socket.IO.
+
+    High-rate telemetry carries live values only. `mission` is a bounded
+    lifecycle projection -- never point_results, point_status, the report or
+    survey maps -- so packet size does not grow with mission length.
+    Pass `mission_status` to reuse a payload already built this tick.
+    """
 
     snapshot = rover_state.snapshot()
 
@@ -451,7 +460,11 @@ def build_telemetry_payload() -> dict[str, Any]:
     battery = snapshot["battery"]
     accuracy = snapshot["accuracy"]
     safety = snapshot["safety"]
-    mission = build_mission_status_payload()
+    mission = telemetry_mission_projection(
+        mission_status
+        if mission_status is not None
+        else build_mission_status_payload()
+    )
 
     local_x = _finite_float(position.get("local_x_m"))
     local_y = _finite_float(position.get("local_y_m"))

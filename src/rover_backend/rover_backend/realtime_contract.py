@@ -182,3 +182,37 @@ class timed:
                 self._name,
                 (time.perf_counter() - self._started) * 1000.0,
             )
+
+
+# ---------------------------------------------------------------------------
+# A. High-rate telemetry: bounded mission projection
+# ---------------------------------------------------------------------------
+
+# Exactly the mission fields the frontend telemetry adapter reads from
+# telemetry.mission (px4TelemetryAdapter.toRoverTelemetry). Everything here is
+# scalar, so telemetry size is independent of mission length and history.
+TELEMETRY_MISSION_FIELDS: tuple[str, ...] = (
+    "mission_id",
+    "mission_run_id",
+    "state",
+    "loaded",
+    "ready",
+    "total_points",
+    "navigation_point_count",
+    "active_point_id",
+    "active_point_index",
+    "active_point_number",
+    "active_point_state",
+    "completed_points",
+    "skipped_points",
+    "failed_points",
+    "remaining_points",
+    "progress_percent",
+    "marking_active",
+)
+
+
+def telemetry_mission_projection(mission_status: dict[str, Any]) -> dict[str, Any]:
+    """Lifecycle subset embedded in high-rate telemetry. No point history."""
+
+    return {key: mission_status.get(key) for key in TELEMETRY_MISSION_FIELDS}
