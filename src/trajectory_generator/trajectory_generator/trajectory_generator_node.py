@@ -89,6 +89,7 @@ from std_srvs.srv import Trigger
 from trajectory_generator.localization_frame import GeographicOrigin
 from trajectory_generator.localization_frame import project_geodetic_to_px4_ned
 from trajectory_generator.localization_frame import transform_ned_to_enu
+from trajectory_generator.topology import compile_metric_topology
 
 
 class TrajectoryGenerator(Node):
@@ -1909,83 +1910,6 @@ class TrajectoryGenerator(Node):
                 marking_index=(final_marking_index if is_final else -1),
             )
 
-    @staticmethod
-    def _angle_between_vectors_deg(
-        first: tuple[float, float],
-        second: tuple[float, float],
-    ) -> float:
-        first_length = math.hypot(first[0], first[1])
-        second_length = math.hypot(second[0], second[1])
-
-        if first_length <= 0.0 or second_length <= 0.0:
-            raise ValueError("Cannot calculate extension angle from zero vector")
-
-        cosine = (
-            first[0] * second[0] + first[1] * second[1]
-        ) / (first_length * second_length)
-        cosine = max(-1.0, min(1.0, cosine))
-        return math.degrees(math.acos(cosine))
-
-    def _extension_transition_geometry(
-        self,
-        *,
-        marking_points: list[tuple[float, float]],
-        index: int,
-    ) -> tuple[bool, tuple[float, float] | None, float | None, float | None]:
-        """Return whether this short gap is a true row-end transition.
-
-        Interior row end:
-            incoming heading = previous marking -> current marking.
-
-        First marking row end:
-            there is no previous surveyed marking, so infer incoming heading
-            as the reverse of next marking -> following marking. This gives
-            the requested P1-heading behaviour for a serpentine mission.
-
-        Short points on one straight bearing therefore never create an
-        extension point.
-        """
-
-        following_index = index + 2
-        if following_index >= len(marking_points):
-            return False, None, None, None
-
-        current = marking_points[index]
-        next_marking = marking_points[index + 1]
-        following = marking_points[following_index]
-
-        transfer = (
-            next_marking[0] - current[0],
-            next_marking[1] - current[1],
-        )
-        outgoing = (
-            following[0] - next_marking[0],
-            following[1] - next_marking[1],
-        )
-
-        if index > 0:
-            previous = marking_points[index - 1]
-            incoming = (
-                current[0] - previous[0],
-                current[1] - previous[1],
-            )
-        else:
-            # P1 has no previous surveyed point. In a serpentine row turn,
-            # P2 -> P3 runs opposite to the heading into P1.
-            incoming = (-outgoing[0], -outgoing[1])
-
-        transfer_angle = self._angle_between_vectors_deg(incoming, transfer)
-        reversal_angle = self._angle_between_vectors_deg(incoming, outgoing)
-
-        use_extension = (
-            self.ROW_TRANSFER_MIN_ANGLE_DEG
-            <= transfer_angle
-            <= self.ROW_TRANSFER_MAX_ANGLE_DEG
-            and reversal_angle >= self.ROW_REVERSAL_MIN_ANGLE_DEG
-        )
-
-        return use_extension, incoming, transfer_angle, reversal_angle
-
     def _calculate_dummy_point(
         self,
         *,
@@ -2054,38 +1978,27 @@ class TrajectoryGenerator(Node):
             "fresh current C->P1 is owned by RPP after START/ARM"
         )
 
+        topology = compile_metric_topology(
+            marking_points,
+            extension_mode=self.extension_mode or "DISABLE",
+            row_transition_threshold_m=self.row_transition_threshold_m,
+            minimum_segment_length_m=self.minimum_segment_length_m,
+            row_transfer_min_angle_deg=self.ROW_TRANSFER_MIN_ANGLE_DEG,
+            row_transfer_max_angle_deg=self.ROW_TRANSFER_MAX_ANGLE_DEG,
+            row_reversal_min_angle_deg=self.ROW_REVERSAL_MIN_ANGLE_DEG,
+        )
+
         for index in range(len(marking_points) - 1):
             current_marking = marking_points[index]
             next_marking = marking_points[index + 1]
 
-            transition_distance = self._distance(
-                current_marking,
-                next_marking,
-            )
+            segment_topology = topology.segments[index]
 
-            if transition_distance < self.minimum_segment_length_m:
-                raise ValueError(
-                    "Consecutive marking points "
-                    f"{index + 1} and "
-                    f"{index + 2} are too close"
-                )
-
-            use_dummy = (
-                self.extension_mode == "ENABLE"
-                and self.row_transition_threshold_m is not None
-                and transition_distance < self.row_transition_threshold_m
-            )
-
-            if use_dummy:
-                (
-                    use_dummy,
-                    incoming_direction,
-                    transfer_angle,
-                    reversal_angle,
-                ) = self._extension_transition_geometry(
-                    marking_points=marking_points,
-                    index=index,
-                )
+            transition_distance = segment_topology.distance_m
+            use_dummy = segment_topology.use_dummy
+            incoming_direction = segment_topology.incoming_direction
+            transfer_angle = segment_topology.transfer_angle_deg
+            reversal_angle = segment_topology.reversal_angle_deg
 
             if use_dummy:
                 assert incoming_direction is not None
