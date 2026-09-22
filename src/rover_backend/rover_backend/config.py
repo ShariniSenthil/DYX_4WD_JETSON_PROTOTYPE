@@ -224,6 +224,7 @@ class Settings:
     extension_trigger_distance_m: float
 
     telemetry_broadcast_hz: float
+    realtime_metrics_enabled: bool
     socket_path: str
 
     beacon_enabled: bool
@@ -453,6 +454,11 @@ def load_settings() -> Settings:
             "DYX_TELEMETRY_BROADCAST_HZ",
             50.0,
             minimum=0.5,
+        ),
+        # Development-only once-per-second Socket.IO rate/size/timing summary.
+        realtime_metrics_enabled=_read_bool(
+            "DYX_REALTIME_METRICS",
+            False,
         ),
         socket_path=socket_path,
         beacon_enabled=_read_bool(

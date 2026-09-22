@@ -52,6 +52,8 @@ from socketio.exceptions import ConnectionRefusedError as SocketConnectionRefuse
 from rover_backend.auth import authentication_store
 from rover_backend.config import client_ip_is_allowed
 from rover_backend.config import settings
+from rover_backend.realtime_contract import RealtimeMetrics
+from rover_backend.realtime_contract import timed
 from rover_backend.state import rover_state
 from rover_backend.state import utc_now_iso
 from rover_backend.system_routes import build_mission_status_payload
@@ -101,6 +103,16 @@ _event_loop: asyncio.AbstractEventLoop | None = None
 
 _lifecycle_lock = asyncio.Lock()
 _revocation_callback_registered = False
+
+# DYX_REALTIME_METRICS=1 logs one rate/size/timing summary per second.
+realtime_metrics = RealtimeMetrics(enabled=settings.realtime_metrics_enabled)
+
+
+async def _emit(event: str, payload: Any, **kwargs: Any) -> None:
+    """Broadcast emit that feeds the development counters."""
+
+    realtime_metrics.record_emit(event, payload)
+    await sio.emit(event, payload, **kwargs)
 
 
 def notify_authoritative_state_changed() -> None:
@@ -701,18 +713,31 @@ async def _broadcast_loop() -> None:
             records = await _all_socket_records()
 
             if records:
-                telemetry = build_telemetry_payload()
+                with timed(realtime_metrics, "build_telemetry_payload"):
+                    telemetry = build_telemetry_payload()
 
-                mission = build_mission_status_payload()
+                with timed(realtime_metrics, "build_mission_status_payload"):
+                    mission = build_mission_status_payload()
 
                 safety = rover_state.section("safety")
 
-                await sio.emit(
+                if realtime_metrics.enabled:
+                    point_results = mission.get("point_results")
+                    realtime_metrics.set_gauge(
+                        "point_results_count",
+                        len(point_results) if isinstance(point_results, dict) else 0,
+                    )
+                    realtime_metrics.set_gauge(
+                        "total_points", mission.get("total_points", 0)
+                    )
+                    realtime_metrics.set_gauge("socket_clients", len(records))
+
+                await _emit(
                     "telemetry",
                     telemetry,
                 )
 
-                await sio.emit(
+                await _emit(
                     "mission_status",
                     mission,
                 )
@@ -724,7 +749,7 @@ async def _broadcast_loop() -> None:
                 if progress_signature != previous_progress_signature:
                     previous_progress_signature = progress_signature
 
-                    await sio.emit(
+                    await _emit(
                         "mission_progress",
                         progress,
                     )
@@ -734,7 +759,7 @@ async def _broadcast_loop() -> None:
                 if safety_signature != previous_safety_signature:
                     previous_safety_signature = safety_signature
 
-                    await sio.emit(
+                    await _emit(
                         "safety_state",
                         safety,
                     )
@@ -750,7 +775,7 @@ async def _broadcast_loop() -> None:
                     if point_event_signature != previous_point_event_signature:
                         previous_point_event_signature = point_event_signature
 
-                        await sio.emit(
+                        await _emit(
                             _point_event_name(point_event),
                             point_event,
                         )
@@ -769,16 +794,18 @@ async def _broadcast_loop() -> None:
                 if mission_state != previous_mission_state:
                     previous_mission_state = mission_state
 
-                    await sio.emit(
+                    await _emit(
                         "mission_state",
                         mission,
                     )
 
                     if mission_state == "COMPLETED":
-                        await sio.emit(
+                        await _emit(
                             "mission_completed",
                             mission,
                         )
+
+            realtime_metrics.maybe_flush()
 
             validation_tick += 1
 
