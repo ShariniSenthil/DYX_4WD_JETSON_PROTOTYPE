@@ -56,10 +56,20 @@ def test_marking_hold_revalidates_certificate_and_resets_on_any_loss():
     handler = function_source("_precision_marking_pre_spray")
     assert "self._precision_terminal_decision(now_monotonic_sec)" in handler
     assert "self._reset_precision_marking_hold()" in handler
-    assert "self._marking_hold_elapsed_sec < self.marking_hold_sec" in handler
-    assert handler.index("self._capture_accuracy_snapshot(") > handler.index(
-        "self._marking_hold_elapsed_sec < self.marking_hold_sec"
+    # The hold is the mode's effective hold: 0 s only for radial20, whose
+    # certificate already proves the settled stop; marking_hold_sec otherwise.
+    assert "hold_required_sec = self._effective_marking_hold_sec()" in handler
+    assert "self._marking_hold_elapsed_sec < hold_required_sec" in handler
+    assert handler.index("self._precision_terminal_decision(now_monotonic_sec)") < (
+        handler.index("self._marking_hold_elapsed_sec < hold_required_sec")
     )
+    assert handler.index("self._capture_accuracy_snapshot(") > handler.index(
+        "self._marking_hold_elapsed_sec < hold_required_sec"
+    )
+    effective = function_source("_effective_marking_hold_sec")
+    assert "return self.marking_hold_sec" in effective
+    replaces = function_source("_certified_stop_replaces_marking_hold")
+    assert 'return self.terminal_stop_mode == "radial20"' in replaces
 
 
 def test_dummy_certificate_path_never_uses_legacy_radius_speed_gate():

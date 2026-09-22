@@ -281,6 +281,11 @@ class SprayController(Node):
 
         self.marking_active_since: Optional[float] = None
 
+        # Monotonic transition timestamps of the latest transaction, for field
+        # latency measurement only. Written once per transition, never read by
+        # any gate. Same CLOCK_MONOTONIC as Mission Manager/RPP on this host.
+        self.transaction_timing: dict[str, float] = {}
+
         # ==========================================================
         # Spray transaction state
         # ==========================================================
@@ -952,6 +957,11 @@ class SprayController(Node):
             "journal_state": (
                 self.journal.get("state") if self.journal is not None else None
             ),
+            "transaction_timing_monotonic": {
+                name: round(value, 6)
+                for name, value in self.transaction_timing.items()
+                if value is not None
+            },
             "press_value": self.press_value,
             "release_value": self.release_value,
             "spray_duration_sec": self.spray_duration_sec,
@@ -1007,6 +1017,8 @@ class SprayController(Node):
             kind="RELEASE",
             value=self.release_value,
         ):
+            # First RELEASE only; retries do not move the timestamp.
+            self.transaction_timing.setdefault("release_sent", now)
             self.state = self.STATE_WAIT_RELEASE_ACK
             return
 
@@ -1014,6 +1026,7 @@ class SprayController(Node):
         self.next_release_retry_at = now + self.release_retry_interval_sec
 
     def _release_succeeded(self) -> None:
+        self.transaction_timing["release_ack"] = time.monotonic()
         self.press_may_be_active = False
         self.release_confirmed = True
         self._publish_active(False)
@@ -1044,6 +1057,7 @@ class SprayController(Node):
             state=self.JOURNAL_COMPLETED,
         )
 
+        self.transaction_timing["success"] = time.monotonic()
         self._publish_result(
             result="SUCCESS",
             reason=None,
@@ -1056,7 +1070,29 @@ class SprayController(Node):
             f"{self.transaction_point_id} | "
             f"press={self.press_value:+.3f} | "
             f"duration={self.spray_duration_sec:.3f}s | "
-            f"release={self.release_value:+.3f}"
+            f"release={self.release_value:+.3f} | "
+            f"timing={self._transaction_timing_summary()}"
+        )
+
+    def _transaction_timing_summary(self) -> str:
+        """Stage-to-stage latencies (ms) for the latest transaction."""
+        order = (
+            "marking_active_seen",
+            "pre_spray_gate_valid",
+            "press_sent",
+            "press_ack",
+            "release_sent",
+            "release_ack",
+            "success",
+        )
+        stamps = [
+            (name, self.transaction_timing[name])
+            for name in order
+            if self.transaction_timing.get(name) is not None
+        ]
+        return " ".join(
+            f"{a}->{b}={1000.0 * (tb - ta):.0f}ms"
+            for (a, ta), (b, tb) in zip(stamps, stamps[1:])
         )
 
     def _set_fault_without_press(
@@ -1206,6 +1242,10 @@ class SprayController(Node):
             if now - self.marking_active_since < self.pre_spray_stable_sec:
                 return
 
+            self.transaction_timing = {
+                "marking_active_seen": self.marking_active_since,
+                "pre_spray_gate_valid": now,
+            }
             self._begin_transaction_from_current_point()
 
             if not self._transaction_matches_current():
@@ -1232,6 +1272,7 @@ class SprayController(Node):
                 return
 
             self.press_command_sent_at = self.command_sent_at
+            self.transaction_timing["press_sent"] = self.command_sent_at
             self.press_may_be_active = True
             self.release_confirmed = False
             self._publish_active(True)
@@ -1285,6 +1326,7 @@ class SprayController(Node):
             self._write_journal(
                 state=self.JOURNAL_PRESSED,
             )
+            self.transaction_timing["press_ack"] = now
 
             # The configured spray duration is the physical PRESS hold time.
             # Start the timer only after PX4/MAVROS has ACKed the PRESS command,

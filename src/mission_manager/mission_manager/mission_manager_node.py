@@ -567,6 +567,10 @@ class MissionManager(Node):
         self._marking_hold_started: Optional[float] = None
         self._marking_hold_elapsed_sec = 0.0
         self._spray_request_started: Optional[float] = None
+        # Monotonic transition stamps for the active marking point and the
+        # last completed one. Field latency measurement only; never a gate.
+        self._marking_timing: dict[str, Any] = {}
+        self._last_marking_timing: dict[str, Any] = {}
 
         # Final mission completion is reported first, then on the next control
         # tick the exact same STOP cleanup is executed automatically.
@@ -667,7 +671,9 @@ class MissionManager(Node):
         self.get_logger().warn(
             f"Marking: first <= {self.marking_tolerance_m*1000.0:.0f} mm + "
             f"speed <= {self.stationary_speed_tolerance_mps:.3f} m/s starts "
-            f"a fixed {self.marking_hold_sec:.2f}s PRE-MARK verification; "
+            f"a fixed {self._effective_marking_hold_sec():.2f}s PRE-MARK verification "
+            f"(terminal_stop_mode={self.terminal_stop_mode}; radial20's settled-stop "
+            "certificate replaces the hold); "
             "spray starts only if the point is still valid at the end"
         )
         self.get_logger().warn(
@@ -1378,6 +1384,30 @@ class MissionManager(Node):
         }
         return all(result.get(key) == value for key, value in expected.items())
 
+    def _certified_stop_replaces_marking_hold(self) -> bool:
+        """True when the terminal certificate already proves a settled stop.
+
+        radial20 certifies only after RPP's position/yaw-rate stationary
+        window (radial_stop_stationary_window_sec) has held inside tolerance
+        with the zero latched, so Mission Manager's marking_hold_sec would
+        re-measure the same settling. precision_fsm and legacy keep the hold.
+        """
+        return self.terminal_stop_mode == "radial20"
+
+    def _effective_marking_hold_sec(self) -> float:
+        if (
+            self.terminal_certificate_required
+            and self._certified_stop_replaces_marking_hold()
+        ):
+            return 0.0
+        return self.marking_hold_sec
+
+    def _stamp_marking_timing(self, name: str, value: Optional[float] = None) -> None:
+        """Record the first occurrence of a marking transition (monotonic)."""
+        self._marking_timing.setdefault(
+            name, time.monotonic() if value is None else value
+        )
+
     def _reset_precision_marking_hold(self) -> None:
         """Reset only Mission Manager's verification dwell, never RPP zero."""
         self._marking_hold_started = None
@@ -1435,25 +1465,49 @@ class MissionManager(Node):
             )
             return False
 
+        if self._rpp_terminal_result_last_rx_monotonic is not None:
+            self._stamp_marking_timing(
+                "rpp_result_rx", self._rpp_terminal_result_last_rx_monotonic
+            )
+        # RPP stamps its certificate on the ROS clock, not CLOCK_MONOTONIC, so
+        # it is compared only against Mission Manager's own ROS-clock stamp.
+        certified_at = (decision.certificate or {}).get("certified_timestamp_sec")
+        if (
+            "certificate_valid" not in self._marking_timing
+            and isinstance(certified_at, (int, float))
+            and math.isfinite(certified_at)
+        ):
+            self._marking_timing["rpp_certified_ros_sec"] = float(certified_at)
+            self._marking_timing["certificate_valid_ros_sec"] = (
+                self.get_clock().now().nanoseconds / 1.0e9
+            )
+        self._stamp_marking_timing("certificate_valid", now_monotonic_sec)
+
+        # radial20's certificate already carries the settled-stop proof, so
+        # the certificate-valid tick itself commits the spray request (the
+        # hold marker still records that this point's transaction began).
+        # Other modes keep the fixed marking_hold_sec verification dwell.
+        hold_required_sec = self._effective_marking_hold_sec()
         if self._marking_hold_started is None:
             self._marking_hold_started = now_monotonic_sec
             self._arrival_settle_started = now_monotonic_sec
-            self._last_message = (
-                f"{point_id} precision certificate valid; starting "
-                f"{self.marking_hold_sec:.1f}s pre-mark hold; spray remains OFF"
-            )
-            self._publish_marking_active(False)
-            self._publish_status(force=True)
-            return False
+            if hold_required_sec > 0.0:
+                self._last_message = (
+                    f"{point_id} precision certificate valid; starting "
+                    f"{hold_required_sec:.1f}s pre-mark hold; spray remains OFF"
+                )
+                self._publish_marking_active(False)
+                self._publish_status(force=True)
+                return False
 
         self._marking_hold_elapsed_sec = max(
             0.0, now_monotonic_sec - self._marking_hold_started
         )
         self._arrival_settle_elapsed_sec = self._marking_hold_elapsed_sec
         self._publish_marking_active(False)
-        if self._marking_hold_elapsed_sec < self.marking_hold_sec:
+        if self._marking_hold_elapsed_sec < hold_required_sec:
             remaining = max(
-                0.0, self.marking_hold_sec - self._marking_hold_elapsed_sec
+                0.0, hold_required_sec - self._marking_hold_elapsed_sec
             )
             self._last_message = (
                 f"{point_id} precision certificate hold; "
@@ -1487,12 +1541,19 @@ class MissionManager(Node):
             accuracy=accuracy,
             spray=pending_spray,
         )
+        self._stamp_marking_timing("accuracy_achieved", now_monotonic_sec)
         self._spray_request_started = now_monotonic_sec
         if self.spray_required:
             self._publish_marking_active(True)
+            self._stamp_marking_timing("marking_active_true", now_monotonic_sec)
             self._last_message = (
-                f"{point_id} precision certificate held for "
-                f"{self.marking_hold_sec:.1f}s; spray/mark triggered"
+                f"{point_id} precision certificate valid"
+                + (
+                    f" and held for {hold_required_sec:.1f}s"
+                    if hold_required_sec > 0.0
+                    else " (certified settled stop)"
+                )
+                + "; spray/mark triggered"
             )
             self._publish_status(force=True)
             return False
@@ -1544,6 +1605,12 @@ class MissionManager(Node):
 
             key = (run_id, point_id)
             if result == "SUCCESS":
+                if (
+                    self._spray_request_started is not None
+                    and self._active_marking_number is not None
+                    and point_id == f"P{self._active_marking_number+1:04d}"
+                ):
+                    self._stamp_marking_timing("spray_success_rx")
                 self._spray_success_keys.add(key)
                 self._spray_failure_keys.pop(key, None)
                 self._last_message = (
@@ -2823,8 +2890,55 @@ class MissionManager(Node):
         self._spray_request_started = None
         self._auto_continue_until = None
 
+    def _finish_marking_timing(self, point_id: str) -> None:
+        """Freeze the completed point's transition stamps and log them once."""
+        self._stamp_marking_timing("completed")
+        timing = dict(self._marking_timing)
+        timing["point_id"] = point_id
+        self._last_marking_timing = timing
+        order = (
+            "rpp_result_rx",
+            "certificate_valid",
+            "accuracy_achieved",
+            "marking_active_true",
+            "spray_success_rx",
+            "completed",
+        )
+        stamps = [
+            (name, timing[name])
+            for name in order
+            if isinstance(timing.get(name), (int, float))
+        ]
+        summary = " ".join(
+            f"{a}->{b}={1000.0 * (tb - ta):.0f}ms"
+            for (a, ta), (b, tb) in zip(stamps, stamps[1:])
+        )
+        certified = timing.get("rpp_certified_ros_sec")
+        accepted = timing.get("certificate_valid_ros_sec")
+        if isinstance(certified, float) and isinstance(accepted, float):
+            summary = (
+                f"rpp_certified->certificate_valid(ros)="
+                f"{1000.0 * (accepted - certified):.0f}ms " + summary
+            )
+        self.get_logger().info(f"MARKING TIMING | {point_id} | {summary}")
+
+    def _log_next_goal_release(self) -> None:
+        """Stamp the AUTO next-goal release for the last completed point."""
+        timing = self._last_marking_timing
+        if not timing or "next_goal_released" in timing:
+            return
+        timing["next_goal_released"] = time.monotonic()
+        completed = timing.get("completed")
+        if isinstance(completed, (int, float)):
+            self.get_logger().info(
+                f"MARKING TIMING | {timing.get('point_id')} | "
+                "completed->next_goal_released="
+                f"{1000.0 * (timing['next_goal_released'] - completed):.0f}ms"
+            )
+
     def _reset_arrival_state(self) -> None:
         """Reset working state after an actual point/mission transition."""
+        self._marking_timing = {}
         self._reset_point_timers()
         self._marking_error_valid = False
         self._marking_xtrack_m = math.inf
@@ -3604,13 +3718,22 @@ class MissionManager(Node):
             "arrival_settle_elapsed_sec": round(self._arrival_settle_elapsed_sec, 3),
             "arrival_settle_required_sec": self.arrival_settle_sec,
             "marking_hold_elapsed_sec": round(self._marking_hold_elapsed_sec, 3),
-            "marking_hold_required_sec": self.marking_hold_sec,
+            "marking_hold_required_sec": self._effective_marking_hold_sec(),
+            "marking_hold_configured_sec": self.marking_hold_sec,
+            "marking_timing_monotonic": {
+                key: (round(value, 6) if isinstance(value, float) else value)
+                for key, value in self._marking_timing.items()
+            },
+            "last_marking_timing_monotonic": {
+                key: (round(value, 6) if isinstance(value, float) else value)
+                for key, value in self._last_marking_timing.items()
+            },
             "verification_hold_elapsed_sec": round(self._marking_hold_elapsed_sec, 3),
-            "verification_hold_required_sec": self.marking_hold_sec,
+            "verification_hold_required_sec": self._effective_marking_hold_sec(),
             # Compatibility names retained for current frontend/backend.
             # hold_* now represents the 3-second PRE-MARK verification.
             "hold_elapsed_sec": round(self._marking_hold_elapsed_sec, 3),
-            "hold_required_sec": self.marking_hold_sec,
+            "hold_required_sec": self._effective_marking_hold_sec(),
             "marking_error_mode": "RADIAL_2D",
             "marking_tolerance_m": self.marking_tolerance_m,
             "goal_plane_overshoot_trigger_m": self.GOAL_PLANE_OVERSHOOT_TRIGGER_M,
@@ -3894,6 +4017,7 @@ class MissionManager(Node):
                     return
 
                 self._auto_continue_until = None
+                self._log_next_goal_release()
 
             self._publish_goal()
 
@@ -4312,6 +4436,7 @@ class MissionManager(Node):
                 spray=spray,
                 point_result=point_result,
             )
+            self._finish_marking_timing(point_id)
 
             self._current_path_index = self._next_semantic_index(
                 self._current_path_index + 1
