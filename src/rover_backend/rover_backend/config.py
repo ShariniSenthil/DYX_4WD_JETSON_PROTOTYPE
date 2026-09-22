@@ -225,6 +225,8 @@ class Settings:
 
     telemetry_broadcast_hz: float
     realtime_metrics_enabled: bool
+    mission_status_heartbeat_sec: float
+    socket_mission_status_compact: bool
     socket_path: str
 
     beacon_enabled: bool
@@ -458,6 +460,21 @@ def load_settings() -> Settings:
         # Development-only once-per-second Socket.IO rate/size/timing summary.
         realtime_metrics_enabled=_read_bool(
             "DYX_REALTIME_METRICS",
+            False,
+        ),
+        # Socket mission_status is change-driven; this only bounds how long an
+        # unchanged lifecycle packet can go unsent (diagnostics/recovery).
+        mission_status_heartbeat_sec=_read_float(
+            "DYX_MISSION_STATUS_HEARTBEAT_SEC",
+            1.0,
+            minimum=0.2,
+        ),
+        # Compatibility switch. False keeps the full mission_status contract
+        # (point_results, report, last_point_event) for tablet builds that
+        # still read row results from it. Set True once every deployed
+        # frontend consumes point_result socket events.
+        socket_mission_status_compact=_read_bool(
+            "DYX_SOCKET_MISSION_STATUS_COMPACT",
             False,
         ),
         socket_path=socket_path,

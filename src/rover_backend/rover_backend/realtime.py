@@ -6,10 +6,17 @@ streams backend state to authenticated frontend clients.
 Emitted events:
 
     telemetry
-        Complete rover telemetry payload at the configured update rate.
+        High-rate live values (vehicle, position, GNSS/RTK, battery, RPP debug,
+        RPP live radial accuracy, stream freshness, safety). Its `mission`
+        member is a bounded lifecycle projection; packet size does not grow
+        with mission length or completed-point history.
 
     mission_status
-        Complete mission lifecycle and point-progress payload.
+        Mission lifecycle, emitted when a non-volatile lifecycle field changes
+        plus a low-rate heartbeat (DYX_MISSION_STATUS_HEARTBEAT_SEC). With
+        DYX_SOCKET_MISSION_STATUS_COMPACT=1 it is the compact
+        mission_lifecycle@1 contract (no point_results/report history);
+        otherwise the full REST contract, for older tablet builds.
 
     mission_progress
         Compact mission progress payload emitted when progress changes.
@@ -52,7 +59,10 @@ from socketio.exceptions import ConnectionRefusedError as SocketConnectionRefuse
 from rover_backend.auth import authentication_store
 from rover_backend.config import client_ip_is_allowed
 from rover_backend.config import settings
+from rover_backend.realtime_contract import ChangeDrivenEmitter
 from rover_backend.realtime_contract import RealtimeMetrics
+from rover_backend.realtime_contract import build_mission_lifecycle_payload
+from rover_backend.realtime_contract import mission_lifecycle_signature
 from rover_backend.realtime_contract import timed
 from rover_backend.state import rover_state
 from rover_backend.state import utc_now_iso
@@ -113,6 +123,16 @@ async def _emit(event: str, payload: Any, **kwargs: Any) -> None:
 
     realtime_metrics.record_emit(event, payload)
     await sio.emit(event, payload, **kwargs)
+
+
+def _socket_mission_payload(mission: dict[str, Any]) -> dict[str, Any]:
+    """mission_status as sent on Socket.IO (REST keeps the full contract)."""
+
+    if settings.socket_mission_status_compact:
+        return build_mission_lifecycle_payload(
+            mission, rover_state.section("mission")
+        )
+    return mission
 
 
 def notify_authoritative_state_changed() -> None:
@@ -344,7 +364,7 @@ async def connect(
 
     await sio.emit(
         "mission_status",
-        mission,
+        _socket_mission_payload(mission),
         to=sid,
     )
 
@@ -698,6 +718,9 @@ async def _broadcast_loop() -> None:
 
     validation_tick = 0
 
+    mission_status_emitter = ChangeDrivenEmitter(
+        heartbeat_sec=float(settings.mission_status_heartbeat_sec),
+    )
     previous_progress_signature: str | None = None
     previous_safety_signature: str | None = None
     previous_point_event_signature: str | None = None
@@ -711,6 +734,11 @@ async def _broadcast_loop() -> None:
             # snapshot lock (which can be held by projection) off the ASGI loop.
             await asyncio.to_thread(trajectory_snapshot.check_timeout)
             records = await _all_socket_records()
+
+            if not records:
+                # A client that connects later gets a fresh snapshot on
+                # connect; do not let a stale signature suppress it.
+                mission_status_emitter.reset()
 
             if records:
                 with timed(realtime_metrics, "build_mission_status_payload"):
@@ -732,15 +760,25 @@ async def _broadcast_loop() -> None:
                     )
                     realtime_metrics.set_gauge("socket_clients", len(records))
 
+                # A. High-rate telemetry: live values, bounded size.
                 await _emit(
                     "telemetry",
                     telemetry,
                 )
 
-                await _emit(
-                    "mission_status",
-                    mission,
-                )
+                # B. Mission lifecycle: change-driven plus low-rate heartbeat.
+                # Evaluated on every iteration, including state-change
+                # wake-ups, so a safety change is never delayed to a heartbeat.
+                with timed(realtime_metrics, "mission_lifecycle_signature"):
+                    mission_signature = mission_lifecycle_signature(
+                        mission, rover_state.section("mission")
+                    )
+
+                if mission_status_emitter.should_emit(mission_signature):
+                    await _emit(
+                        "mission_status",
+                        _socket_mission_payload(mission),
+                    )
 
                 progress = _mission_progress_payload(mission)
 
@@ -796,13 +834,13 @@ async def _broadcast_loop() -> None:
 
                     await _emit(
                         "mission_state",
-                        mission,
+                        _socket_mission_payload(mission),
                     )
 
                     if mission_state == "COMPLETED":
                         await _emit(
                             "mission_completed",
-                            mission,
+                            _socket_mission_payload(mission),
                         )
 
             realtime_metrics.maybe_flush()

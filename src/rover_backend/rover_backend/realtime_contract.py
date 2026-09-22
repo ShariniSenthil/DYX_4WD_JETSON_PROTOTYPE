@@ -216,3 +216,188 @@ def telemetry_mission_projection(mission_status: dict[str, Any]) -> dict[str, An
     """Lifecycle subset embedded in high-rate telemetry. No point history."""
 
     return {key: mission_status.get(key) for key in TELEMETRY_MISSION_FIELDS}
+
+
+# ---------------------------------------------------------------------------
+# B. Mission lifecycle: compact, change-driven
+# ---------------------------------------------------------------------------
+
+MISSION_LIFECYCLE_FIELDS: tuple[str, ...] = (
+    "mission_id",
+    "mission_run_id",
+    "filename",
+    "state",
+    "state_lower",
+    "loaded",
+    "ready",
+    "accepted_for_start",
+    "staged",
+    "staged_id",
+    "trajectory_ready",
+    "total_points",
+    "active_point_id",
+    "active_point_index",
+    "active_point_number",
+    "active_point_state",
+    "completed_points",
+    "failed_points",
+    "skipped_points",
+    "remaining_points",
+    "progress_percent",
+    "pause_reason",
+    "resume_available",
+    "mission_enable",
+    "emergency_stop",
+    "gps_fix_type",
+    "rtk_state",
+    "rtk_fixed",
+    "rtk_motion_ok",
+    "rtk_reason",
+    "px4_connected",
+    "px4_mode",
+    "px4_armed",
+    "start_stage",
+    "resume_stage",
+    "stop_stage",
+    "start_failed_stage",
+    "alignment_active",
+    "marking_active",
+    "spray_controller_ready",
+    "spray_controller_state",
+    "spray_fault_reason",
+    "current_point_spray_confirmed",
+    "terminal_cleanup_status",
+    "terminal_cleanup_error",
+    # Per-point state strings (one short string per point). Bounded by the
+    # mission's point count, not by history; the frontend reconciles missed
+    # point events from it. Sent only when it changes.
+    "point_status",
+    "message",
+    "error",
+    "updated_at",
+)
+
+# Fields of the rover_state mission section that the REST mission-status
+# contract does not carry but the lifecycle contract needs.
+MISSION_SECTION_LIFECYCLE_FIELDS: tuple[str, ...] = (
+    "execution_mode",
+    "safety_generation",
+)
+
+# Continuously varying diagnostics. They never make a lifecycle packet
+# "changed"; their latest values ride along on the next change or heartbeat.
+VOLATILE_MISSION_FIELDS: frozenset[str] = frozenset(
+    {
+        "updated_at",
+        "rtk_correction_age_sec",
+        "gps_fix_status_age_sec",
+        "rtk_health_status_age_sec",
+        "rtk_age_status_age_sec",
+        "arrival_settle_elapsed_sec",
+        "hold_elapsed_sec",
+        "survey_truth_gnss_samples",
+    }
+)
+
+# Heavy/unbounded fields replaced in the signature by a cheap change proxy.
+_HEAVY_MISSION_FIELDS: frozenset[str] = frozenset(
+    {"point_results", "last_point_event", "report", "active_waypoint"}
+)
+
+
+def build_mission_lifecycle_payload(
+    mission_status: dict[str, Any],
+    mission_section: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compact socket mission_status: lifecycle only, no growing history."""
+
+    payload = {key: mission_status.get(key) for key in MISSION_LIFECYCLE_FIELDS}
+    section = mission_section or {}
+    for key in MISSION_SECTION_LIFECYCLE_FIELDS:
+        payload[key] = section.get(key)
+    payload["contract"] = "mission_lifecycle@1"
+    return payload
+
+
+def _last_point_event_identity(event: Any) -> list[Any] | None:
+    if not isinstance(event, dict):
+        return None
+    return [
+        event.get("mission_run_id"),
+        event.get("point_id"),
+        event.get("event"),
+        event.get("received_at"),
+    ]
+
+
+def mission_lifecycle_signature(
+    mission_status: dict[str, Any],
+    mission_section: dict[str, Any] | None = None,
+) -> str:
+    """Deterministic change detector for mission_status emission.
+
+    Cost is O(point count) for point_status only; point_results is never
+    serialized. point_results only changes in the point-event callback, which
+    always replaces last_point_event with a fresh received_at, so that event's
+    identity plus the result count is a complete proxy.
+    """
+
+    comparable: dict[str, Any] = {
+        key: value
+        for key, value in mission_status.items()
+        if key not in VOLATILE_MISSION_FIELDS and key not in _HEAVY_MISSION_FIELDS
+    }
+    point_results = mission_status.get("point_results")
+    comparable["_point_results_count"] = (
+        len(point_results) if isinstance(point_results, dict) else 0
+    )
+    comparable["_last_point_event"] = _last_point_event_identity(
+        mission_status.get("last_point_event")
+    )
+    report = mission_status.get("report")
+    if isinstance(report, dict):
+        comparable["_report"] = {
+            key: report.get(key)
+            for key in ("available", "terminal_available", "status", "mission_id",
+                        "cleanup_complete", "error", "generated_at")
+        }
+    section = mission_section or {}
+    for key in MISSION_SECTION_LIFECYCLE_FIELDS:
+        comparable[key] = section.get(key)
+    return json.dumps(
+        comparable,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+@dataclass(slots=True)
+class ChangeDrivenEmitter:
+    """Emit on signature change, or on a low-rate heartbeat.
+
+    A change is emitted on the same broadcast iteration that observes it;
+    the heartbeat only bounds how long an unchanged packet can go unsent.
+    """
+
+    heartbeat_sec: float
+    clock: Callable[[], float] = time.monotonic
+    _signature: str | None = None
+    _last_emit: float | None = None
+
+    def should_emit(self, signature: str) -> bool:
+        now = self.clock()
+        changed = signature != self._signature
+        due = self._last_emit is None or (
+            self.heartbeat_sec > 0 and now - self._last_emit >= self.heartbeat_sec
+        )
+        if changed or due:
+            self._signature = signature
+            self._last_emit = now
+            return True
+        return False
+
+    def reset(self) -> None:
+        self._signature = None
+        self._last_emit = None

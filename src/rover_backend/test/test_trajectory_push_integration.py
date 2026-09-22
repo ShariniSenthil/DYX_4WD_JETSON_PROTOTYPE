@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from rover_backend.realtime_contract import RealtimeMetrics, timed
+from rover_backend.realtime_contract import ChangeDrivenEmitter, RealtimeMetrics, timed
 from rover_backend.trajectory_push import (
     TrajectorySnapshotService,
     legacy_points,
@@ -267,11 +267,13 @@ def test_realtime_loop_expires_pending_snapshot_without_clients_or_rest(context)
             "asyncio": asyncio,
             "_stop_event": stop,
             "_state_change_event": changed,
-            "settings": SimpleNamespace(telemetry_broadcast_hz=1),
+            "settings": SimpleNamespace(telemetry_broadcast_hz=1,
+                                        mission_status_heartbeat_sec=1.0),
             "_all_socket_records": no_clients,
             "LOGGER": Mock(),
             "realtime_metrics": RealtimeMetrics(enabled=False),
             "timed": timed,
+            "ChangeDrivenEmitter": ChangeDrivenEmitter,
         })
         broadcast = production_function("realtime.py", "_broadcast_loop", context)
         await asyncio.wait_for(broadcast(), timeout=1)
