@@ -8661,25 +8661,20 @@ class RPPController(Node):
         pivot_heading_error,
         signed_cross_track,
     ):
-        """Keep intentional moving xtrack recovery from re-triggering a pivot.
+        """Allow xtrack recovery only below the configured pivot threshold.
 
-        The global xtrack controller is allowed to steer away from the fixed
-        path bearing while it recaptures the line. A path-heading-only
-        re-entry test would therefore mistake its own recovery command for a
-        new alignment failure.
-
-        Suppression is bounded by MAX_MOVING_HEADING_ERROR_RAD: once the rover
-        escapes the existing moving-steering envelope, stationary alignment
-        is allowed to take over again.
+        Xtrack recovery may continue steering while the segment/path-heading
+        error is below pivot_enter_angle. At or above the configured 15deg
+        pivot threshold, it must not suppress stationary pivot/alignment.
         """
         recovery_needed = (
             self.xtrack_priority_active
             or abs(signed_cross_track) >= self.xtrack_priority_enter
         )
-        inside_moving_envelope = (
-            abs(pivot_heading_error) <= self.MAX_MOVING_HEADING_ERROR_RAD
+        below_pivot_threshold = (
+            abs(pivot_heading_error) < self.pivot_enter_angle
         )
-        return recovery_needed and inside_moving_envelope
+        return recovery_needed and below_pivot_threshold
 
     def limit_moving_guidance_bearing(self, desired_bearing):
         """Keep moving recovery below the PX4 45-degree pivot threshold."""

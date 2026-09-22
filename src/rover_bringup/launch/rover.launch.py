@@ -471,16 +471,16 @@ def generate_launch_description() -> LaunchDescription:
                         #   measured settle, keeps fixed geometry (no reanchor),
                         #   then releases into the normal acceleration ramp
                         #   aligned-start (no carrier latch) still uses 1.00 m/s
-                        #   xtrack recovery speed cap     = 0.30 m/s max
+                        #   xtrack recovery speed reduction = DISABLED
                         #   xtrack engage/release        = 15 mm / 8 mm
                         #   release heading              = <=4 deg
                         #   release xtrack rate          = <=10 mm/s
                         #   all release gates stable     = 0.30 s
                         "segment_alignment_speed_mps": CRUISE_SPEED_MPS,
                         "segment_alignment_recovery_speed_mps": CRUISE_SPEED_MPS,
-                        "xtrack_priority_speed_mps": min(
-                            0.30, CRUISE_SPEED_MPS
-                        ),
+                        # Keep xtrack steering/recovery active, but do not
+                        # reduce translation speed below the selected cruise.
+                        "xtrack_priority_speed_mps": CRUISE_SPEED_MPS,
                         "decel_profile_speed_1_mps": CRUISE_SPEED_MPS,
                         "decel_profile_speed_2_mps": CRUISE_SPEED_MPS,
                         "decel_profile_speed_3_mps": CRUISE_SPEED_MPS,
@@ -494,9 +494,9 @@ def generate_launch_description() -> LaunchDescription:
                             TERMINAL_FLOOR_SPEED_MPS, CRUISE_SPEED_MPS
                         ),
                         # PX4 native rover alignment:
-                        # pivot begins at >=45deg,
-                        # PX4 TURN->DRIVE threshold is 6deg; RPP holds zero translation
-                        # and true absolute yaw until its 4deg release.
+                        # segment alignment/pivot begins at >=15deg.
+                        # RPP holds zero translation during pivot/alignment and
+                        # releases through the existing settled alignment lifecycle.
                         # Normal line correction remains +/-12deg.
                         # Post-pivot geometry remains fixed; reanchor is
                         # intentionally bypassed for C->P1 and later legs.
@@ -529,7 +529,8 @@ def generate_launch_description() -> LaunchDescription:
                         "moving_yaw_deadband_exit_deg": 1.00,
                         "moving_yaw_rate_slew_radps2": 0.60,
                         # V4.2: no intermediate 0.40 m/s heading-speed tier.
-                        # The separate 0.30 m/s xtrack recovery cap is unchanged.
+                        # Xtrack recovery also runs at cruise; >=15deg path-heading
+                        # error is handed to stationary pivot/alignment instead.
                         "moving_alignment_min_speed_mps": CRUISE_SPEED_MPS,
                         "alignment_reentry_goal_distance_m": 0.60,
                         # Hardened speed arbitration:
