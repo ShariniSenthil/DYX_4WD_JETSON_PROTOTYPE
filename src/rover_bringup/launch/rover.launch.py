@@ -191,7 +191,6 @@ def generate_launch_description() -> LaunchDescription:
                             "/rtk_correction_bridge/" "correction_age_sec"
                         ),
                         ("required_gps_fix_type"): 6,
-                        "rtk_stable_sec": 3.0,
                         ("max_correction_age_sec"): 2.0,
                         ("reference_timeout_sec"): 1.0,
                         ("max_reference_skew_sec"): 0.25,

@@ -267,10 +267,12 @@ achieves a real stop.
   "Not this project" below), not this one.
 - **Since 2026-09-22 (`STEERING_FIX_V4`) `trajectory_generator` no longer
   gates placement on RTK.** Placement only projects surveyed lat/lon through
-  PX4 `gp_origin`, so it requires frame evidence only (origin, fresh fused
-  global + local odom, receive skew, finite values, origin residual). The
-  `rtk_stable_sec` dwell and the fix-type/correction checks are gone from
-  placement; RTK quality is reported as `rtk_diagnostic` in
+  PX4 `gp_origin`, so it requires frame evidence only (connected FCU
+  session, current-session origin, fresh fused global + local odom, receive
+  skew, finite values, origin residual). The fix-type/correction checks are
+  gone from placement, and the `rtk_stable_sec` dwell **and parameter were
+  removed** (also from `rover.launch.py`); RTK quality is reported as
+  `rtk_diagnostic` in
   `/trajectory_generator/status`. **The RTK motion gate is Mission Manager's
   `_rtk_motion_ok()`** (fresh `fix_type == 6` at START/RESUME/NEXT), pinned by
   `src/mission_manager/test/test_rtk_motion_gate_contract.py`. A trajectory
@@ -296,7 +298,7 @@ the one currently governing behavior).
 | `rpp_controller.yaml` | `cruise_speed_mps: 1.0`, `acceleration_distance_m: 0.5`, `deceleration_distance_m: 0.5` / `deceleration_floor_speed_mps: 0.15`, `pivot_enter_angle_deg: 45.0` / `pivot_exit_angle_deg: 12.0`, `pivot_yaw_kp: 1.0`, `maximum_yaw_rate_radps: 0.2` / `minimum_yaw_rate_radps: 0.06`, `waypoint_tolerance_m: 0.03`, `line_tracking_lookahead_m: 0.55` (0.35-0.8 adaptive — landed **today**, commit `d38155d`; ⚠ **this is NOT the lookahead that runs** — see the 2026-09-04 control-path section), `xtrack_priority_enter_m: 0.015` / `exit_m: 0.008`. Most `precision_*` gates are OFF by default (`precision_speed_control_enabled`, `precision_terminal_enabled`, `precision_pivot_enabled`, `precision_tracking_control_enabled`, `precision_curvature_enabled` all `false`) — only `precision_guidance_enabled` and `geometry_tracking_enabled` are on, deliberately preserving "the production 30mm latch" (`rover.launch.py:490` comment). |
 | `mission_manager.yaml` | `marking_tolerance_m: 0.03`, `arrival_settle_sec: 0.3`, `marking_hold_sec: 3.0`, `stationary_speed_tolerance_mps: 0.01`, `spray_required: true`, `spray_confirmation_timeout_sec: 7.0`, `waypoint_match_tolerance_m: 0.002` |
 | `spray_controller.yaml` | `press_value: 1.0`, `release_value: 0.0`, `spray_duration_sec: 0.5`, `pre_spray_stable_sec: 0.25`, `hard_press_timeout_sec: 5.0`, `require_px4_armed: true`, `require_px4_offboard: true` |
-| `trajectory_generator.yaml` | `required_gps_fix_type: 6`, `rtk_stable_sec: 3.0`, `max_correction_age_sec: 2.0`, `interpolation_spacing_m: 0.05`, `localization_mode: shadow`, `frame_id: map` |
+| `trajectory_generator.yaml` (`rtk_stable_sec` removed 2026-09-22) | `required_gps_fix_type: 6`, `rtk_stable_sec: 3.0`, `max_correction_age_sec: 2.0`, `interpolation_spacing_m: 0.05`, `localization_mode: shadow`, `frame_id: map` |
 | `cmd_vel_bridge.yaml` | `command_timeout_sec: 0.25`, `backend_heartbeat_timeout_sec: 1.5`, `maximum_speed_mps: 1.0` |
 
 FCU (live capture, same bundle): ⚠ `EKF2_GPS_P_NOISE=0.5` — **STALE, this is

@@ -227,11 +227,6 @@ class TrajectoryGenerator(Node):
         )
 
         self.declare_parameter(
-            "rtk_stable_sec",
-            3.0,
-        )
-
-        self.declare_parameter(
             "max_correction_age_sec",
             2.0,
         )
@@ -337,8 +332,6 @@ class TrajectoryGenerator(Node):
         self.required_gps_fix_type = int(
             self.get_parameter("required_gps_fix_type").value
         )
-
-        self.rtk_stable_sec = float(self.get_parameter("rtk_stable_sec").value)
 
         self.max_correction_age_sec = float(
             self.get_parameter("max_correction_age_sec").value
@@ -594,7 +587,6 @@ class TrajectoryGenerator(Node):
 
         self.rtk_healthy = False
         self.correction_age_sec = math.inf
-        self.rtk_ready_since = None
 
         self.prepare_requested = False
         self.preparing = False
@@ -716,7 +708,6 @@ class TrajectoryGenerator(Node):
             )
 
         positive_values = {
-            "rtk_stable_sec": (self.rtk_stable_sec),
             "max_correction_age_sec": (self.max_correction_age_sec),
             "reference_timeout_sec": (self.reference_timeout_sec),
             "max_reference_skew_sec": (self.max_reference_skew_sec),
@@ -1105,7 +1096,6 @@ class TrajectoryGenerator(Node):
                 self.preparing = True
                 self.ready = False
                 self.last_error = None
-                self.rtk_ready_since = None
 
                 self._publish_ready(False)
 
@@ -2675,7 +2665,6 @@ class TrajectoryGenerator(Node):
         self.prepare_requested = False
         self.preparing = False
         self.ready = False
-        self.rtk_ready_since = None
 
         self.prepared_marking_points = []
         self.prepared_navigation_points = []
@@ -2865,8 +2854,6 @@ class TrajectoryGenerator(Node):
                 timing["waiting_reason"] = reason
 
                 if report_waiting:
-                    self.rtk_ready_since = None
-
                     self._publish_ready(False)
 
                     self._log_waiting(reason)
@@ -2879,11 +2866,6 @@ class TrajectoryGenerator(Node):
             # READY therefore does not imply RTK FIXED. Motion is gated
             # by Mission Manager's fresh RTK FIXED check at
             # START/RESUME/NEXT.
-            #
-            # rtk_stable_sec is still declared for configuration
-            # compatibility but no longer gates placement.
-            self.rtk_ready_since = None
-
             timing.pop("waiting_reason", None)
             timing["armed_to_reference_valid_ms"] = self._ms_since(
                 self._placement_armed_monotonic

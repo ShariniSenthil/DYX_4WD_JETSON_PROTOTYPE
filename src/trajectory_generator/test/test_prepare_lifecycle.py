@@ -79,7 +79,6 @@ def _fake_generator():
     node.prepare_requested = False
     node.preparing = False
     node.ready = False
-    node.rtk_ready_since = None
 
     node.raw_coordinate_mode = None
     node.raw_marking_points = []
@@ -838,7 +837,6 @@ def test_control_loop_reference_wait_reports_compiled_preparing():
     assert node.preparing is True
     assert node.ready is False
 
-    assert node.rtk_ready_since is None
     assert node._trajectory_phase() == "COMPILED"
 
     assert ready_values[-1] is False
@@ -879,10 +877,8 @@ def test_control_loop_places_gps_immediately_when_reference_is_valid():
     assert _run_prepare(node).success is True
     assert node._trajectory_phase() == "COMPILED"
 
-    # A huge legacy dwell value makes this test prove that placement no
-    # longer depends on rtk_stable_sec after the reference itself is valid.
-    node.rtk_stable_sec = 999.0
-    node.rtk_ready_since = None
+    # Placement must happen on this call: no RTK stability dwell exists
+    # (rtk_stable_sec was removed; see test_no_placement_dwell).
 
     node._maybe_request_gp_origin = lambda: None
 
@@ -969,6 +965,3 @@ def test_control_loop_places_gps_immediately_when_reference_is_valid():
 
     assert node.prepared_path_signature is not None
     assert node._trajectory_phase() == "PLACED"
-
-    # The old fixed-time stabilization timer is no longer part of placement.
-    assert node.rtk_ready_since is None
