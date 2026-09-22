@@ -2611,8 +2611,6 @@ class TrajectoryGenerator(Node):
                     reason,
                 ) = self._reference_is_ready()
 
-                now = self.get_clock().now()
-
                 if not reference_ready:
                     self.rtk_ready_since = None
 
@@ -2622,21 +2620,17 @@ class TrajectoryGenerator(Node):
 
                     return
 
-                if self.rtk_ready_since is None:
-                    self.rtk_ready_since = now
-
-                    self._log_waiting("RTK FIXED detected; " "stabilizing reference")
-
-                    return
-
-                stable_age = (now - self.rtk_ready_since).nanoseconds / 1e9
-
-                if stable_age < self.rtk_stable_sec:
-                    self._log_waiting(
-                        "RTK stable " f"{stable_age:.1f}/" f"{self.rtk_stable_sec:.1f}s"
-                    )
-
-                    return
+                # Placement projects surveyed lat/lon through PX4 gp_origin
+                # only; it never consumes the live RTK position, so a
+                # fixed-time dwell adds latency but no placement evidence.
+                # _reference_is_ready() is a single-sample check, so READY no
+                # longer implies RTK has been continuously FIXED. Motion is
+                # still gated by Mission Manager's fresh RTK FIXED check at
+                # START/RESUME/NEXT.
+                #
+                # rtk_stable_sec is still declared for configuration
+                # compatibility but no longer gates placement.
+                self.rtk_ready_since = None
 
             try:
                 # PREPARE creates only fixed surveyed mission geometry.

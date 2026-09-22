@@ -799,3 +799,119 @@ def test_control_loop_reference_wait_reports_compiled_preparing():
         waiting["message"]
         == "PX4 gp_origin unavailable"
     )
+
+
+def test_control_loop_places_gps_immediately_when_reference_is_valid():
+    node = _fake_generator()
+
+    metadata = {
+        "mission_id": "mission-gps",
+        "checksum_sha256": "d" * 64,
+        "extension_mode": "DISABLE",
+    }
+
+    node._load_mission_source = lambda: (
+        metadata,
+        "gps",
+        [
+            (13.0000000, 80.0000000),
+            (13.0000000, 80.0000100),
+        ],
+    )
+
+    assert _run_prepare(node).success is True
+    assert node._trajectory_phase() == "COMPILED"
+
+    # A huge legacy dwell value makes this test prove that placement no
+    # longer depends on rtk_stable_sec after the reference itself is valid.
+    node.rtk_stable_sec = 999.0
+    node.rtk_ready_since = None
+
+    node._maybe_request_gp_origin = lambda: None
+
+    node._reference_is_ready = lambda: (
+        True,
+        "PX4 gp_origin verified: frame residual=0.010m",
+    )
+
+    node._log_waiting = lambda reason: pytest.fail(
+        f"valid reference must not enter RTK dwell: {reason}"
+    )
+
+    conversion_calls = []
+
+    def convert_markings():
+        conversion_calls.append(True)
+        return [
+            (0.0, 0.0),
+            (1.0, 0.0),
+        ]
+
+    node._convert_markings_to_local = convert_markings
+
+    node.POINT_TYPE_MARKING = (
+        TrajectoryGenerator.POINT_TYPE_MARKING
+    )
+    node.POINT_TYPE_PASS_THROUGH = (
+        TrajectoryGenerator.POINT_TYPE_PASS_THROUGH
+    )
+
+    node._generate_navigation_path = lambda markings: (
+        list(markings),
+        [
+            node.POINT_TYPE_MARKING
+            for _ in markings
+        ],
+        list(range(len(markings))),
+        0,
+    )
+
+    node.get_clock = lambda: _TestClock(
+        5_000_000_000
+    )
+
+    node._build_path = lambda points, stamp: (
+        tuple(points),
+        stamp,
+    )
+
+    node._make_signature = (
+        TrajectoryGenerator._make_signature
+    )
+
+    node.mission_waypoints_pub = SimpleNamespace(
+        publish=lambda _message: None
+    )
+
+    node.nav_path_pub = SimpleNamespace(
+        publish=lambda _message: None
+    )
+
+    node._publish_path_metadata = (
+        lambda **_kwargs: None
+    )
+
+    node._publish_path_signature = (
+        lambda _signature: None
+    )
+
+    node._publish_survey_targets = (
+        lambda _signature, cleared=False: None
+    )
+
+    node._publish_ready = lambda _value: None
+    node._publish_status = lambda **_kwargs: None
+
+    TrajectoryGenerator._control_loop(node)
+
+    assert len(conversion_calls) == 1
+
+    assert node.prepare_requested is False
+    assert node.preparing is False
+    assert node.ready is True
+
+    assert node.prepared_path_signature is not None
+    assert node._trajectory_phase() == "PLACED"
+
+    # The old fixed-time stabilization timer is no longer part of placement.
+    assert node.rtk_ready_since is None
