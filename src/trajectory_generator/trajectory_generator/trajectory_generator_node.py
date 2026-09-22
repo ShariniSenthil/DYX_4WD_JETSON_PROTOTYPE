@@ -2581,7 +2581,22 @@ class TrajectoryGenerator(Node):
     # ==========================================================
 
     def _source_topology_is_current(self) -> bool:
-        """Return whether source topology belongs to the current mission."""
+        """Return whether source topology belongs to the current mission.
+
+        Identity is mission_id plus the SHA-256 of the mission.csv bytes. It
+        does not cover the other compile inputs (coordinate/extension mode
+        from metadata, node parameters, class constants). That is sufficient
+        because topology never outlives its PREPARE transaction: every
+        PREPARE reloads and recompiles, the only reuse is re-placement after
+        an FCU session change inside the same transaction, and parameters
+        are fixed for the node's lifetime. If topology or placement is ever
+        cached across PREPAREs or processes, add a compile-input signature.
+
+        Source topology is diagnostics and lifecycle state only. The placed
+        path's dummy decisions come from compile_metric_topology() on the
+        actual PX4-local marking points (see _generate_navigation_path), and
+        the published path_signature covers that placed geometry.
+        """
 
         return (
             self.source_topology is not None
