@@ -1712,6 +1712,20 @@ class MissionManager(Node):
             self._emit_system_event("RTK_PAUSED", reason)
             self._publish_status(force=True)
 
+    def _px4_offboard_armed_fresh_locked(self) -> bool:
+        """True when fresh MAVROS state shows connected + OFFBOARD + armed.
+
+        Caller holds ``self._lock``. Same freshness bound as the runtime PX4
+        control monitor, so a fast path is never taken on older evidence
+        than the monitor itself would accept while RUNNING.
+        """
+        return (
+            self._fcu_connected
+            and self._age(self._last_fcu_rx_monotonic) <= self.FCU_STATE_STALE_SEC
+            and self._px4_mode == "OFFBOARD"
+            and self._px4_armed
+        )
+
     def _monitor_runtime_px4_control(self) -> None:
         """Stop mission motion if PX4 unexpectedly leaves OFFBOARD or disarms.
 
@@ -2300,22 +2314,29 @@ class MissionManager(Node):
                 require_ready_state=False, require_estop_released=True
             )
 
-            self._resume_stage = "ZERO_SETPOINT_SETTLE"
             with self._lock:
                 self._disable_motion_preserve_estop()
-            time.sleep(self.OFFBOARD_STREAM_SETTLE_SEC)
+                # Operator PAUSE leaves PX4 connected, armed and in OFFBOARD
+                # with the zero setpoint stream live. Nothing to rebuild:
+                # skip the settle and every PX4 service call.
+                px4_already_controlled = self._px4_offboard_armed_fresh_locked()
 
-            self._resume_stage = "SWITCHING_OFFBOARD"
-            if self._px4_mode != "OFFBOARD":
-                self._request_px4_mode("OFFBOARD")
-                with self._lock:
-                    self._px4_mode = "OFFBOARD"
+            if not px4_already_controlled:
+                # Degraded/recovery path: unchanged conservative sequence.
+                self._resume_stage = "ZERO_SETPOINT_SETTLE"
+                time.sleep(self.OFFBOARD_STREAM_SETTLE_SEC)
 
-            self._resume_stage = "ARMING"
-            if not self._px4_armed:
-                self._request_arm(True)
-                with self._lock:
-                    self._px4_armed = True
+                self._resume_stage = "SWITCHING_OFFBOARD"
+                if self._px4_mode != "OFFBOARD":
+                    self._request_px4_mode("OFFBOARD")
+                    with self._lock:
+                        self._px4_mode = "OFFBOARD"
+
+                self._resume_stage = "ARMING"
+                if not self._px4_armed:
+                    self._request_arm(True)
+                    with self._lock:
+                        self._px4_armed = True
 
             self._resume_stage = "FINAL_CHECK"
             with self._lock:
@@ -2330,6 +2351,14 @@ class MissionManager(Node):
                 if self._state != "PAUSED":
                     raise RuntimeError(
                         f"Mission state changed during RESUME (state={self._state})"
+                    )
+                if (
+                    px4_already_controlled
+                    and not self._px4_offboard_armed_fresh_locked()
+                ):
+                    raise RuntimeError(
+                        "PX4 left OFFBOARD/armed during RESUME "
+                        f"(mode={self._px4_mode}, armed={self._px4_armed})"
                     )
                 self._require_motion_health(
                     require_ready_state=False,
