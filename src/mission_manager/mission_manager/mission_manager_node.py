@@ -2418,17 +2418,24 @@ class MissionManager(Node):
             )
             with self._lock:
                 self._disable_motion_preserve_estop()
-            time.sleep(self.OFFBOARD_STREAM_SETTLE_SEC)
+                # WAITING_FOR_NEXT keeps PX4 armed in OFFBOARD with the zero
+                # stream live, exactly like operator PAUSE: no settle and no
+                # PX4 service call are needed.
+                px4_already_controlled = self._px4_offboard_armed_fresh_locked()
 
-            if self._px4_mode != "OFFBOARD":
-                self._request_px4_mode("OFFBOARD")
-                with self._lock:
-                    self._px4_mode = "OFFBOARD"
+            if not px4_already_controlled:
+                # Degraded/recovery path: unchanged conservative sequence.
+                time.sleep(self.OFFBOARD_STREAM_SETTLE_SEC)
 
-            if not self._px4_armed:
-                self._request_arm(True)
-                with self._lock:
-                    self._px4_armed = True
+                if self._px4_mode != "OFFBOARD":
+                    self._request_px4_mode("OFFBOARD")
+                    with self._lock:
+                        self._px4_mode = "OFFBOARD"
+
+                if not self._px4_armed:
+                    self._request_arm(True)
+                    with self._lock:
+                        self._px4_armed = True
 
             with self._lock:
                 if self._emergency_stop:
@@ -2442,6 +2449,14 @@ class MissionManager(Node):
                 if self._state != "WAITING_FOR_NEXT":
                     raise RuntimeError(
                         f"Mission state changed during NEXT (state={self._state})"
+                    )
+                if (
+                    px4_already_controlled
+                    and not self._px4_offboard_armed_fresh_locked()
+                ):
+                    raise RuntimeError(
+                        "PX4 left OFFBOARD/armed during NEXT "
+                        f"(mode={self._px4_mode}, armed={self._px4_armed})"
                     )
                 self._require_motion_health(
                     require_ready_state=False,
