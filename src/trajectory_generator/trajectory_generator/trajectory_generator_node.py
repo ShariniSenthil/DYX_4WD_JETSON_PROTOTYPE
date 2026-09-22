@@ -1407,10 +1407,49 @@ class TrajectoryGenerator(Node):
             float(self.latest_local_odom.pose.pose.position.y),
         )
 
-    def _reference_is_ready(
+    def _rtk_diagnostic_status(
         self,
     ) -> tuple[bool, str]:
-        """Validate gp_origin against PX4's live fused-global/local pair."""
+        """Report RTK quality for diagnostics only; never gates placement.
+
+        Placement projects surveyed lat/lon through PX4 gp_origin and never
+        consumes the live RTK position, so fix type, correction health and
+        correction age do not change the placed geometry. They decide
+        whether the rover may MOVE, which is Mission Manager's
+        _rtk_motion_ok() gate at START/RESUME/NEXT (while RUNNING, Mission
+        Manager warns on FLOAT and pauses on lost/stale fix).
+        """
+
+        if self.latest_gps_status is None:
+            return False, "No GPS status"
+        if self._age_seconds(self.latest_gps_status_time) > self.reference_timeout_sec:
+            return False, "GPS status is stale"
+        if int(self.latest_gps_status.fix_type) < self.required_gps_fix_type:
+            return (
+                False,
+                f"fix_type={self.latest_gps_status.fix_type} "
+                f"< {self.required_gps_fix_type}",
+            )
+        if not self.rtk_healthy:
+            return False, "RTK correction bridge unhealthy"
+        if (
+            not math.isfinite(self.correction_age_sec)
+            or self.correction_age_sec > self.max_correction_age_sec
+        ):
+            return False, f"RTK correction age {self.correction_age_sec:.2f}s"
+        return True, "RTK FIXED"
+
+    def _placement_reference_is_ready(
+        self,
+    ) -> tuple[bool, str]:
+        """Validate that surveyed GPS can be placed into the PX4 map frame.
+
+        Frame-consistency evidence only: the current gp_origin, fresh fused
+        global and local samples, their receive skew, finite values, and
+        agreement of fused global projected through gp_origin with PX4
+        local ENU. RTK quality is motion policy, see
+        _rtk_diagnostic_status().
+        """
 
         if self.latest_gp_origin is None:
             if self.localization_mode == "px4_origin":
@@ -1424,31 +1463,11 @@ class TrajectoryGenerator(Node):
             return False, "PX4 fused global position unavailable"
         if self.latest_local_odom is None:
             return False, "PX4 local odometry unavailable for origin validation"
-        if self.latest_gps_status is None:
-            return False, "No GPS status"
 
         if self._age_seconds(self.latest_fused_global_time) > self.reference_timeout_sec:
             return False, "PX4 fused global position is stale"
         if self._age_seconds(self.latest_local_time) > self.reference_timeout_sec:
             return False, "PX4 local odometry is stale"
-        if self._age_seconds(self.latest_gps_status_time) > self.reference_timeout_sec:
-            return False, "GPS status is stale"
-
-        if int(self.latest_gps_status.fix_type) < self.required_gps_fix_type:
-            return (
-                False,
-                "RTK FIXED required; "
-                f"fix_type={self.latest_gps_status.fix_type}",
-            )
-
-        if not self.rtk_healthy:
-            return False, "RTK correction bridge unhealthy"
-
-        if (
-            not math.isfinite(self.correction_age_sec)
-            or self.correction_age_sec > self.max_correction_age_sec
-        ):
-            return False, f"RTK correction age {self.correction_age_sec:.2f}s"
 
         receive_skew = abs(
             (self.latest_fused_global_time - self.latest_local_time).nanoseconds
@@ -2317,6 +2336,7 @@ class TrajectoryGenerator(Node):
                 else None
             )
             trajectory_phase = self._trajectory_phase()
+            rtk_ok, rtk_reason = self._rtk_diagnostic_status()
 
             return {
                 "state": str(state).upper(),
@@ -2377,6 +2397,14 @@ class TrajectoryGenerator(Node):
                 "localization": dict(
                     self.localization_shadow_summary
                 ),
+                # Diagnostic only, using this node's thresholds. Placement
+                # does not require RTK FIXED, and this is NOT Mission
+                # Manager's verdict: Mission Manager owns the RTK motion gate.
+                "rtk_diagnostic": {
+                    "ok": rtk_ok,
+                    "reason": rtk_reason,
+                    "motion_gate_owner": "mission_manager",
+                },
                 "error": self.last_error,
             }
 
@@ -2609,7 +2637,7 @@ class TrajectoryGenerator(Node):
                 (
                     reference_ready,
                     reason,
-                ) = self._reference_is_ready()
+                ) = self._placement_reference_is_ready()
 
                 if not reference_ready:
                     self.rtk_ready_since = None
@@ -2621,11 +2649,10 @@ class TrajectoryGenerator(Node):
                     return
 
                 # Placement projects surveyed lat/lon through PX4 gp_origin
-                # only; it never consumes the live RTK position, so a
-                # fixed-time dwell adds latency but no placement evidence.
-                # _reference_is_ready() is a single-sample check, so READY no
-                # longer implies RTK has been continuously FIXED. Motion is
-                # still gated by Mission Manager's fresh RTK FIXED check at
+                # only; it never consumes the live RTK position, so neither
+                # RTK quality nor a fixed-time dwell adds placement evidence.
+                # READY therefore does not imply RTK FIXED. Motion is gated
+                # by Mission Manager's fresh RTK FIXED check at
                 # START/RESUME/NEXT.
                 #
                 # rtk_stable_sec is still declared for configuration

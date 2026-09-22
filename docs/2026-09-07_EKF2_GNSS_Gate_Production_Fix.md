@@ -180,6 +180,13 @@ different questions for different layers. The second one already has a home —
 `rtk_stable_sec: 3.0`. Requiring RTK FIXED *inside the estimator* removes its
 only absolute reference instead of pausing the mission.
 
+> **Update 2026-09-22:** the "good enough to paint" gate no longer lives in
+> `trajectory_generator` — placement stopped requiring RTK FIXED and the
+> `rtk_stable_sec` dwell because placement only projects through PX4
+> `gp_origin`. The gate is now solely Mission Manager's `_rtk_motion_ok()`
+> (fresh `fix_type == 6` at START/RESUME/NEXT). The argument above still
+> holds: the estimator should not require FIXED.
+
 ## 5. Verdict — the fix is one parameter
 
 `runGnssChecks` was replayed sample-by-sample over all 9,488 samples under each

@@ -95,6 +95,26 @@ def _fake_generator():
 
     node.last_error = None
 
+    node.reference_timeout_sec = 1.0
+    node.max_reference_skew_sec = 0.25
+    node.origin_consistency_max_m = 0.30
+    node.required_gps_fix_type = 6
+    node.max_correction_age_sec = 2.0
+    node.GP_ORIGIN_REQUEST_MAX_ATTEMPTS = (
+        TrajectoryGenerator.GP_ORIGIN_REQUEST_MAX_ATTEMPTS
+    )
+    node.gp_origin_request_attempts = 0
+
+    node.latest_gp_origin = None
+    node.latest_fused_global_fix = None
+    node.latest_fused_global_time = None
+    node.latest_local_odom = None
+    node.latest_local_time = None
+    node.latest_gps_status = None
+    node.latest_gps_status_time = None
+    node.rtk_healthy = False
+    node.correction_age_sec = float("inf")
+
     node.published_ready = []
     node.status_calls = []
     node.empty_output_count = 0
@@ -121,6 +141,9 @@ def _fake_generator():
     _bind(node, "_trajectory_phase")
     _bind(node, "_build_status_payload")
     _bind(node, "_log_waiting")
+    _bind(node, "_age_seconds")
+    _bind(node, "_rtk_diagnostic_status")
+    _bind(node, "_placement_reference_is_ready")
     _bind(node, "_clear_prepared_state")
     _bind(node, "_reset_all_runtime")
     _bind(node, "_set_error")
@@ -748,7 +771,7 @@ def test_control_loop_reference_wait_reports_compiled_preparing():
 
     node._maybe_request_gp_origin = lambda: None
 
-    node._reference_is_ready = lambda: (
+    node._placement_reference_is_ready = lambda: (
         False,
         "PX4 gp_origin unavailable",
     )
@@ -829,7 +852,7 @@ def test_control_loop_places_gps_immediately_when_reference_is_valid():
 
     node._maybe_request_gp_origin = lambda: None
 
-    node._reference_is_ready = lambda: (
+    node._placement_reference_is_ready = lambda: (
         True,
         "PX4 gp_origin verified: frame residual=0.010m",
     )

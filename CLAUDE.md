@@ -265,8 +265,16 @@ achieves a real stop.
   an old memory note about a project called `4WD_SERVER` said NTRIP wasn't
   configured; that note is about a *different, unrelated repo* (see
   "Not this project" below), not this one.
-- `trajectory_generator` requires `required_gps_fix_type: 6` and
-  `rtk_stable_sec: 3.0` before treating the fix as mission-ready.
+- **Since 2026-09-22 (`STEERING_FIX_V4`) `trajectory_generator` no longer
+  gates placement on RTK.** Placement only projects surveyed lat/lon through
+  PX4 `gp_origin`, so it requires frame evidence only (origin, fresh fused
+  global + local odom, receive skew, finite values, origin residual). The
+  `rtk_stable_sec` dwell and the fix-type/correction checks are gone from
+  placement; RTK quality is reported as `rtk_diagnostic` in
+  `/trajectory_generator/status`. **The RTK motion gate is Mission Manager's
+  `_rtk_motion_ok()`** (fresh `fix_type == 6` at START/RESUME/NEXT), pinned by
+  `src/mission_manager/test/test_rtk_motion_gate_contract.py`. A trajectory
+  can be READY while RTK is FLOAT; that must not be read as "safe to move".
 
 ## Live-captured params (2026-08-31 evening, matches HEAD `7ac712b`)
 
