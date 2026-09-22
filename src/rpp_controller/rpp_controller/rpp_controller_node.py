@@ -8647,24 +8647,14 @@ class RPPController(Node):
         )
 
     def apply_heading_speed_limit(self, base_speed, heading_error):
-        """Use one fixed 4-degree heading-speed coordination boundary.
+        """Preserve upstream speed without an intermediate heading-speed cap.
 
-        Up to and including heading_min_speed (configured as 4deg), preserve
-        the requested translational speed. Above that boundary, reduce only
-        to moving_alignment_min_speed until the existing stationary-alignment
-        authority takes ownership.
-
-        This does NOT reduce xtrack recovery steering authority and never
-        raises a lower speed already requested by acceleration, radial20,
-        terminal braking, or another upstream speed limit.
+        V4.2 test variant: heading error alone no longer reduces translation
+        to 0.40 m/s. Acceleration, terminal braking, radial stop, and the
+        separate 0.30 m/s xtrack-priority recovery cap remain authoritative.
         """
-        base_speed = max(0.0, min(float(base_speed), self.cruise_speed))
-        error_abs = abs(self.normalize_angle(heading_error))
-
-        if error_abs <= self.heading_min_speed:
-            return base_speed
-
-        return min(base_speed, self.moving_alignment_min_speed)
+        _ = heading_error
+        return max(0.0, min(float(base_speed), self.cruise_speed))
 
     def suppress_mid_leg_alignment_reentry(
         self,

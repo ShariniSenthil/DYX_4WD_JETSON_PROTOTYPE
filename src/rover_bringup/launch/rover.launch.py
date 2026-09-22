@@ -528,9 +528,9 @@ def generate_launch_description() -> LaunchDescription:
                         "moving_yaw_deadband_enter_deg": 0.50,
                         "moving_yaw_deadband_exit_deg": 1.00,
                         "moving_yaw_rate_slew_radps2": 0.60,
-                        "moving_alignment_min_speed_mps": min(
-                            0.40, CRUISE_SPEED_MPS
-                        ),
+                        # V4.2: no intermediate 0.40 m/s heading-speed tier.
+                        # The separate 0.30 m/s xtrack recovery cap is unchanged.
+                        "moving_alignment_min_speed_mps": CRUISE_SPEED_MPS,
                         "alignment_reentry_goal_distance_m": 0.60,
                         # Hardened speed arbitration:
                         # - post-pivot line capture and global xtrack recovery are capped
