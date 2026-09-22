@@ -2315,16 +2315,12 @@ class TrajectoryGenerator(Node):
             "extension_mode": (self.extension_mode),
             "dummy_point_distance_m": (self.dummy_point_distance_m),
             "row_transition_threshold_m": (self.row_transition_threshold_m),
-            "source_topology_compiled": (
-                self.source_topology is not None
-                and self.source_topology_mission_id == self.mission_id
-                and self.source_topology_checksum == self.mission_checksum
-            ),
+            "source_topology_compiled": self._source_topology_is_current(),
             "source_topology_mission_id": self.source_topology_mission_id,
             "source_topology_checksum": self.source_topology_checksum,
             "source_topology_segment_count": (
                 len(self.source_topology.segments)
-                if self.source_topology is not None
+                if self._source_topology_is_current()
                 else 0
             ),
             "source_topology_dummy_decision_count": (
@@ -2333,10 +2329,14 @@ class TrajectoryGenerator(Node):
                     for segment in self.source_topology.segments
                     if segment.use_dummy
                 )
-                if self.source_topology is not None
+                if self._source_topology_is_current()
                 else 0
             ),
-            "source_topology_compile_ms": self.source_topology_compile_ms,
+            "source_topology_compile_ms": (
+                self.source_topology_compile_ms
+                if self._source_topology_is_current()
+                else None
+            ),
             "marking_point_count": len(
                 self.prepared_marking_points or self.raw_marking_points
             ),
@@ -2406,6 +2406,17 @@ class TrajectoryGenerator(Node):
     # ==========================================================
     # Runtime state
     # ==========================================================
+
+    def _source_topology_is_current(self) -> bool:
+        """Return whether source topology belongs to the current mission."""
+
+        return (
+            self.source_topology is not None
+            and self.source_topology_mission_id is not None
+            and self.source_topology_checksum is not None
+            and self.source_topology_mission_id == self.mission_id
+            and self.source_topology_checksum == self.mission_checksum
+        )
 
     def _clear_prepared_state(
         self,
