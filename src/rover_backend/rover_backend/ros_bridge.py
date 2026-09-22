@@ -60,6 +60,7 @@ from mission_manager_interfaces.srv import ReleaseEmergencyStop
 from std_srvs.srv import Trigger
 
 from rover_backend.config import settings
+from rover_backend.manager_status_sync import ManagerStatusSync
 from rover_backend.mission_report import MissionReportError
 from rover_backend.mission_report import StaleMissionTerminalEvent
 from rover_backend.mission_report import mission_report_store
@@ -385,6 +386,11 @@ class RoverBackendRosNode(Node):
 
     SERVICE_DISCOVERY_TIMEOUT_SEC = 3.0
     SERVICE_RESPONSE_TIMEOUT_SEC = 5.0
+    # Defensive bound only. Mission Manager force-publishes the acknowledged
+    # status before its Trigger returns, so a healthy command synchronizes
+    # with no measurable added delay. Expiry never fails the command.
+    MANAGER_STATUS_SYNC_TIMEOUT_SEC = 0.5
+
     MANAGER_RESPONSE_TIMEOUT_SEC = {
         # START/RESUME/NEXT can each include OFFBOARD and ARM service
         # discovery/response waits plus state confirmations. These contracts
@@ -422,6 +428,7 @@ class RoverBackendRosNode(Node):
 
         self._command_lock = threading.RLock()
         self._runtime_lock = threading.RLock()
+        self._manager_status_sync = ManagerStatusSync()
         # Mission Manager status arrives on a ROS executor thread. Durable
         # runtime persistence performs flush/fsync and must never block that
         # callback. Keep only the newest pending status while the worker is
@@ -2871,6 +2878,9 @@ class RoverBackendRosNode(Node):
         # mission_manager is the sole owner of the motion safety gate.
         # Never perform durable file I/O from this ROS subscription callback.
         self._schedule_mission_runtime_persist(payload)
+        # Only after rover_state holds this status: a command waiting on its
+        # acknowledgment must wake to the snapshot that carries it.
+        self._manager_status_sync.observe(payload)
         _notify_authoritative_state_changed()
 
 
@@ -3854,15 +3864,33 @@ class RoverBackendRosNode(Node):
         self,
         command: str,
     ) -> dict[str, Any]:
+        ack_before = self._manager_status_sync.mark(command)
         accepted, service_message = self._manager_command(command)
         if not accepted:
             # mission_manager returns the exact failed Start/Resume/etc reason.
             raise RuntimeError(service_message)
 
+        # Mission Manager published the acknowledged status before returning;
+        # wait (event-driven) until our subscription has committed it, so the
+        # HTTP response is not one status behind. The command already
+        # executed: a sync timeout is recorded, never raised.
+        sync = self._manager_status_sync.wait_for_ack(
+            command,
+            ack_before,
+            self.MANAGER_STATUS_SYNC_TIMEOUT_SEC,
+        )
+        if sync.supported and not sync.synchronized:
+            self.get_logger().warning(
+                f"{command}: acknowledged status not received within "
+                f"{self.MANAGER_STATUS_SYNC_TIMEOUT_SEC:.2f}s; returning best "
+                "available snapshot (Socket.IO remains authoritative)"
+            )
+
         rover_state.update(
             "mission",
             message=service_message,
             error=None,
+            last_command_status_sync=sync.as_dict(),
         )
         _notify_authoritative_state_changed()
         return rover_state.section("mission")

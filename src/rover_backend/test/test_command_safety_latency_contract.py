@@ -63,3 +63,35 @@ def test_realtime_has_event_driven_authoritative_state_wakeup():
     assert "def notify_authoritative_state_changed" in realtime
     assert "state_change_event.wait()" in realtime
     assert "loop.call_soon_threadsafe(state_change_event.set)" in realtime
+
+
+def test_command_response_waits_for_acknowledged_status_without_sleeping():
+    proxy = function_source("_proxy_manager_operation")
+    mark = proxy.index("self._manager_status_sync.mark(command)")
+    dispatch = proxy.index("self._manager_command(command)")
+    rejection = proxy.index("raise RuntimeError(service_message)")
+    wait = proxy.index("self._manager_status_sync.wait_for_ack(")
+    snapshot = proxy.index('return rover_state.section("mission")')
+    assert mark < dispatch < rejection < wait < snapshot
+    assert "time.sleep" not in proxy
+    # A sync timeout is logged/recorded; only a manager rejection raises.
+    assert proxy.count("raise ") == 1
+    assert "last_command_status_sync" in proxy
+    assert "MANAGER_STATUS_SYNC_TIMEOUT_SEC = 0.5" in BRIDGE_SOURCE
+
+
+def test_status_ack_is_observed_only_after_state_commit():
+    callback = function_source("_mission_status_callback")
+    commit = callback.rindex('rover_state.update(\n            "mission",')
+    observe = callback.index("self._manager_status_sync.observe(payload)")
+    notify = callback.rindex("_notify_authoritative_state_changed()")
+    assert commit < observe < notify
+
+
+def test_sync_primitive_is_condition_based():
+    sync_source = (PACKAGE_ROOT / "rover_backend" / "manager_status_sync.py").read_text(
+        encoding="utf-8"
+    )
+    assert "threading.Condition()" in sync_source
+    assert "wait_for(" in sync_source
+    assert "time.sleep" not in sync_source

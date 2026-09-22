@@ -91,3 +91,17 @@ def test_release_validates_generation_before_clearing_estop_latch():
     assert request_read < generation_check < latch_release
     assert "response.success = False" in release
     assert "response.current_generation = current_generation" in release
+
+
+def test_command_ack_published_only_after_successful_handler():
+    wrapper = function_source("_acknowledged_trigger")
+    handler = wrapper.index("response = handler(request, response)")
+    gate = wrapper.index("if response.success:")
+    bump = wrapper.index("self._command_acks[command] = (")
+    publish = wrapper.index("self._publish_status(force=True)")
+    assert handler < gate < bump < publish
+    for command in ("start", "pause", "resume", "next_point", "skip_point", "stop"):
+        assert f'self._acknowledged_trigger("{command}", ' in SOURCE
+    payload = function_source("_status_payload")
+    assert '"command_acks": dict(self._command_acks)' in payload
+    assert '"command_ack_epoch": self._command_ack_epoch' in payload

@@ -71,6 +71,18 @@ from mission_manager.precision_feature_gates import (
 )
 
 
+# Trigger commands whose success is acknowledged in /mission_manager/status
+# (see MissionManager._acknowledged_trigger).
+ACKNOWLEDGED_TRIGGER_COMMANDS = (
+    "start",
+    "pause",
+    "resume",
+    "next_point",
+    "skip_point",
+    "stop",
+)
+
+
 class MissionManager(Node):
     """Mission/safety/marking state machine. Motion control is RPP's job."""
 
@@ -113,6 +125,15 @@ class MissionManager(Node):
         self._mission_service_group = MutuallyExclusiveCallbackGroup()
 
         self._lock = threading.RLock()
+
+        # Per-command success acknowledgments, published in status. The
+        # backend waits for its command's counter to advance so its HTTP
+        # response carries the status this command produced. The epoch makes
+        # a manager restart a new counter domain rather than a regression.
+        self._command_ack_epoch = uuid.uuid4().hex
+        self._command_acks: dict[str, int] = {
+            name: 0 for name in ACKNOWLEDGED_TRIGGER_COMMANDS
+        }
 
         # ----------------------------------------------------------
         # Parameters: mission/safety/marking only
@@ -438,37 +459,37 @@ class MissionManager(Node):
         self.create_service(
             Trigger,
             "/mission_manager/start",
-            self._start_service,
+            self._acknowledged_trigger("start", self._start_service),
             callback_group=self._mission_service_group,
         )
         self.create_service(
             Trigger,
             "/mission_manager/pause",
-            self._pause_service,
+            self._acknowledged_trigger("pause", self._pause_service),
             callback_group=self._mission_service_group,
         )
         self.create_service(
             Trigger,
             "/mission_manager/resume",
-            self._resume_service,
+            self._acknowledged_trigger("resume", self._resume_service),
             callback_group=self._mission_service_group,
         )
         self.create_service(
             Trigger,
             "/mission_manager/next_point",
-            self._next_point_service,
+            self._acknowledged_trigger("next_point", self._next_point_service),
             callback_group=self._mission_service_group,
         )
         self.create_service(
             Trigger,
             "/mission_manager/skip_point",
-            self._skip_point_service,
+            self._acknowledged_trigger("skip_point", self._skip_point_service),
             callback_group=self._mission_service_group,
         )
         self.create_service(
             Trigger,
             "/mission_manager/stop",
-            self._stop_service,
+            self._acknowledged_trigger("stop", self._stop_service),
             callback_group=self._mission_service_group,
         )
         self.create_service(
@@ -3459,6 +3480,8 @@ class MissionManager(Node):
             "mission_enable": self._mission_enable,
             "emergency_stop": self._emergency_stop,
             "safety_generation": self._safety_generation,
+            "command_ack_epoch": self._command_ack_epoch,
+            "command_acks": dict(self._command_acks),
             "px4_connected": self._fcu_connected,
             "px4_mode": self._px4_mode,
             "px4_armed": self._px4_armed,
@@ -3553,6 +3576,29 @@ class MissionManager(Node):
             "start_failed_stage": self._start_failed_stage,
             "start_debug": dict(self._start_debug),
         }
+
+    def _acknowledged_trigger(self, command: str, handler):
+        """Wrap a Trigger handler so success is acknowledged in status.
+
+        The handler's own ordering (safety checks, motion enable, STOP disarm
+        confirmation) is untouched. Only after it returns success is the
+        counter advanced and a status force-published, which happens before
+        the service response is sent.
+        """
+
+        def callback(
+            request: Trigger.Request, response: Trigger.Response
+        ) -> Trigger.Response:
+            response = handler(request, response)
+            if response.success:
+                with self._lock:
+                    self._command_acks[command] = (
+                        self._command_acks.get(command, 0) + 1
+                    )
+                    self._publish_status(force=True)
+            return response
+
+        return callback
 
     def _publish_status(self, *, force: bool = False) -> None:
         now = time.monotonic()
