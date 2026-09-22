@@ -101,6 +101,7 @@ class TrajectoryGenerator(Node):
     WGS84_F = 1.0 / 298.257223563
 
     CONTROL_HZ = 5.0
+    PLACEMENT_KICK_DELAY_SEC = 0.001
 
     # PX4 broadcasts GPS_GLOBAL_ORIGIN once, on change -- not as a stream.
     # If nothing is listening at that instant (e.g. this node's MAVROS
@@ -636,6 +637,15 @@ class TrajectoryGenerator(Node):
             self._control_loop,
         )
 
+        # Event-driven placement: reset by PREPARE and by the sensor
+        # callbacks that complete the placement reference, so placement
+        # runs right after that callback instead of on the next 5 Hz tick.
+        self._placement_kick_timer = self.create_timer(
+            self.PLACEMENT_KICK_DELAY_SEC,
+            self._on_placement_kick,
+        )
+        self._placement_kick_timer.cancel()
+
         self.get_logger().warn("===== TRAJECTORY GENERATOR STARTED =====")
 
         self.get_logger().warn(f"Mission file  : {self.mission_file}")
@@ -757,6 +767,8 @@ class TrajectoryGenerator(Node):
                     "Re-prepare the surveyed mission."
                 )
 
+            self._request_placement_if_waiting_locked()
+
         if previous is None:
             self.get_logger().warn(
                 "PX4 gp_origin received: "
@@ -855,6 +867,7 @@ class TrajectoryGenerator(Node):
         with self._lock:
             self.latest_fused_global_fix = message
             self.latest_fused_global_time = self.get_clock().now()
+            self._request_placement_if_waiting_locked()
 
     def _local_odom_callback(
         self,
@@ -863,6 +876,7 @@ class TrajectoryGenerator(Node):
         with self._lock:
             self.latest_local_odom = message
             self.latest_local_time = self.get_clock().now()
+            self._request_placement_if_waiting_locked()
 
     def _gps_status_callback(
         self,
@@ -1011,6 +1025,11 @@ class TrajectoryGenerator(Node):
                     state="PREPARING",
                     message=("Mission accepted for " "trajectory preparation"),
                 )
+
+                # Place right after this service returns: immediately for a
+                # local mission, or for a GPS mission whose PX4 frame
+                # reference is already valid.
+                self._request_placement_attempt()
 
                 response.success = True
 
@@ -2619,154 +2638,211 @@ class TrajectoryGenerator(Node):
     def _control_loop(
         self,
     ) -> None:
+        """Watchdog/fallback tick.
+
+        Normal placement is event-driven (_request_placement_attempt). This
+        tick keeps the gp_origin request retry alive, reports why a GPS
+        mission is still waiting, and retries placement as a fallback.
+        """
+
         # Runs regardless of prepare_requested so the origin is already
         # available by the time an operator actually prepares a mission,
         # instead of only starting the retry once PREPARE stalls on it.
         self._maybe_request_gp_origin()
 
         with self._lock:
-            if not self.prepare_requested:
-                return
+            self._try_place_prepared_mission_locked(report_waiting=True)
 
-            if self.raw_coordinate_mode is None or not self.raw_marking_points:
-                self._set_error("No valid mission is loaded")
+    def _request_placement_attempt(self) -> None:
+        """Schedule one placement attempt right after this callback returns.
 
-                return
+        Placement can generate a large path, so it must not run inside the
+        PREPARE service callback (backend waits on its response) or inside
+        a high-rate sensor callback. A single persistent one-shot timer is
+        reset instead; repeated requests before it fires coalesce.
+        """
 
-            if self.raw_coordinate_mode == "gps":
-                (
-                    reference_ready,
-                    reason,
-                ) = self._placement_reference_is_ready()
+        self._placement_kick_timer.reset()
 
-                if not reference_ready:
+    def _on_placement_kick(self) -> None:
+        self._placement_kick_timer.cancel()
+
+        with self._lock:
+            self._try_place_prepared_mission_locked(report_waiting=False)
+
+    def _request_placement_if_waiting_locked(self) -> None:
+        """Cheap sensor-callback hook: kick only while a GPS mission waits."""
+
+        if self.prepare_requested and self.raw_coordinate_mode == "gps":
+            self._request_placement_attempt()
+
+    def _try_place_prepared_mission_locked(
+        self,
+        *,
+        report_waiting: bool,
+    ) -> bool:
+        """Place the prepared mission at most once. Caller holds self._lock.
+
+        Returns True only when this call produced the READY/PLACED path.
+        prepare_requested is the one-shot guard: success and every failure
+        clear it, so repeated triggers cannot regenerate or republish.
+        """
+
+        if not self.prepare_requested:
+            return False
+
+        if self.raw_coordinate_mode is None or not self.raw_marking_points:
+            self._set_error("No valid mission is loaded")
+
+            return False
+
+        if not self._source_topology_is_current():
+            self._set_error(
+                "Source topology does not belong to the current mission; "
+                "re-prepare the surveyed mission"
+            )
+
+            return False
+
+        if self.raw_coordinate_mode == "gps":
+            (
+                reference_ready,
+                reason,
+            ) = self._placement_reference_is_ready()
+
+            if not reference_ready:
+                if report_waiting:
                     self.rtk_ready_since = None
 
                     self._publish_ready(False)
 
                     self._log_waiting(reason)
 
-                    return
+                return False
 
-                # Placement projects surveyed lat/lon through PX4 gp_origin
-                # only; it never consumes the live RTK position, so neither
-                # RTK quality nor a fixed-time dwell adds placement evidence.
-                # READY therefore does not imply RTK FIXED. Motion is gated
-                # by Mission Manager's fresh RTK FIXED check at
-                # START/RESUME/NEXT.
-                #
-                # rtk_stable_sec is still declared for configuration
-                # compatibility but no longer gates placement.
-                self.rtk_ready_since = None
+            # Placement projects surveyed lat/lon through PX4 gp_origin
+            # only; it never consumes the live RTK position, so neither
+            # RTK quality nor a fixed-time dwell adds placement evidence.
+            # READY therefore does not imply RTK FIXED. Motion is gated
+            # by Mission Manager's fresh RTK FIXED check at
+            # START/RESUME/NEXT.
+            #
+            # rtk_stable_sec is still declared for configuration
+            # compatibility but no longer gates placement.
+            self.rtk_ready_since = None
 
-            try:
-                # PREPARE creates only fixed surveyed mission geometry.
-                # RPP captures fresh current C at START after ARM.
-                _generation_started_monotonic = time.monotonic()
+        try:
+            # PREPARE creates only fixed surveyed mission geometry.
+            # RPP captures fresh current C at START after ARM.
+            _generation_started_monotonic = time.monotonic()
 
-                marking_points = self._convert_markings_to_local()
+            marking_points = self._convert_markings_to_local()
 
-                (
-                    navigation_points,
-                    point_types,
-                    marking_indices,
-                    dummy_count,
-                ) = self._generate_navigation_path(
-                    marking_points,
-                )
+            (
+                navigation_points,
+                point_types,
+                marking_indices,
+                dummy_count,
+            ) = self._generate_navigation_path(
+                marking_points,
+            )
 
-                stamp = self.get_clock().now().to_msg()
+            stamp = self.get_clock().now().to_msg()
 
-                mission_path = self._build_path(
-                    marking_points,
-                    stamp,
-                )
+            mission_path = self._build_path(
+                marking_points,
+                stamp,
+            )
 
-                navigation_path = self._build_path(
-                    navigation_points,
-                    stamp,
-                )
+            navigation_path = self._build_path(
+                navigation_points,
+                stamp,
+            )
 
-                _generation_elapsed_ms = (
-                    time.monotonic() - _generation_started_monotonic
-                ) * 1000.0
-                self.get_logger().info(
-                    "PATH GENERATION | "
-                    f"points={len(navigation_points)} "
-                    f"elapsed={_generation_elapsed_ms:.1f}ms"
-                )
+            _generation_elapsed_ms = (
+                time.monotonic() - _generation_started_monotonic
+            ) * 1000.0
+            self.get_logger().info(
+                "PATH GENERATION | "
+                f"points={len(navigation_points)} "
+                f"elapsed={_generation_elapsed_ms:.1f}ms"
+            )
 
-                signature = self._make_signature(
-                    navigation_points=(navigation_points),
-                    marking_points=(marking_points),
-                    point_types=(point_types),
-                    marking_indices=(marking_indices),
-                )
+            signature = self._make_signature(
+                navigation_points=(navigation_points),
+                marking_points=(marking_points),
+                point_types=(point_types),
+                marking_indices=(marking_indices),
+            )
 
-                self.prepared_marking_points = marking_points
+            self.prepared_marking_points = marking_points
 
-                self.prepared_navigation_points = navigation_points
+            self.prepared_navigation_points = navigation_points
 
-                self.prepared_path_types = point_types
+            self.prepared_path_types = point_types
 
-                self.prepared_marking_indices = marking_indices
+            self.prepared_marking_indices = marking_indices
 
-                self.prepared_path_signature = signature
+            self.prepared_path_signature = signature
 
-                self.mission_waypoints_pub.publish(mission_path)
+            self.mission_waypoints_pub.publish(mission_path)
 
-                self.nav_path_pub.publish(navigation_path)
+            self.nav_path_pub.publish(navigation_path)
 
-                self._publish_path_metadata(
-                    point_types=point_types,
-                    marking_indices=(marking_indices),
-                )
+            self._publish_path_metadata(
+                point_types=point_types,
+                marking_indices=(marking_indices),
+            )
 
-                # Commit marker: subscribers install the separately retained
-                # path components only after this matching signature arrives.
-                self._publish_path_signature(signature)
+            # Commit marker: subscribers install the separately retained
+            # path components only after this matching signature arrives.
+            self._publish_path_signature(signature)
 
-                self._publish_survey_targets(signature)
+            self._publish_survey_targets(signature)
 
-                self.prepare_requested = False
-                self.preparing = False
-                self.ready = True
-                self.last_error = None
+            self.prepare_requested = False
+            self.preparing = False
+            self.ready = True
+            self.last_error = None
 
-                self._publish_ready(True)
+            self._publish_ready(True)
 
-                self._publish_status(
-                    state="READY",
-                    message=("Mission trajectory prepared"),
-                    dummy_count=dummy_count,
-                )
+            self._publish_status(
+                state="READY",
+                message=("Mission trajectory prepared"),
+                dummy_count=dummy_count,
+            )
 
-                pass_through_count = sum(
-                    1
-                    for value in point_types
-                    if (value == self.POINT_TYPE_PASS_THROUGH)
-                )
+            pass_through_count = sum(
+                1
+                for value in point_types
+                if (value == self.POINT_TYPE_PASS_THROUGH)
+            )
 
-                self.get_logger().warn("===== TRAJECTORY READY =====")
+            self.get_logger().warn("===== TRAJECTORY READY =====")
 
-                self.get_logger().warn(f"Mission ID        : " f"{self.mission_id}")
+            self.get_logger().warn(f"Mission ID        : " f"{self.mission_id}")
 
-                self.get_logger().warn(f"Signature         : " f"{signature[:12]}")
+            self.get_logger().warn(f"Signature         : " f"{signature[:12]}")
 
-                self.get_logger().warn(f"Marking points    : " f"{len(marking_points)}")
+            self.get_logger().warn(f"Marking points    : " f"{len(marking_points)}")
 
-                self.get_logger().warn(f"Dummy points      : " f"{dummy_count}")
+            self.get_logger().warn(f"Dummy points      : " f"{dummy_count}")
 
-                self.get_logger().warn(f"Pass-through pts  : " f"{pass_through_count}")
+            self.get_logger().warn(f"Pass-through pts  : " f"{pass_through_count}")
 
-                self.get_logger().warn(
-                    f"Navigation points : " f"{len(navigation_points)}"
-                )
+            self.get_logger().warn(
+                f"Navigation points : " f"{len(navigation_points)}"
+            )
 
-                self.get_logger().warn("Ready topic        : true")
+            self.get_logger().warn("Ready topic        : true")
 
-            except ValueError as error:
-                self._set_error(str(error))
+        except ValueError as error:
+            self._set_error(str(error))
+
+            return False
+
+        return True
 
 
 def main(

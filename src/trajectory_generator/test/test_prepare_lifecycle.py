@@ -11,7 +11,7 @@ import pytest
 
 pytest.importorskip("rclpy")
 
-from trajectory_generator.trajectory_generator_node import TrajectoryGenerator
+from trajectory_generator.trajectory_generator_node import TrajectoryGenerator  # noqa: E402
 
 
 class _Logger:
@@ -34,6 +34,21 @@ def _bind(instance, name):
             instance,
         ),
     )
+
+
+class _FakeTimer:
+    """Stands in for the one-shot placement timer; tests fire it by hand."""
+
+    def __init__(self):
+        self.armed = False
+        self.reset_count = 0
+
+    def reset(self):
+        self.armed = True
+        self.reset_count += 1
+
+    def cancel(self):
+        self.armed = False
 
 
 def _fake_generator():
@@ -144,6 +159,12 @@ def _fake_generator():
     _bind(node, "_age_seconds")
     _bind(node, "_rtk_diagnostic_status")
     _bind(node, "_placement_reference_is_ready")
+    _bind(node, "_request_placement_attempt")
+    _bind(node, "_request_placement_if_waiting_locked")
+    _bind(node, "_on_placement_kick")
+    _bind(node, "_try_place_prepared_mission_locked")
+
+    node._placement_kick_timer = _FakeTimer()
     _bind(node, "_clear_prepared_state")
     _bind(node, "_reset_all_runtime")
     _bind(node, "_set_error")
