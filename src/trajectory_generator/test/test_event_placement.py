@@ -356,3 +356,53 @@ def test_surveyed_points_are_not_moved_to_rover_pose():
 
     assert node.prepared_marking_points[0] == pytest.approx((0.0, 0.0))
     assert node.prepared_navigation_points[0] == pytest.approx((0.0, 0.0))
+
+
+def test_timing_evidence_covers_prepare_to_ready():
+    node = _placement_generator()
+    _install_frame(node)
+    good_odom = node.latest_local_odom
+    node.latest_local_odom = None
+    _mission(node, "gps-a", "gps", GPS_SERPENTINE)
+
+    _prepare(node)
+    _fire_kick(node)
+
+    waiting = node._build_status_payload(state="PREPARING", message="w")
+    timing = waiting["timing"]
+    assert timing["armed_reason"] == "prepare"
+    assert timing["source_compile_ms"] >= 0.0
+    assert timing["prepare_to_compiled_ms"] >= 0.0
+    assert "local odometry unavailable" in timing["waiting_reason"]
+    assert "prepare_to_ready_ms" not in timing
+
+    TrajectoryGenerator._local_odom_callback(node, good_odom)
+    _fire_kick(node)
+
+    ready = [e[1] for e in node.events if e[0] == "status"][-1]
+    timing = ready["timing"]
+    assert ready["state"] == "READY"
+    assert "waiting_reason" not in timing
+    assert timing["placement_evaluations"] == 2
+    for key in (
+        "armed_to_reference_valid_ms",
+        "generation_ms",
+        "armed_to_ready_ms",
+        "prepare_to_ready_ms",
+    ):
+        assert timing[key] >= 0.0, key
+    assert timing["armed_to_ready_ms"] <= timing["prepare_to_ready_ms"]
+
+
+def test_clear_resets_timing_evidence():
+    node = _placement_generator()
+    _mission(node, "local-a", "local", LOCAL_LINE, extension="DISABLE")
+    _prepare(node)
+    _fire_kick(node)
+    assert node.placement_timing
+
+    TrajectoryGenerator._reset_all_runtime(node, publish_empty=True)
+
+    assert node.placement_timing == {}
+    payload = node._build_status_payload(state="IDLE", message="cleared")
+    assert payload["timing"] == {}

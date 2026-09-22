@@ -612,6 +612,12 @@ class TrajectoryGenerator(Node):
         self.source_topology_checksum: str | None = None
         self.source_topology_compile_ms: float | None = None
 
+        # Monotonic latency evidence for the current PREPARE transaction,
+        # published as status["timing"]. Durations only; no wall clock.
+        self.placement_timing: dict[str, Any] = {}
+        self._prepare_received_monotonic: float | None = None
+        self._placement_armed_monotonic: float | None = None
+
         self.extension_mode: str | None = None
 
         self.dummy_point_distance_m: float | None = None
@@ -861,6 +867,7 @@ class TrajectoryGenerator(Node):
         self.prepare_requested = True
         self.preparing = True
         self.last_error = None
+        self._arm_placement_timing_locked("fcu_session")
 
         self._publish_status(
             state="PREPARING",
@@ -985,6 +992,10 @@ class TrajectoryGenerator(Node):
         """Load mission.csv and request path preparation."""
 
         with self._lock:
+            self._prepare_received_monotonic = time.monotonic()
+            self._placement_armed_monotonic = None
+            self.placement_timing = {}
+
             # A PREPARE always establishes a new source compilation
             # transaction. Never expose topology from the previous mission
             # while loading/validating the new mission.
@@ -1064,6 +1075,12 @@ class TrajectoryGenerator(Node):
                 self.source_topology_compile_ms = (
                     time.monotonic() - source_compile_started
                 ) * 1000.0
+                self.placement_timing["source_compile_ms"] = round(
+                    self.source_topology_compile_ms, 1
+                )
+                self.placement_timing["prepare_to_compiled_ms"] = (
+                    self._ms_since(self._prepare_received_monotonic)
+                )
 
                 # Bind the compiled semantics to the exact uploaded mission.
                 # Part 2B must reject this topology if either identity differs.
@@ -1100,6 +1117,7 @@ class TrajectoryGenerator(Node):
                 # Place right after this service returns: immediately for a
                 # local mission, or for a GPS mission whose PX4 frame
                 # reference is already valid.
+                self._arm_placement_timing_locked("prepare")
                 self._request_placement_attempt()
 
                 response.success = True
@@ -2477,6 +2495,7 @@ class TrajectoryGenerator(Node):
                     if source_topology is not None
                     else 0
                 ),
+                "timing": dict(self.placement_timing),
                 "source_topology_compile_ms": (
                     self.source_topology_compile_ms
                     if source_current
@@ -2691,6 +2710,10 @@ class TrajectoryGenerator(Node):
         self.source_topology_checksum = None
         self.source_topology_compile_ms = None
 
+        self.placement_timing = {}
+        self._prepare_received_monotonic = None
+        self._placement_armed_monotonic = None
+
         self.extension_mode = None
         self.dummy_point_distance_m = None
         self.row_transition_threshold_m = None
@@ -2754,6 +2777,28 @@ class TrajectoryGenerator(Node):
         with self._lock:
             self._try_place_prepared_mission_locked(report_waiting=True)
 
+    @staticmethod
+    def _ms_since(started: float | None) -> float | None:
+        if started is None:
+            return None
+        return round((time.monotonic() - started) * 1000.0, 1)
+
+    def _arm_placement_timing_locked(self, reason: str) -> None:
+        """Start timing one placement run (PREPARE or FCU-session re-arm)."""
+
+        self._placement_armed_monotonic = time.monotonic()
+        for key in (
+            "placement_evaluations",
+            "waiting_reason",
+            "armed_to_reference_valid_ms",
+            "generation_ms",
+            "armed_to_ready_ms",
+            "prepare_to_ready_ms",
+        ):
+            self.placement_timing.pop(key, None)
+        self.placement_timing["armed_reason"] = reason
+        self.placement_timing["placement_evaluations"] = 0
+
     def _request_placement_attempt(self) -> None:
         """Schedule one placement attempt right after this callback returns.
 
@@ -2805,6 +2850,11 @@ class TrajectoryGenerator(Node):
 
             return False
 
+        timing = self.placement_timing
+        timing["placement_evaluations"] = (
+            int(timing.get("placement_evaluations", 0)) + 1
+        )
+
         if self.raw_coordinate_mode == "gps":
             (
                 reference_ready,
@@ -2812,6 +2862,8 @@ class TrajectoryGenerator(Node):
             ) = self._placement_reference_is_ready()
 
             if not reference_ready:
+                timing["waiting_reason"] = reason
+
                 if report_waiting:
                     self.rtk_ready_since = None
 
@@ -2831,6 +2883,11 @@ class TrajectoryGenerator(Node):
             # rtk_stable_sec is still declared for configuration
             # compatibility but no longer gates placement.
             self.rtk_ready_since = None
+
+            timing.pop("waiting_reason", None)
+            timing["armed_to_reference_valid_ms"] = self._ms_since(
+                self._placement_armed_monotonic
+            )
 
         try:
             # PREPARE creates only fixed surveyed mission geometry.
@@ -2868,6 +2925,7 @@ class TrajectoryGenerator(Node):
                 f"points={len(navigation_points)} "
                 f"elapsed={_generation_elapsed_ms:.1f}ms"
             )
+            timing["generation_ms"] = round(_generation_elapsed_ms, 1)
 
             signature = self._make_signature(
                 navigation_points=(navigation_points),
@@ -2908,6 +2966,13 @@ class TrajectoryGenerator(Node):
             self.ready = True
             self.last_error = None
 
+            timing["armed_to_ready_ms"] = self._ms_since(
+                self._placement_armed_monotonic
+            )
+            timing["prepare_to_ready_ms"] = self._ms_since(
+                self._prepare_received_monotonic
+            )
+
             self._publish_ready(True)
 
             self._publish_status(
@@ -2939,6 +3004,11 @@ class TrajectoryGenerator(Node):
             )
 
             self.get_logger().warn("Ready topic        : true")
+
+            self.get_logger().warn(
+                "PLACEMENT TIMING | "
+                + " ".join(f"{key}={value}" for key, value in timing.items())
+            )
 
         except ValueError as error:
             self._set_error(str(error))

@@ -136,6 +136,8 @@ def test_fresh_session_origin_restores_placement_exactly_once():
     assert node._trajectory_phase() == "PLACED"
     assert node.placed_session_generation == node.fcu_session_generation
     assert node.placed_session_generation != first_session
+    assert node.placement_timing["armed_reason"] == "fcu_session"
+    assert node.placement_timing["armed_to_ready_ms"] >= 0.0
     # Same surveyed mission, same origin: identical geometry.
     assert node.prepared_path_signature == first_signature
     assert len(_signatures(node)) == 1

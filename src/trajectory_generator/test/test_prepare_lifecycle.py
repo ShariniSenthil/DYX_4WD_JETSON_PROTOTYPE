@@ -170,6 +170,12 @@ def _fake_generator():
     _bind(node, "_try_place_prepared_mission_locked")
     _bind(node, "_advance_fcu_session_locked")
     _bind(node, "_mavros_state_callback")
+    _bind(node, "_arm_placement_timing_locked")
+    node._ms_since = TrajectoryGenerator._ms_since
+
+    node.placement_timing = {}
+    node._prepare_received_monotonic = None
+    node._placement_armed_monotonic = None
 
     node._placement_kick_timer = _FakeTimer()
     _bind(node, "_clear_prepared_state")
