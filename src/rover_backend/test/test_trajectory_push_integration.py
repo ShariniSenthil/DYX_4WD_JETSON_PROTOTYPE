@@ -274,6 +274,7 @@ def test_realtime_loop_expires_pending_snapshot_without_clients_or_rest(context)
             "realtime_metrics": RealtimeMetrics(enabled=False),
             "timed": timed,
             "ChangeDrivenEmitter": ChangeDrivenEmitter,
+            "_emit_pending_point_events": lambda deliver: asyncio.sleep(0),
         })
         broadcast = production_function("realtime.py", "_broadcast_loop", context)
         await asyncio.wait_for(broadcast(), timeout=1)

@@ -1,11 +1,19 @@
-"""Realtime Socket.IO transport contract.
+"""Realtime Socket.IO transport contract (Phases 4-6, 8).
 
-High-rate telemetry size is bounded independent of mission history, and
-socket mission_status is change-driven.
+Telemetry size is bounded, mission_status is change-driven, and every point
+event is delivered once, in order, carrying the exact stored point result.
 """
 
 from __future__ import annotations
 
+import ast
+import asyncio
+import collections
+import copy
+import json
+import traceback
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +23,7 @@ from helpers.realtime_fixtures import synthetic_point_result
 from rover_backend import realtime_contract as rc
 from rover_backend.realtime_contract import payload_size_bytes
 
+SOURCE = Path(__file__).resolve().parents[1] / "rover_backend"
 ADAPTER_MISSION_FIELDS = {
     # px4TelemetryAdapter.toRoverTelemetry reads these from telemetry.mission
     "active_point_index", "active_point_number", "active_point_state",
@@ -166,3 +175,188 @@ def test_change_driven_emitter_heartbeat_and_immediate_change():
     assert emitter.should_emit("b") is True          # change: immediate
     emitter.reset()
     assert emitter.should_emit("b") is True          # new client after reset
+
+
+# --------------------------------------------------------------------- C
+
+
+def test_point_result_event_copies_exact_stored_result():
+    stored = synthetic_point_result(24)
+    raw_event = {
+        "event": "COMPLETED", "point_id": "P0025", "point_index": 24,
+        "mission_run_id": "run-1", "received_at": "t",
+        "accuracy": stored["accuracy"],
+    }
+    event = rc.build_point_result_event(raw_event, stored, "mission-1")
+    assert event["contract"] == "point_result@1"
+    assert event["mission_id"] == "mission-1"
+    assert event["point_result"]["mission_id"] == "mission-1"
+    assert "event_history" not in event["point_result"]
+    accuracy = event["point_result"]["accuracy"]
+    assert accuracy == stored["accuracy"]
+    assert accuracy["measurement_source"] == "RPP_TERMINAL_RESULT"
+    for key in ("along_track_error_mm", "cross_track_error_mm",
+                "overall_accuracy_mm", "tolerance_mm", "within_tolerance",
+                "timestamp_unix_ns"):
+        assert accuracy[key] == stored["accuracy"][key]
+    assert event["point_result"]["spray"] == stored["spray"]
+    # Original event fields are preserved for existing consumers.
+    assert event["event"] == "COMPLETED" and event["point_index"] == 24
+    assert rc.point_event_socket_name(event) == "point_completed"
+    assert rc.point_event_socket_name({"event": "ACCURACY_ACHIEVED"}) == "point_event"
+
+
+def test_point_result_event_never_invents_a_result():
+    event = rc.build_point_result_event({"event": "MISSION_TERMINATED"}, None, "m")
+    assert event["point_result"] is None
+
+
+# ------------------------------------------------------- broadcast loop
+
+
+def _production(name, namespace):
+    tree = ast.parse((SOURCE / "realtime.py").read_text())
+    fn = next(n for n in tree.body
+              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "realtime.py", "exec"), namespace)
+    return namespace[name]
+
+
+def test_loop_emits_every_point_event_in_order_and_mission_status_on_change(
+    routes, state,
+):
+    populate_mission(state, 5, completed=2)
+    state.update("mission", emergency_stop=False)
+    emitted: list[tuple[str, dict]] = []
+    failures: list[str] = []
+    queue: collections.deque = collections.deque()
+
+    async def run():
+        stop = asyncio.Event()
+        changed = asyncio.Event()
+        iterations = {"n": 0}
+        script = {
+            # iteration -> action before records are read
+            1: lambda: [queue.append({"event": "ACCURACY_ACHIEVED", "point_id": "P0003"}),
+                        queue.append({"event": "COMPLETED", "point_id": "P0003"})],
+            4: lambda: state.update("mission", emergency_stop=True),
+        }
+
+        async def records():
+            iterations["n"] += 1
+            action = script.get(iterations["n"])
+            if action:
+                action()
+            if iterations["n"] >= 7:
+                stop.set()
+                changed.set()
+            return [("sid", object())]
+
+        async def fake_emit(event, payload, **_kw):
+            emitted.append((event, copy.deepcopy(payload)))
+
+        namespace = {
+            "asyncio": asyncio,
+            "_stop_event": stop,
+            "_state_change_event": changed,
+            "settings": SimpleNamespace(telemetry_broadcast_hz=200,
+                                        mission_status_heartbeat_sec=60.0,
+                                        socket_mission_status_compact=False,
+                                        arrival_settle_seconds=0.3,
+                                        marking_hold_seconds=3.0),
+            "_all_socket_records": records,
+            "trajectory_snapshot": SimpleNamespace(check_timeout=lambda: None),
+            "_pending_point_events": queue,
+            "_emit": fake_emit,
+            "build_mission_status_payload": routes.build_mission_status_payload,
+            "build_telemetry_payload": routes.build_telemetry_payload,
+            "rover_state": state,
+            "realtime_metrics": rc.RealtimeMetrics(enabled=False),
+            "timed": rc.timed,
+            "ChangeDrivenEmitter": rc.ChangeDrivenEmitter,
+            "mission_lifecycle_signature": rc.mission_lifecycle_signature,
+            "point_event_socket_name": rc.point_event_socket_name,
+            "_revalidate_socket_sessions": lambda: asyncio.sleep(0),
+            "LOGGER": SimpleNamespace(exception=lambda *a, **k: failures.append(
+                traceback.format_exc())),
+        }
+        _production("_stable_signature", namespace.setdefault("json", json) and namespace)
+        _production("_mission_progress_payload", namespace)
+        _production("_socket_mission_payload", namespace)
+        _production("_emit_pending_point_events", namespace)
+        loop = _production("_broadcast_loop", namespace)
+        await asyncio.wait_for(loop(), timeout=5)
+
+    asyncio.run(run())
+    assert failures == []
+    names = [name for name, _ in emitted]
+    # Both same-tick point events delivered, in order, before that tick's
+    # lifecycle packets.
+    point_events = [(n, p["event"]) for n, p in emitted if n.startswith("point_")]
+    assert point_events == [("point_event", "ACCURACY_ACHIEVED"),
+                            ("point_completed", "COMPLETED")]
+    # Telemetry every iteration; mission_status only first + on e-stop change.
+    assert names.count("telemetry") == 7
+    mission_status = [p for n, p in emitted if n == "mission_status"]
+    assert len(mission_status) == 2
+    assert mission_status[1]["emergency_stop"] is True
+    # Queued before iteration 1 reads state: delivered ahead of its telemetry.
+    assert names.index("point_completed") < names.index("telemetry")
+
+
+def test_ros_point_event_callback_publishes_exactly_the_stored_result(state):
+    """Run the production _point_event_callback body (ROS-free)."""
+
+    import math
+    from helpers.realtime_fixtures import synthetic_accuracy
+
+    tree = ast.parse((SOURCE / "ros_bridge.py").read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+               and n.name == "RoverBackendRosNode")
+    fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+              and n.name == "_point_event_callback")
+    published: list[dict] = []
+    namespace = {
+        "copy": copy, "Any": object, "String": object,
+        "rover_state": state,
+        "_json_object": json.loads,
+        "utc_now_iso": lambda: "2026-09-22T10:00:00+00:00",
+        "_safe_int": lambda v, d=0: int(v) if isinstance(v, int) else d,
+        "_finite_float": lambda v, d=None: (
+            float(v) if isinstance(v, (int, float)) and math.isfinite(v) else d),
+        "_notify_authoritative_state_changed": lambda: None,
+        "_publish_point_result_event": published.append,
+        "build_point_result_event": rc.build_point_result_event,
+    }
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "ros_bridge.py", "exec"), namespace)
+    node = SimpleNamespace(_mark_ros_message=lambda: None,
+                           _schedule_live_report_checkpoint=lambda: None,
+                           _schedule_terminal_mission_cleanup=lambda _e: None)
+    populate_mission(state, 3, completed=0)
+    accuracy = synthetic_accuracy(0)
+    for event_name in ("ACCURACY_ACHIEVED", "COMPLETED"):
+        message = SimpleNamespace(data=json.dumps({
+            "event": event_name, "point_id": "P0001", "point_index": 0,
+            "mission_run_id": "run-1", "state": "COMPLETED",
+            "accuracy": accuracy,
+            "spray": {"attempted": True, "outcome": "SUCCESS",
+                      "reason": None, "elapsed_sec": 0.5},
+        }))
+        namespace["_point_event_callback"](node, message)
+
+    assert [e["event"] for e in published] == ["ACCURACY_ACHIEVED", "COMPLETED"]
+    stored = state.section("mission")["point_results"]["P0001"]
+    last = published[-1]
+    assert last["mission_id"] == "mission-1"
+    assert last["mission_run_id"] == "run-1"
+    expected = {k: v for k, v in stored.items() if k != "event_history"}
+    expected["mission_id"] = "mission-1"
+    assert last["point_result"] == expected
+    for key in ("along_track_error_mm", "cross_track_error_mm",
+                "overall_accuracy_mm", "timestamp_unix_ns"):
+        assert last["point_result"]["accuracy"][key] == accuracy[key]
+    assert last["point_result"]["accuracy"]["measurement_source"] == "RPP_TERMINAL_RESULT"
+    # The published event is an independent copy of state.
+    last["point_result"]["accuracy"]["overall_accuracy_mm"] = -1
+    assert state.section("mission")["point_results"]["P0001"]["accuracy"][
+        "overall_accuracy_mm"] == accuracy["overall_accuracy_mm"]

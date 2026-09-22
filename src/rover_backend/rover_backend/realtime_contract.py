@@ -401,3 +401,49 @@ class ChangeDrivenEmitter:
     def reset(self) -> None:
         self._signature = None
         self._last_emit = None
+
+
+# ---------------------------------------------------------------------------
+# C. Point result events
+# ---------------------------------------------------------------------------
+
+_POINT_EVENT_SOCKET_NAMES = {
+    "COMPLETED": "point_completed",
+    "SKIPPED": "point_skipped",
+    "FAILED": "point_failed",
+}
+
+
+def point_event_socket_name(point_event: dict[str, Any]) -> str:
+    event_name = str(point_event.get("event", "")).strip().upper()
+    return _POINT_EVENT_SOCKET_NAMES.get(event_name, "point_event")
+
+
+def build_point_result_event(
+    point_event: dict[str, Any],
+    point_result: dict[str, Any] | None,
+    mission_id: Any,
+) -> dict[str, Any]:
+    """Socket payload for one Mission Manager point event.
+
+    The original event fields are preserved (existing consumers read them).
+    `point_result` is the exact immutable result the backend just stored in
+    point_results[point_id] -- the same object the canonical report is built
+    from -- minus its per-point event history. Accuracy is copied, never
+    recomputed.
+    """
+
+    payload = dict(point_event)
+    payload.setdefault("mission_id", mission_id)
+    if isinstance(point_result, dict):
+        result = {
+            key: value
+            for key, value in point_result.items()
+            if key != "event_history"
+        }
+        result.setdefault("mission_id", mission_id)
+        payload["point_result"] = result
+    else:
+        payload["point_result"] = None
+    payload["contract"] = "point_result@1"
+    return payload

@@ -28,7 +28,10 @@ Emitted events:
     point_skipped
     point_failed
     point_event
-        Events derived from /mission_manager/point_event through ros_bridge.
+        One event per /mission_manager/point_event, in arrival order, never
+        coalesced. Carries `point_result` (point_result@1): the exact
+        immutable result stored in point_results[point_id], including the
+        RPP_TERMINAL_RESULT accuracy and frozen RAW GNSS survey snapshot.
 
     mission_completed
         Emitted once when the mission enters COMPLETED.
@@ -45,6 +48,7 @@ Socket.IO auth payload, X-Rover-Token, or Authorization: Bearer.
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import threading
@@ -63,6 +67,7 @@ from rover_backend.realtime_contract import ChangeDrivenEmitter
 from rover_backend.realtime_contract import RealtimeMetrics
 from rover_backend.realtime_contract import build_mission_lifecycle_payload
 from rover_backend.realtime_contract import mission_lifecycle_signature
+from rover_backend.realtime_contract import point_event_socket_name
 from rover_backend.realtime_contract import timed
 from rover_backend.state import rover_state
 from rover_backend.state import utc_now_iso
@@ -123,6 +128,26 @@ async def _emit(event: str, payload: Any, **kwargs: Any) -> None:
 
     realtime_metrics.record_emit(event, payload)
     await sio.emit(event, payload, **kwargs)
+
+
+# Point events are queued by the ROS thread and emitted in arrival order.
+# (Previously the loop diffed last_point_event, so two events landing between
+# broadcast ticks -- e.g. ACCURACY_ACHIEVED then COMPLETED -- collapsed into
+# one and the first was never emitted.) deque append/popleft are thread-safe.
+_POINT_EVENT_QUEUE_LIMIT = 512
+_pending_point_events: collections.deque[dict[str, Any]] = collections.deque(
+    maxlen=_POINT_EVENT_QUEUE_LIMIT
+)
+
+
+def publish_point_event(event: dict[str, Any]) -> None:
+    """Queue one immutable point-result event (called from the ROS thread)."""
+
+    if _event_loop is None:
+        # Realtime not running: clients hydrate from the canonical report.
+        return
+    _pending_point_events.append(event)
+    notify_authoritative_state_changed()
 
 
 def _socket_mission_payload(mission: dict[str, Any]) -> dict[str, Any]:
@@ -564,21 +589,6 @@ def _mission_progress_payload(
     }
 
 
-def _point_event_name(
-    point_event: dict[str, Any],
-) -> str:
-    event_name = str(point_event.get("event", "")).strip().upper()
-
-    return {
-        "COMPLETED": "point_completed",
-        "SKIPPED": "point_skipped",
-        "FAILED": "point_failed",
-    }.get(
-        event_name,
-        "point_event",
-    )
-
-
 # ---------------------------------------------------------------------------
 # Authentication revocation
 # ---------------------------------------------------------------------------
@@ -697,6 +707,18 @@ async def _revalidate_socket_sessions() -> None:
         )
 
 
+async def _emit_pending_point_events(deliver: bool) -> None:
+    """Drain queued point events in order; drop them when nobody listens."""
+
+    while _pending_point_events:
+        try:
+            event = _pending_point_events.popleft()
+        except IndexError:
+            return
+        if deliver:
+            await _emit(point_event_socket_name(event), event)
+
+
 async def _broadcast_loop() -> None:
     stop_event = _stop_event
     state_change_event = _state_change_event
@@ -723,7 +745,6 @@ async def _broadcast_loop() -> None:
     )
     previous_progress_signature: str | None = None
     previous_safety_signature: str | None = None
-    previous_point_event_signature: str | None = None
     previous_mission_state: str | None = None
     next_deadline = asyncio.get_running_loop().time()
     periodic_iteration = True
@@ -734,6 +755,10 @@ async def _broadcast_loop() -> None:
             # snapshot lock (which can be held by projection) off the ASGI loop.
             await asyncio.to_thread(trajectory_snapshot.check_timeout)
             records = await _all_socket_records()
+
+            # Point results first: the row update must not queue behind the
+            # lifecycle packets of the same tick.
+            await _emit_pending_point_events(deliver=bool(records))
 
             if not records:
                 # A client that connects later gets a fresh snapshot on
@@ -801,22 +826,6 @@ async def _broadcast_loop() -> None:
                         "safety_state",
                         safety,
                     )
-
-                point_event = mission.get("last_point_event")
-
-                if isinstance(
-                    point_event,
-                    dict,
-                ):
-                    point_event_signature = _stable_signature(point_event)
-
-                    if point_event_signature != previous_point_event_signature:
-                        previous_point_event_signature = point_event_signature
-
-                        await _emit(
-                            _point_event_name(point_event),
-                            point_event,
-                        )
 
                 mission_state = (
                     str(
@@ -971,6 +980,7 @@ async def stop_realtime() -> None:
         _stop_event = None
         _state_change_event = None
         _event_loop = None
+        _pending_point_events.clear()
 
         LOGGER.info("Realtime broadcaster stopped")
 

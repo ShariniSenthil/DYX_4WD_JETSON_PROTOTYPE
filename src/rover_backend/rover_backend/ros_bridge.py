@@ -60,6 +60,7 @@ from mission_manager_interfaces.srv import ReleaseEmergencyStop
 from std_srvs.srv import Trigger
 
 from rover_backend.config import settings
+from rover_backend.realtime_contract import build_point_result_event
 from rover_backend.manager_status_sync import ManagerStatusSync
 from rover_backend.mission_report import MissionReportError
 from rover_backend.mission_report import StaleMissionTerminalEvent
@@ -99,6 +100,17 @@ def _notify_authoritative_state_changed() -> None:
         notify_authoritative_state_changed()
     except ImportError:
         # Realtime may not be imported during isolated ROS-node tests.
+        return
+
+
+def _publish_point_result_event(event: dict[str, Any]) -> None:
+    """Queue one point-result socket event (lazy import, see above)."""
+
+    try:
+        from rover_backend.realtime import publish_point_event
+
+        publish_point_event(event)
+    except ImportError:
         return
 
 
@@ -3205,6 +3217,17 @@ class RoverBackendRosNode(Node):
             waypoint_survey_run_id=(
                 stored_survey_run_id or None
             ),
+        )
+        # Immutable per-point socket event: the same result object just
+        # stored for the canonical report. Copy only -- no accuracy math.
+        _publish_point_result_event(
+            copy.deepcopy(
+                build_point_result_event(
+                    payload,
+                    point_results.get(point_id) if point_id else None,
+                    mission.get("mission_id"),
+                )
+            )
         )
         _notify_authoritative_state_changed()
 
