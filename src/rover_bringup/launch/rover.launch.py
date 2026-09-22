@@ -185,6 +185,11 @@ def generate_launch_description() -> LaunchDescription:
                         # Survey GPS -> gp_origin -> NED -> MAVROS ENU.
                         "localization_mode": "px4_origin",
                         "local_odom_topic": ("/mavros/" "local_position/odom"),
+                        # GPS status, RTK health/age, required_gps_fix_type
+                        # and max_correction_age_sec feed the status
+                        # rtk_diagnostic field ONLY. They do not gate
+                        # placement; the RTK motion gate is mission_manager
+                        # _rtk_motion_ok() at START/RESUME/NEXT.
                         "gps_status_topic": ("/mavros/" "gpsstatus/gps1/raw"),
                         "rtk_health_topic": ("/rtk_correction_bridge/" "healthy"),
                         ("rtk_correction_age_" "topic"): (
