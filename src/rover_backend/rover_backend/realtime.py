@@ -146,6 +146,12 @@ def publish_point_event(event: dict[str, Any]) -> None:
     if _event_loop is None:
         # Realtime not running: clients hydrate from the canonical report.
         return
+    if len(_pending_point_events) >= _POINT_EVENT_QUEUE_LIMIT:
+        # The oldest event is evicted; clients recover it from the report.
+        LOGGER.warning(
+            "point event queue full (%d); dropping oldest undelivered event",
+            _POINT_EVENT_QUEUE_LIMIT,
+        )
     _pending_point_events.append(event)
     notify_authoritative_state_changed()
 
@@ -804,6 +810,7 @@ async def _broadcast_loop() -> None:
                         "mission_status",
                         _socket_mission_payload(mission),
                     )
+                    mission_status_emitter.commit(mission_signature)
 
                 progress = _mission_progress_payload(mission)
 

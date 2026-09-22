@@ -69,6 +69,7 @@ def bridge():
     node = SimpleNamespace(
         _last_rpp_debug_monotonic=None,
         _last_rpp_accuracy_monotonic=None,
+        _rpp_accuracy_last_receipt_monotonic=None,
         _rpp_debug_dropped_frames=0,
         _mark_ros_message=lambda: None,
         RPP_ACCURACY_STALE_SEC=stale_sec,
@@ -98,9 +99,24 @@ def test_never_received_is_not_fresh(bridge):
     assert accuracy["rpp_accuracy_receive_age_ms"] is None
 
 
-def test_fresh_then_stale_while_retained_value_stays(bridge):
+def _stream(bridge, samples=2):
+    for _ in range(samples):
+        bridge.callback(SAMPLE)
+        bridge.clock.now += 0.05
+
+
+def test_lone_retained_sample_is_never_fresh(bridge):
+    # TRANSIENT_LOCAL redelivers the last sample on (re)subscription, e.g.
+    # after a backend restart while RPP is silent.
     bridge.callback(SAMPLE)
-    bridge.clock.now += 0.05
+    bridge.monitor()
+    accuracy = bridge.state.section("accuracy")
+    assert accuracy["available"] is True
+    assert accuracy["rpp_accuracy_stream_fresh"] is False
+
+
+def test_fresh_then_stale_while_retained_value_stays(bridge):
+    _stream(bridge)
     bridge.monitor()
     accuracy = bridge.state.section("accuracy")
     assert accuracy["rpp_accuracy_stream_fresh"] is True
@@ -116,8 +132,8 @@ def test_fresh_then_stale_while_retained_value_stays(bridge):
     assert accuracy["radial_error_mm"] == 5.0
     assert accuracy["available"] is True
 
-    # A new sample revives it.
-    bridge.callback(SAMPLE)
+    # A resumed stream (two samples in the window) revives it.
+    _stream(bridge)
     bridge.monitor()
     assert bridge.state.section("accuracy")["rpp_accuracy_stream_fresh"] is True
 

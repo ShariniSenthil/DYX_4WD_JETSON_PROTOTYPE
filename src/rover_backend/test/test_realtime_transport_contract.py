@@ -160,21 +160,44 @@ class Clock:
         return self.now
 
 
+def _emit_if_due(emitter, signature):
+    if emitter.should_emit(signature):
+        emitter.commit(signature)
+        return True
+    return False
+
+
 def test_change_driven_emitter_heartbeat_and_immediate_change():
     clock = Clock()
     emitter = rc.ChangeDrivenEmitter(heartbeat_sec=1.0, clock=clock)
-    assert emitter.should_emit("a") is True          # first packet
+    assert _emit_if_due(emitter, "a") is True        # first packet
     emitted = 0
     for _ in range(49):                               # ~1 s at 50 Hz, unchanged
         clock.now += 0.02
-        emitted += emitter.should_emit("a")
+        emitted += _emit_if_due(emitter, "a")
     assert emitted == 0
     clock.now += 0.02
-    assert emitter.should_emit("a") is True          # heartbeat
+    assert _emit_if_due(emitter, "a") is True        # heartbeat
     clock.now += 0.001
-    assert emitter.should_emit("b") is True          # change: immediate
+    assert _emit_if_due(emitter, "b") is True        # change: immediate
     emitter.reset()
-    assert emitter.should_emit("b") is True          # new client after reset
+    assert _emit_if_due(emitter, "b") is True        # new client after reset
+
+
+def test_failed_emit_is_retried_on_the_next_iteration():
+    clock = Clock()
+    emitter = rc.ChangeDrivenEmitter(heartbeat_sec=60.0, clock=clock)
+    _emit_if_due(emitter, "a")
+    assert emitter.should_emit("estop") is True
+    # emit raised -> commit() never called -> the change is still pending
+    clock.now += 0.02
+    assert emitter.should_emit("estop") is True
+
+
+def test_default_heartbeat_is_slow_for_the_deployed_tablet():
+    from rover_backend.config import settings
+    assert settings.mission_status_heartbeat_sec == 5.0
+    assert settings.socket_mission_status_compact is False
 
 
 # --------------------------------------------------------------------- C

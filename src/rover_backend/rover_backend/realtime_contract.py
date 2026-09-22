@@ -387,16 +387,20 @@ class ChangeDrivenEmitter:
     _last_emit: float | None = None
 
     def should_emit(self, signature: str) -> bool:
+        """Decide only; call `commit()` after the emit succeeds."""
+
         now = self.clock()
         changed = signature != self._signature
         due = self._last_emit is None or (
             self.heartbeat_sec > 0 and now - self._last_emit >= self.heartbeat_sec
         )
-        if changed or due:
-            self._signature = signature
-            self._last_emit = now
-            return True
-        return False
+        return changed or due
+
+    def commit(self, signature: str) -> None:
+        """Record a delivered packet. A failed emit is retried next iteration."""
+
+        self._signature = signature
+        self._last_emit = self.clock()
 
     def reset(self) -> None:
         self._signature = None

@@ -464,9 +464,11 @@ def load_settings() -> Settings:
         ),
         # Socket mission_status is change-driven; this only bounds how long an
         # unchanged lifecycle packet can go unsent (diagnostics/recovery).
+        # Kept slow on purpose: the b86b6af tablet build issues two REST reads
+        # (status + report) for every mission_status it receives.
         mission_status_heartbeat_sec=_read_float(
             "DYX_MISSION_STATUS_HEARTBEAT_SEC",
-            1.0,
+            5.0,
             minimum=0.2,
         ),
         # Compatibility switch. False keeps the full mission_status contract

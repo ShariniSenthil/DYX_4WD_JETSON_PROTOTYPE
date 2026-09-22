@@ -520,6 +520,7 @@ class RoverBackendRosNode(Node):
         # retained after RPP stops publishing, so freshness must be tracked
         # independently of the value.
         self._last_rpp_accuracy_monotonic: float | None = None
+        self._rpp_accuracy_last_receipt_monotonic: float | None = None
         self._last_rpp_debug_sequence: int | None = None
         self._rpp_debug_dropped_frames = 0
         self._rpp_debug_callback_group = MutuallyExclusiveCallbackGroup()
@@ -1564,7 +1565,18 @@ class RoverBackendRosNode(Node):
         if payload is None:
             return
 
-        self._last_rpp_accuracy_monotonic = time.monotonic()
+        # A lone sample -- e.g. the TRANSIENT_LOCAL retained one delivered on
+        # (re)subscription after a backend restart -- is not evidence of a
+        # live stream. Freshness needs two receipts within the stale window
+        # (costs one 50 ms cycle when the stream starts).
+        now = time.monotonic()
+        previous_receipt = self._rpp_accuracy_last_receipt_monotonic
+        self._rpp_accuracy_last_receipt_monotonic = now
+        if (
+            previous_receipt is not None
+            and now - previous_receipt <= self.RPP_ACCURACY_STALE_SEC
+        ):
+            self._last_rpp_accuracy_monotonic = now
 
         cross_track_mm = _finite_float(payload.get("cross_track_error_mm"))
         front_back_mm = _finite_float(payload.get("front_back_error_mm"))
