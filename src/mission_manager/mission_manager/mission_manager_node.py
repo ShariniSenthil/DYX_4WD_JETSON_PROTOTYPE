@@ -98,7 +98,6 @@ class MissionManager(Node):
     SERVICE_DISCOVERY_TIMEOUT_SEC = 3.0
     SERVICE_RESPONSE_TIMEOUT_SEC = 5.0
     VEHICLE_STATE_CONFIRM_TIMEOUT_SEC = 3.0
-    OFFBOARD_BEFORE_ARM_SETTLE_SEC = 0.50
     GOAL_PLANE_OVERSHOOT_TRIGGER_M = 0.020
 
     # Non-blocking AUTO-continue hold: after a point reaches COMPLETED (or
@@ -2181,14 +2180,22 @@ class MissionManager(Node):
                 with self._lock:
                     self._px4_mode = "OFFBOARD"
 
-            # Keep the existing zero PositionTarget stream active while PX4
-            # settles in OFFBOARD. Only after this do we send ARM.
-            time.sleep(self.OFFBOARD_BEFORE_ARM_SETTLE_SEC)
-
-            if self._px4_mode != "OFFBOARD":
-                raise RuntimeError(
-                    f"PX4 left OFFBOARD before ARM (mode={self._px4_mode})"
-                )
+            # No fixed post-OFFBOARD dwell: the SET_MODE ACK above is the
+            # OFFBOARD confirmation and the zero stream is already live. ARM
+            # follows immediately, but never after a newer hard stop.
+            with self._lock:
+                if self._px4_mode != "OFFBOARD":
+                    raise RuntimeError(
+                        f"PX4 left OFFBOARD before ARM (mode={self._px4_mode})"
+                    )
+                if self._emergency_stop:
+                    raise RuntimeError(
+                        "START invalidated before ARM because emergency stop is active"
+                    )
+                if self._safety_generation != safety_generation:
+                    raise RuntimeError(
+                        "START invalidated before ARM by a newer hard-stop assertion"
+                    )
 
             self._start_stage = "ARMING"
             self._request_arm(True)
