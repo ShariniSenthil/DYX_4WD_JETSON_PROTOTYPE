@@ -965,3 +965,18 @@ def test_control_loop_places_gps_immediately_when_reference_is_valid():
 
     assert node.prepared_path_signature is not None
     assert node._trajectory_phase() == "PLACED"
+
+
+def test_initial_idle_status_is_uncompiled():
+    node = _fake_generator()
+
+    payload = node._build_status_payload(
+        state="IDLE",
+        message="Waiting for mission upload and prepare request",
+    )
+
+    assert payload["trajectory_phase"] == "UNCOMPILED"
+    assert payload["placement_ready"] is False
+    assert payload["ready"] is False
+    assert payload["source_topology_compiled"] is False
+    assert payload["timing"] == {}
