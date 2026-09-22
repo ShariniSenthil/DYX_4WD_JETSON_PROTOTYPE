@@ -504,6 +504,10 @@ class RoverBackendRosNode(Node):
         self._last_position_message_monotonic: float | None = None
         self._last_rtk_message_monotonic: float | None = None
         self._last_rpp_debug_monotonic: float | None = None
+        # /rpp/accuracy is RELIABLE + TRANSIENT_LOCAL: the last sample stays
+        # retained after RPP stops publishing, so freshness must be tracked
+        # independently of the value.
+        self._last_rpp_accuracy_monotonic: float | None = None
         self._last_rpp_debug_sequence: int | None = None
         self._rpp_debug_dropped_frames = 0
         self._rpp_debug_callback_group = MutuallyExclusiveCallbackGroup()
@@ -906,8 +910,16 @@ class RoverBackendRosNode(Node):
                 direct_serial_last_successful_write_age_sec=None,
             )
 
+    # rpp_controller publishes /rpp/accuracy from publish_mm_monitor() once
+    # per 20 Hz control cycle (CONTROL_HZ), but only on cycles that reach the
+    # tracking branch -- it is silent during e-stop, mission-disabled, marking
+    # hold and other early-return states. 0.25 s = five missed 50 ms cycles,
+    # the same window used for /rpp/debug.
+    RPP_ACCURACY_STALE_SEC = 0.25
+
     def _rpp_debug_stale_monitor(self) -> None:
         rpp_debug_age = self._monotonic_age(self._last_rpp_debug_monotonic)
+        rpp_accuracy_age = self._monotonic_age(self._last_rpp_accuracy_monotonic)
         rover_state.update(
             "accuracy",
             rpp_debug_receive_age_ms=(
@@ -915,6 +927,14 @@ class RoverBackendRosNode(Node):
             ),
             rpp_debug_stream_fresh=(rpp_debug_age <= 0.25),
             rpp_debug_dropped_frames=self._rpp_debug_dropped_frames,
+            rpp_accuracy_receive_age_ms=(
+                rpp_accuracy_age * 1000.0
+                if math.isfinite(rpp_accuracy_age)
+                else None
+            ),
+            rpp_accuracy_stream_fresh=(
+                rpp_accuracy_age <= self.RPP_ACCURACY_STALE_SEC
+            ),
         )
 
     # ==========================================================
@@ -1531,6 +1551,8 @@ class RoverBackendRosNode(Node):
         payload = _json_object(message.data)
         if payload is None:
             return
+
+        self._last_rpp_accuracy_monotonic = time.monotonic()
 
         cross_track_mm = _finite_float(payload.get("cross_track_error_mm"))
         front_back_mm = _finite_float(payload.get("front_back_error_mm"))

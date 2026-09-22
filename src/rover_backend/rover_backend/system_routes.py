@@ -539,6 +539,12 @@ def build_telemetry_payload() -> dict[str, Any]:
                 False,
             )
         ),
+        # Live radial panel freshness (/rpp/accuracy only). Independent of
+        # /rpp/debug; the retained TRANSIENT_LOCAL sample is never "live".
+        "rpp_accuracy_receive_age_ms": accuracy.get("rpp_accuracy_receive_age_ms"),
+        "rpp_accuracy_stream_fresh": bool(
+            accuracy.get("rpp_accuracy_stream_fresh", False)
+        ),
 
         # Exact RPP controller-view telemetry.
         "rpp_debug_available": bool(

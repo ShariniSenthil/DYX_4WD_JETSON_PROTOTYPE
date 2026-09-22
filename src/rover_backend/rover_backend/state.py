@@ -299,6 +299,9 @@ class RoverState:
                 "rpp_debug_control_compute_ms": None,
                 "rpp_debug_control_deadline_missed": False,
                 "rpp_debug_stream_fresh": False,
+                # Independent freshness of the retained /rpp/accuracy stream.
+                "rpp_accuracy_receive_age_ms": None,
+                "rpp_accuracy_stream_fresh": False,
                 "rpp_debug_dropped_frames": 0,
                 "rpp_debug_reason": "UNKNOWN",
                 "rpp_control_mode": "UNKNOWN",
