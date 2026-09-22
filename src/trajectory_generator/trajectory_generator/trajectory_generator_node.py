@@ -2297,6 +2297,89 @@ class TrajectoryGenerator(Node):
 
         self._publish_survey_targets(None, cleared=True)
 
+    def _build_status_payload(
+        self,
+        *,
+        state: str,
+        message: str,
+        dummy_count: int = 0,
+    ) -> dict[str, Any]:
+        """Build one internally consistent generator status payload."""
+
+        # Status consumers must never observe topology identity and mission
+        # identity from different PREPARE transactions. _lock is an RLock,
+        # so this remains safe when called by code already holding the lock.
+        with self._lock:
+            source_current = self._source_topology_is_current()
+            source_topology = (
+                self.source_topology
+                if source_current
+                else None
+            )
+            trajectory_phase = self._trajectory_phase()
+
+            return {
+                "state": str(state).upper(),
+                "message": message,
+                "ready": self.ready,
+                "trajectory_phase": trajectory_phase,
+                "placement_ready": trajectory_phase == "PLACED",
+                "mission_id": self.mission_id,
+                "mission_checksum": self.mission_checksum,
+                "path_signature": self.prepared_path_signature,
+                "coordinate_mode": self.raw_coordinate_mode,
+                "extension_mode": self.extension_mode,
+                "dummy_point_distance_m": self.dummy_point_distance_m,
+                "row_transition_threshold_m": (
+                    self.row_transition_threshold_m
+                ),
+                "source_topology_compiled": source_current,
+                "source_topology_mission_id": (
+                    self.source_topology_mission_id
+                    if source_current
+                    else None
+                ),
+                "source_topology_checksum": (
+                    self.source_topology_checksum
+                    if source_current
+                    else None
+                ),
+                "source_topology_segment_count": (
+                    len(source_topology.segments)
+                    if source_topology is not None
+                    else 0
+                ),
+                "source_topology_dummy_decision_count": (
+                    sum(
+                        1
+                        for segment in source_topology.segments
+                        if segment.use_dummy
+                    )
+                    if source_topology is not None
+                    else 0
+                ),
+                "source_topology_compile_ms": (
+                    self.source_topology_compile_ms
+                    if source_current
+                    else None
+                ),
+                "marking_point_count": len(
+                    self.prepared_marking_points
+                    or self.raw_marking_points
+                ),
+                "navigation_point_count": len(
+                    self.prepared_navigation_points
+                ),
+                "dummy_point_count": int(dummy_count),
+                "interpolation_spacing_m": (
+                    self.interpolation_spacing_m
+                ),
+                "localization": dict(
+                    self.localization_shadow_summary
+                ),
+                "error": self.last_error,
+            }
+
     def _publish_status(
         self,
         *,
@@ -2304,48 +2387,11 @@ class TrajectoryGenerator(Node):
         message: str,
         dummy_count: int = 0,
     ) -> None:
-        status = {
-            "state": str(state).upper(),
-            "message": message,
-            "ready": self.ready,
-            "mission_id": (self.mission_id),
-            "mission_checksum": (self.mission_checksum),
-            "path_signature": self.prepared_path_signature,
-            "coordinate_mode": (self.raw_coordinate_mode),
-            "extension_mode": (self.extension_mode),
-            "dummy_point_distance_m": (self.dummy_point_distance_m),
-            "row_transition_threshold_m": (self.row_transition_threshold_m),
-            "source_topology_compiled": self._source_topology_is_current(),
-            "source_topology_mission_id": self.source_topology_mission_id,
-            "source_topology_checksum": self.source_topology_checksum,
-            "source_topology_segment_count": (
-                len(self.source_topology.segments)
-                if self._source_topology_is_current()
-                else 0
-            ),
-            "source_topology_dummy_decision_count": (
-                sum(
-                    1
-                    for segment in self.source_topology.segments
-                    if segment.use_dummy
-                )
-                if self._source_topology_is_current()
-                else 0
-            ),
-            "source_topology_compile_ms": (
-                self.source_topology_compile_ms
-                if self._source_topology_is_current()
-                else None
-            ),
-            "marking_point_count": len(
-                self.prepared_marking_points or self.raw_marking_points
-            ),
-            "navigation_point_count": len(self.prepared_navigation_points),
-            "dummy_point_count": int(dummy_count),
-            "interpolation_spacing_m": (self.interpolation_spacing_m),
-            "localization": dict(self.localization_shadow_summary),
-            "error": self.last_error,
-        }
+        status = self._build_status_payload(
+            state=state,
+            message=message,
+            dummy_count=dummy_count,
+        )
 
         status_message = String()
 
@@ -2417,6 +2463,30 @@ class TrajectoryGenerator(Node):
             and self.source_topology_mission_id == self.mission_id
             and self.source_topology_checksum == self.mission_checksum
         )
+
+    def _trajectory_phase(self) -> str:
+        """Return the static-source versus placed-path lifecycle phase.
+
+        This is intentionally separate from the existing top-level status
+        state. PREPARING/READY remain backward-compatible for current
+        consumers while this field exposes the architecture boundary:
+
+            UNCOMPILED -> COMPILED -> PLACED
+
+        A placement/reference failure may move PLACED back to COMPILED
+        without discarding the validated surveyed mission.
+        """
+
+        if not self._source_topology_is_current():
+            return "UNCOMPILED"
+
+        if (
+            self.ready
+            and self.prepared_path_signature is not None
+        ):
+            return "PLACED"
+
+        return "COMPILED"
 
     def _clear_prepared_state(
         self,

@@ -58,6 +58,7 @@ def _fake_generator():
     )
 
     node.minimum_segment_length_m = 0.001
+    node.interpolation_spacing_m = 0.05
     node.localization_mode = "px4_origin"
 
     node.prepare_requested = False
@@ -117,6 +118,8 @@ def _fake_generator():
     node.get_logger = lambda: _Logger()
 
     _bind(node, "_source_topology_is_current")
+    _bind(node, "_trajectory_phase")
+    _bind(node, "_build_status_payload")
     _bind(node, "_clear_prepared_state")
     _bind(node, "_reset_all_runtime")
     _bind(node, "_set_error")
@@ -377,3 +380,153 @@ def test_binding_check_rejects_mission_or_checksum_mismatch():
     node.mission_checksum = "b" * 64
 
     assert node._source_topology_is_current() is False
+
+
+def test_successful_prepare_reports_compiled_phase():
+    node = _fake_generator()
+
+    node._load_mission_source = lambda: _mission(
+        "mission-a",
+        "a" * 64,
+    )
+
+    assert _run_prepare(node).success is True
+
+    payload = node._build_status_payload(
+        state="PREPARING",
+        message="waiting for placement",
+    )
+
+    assert payload["trajectory_phase"] == "COMPILED"
+    assert payload["placement_ready"] is False
+
+    assert payload["source_topology_compiled"] is True
+    assert payload["source_topology_mission_id"] == "mission-a"
+    assert payload["source_topology_checksum"] == "a" * 64
+
+    assert payload["source_topology_segment_count"] == 1
+    assert payload["source_topology_compile_ms"] is not None
+
+
+def test_placed_path_reports_placed_phase():
+    node = _fake_generator()
+
+    node._load_mission_source = lambda: _mission(
+        "mission-a",
+        "a" * 64,
+    )
+
+    assert _run_prepare(node).success is True
+
+    node.ready = True
+    node.prepared_path_signature = "f" * 64
+    node.prepared_marking_points = [
+        (0.0, 0.0),
+        (1.0, 0.0),
+    ]
+    node.prepared_navigation_points = [
+        (0.0, 0.0),
+        (1.0, 0.0),
+    ]
+
+    payload = node._build_status_payload(
+        state="READY",
+        message="placed",
+    )
+
+    assert payload["trajectory_phase"] == "PLACED"
+    assert payload["placement_ready"] is True
+    assert payload["source_topology_compiled"] is True
+    assert payload["path_signature"] == "f" * 64
+
+
+def test_placement_failure_returns_to_compiled_phase():
+    node = _fake_generator()
+
+    node._load_mission_source = lambda: _mission(
+        "mission-a",
+        "a" * 64,
+    )
+
+    assert _run_prepare(node).success is True
+
+    topology = node.source_topology
+
+    node.ready = True
+    node.prepared_path_signature = "f" * 64
+
+    assert node._trajectory_phase() == "PLACED"
+
+    node._set_error(
+        "placement reference unavailable"
+    )
+
+    assert node.source_topology is topology
+    assert node._source_topology_is_current() is True
+    assert node._trajectory_phase() == "COMPILED"
+
+    payload = node._build_status_payload(
+        state="ERROR",
+        message="placement reference unavailable",
+    )
+
+    assert payload["trajectory_phase"] == "COMPILED"
+    assert payload["placement_ready"] is False
+    assert payload["source_topology_compiled"] is True
+
+
+def test_status_hides_stale_topology_details_on_identity_mismatch():
+    node = _fake_generator()
+
+    node._load_mission_source = lambda: _mission(
+        "mission-a",
+        "a" * 64,
+    )
+
+    assert _run_prepare(node).success is True
+
+    assert node._source_topology_is_current() is True
+
+    node.mission_id = "mission-b"
+
+    payload = node._build_status_payload(
+        state="PREPARING",
+        message="synthetic identity mismatch",
+    )
+
+    assert payload["trajectory_phase"] == "UNCOMPILED"
+    assert payload["placement_ready"] is False
+
+    assert payload["source_topology_compiled"] is False
+    assert payload["source_topology_mission_id"] is None
+    assert payload["source_topology_checksum"] is None
+    assert payload["source_topology_segment_count"] == 0
+    assert payload["source_topology_dummy_decision_count"] == 0
+    assert payload["source_topology_compile_ms"] is None
+
+
+def test_full_clear_reports_uncompiled_phase():
+    node = _fake_generator()
+
+    node._load_mission_source = lambda: _mission(
+        "mission-a",
+        "a" * 64,
+    )
+
+    assert _run_prepare(node).success is True
+    assert node._trajectory_phase() == "COMPILED"
+
+    node._reset_all_runtime(
+        publish_empty=True,
+    )
+
+    assert node._trajectory_phase() == "UNCOMPILED"
+
+    payload = node._build_status_payload(
+        state="IDLE",
+        message="cleared",
+    )
+
+    assert payload["trajectory_phase"] == "UNCOMPILED"
+    assert payload["placement_ready"] is False
+    assert payload["source_topology_compiled"] is False
