@@ -243,6 +243,10 @@ class RPPController(Node):
             0.30,
         )
         self.declare_parameter(
+            "xtrack_priority_release_rate_mps",
+            0.010,
+        )
+        self.declare_parameter(
             "xtrack_priority_speed_mps",
             1.00,
         )
@@ -858,6 +862,9 @@ class RPPController(Node):
         )
         self.xtrack_priority_hold_sec = float(
             self.get_parameter("xtrack_priority_hold_sec").value
+        )
+        self.xtrack_priority_release_rate = float(
+            self.get_parameter("xtrack_priority_release_rate_mps").value
         )
         self.xtrack_priority_speed = float(
             self.get_parameter("xtrack_priority_speed_mps").value
@@ -2282,7 +2289,8 @@ class RPPController(Node):
             f"{self.xtrack_priority_enter:.3f}m, recover at "
             f"{self.xtrack_priority_speed:.3f}m/s, release at "
             f"{self.xtrack_priority_exit:.3f}m with heading <= "
-            f"{math.degrees(self.xtrack_priority_release_heading):.1f}deg "
+            f"{math.degrees(self.xtrack_priority_release_heading):.1f}deg, "
+            f"|xtrack_rate| <= {self.xtrack_priority_release_rate:.3f}m/s "
             f"for {self.xtrack_priority_hold_sec:.2f}s"
         )
         self.get_logger().warn(
@@ -2707,6 +2715,9 @@ class RPPController(Node):
             "xtrack_priority_enter_m": (self.xtrack_priority_enter),
             "xtrack_priority_exit_m": (self.xtrack_priority_exit),
             "xtrack_priority_hold_sec": (self.xtrack_priority_hold_sec),
+            "xtrack_priority_release_rate_mps": (
+                self.xtrack_priority_release_rate
+            ),
             "xtrack_priority_speed_mps": (self.xtrack_priority_speed),
             "xtrack_priority_lookahead_m": (self.xtrack_priority_lookahead),
             "xtrack_priority_correction_limit_deg": (
@@ -2947,6 +2958,13 @@ class RPPController(Node):
             raise ValueError(
                 "xtrack_priority_speed_mps must be between minimum speed "
                 "and cruise speed"
+            )
+        if not (
+            math.isfinite(self.xtrack_priority_release_rate)
+            and self.xtrack_priority_release_rate > 0.0
+        ):
+            raise ValueError(
+                "xtrack_priority_release_rate_mps must be finite and > 0"
             )
         if not (0.0 < self.xtrack_rate_filter_alpha <= 1.0):
             raise ValueError("xtrack_rate_filter_alpha must be in (0, 1]")
@@ -8231,21 +8249,25 @@ class RPPController(Node):
         signed_cross_track,
         predicted_cross_track,
         path_heading_error,
+        filtered_xtrack_rate,
     ):
-        """Update the hardened 0.15 m/s xtrack speed-cap latch.
+        """Update the hardened xtrack speed-cap latch.
 
         Entry uses the worse of measured and predicted cross-track error.
         Release requires measured and predicted error to be inside the exit
-        band, heading to be inside the release gate, and all conditions to
-        remain stable for xtrack_priority_hold_sec.
+        band, heading to be inside the release gate, AND lateral cross-track
+        rate to be settled. All release conditions must remain stable for
+        xtrack_priority_hold_sec.
 
-        This changes only speed ownership. Steering remains continuous and
-        exact radial <=30 mm remains the only normal zero-command owner.
+        The rate gate prevents a transient zero-crossing from releasing the
+        0.30 m/s recovery cap while the rover still carries lateral motion
+        toward or through the fixed survey line.
         """
         values = (
             signed_cross_track,
             predicted_cross_track,
             path_heading_error,
+            filtered_xtrack_rate,
         )
         if not all(math.isfinite(value) for value in values):
             raise ValueError("non-finite xtrack speed-cap state input")
@@ -8265,6 +8287,7 @@ class RPPController(Node):
                 "XTRACK SPEED CAP ENGAGED | "
                 f"measured={self.ground_xtrack(signed_cross_track) * 1000.0:+.1f}mm | "
                 f"predicted={self.ground_xtrack(predicted_cross_track) * 1000.0:+.1f}mm | "
+                f"rate={self.ground_xtrack(filtered_xtrack_rate) * 1000.0:+.1f}mm/s | "
                 f"metric={error_metric * 1000.0:.1f}mm | "
                 f"cap={self.xtrack_priority_speed:.3f}m/s"
             )
@@ -8276,6 +8299,7 @@ class RPPController(Node):
             abs(signed_cross_track) <= self.xtrack_priority_exit
             and abs(predicted_cross_track) <= self.xtrack_priority_exit
             and abs(path_heading_error) <= self.xtrack_priority_release_heading
+            and abs(filtered_xtrack_rate) <= self.xtrack_priority_release_rate
         )
 
         release_elapsed = 0.0
@@ -8296,6 +8320,7 @@ class RPPController(Node):
                     "XTRACK SPEED CAP RELEASED | "
                     f"measured={self.ground_xtrack(signed_cross_track) * 1000.0:+.1f}mm | "
                     f"predicted={self.ground_xtrack(predicted_cross_track) * 1000.0:+.1f}mm | "
+                    f"rate={self.ground_xtrack(filtered_xtrack_rate) * 1000.0:+.1f}mm/s | "
                     f"heading={math.degrees(path_heading_error):.1f}deg | "
                     f"stable={release_elapsed:.2f}s"
                 )
@@ -10334,6 +10359,7 @@ class RPPController(Node):
                 terminal_signed_cross_track,
                 terminal_predicted_cross_track,
                 path_heading_error,
+                terminal_xtrack_rate,
             )
 
             (
@@ -10699,6 +10725,7 @@ class RPPController(Node):
                 global_signed_cross_track,
                 predicted_cross_track,
                 path_heading_error,
+                global_xtrack_rate,
             )
 
         if (

@@ -469,7 +469,9 @@ def generate_launch_description() -> LaunchDescription:
                         #   aligned-start (no carrier latch) still uses 1.00 m/s
                         #   xtrack recovery speed cap     = 0.30 m/s max
                         #   xtrack engage/release        = 15 mm / 8 mm
-                        #   release heading            = <=4 deg stable for 0.30 s
+                        #   release heading              = <=4 deg
+                        #   release xtrack rate          = <=10 mm/s
+                        #   all release gates stable     = 0.30 s
                         "segment_alignment_speed_mps": CRUISE_SPEED_MPS,
                         "segment_alignment_recovery_speed_mps": CRUISE_SPEED_MPS,
                         "xtrack_priority_speed_mps": min(
@@ -869,6 +871,7 @@ def generate_launch_description() -> LaunchDescription:
                         "xtrack_priority_enter_m": 0.015,
                         "xtrack_priority_exit_m": 0.008,
                         "xtrack_priority_hold_sec": 0.30,
+                        "xtrack_priority_release_rate_mps": 0.010,
                         "xtrack_priority_lookahead_m": 0.55,
                         "xtrack_priority_correction_limit_deg": 22.0,
                         "xtrack_prediction_time_sec": 0.25,
