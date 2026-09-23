@@ -526,9 +526,25 @@ def generate_launch_description() -> LaunchDescription:
                         # low-speed steering conditioning.
                         "moving_yaw_rate_max_radps": 0.18,
                         "moving_yaw_kp": 0.85,
-                        "moving_yaw_deadband_enter_deg": 0.50,
-                        "moving_yaw_deadband_exit_deg": 1.00,
+                        # 2026-09-23: 0.50/1.00 -> 0.15/0.30 deg. At the 0.90 m
+                        # cruise lookahead a 1.0 deg quiet band is ~16 mm of
+                        # uncorrected xtrack -- coarser than the 1-2 cm goal.
+                        # Slew + damping below already prevent L/R chatter.
+                        "moving_yaw_deadband_enter_deg": 0.15,
+                        "moving_yaw_deadband_exit_deg": 0.30,
                         "moving_yaw_rate_slew_radps2": 0.60,
+                        # 2026-09-23 course-bias compensation. Bags show the
+                        # rover travels 0.5-1.8 deg off its EKF yaw (body-frame
+                        # EKF velocity angle == position-derived course - yaw),
+                        # which a heading loop turns into a steady offset of
+                        # lookahead*tan(bias) = 11-25 mm (+deadband). Steer
+                        # yaw + beta_hat instead. Sampled only >=0.5 m/s with
+                        # |yaw rate| <= 0.05 rad/s; reset at stops/pivots.
+                        "moving_course_bias_enabled": True,
+                        "moving_course_bias_time_constant_sec": 2.0,
+                        "moving_course_bias_min_speed_mps": 0.50,
+                        "moving_course_bias_max_yaw_rate_radps": 0.05,
+                        "moving_course_bias_limit_deg": 3.0,
                         # Speed-scaled measured-yaw damping:
                         # 0.20 at 0.60m/s -> 0.32 at 1.00m/s, bounded to
                         # 0.08rad/s so damping cannot replace steering authority.

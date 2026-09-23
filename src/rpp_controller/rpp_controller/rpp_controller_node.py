@@ -390,6 +390,17 @@ class RPPController(Node):
         self.declare_parameter("moving_yaw_damping_gain_max", 0.32)
         self.declare_parameter("moving_yaw_rate_filter_alpha", 0.20)
         self.declare_parameter("moving_yaw_damping_limit_radps", 0.08)
+        # Course-bias compensation: steer the direction of travel, not the
+        # reported heading.  The EKF body-frame velocity angle
+        # beta = atan2(v_left, v_forward) measures how far the rover actually
+        # moves to the side of its reported yaw (EKF yaw error, chassis crab or
+        # antenna mounting).  Without it a pure heading loop settles at
+        # xtrack ~= lookahead * tan(beta).  Default off; enabled per launch.
+        self.declare_parameter("moving_course_bias_enabled", False)
+        self.declare_parameter("moving_course_bias_time_constant_sec", 2.0)
+        self.declare_parameter("moving_course_bias_min_speed_mps", 0.50)
+        self.declare_parameter("moving_course_bias_max_yaw_rate_radps", 0.05)
+        self.declare_parameter("moving_course_bias_limit_deg", 3.0)
         self.declare_parameter("moving_alignment_min_speed_mps", 0.40)
         self.declare_parameter(
             "alignment_reentry_goal_distance_m",
@@ -1012,6 +1023,21 @@ class RPPController(Node):
         )
         self.moving_yaw_damping_limit = float(
             self.get_parameter("moving_yaw_damping_limit_radps").value
+        )
+        self.moving_course_bias_enabled = bool(
+            self.get_parameter("moving_course_bias_enabled").value
+        )
+        self.moving_course_bias_time_constant = float(
+            self.get_parameter("moving_course_bias_time_constant_sec").value
+        )
+        self.moving_course_bias_min_speed = float(
+            self.get_parameter("moving_course_bias_min_speed_mps").value
+        )
+        self.moving_course_bias_max_yaw_rate = float(
+            self.get_parameter("moving_course_bias_max_yaw_rate_radps").value
+        )
+        self.moving_course_bias_limit = math.radians(
+            float(self.get_parameter("moving_course_bias_limit_deg").value)
         )
         self.moving_alignment_min_speed = float(
             self.get_parameter("moving_alignment_min_speed_mps").value
@@ -1926,6 +1952,8 @@ class RPPController(Node):
         self.current_y = None
         self.current_yaw = None
         self.current_speed_mps = math.inf
+        self.current_body_velocity_forward_mps = math.inf
+        self.current_body_velocity_left_mps = math.inf
         self.current_yaw_rate_radps = math.inf
         self.last_odom_time = None
 
@@ -2052,6 +2080,11 @@ class RPPController(Node):
         self.moving_yaw_rate_last_time = None
         self.filtered_moving_yaw_rate = 0.0
         self.last_commanded_yaw_rate_radps = 0.0
+        # Course-bias estimate (rad, +left of reported yaw). Reset at every
+        # literal stop and pivot: the bias changes with travel direction.
+        self.moving_course_bias = 0.0
+        self.moving_course_bias_active = False
+        self.moving_course_bias_last_time = None
 
         # Cross-track speed-cap recovery is shared by normal and terminal motion.
         self.xtrack_priority_active = False
@@ -3302,6 +3335,30 @@ class RPPController(Node):
                 "<= moving_yaw_rate_max_radps"
             )
         if not (
+            math.isfinite(self.moving_course_bias_time_constant)
+            and self.moving_course_bias_time_constant > 0.0
+        ):
+            raise ValueError(
+                "moving_course_bias_time_constant_sec must be finite and > 0"
+            )
+        if not (
+            math.isfinite(self.moving_course_bias_min_speed)
+            and self.moving_course_bias_min_speed > 0.0
+        ):
+            raise ValueError("moving_course_bias_min_speed_mps must be finite and > 0")
+        if not (
+            math.isfinite(self.moving_course_bias_max_yaw_rate)
+            and self.moving_course_bias_max_yaw_rate > 0.0
+        ):
+            raise ValueError(
+                "moving_course_bias_max_yaw_rate_radps must be finite and > 0"
+            )
+        if not (
+            math.isfinite(self.moving_course_bias_limit)
+            and 0.0 < self.moving_course_bias_limit <= math.radians(10.0)
+        ):
+            raise ValueError("moving_course_bias_limit_deg must be in (0, 10]")
+        if not (
             math.isfinite(self.steering_reference_speed)
             and 0.0 < self.steering_reference_speed
             <= self.MAXIMUM_MOVING_SPEED_MPS
@@ -3496,6 +3553,63 @@ class RPPController(Node):
     def normalize_angle(angle):
         return math.atan2(math.sin(angle), math.cos(angle))
 
+    def _reset_moving_course_bias(self):
+        """Forget the course-bias estimate (new leg / pivot / literal stop)."""
+        self.moving_course_bias = 0.0
+        self.moving_course_bias_active = False
+        self.moving_course_bias_last_time = None
+
+    def _update_moving_course_bias(self, translational_speed_mps):
+        """Update and return the course-bias estimate in radians.
+
+        beta = atan2(v_left, v_forward) from the body-frame EKF velocity is the
+        angle between where the rover moves and where its reported yaw points
+        (+ = moving left of yaw).  It is only sampled in steady straight
+        driving: commanded and measured forward speed above the minimum and a
+        small measured yaw rate, because during rotation the antenna's
+        lever-arm motion also appears as lateral velocity.  Outside that gate
+        the last estimate is held.
+        """
+        if not self.moving_course_bias_enabled:
+            self.moving_course_bias_active = False
+            return 0.0
+
+        now = self.get_clock().now()
+        if self.moving_course_bias_last_time is None:
+            dt = 1.0 / self.CONTROL_HZ
+        else:
+            dt = (now - self.moving_course_bias_last_time).nanoseconds / 1e9
+            if not math.isfinite(dt) or dt <= 0.0:
+                dt = 1.0 / self.CONTROL_HZ
+            dt = min(dt, self.deceleration_max_dt_sec)
+        self.moving_course_bias_last_time = now
+
+        forward = float(self.current_body_velocity_forward_mps)
+        left = float(self.current_body_velocity_left_mps)
+        yaw_rate = float(self.current_yaw_rate_radps)
+        sampled = (
+            math.isfinite(forward)
+            and math.isfinite(left)
+            and math.isfinite(yaw_rate)
+            and abs(float(translational_speed_mps)) >= self.moving_course_bias_min_speed
+            and forward >= self.moving_course_bias_min_speed
+            and abs(yaw_rate) <= self.moving_course_bias_max_yaw_rate
+        )
+        if sampled:
+            beta = math.atan2(left, forward)
+            beta = max(
+                -self.moving_course_bias_limit,
+                min(self.moving_course_bias_limit, beta),
+            )
+            alpha = dt / (self.moving_course_bias_time_constant + dt)
+            self.moving_course_bias += alpha * (beta - self.moving_course_bias)
+        self.moving_course_bias = max(
+            -self.moving_course_bias_limit,
+            min(self.moving_course_bias_limit, self.moving_course_bias),
+        )
+        self.moving_course_bias_active = sampled
+        return self.moving_course_bias
+
     def explicit_yaw_rate_command(
         self,
         target_yaw_enu_rad,
@@ -3527,6 +3641,7 @@ class RPPController(Node):
             self.moving_yaw_rate_output = 0.0
             self.moving_yaw_rate_last_time = None
             self.filtered_moving_yaw_rate = 0.0
+            self._reset_moving_course_bias()
             if error_abs <= 1.0e-9:
                 self.last_commanded_yaw_rate_radps = 0.0
                 return 0.0
@@ -3539,6 +3654,17 @@ class RPPController(Node):
             command = turn_sign * commanded_mag
             self.last_commanded_yaw_rate_radps = command
             return command
+
+        # Steer the direction of travel (reported yaw + measured course bias)
+        # onto the target bearing, so a steady yaw/course offset does not
+        # become a steady cross-track offset.
+        course_bias = self._update_moving_course_bias(translational_speed_mps)
+        if course_bias != 0.0:
+            yaw_error = self.normalize_angle(
+                float(target_yaw_enu_rad)
+                - (float(self.current_yaw) + course_bias)
+            )
+            error_abs = abs(yaw_error)
 
         measured_yaw_rate = self.current_yaw_rate_radps
         if math.isfinite(float(measured_yaw_rate)):
@@ -4032,6 +4158,10 @@ class RPPController(Node):
             speed_x,
             speed_y,
         )
+        # MAVROS odom twist is body-frame FLU (x forward, y left); verified
+        # against position-derived course on 2026-09-23 bags (+1.80 vs +1.79 deg).
+        self.current_body_velocity_forward_mps = speed_x
+        self.current_body_velocity_left_mps = speed_y
         # MAVROS odometry twist and pose share one callback/freshness stamp.
         # Whether angular.z is the physical chassis yaw rate at pivot dynamics
         # remains a field-validation item and is exposed in pivot diagnostics.
@@ -7592,6 +7722,7 @@ class RPPController(Node):
             self.moving_yaw_rate_last_time = None
             self.filtered_moving_yaw_rate = 0.0
             self.last_commanded_yaw_rate_radps = 0.0
+            self._reset_moving_course_bias()
             output_speed = 0.0
             north = 0.0
             east = 0.0
@@ -7947,6 +8078,10 @@ class RPPController(Node):
             ),
             "steering_state": "UNKNOWN",
             "moving_yaw_quiet": bool(self.moving_yaw_quiet),
+            "course_bias_deg": self._finite_or_none(
+                math.degrees(self.moving_course_bias)
+            ),
+            "course_bias_active": bool(self.moving_course_bias_active),
             "current_yaw_rad": self._finite_or_none(self.current_yaw),
             "current_yaw_deg": (
                 math.degrees(self.current_yaw)
@@ -8239,6 +8374,10 @@ class RPPController(Node):
             "measured_yaw_rate_radps": measured_yaw_rate_radps,
             "steering_state": steering_state,
             "moving_yaw_quiet": bool(self.moving_yaw_quiet),
+            "course_bias_deg": self._finite_or_none(
+                math.degrees(self.moving_course_bias)
+            ),
+            "course_bias_active": bool(self.moving_course_bias_active),
 
             "current_yaw_rad": current_yaw_rad,
             "current_yaw_deg": (

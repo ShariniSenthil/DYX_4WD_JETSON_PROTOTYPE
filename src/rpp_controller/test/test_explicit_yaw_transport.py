@@ -147,6 +147,13 @@ def rpp(enabled=None):
                  and ast.unparse(n.test) == "self.rpp_explicit_yaw_enabled"]
     assert len(selection) == 1
     execute(selection, env)
+    # Real course-bias helpers, feature off: pre-existing harness behaviour.
+    execute([method(RPP, "RPPController", "_reset_moving_course_bias"),
+             method(RPP, "RPPController", "_update_moving_course_bias")], env)
+    node._reset_moving_course_bias = env["_reset_moving_course_bias"].__get__(node)
+    node._update_moving_course_bias = env["_update_moving_course_bias"].__get__(node)
+    node.moving_course_bias_enabled = False
+    node._reset_moving_course_bias()
     return node, env
 
 
