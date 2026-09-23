@@ -379,7 +379,7 @@ def generate_launch_description() -> LaunchDescription:
                         # the old 0.50m setting -- already past the 0.5m
                         # theoretical target, so expect roughly ~1.05-1.15m /
                         # ~2.5-2.7s to reach cruise at this new 1.00m setting.
-                        "acceleration_distance_m": 0.20,
+                        "acceleration_distance_m": 1.00,  # 2026-09-23: operator; 0.5 m/s^2 at 1.0 m/s cruise
                         # Bootstrap ceiling exists only to prevent drivetrain
                         # deadlock; the profile itself starts from literal zero.
                         #
@@ -439,7 +439,7 @@ def generate_launch_description() -> LaunchDescription:
                         # ~4 cm over the final 0.6 m and the rover crossed the
                         # goal plane beside the point rather than on it.
                         "deceleration_enabled": True,
-                        "deceleration_distance_m": 0.20,
+                        "deceleration_distance_m": 1.00,  # 2026-09-23: operator; 0.5 m/s^2 at 1.0 m/s cruise
                         "deceleration_floor_speed_mps": TERMINAL_FLOOR_SPEED_MPS,
                         "deceleration_max_progress_jump_m": 0.10,
                         "deceleration_max_dt_sec": 0.10,
