@@ -45,6 +45,9 @@ class LegacyAlignmentDirective(str, Enum):
     FALLBACK_GLOBAL_XTRACK = "fallback_global_xtrack"
     COMPLETE_ZERO = "complete_zero"
     COMPLETE_FALLTHROUGH = "complete_fallthrough"
+    # Pivot released while still turning; hand straight to moving tracking
+    # (no stationary settle), carrying the current yaw-rate into it.
+    COMPLETE_MOVING_HANDOVER = "complete_moving_handover"
     SAFETY_HOLD = "safety_hold"
 
 
@@ -78,6 +81,12 @@ class LegacyAlignmentConfig:
     # reanchor is offered on every leg. Kept configurable so the field can
     # fall back to entry-leg-only without a rollback.
     reanchor_all_legs: bool = True
+    # 2026-09-23: PX4 Mission mode hands its spot turn straight back to
+    # driving at 6 deg while still rotating (RD_TRANS_TRN_DRV) and never waits
+    # for a stationary settle. When True, a native-pivot release completes
+    # the lifecycle immediately with COMPLETE_MOVING_HANDOVER instead of
+    # entering PIVOT_SETTLE.
+    moving_handover: bool = False
 
     def __post_init__(self) -> None:
         finite_fields = (
@@ -359,6 +368,18 @@ class LegacyAlignmentLifecycle:
                 warn_native_timeout=warn,
             )
         if self.native_carrier_issued:
+            if self.config.moving_handover:
+                self.pivot_complete = True
+                self.keeper_started_at = None
+                self.native_timeout_warned = False
+                self.reset_dwell_timers()
+                return self._result(
+                    previous,
+                    LegacyAlignmentDirective.COMPLETE_MOVING_HANDOVER,
+                    consumed=False,
+                    reset_native_carrier=True,
+                    reason="NATIVE_RELEASE_MOVING_HANDOVER",
+                )
             return self._enter_pivot_settle(previous, "NATIVE_RELEASE_TO_SETTLE")
         self.phase = LegacyAlignmentPhase.NON_PIVOT_CAPTURE
         self.pivot_complete = True

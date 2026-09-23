@@ -150,7 +150,9 @@ def generate_launch_description() -> LaunchDescription:
                         # Bridge preserves the RPP ramp and only clamps
                         # commands above this production safety maximum.
                         "maximum_speed_mps": (1.00),
-                        ("maximum_yaw_rate_" "radps"): 0.45,
+                        # Must be >= rpp_controller maximum_yaw_rate_radps: the
+                        # bridge clamps explicit yaw-rate to this value.
+                        ("maximum_yaw_rate_" "radps"): 0.75,
                     }
                 ],
             ),
@@ -506,7 +508,8 @@ def generate_launch_description() -> LaunchDescription:
                         "segment_alignment_deadband_enter_cross_track_m": 0.08,
                         "segment_alignment_deadband_exit_cross_track_m": 0.04,
                         "segment_alignment_min_effective_heading_error_deg": 10.0,
-                        "segment_alignment_correction_limit_deg": 18.0,
+                        # 2026-09-23: 18 -> 11, stay below the 15 deg pivot re-entry.
+                        "segment_alignment_correction_limit_deg": 11.0,
                         "segment_alignment_cross_track_tolerance_m": 0.03,
                         "segment_alignment_reentry_cross_track_m": 0.08,
                         "segment_alignment_max_cross_track_m": 0.60,
@@ -519,7 +522,10 @@ def generate_launch_description() -> LaunchDescription:
                         # hold time.
                         "alignment_hold_sec": 0.20,
                         # Stationary pivot stays exactly on d1d982 behavior.
-                        "maximum_yaw_rate_radps": 0.45,
+                        # 2026-09-23: 0.45 -> 0.75 rad/s (43 deg/s). PX4 Mission
+                        # pivots at ~45 deg/s; FCU RO_YAW_RATE_LIM is 45 deg/s.
+                        # cmd_vel_bridge maximum_yaw_rate_radps must match.
+                        "maximum_yaw_rate_radps": 0.75,
                         "minimum_yaw_rate_radps": 0.06,
                         "pivot_yaw_kp": 1.80,
                         # Keep tested moving-yaw authority and add
@@ -545,6 +551,23 @@ def generate_launch_description() -> LaunchDescription:
                         "moving_course_bias_min_speed_mps": 0.50,
                         "moving_course_bias_max_yaw_rate_radps": 0.05,
                         "moving_course_bias_limit_deg": 3.0,
+                        # 2026-09-23 PX4-Mission-style corner (bags 190126,
+                        # 190952 vs Mission logs 210/211):
+                        # 1) pivot toward a point 1.5 m ahead on the new line,
+                        #    re-aimed each cycle (absorbs antenna swing);
+                        # 2) ramp the pivot yaw-rate (1.2 rad/s^2, rising only);
+                        # 3) release at 6 deg and hand straight to moving
+                        #    tracking -- no stationary settle;
+                        # 4) lengthen recovery lookahead up to 1.5 m for large
+                        #    xtrack (unchanged below 50 mm).
+                        "pivot_dynamic_target_enabled": True,
+                        "pivot_target_lookahead_m": 1.5,
+                        "pivot_moving_handover_enabled": True,
+                        "pivot_handover_release_error_deg": 6.0,
+                        "pivot_yaw_rate_slew_radps2": 1.2,
+                        "recovery_lookahead_max_m": 1.5,
+                        "recovery_lookahead_xtrack_start_m": 0.05,
+                        "recovery_lookahead_xtrack_gain": 1.0,
                         # Speed-scaled measured-yaw damping:
                         # 0.20 at 0.60m/s -> 0.32 at 1.00m/s, bounded to
                         # 0.08rad/s so damping cannot replace steering authority.
@@ -571,8 +594,10 @@ def generate_launch_description() -> LaunchDescription:
                         #   500 mm final deceleration and the exact 30 mm stop.
                         # Straight-line and cross-track guidance uses the local
                         # /nav_path tangent and a path-distance lookahead.
-                        "path_correction_limit_deg": 18.0,
-                        "terminal_line_correction_limit_deg": 18.0,
+                        # 2026-09-23: 18 -> 11 (below the 15 deg pivot re-entry);
+                        # terminal_line must stay <= path_correction_limit.
+                        "path_correction_limit_deg": 11.0,
+                        "terminal_line_correction_limit_deg": 11.0,
                         # Field-tuned reference: 0.55m lookahead at 0.60m/s.
                         # At 0.8/1.0m/s the controller automatically looks
                         # farther ahead instead of becoming more aggressive in time.
@@ -903,7 +928,9 @@ def generate_launch_description() -> LaunchDescription:
                         # Keep 0.55m at 0.60m/s, scale toward 0.90m by 1.00m/s.
                         "xtrack_priority_lookahead_m": 0.55,
                         "xtrack_priority_lookahead_max_m": 0.90,
-                        "xtrack_priority_correction_limit_deg": 22.0,
+                        # 2026-09-23: 22 -> 12. Bag 190126 recovery reached -15 deg
+                        # and re-triggered a pivot at 1 m/s.
+                        "xtrack_priority_correction_limit_deg": 12.0,
                         "xtrack_prediction_time_sec": 0.25,
                         "xtrack_rate_filter_alpha": 0.20,
                         "xtrack_correction_slew_rate_degps": 30.0,

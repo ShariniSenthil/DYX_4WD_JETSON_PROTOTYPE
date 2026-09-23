@@ -22,6 +22,7 @@ METHODS = (
     "_update_moving_course_bias",
     "explicit_yaw_rate_command",
     "line_guidance",
+    "_recovery_lookahead",
 )
 
 
@@ -97,6 +98,13 @@ def _controller(*, enabled=True, deadband=(0.15, 0.30)):
     node.moving_course_bias_max_yaw_rate = 0.05
     node.moving_course_bias_limit = math.radians(3.0)
     node._reset_moving_course_bias()
+    # Pivot ramp and recovery lookahead off: isolate course-bias behaviour.
+    node.pivot_yaw_rate_slew = 0.0
+    node.pivot_yaw_rate_output = 0.0
+    node.pivot_yaw_rate_last_time = None
+    node.recovery_lookahead_max = 0.0
+    node.recovery_lookahead_xtrack_start = 0.05
+    node.recovery_lookahead_xtrack_gain = 1.0
     # Odometry state.
     node.current_x = node.current_y = 0.0
     node.current_yaw = 0.0

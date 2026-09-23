@@ -401,6 +401,24 @@ class RPPController(Node):
         self.declare_parameter("moving_course_bias_min_speed_mps", 0.50)
         self.declare_parameter("moving_course_bias_max_yaw_rate_radps", 0.05)
         self.declare_parameter("moving_course_bias_limit_deg", 3.0)
+        # PX4-Mission-style corner (2026-09-23). All default to today's
+        # behaviour; rover.launch.py enables them.
+        #  - dynamic target: pivot toward a lookahead point on the new line
+        #    from the current pose (re-aimed each cycle) instead of the fixed
+        #    line bearing, so antenna swing is absorbed during the turn;
+        #  - moving handover: release the pivot at a larger error and hand
+        #    straight to moving tracking, no stationary settle;
+        #  - yaw-rate slew: ramp the stationary pivot rate instead of a step;
+        #  - recovery lookahead: lengthen the lookahead for large xtrack so
+        #    recovery converges without overshoot.
+        self.declare_parameter("pivot_dynamic_target_enabled", False)
+        self.declare_parameter("pivot_target_lookahead_m", 1.5)
+        self.declare_parameter("pivot_moving_handover_enabled", False)
+        self.declare_parameter("pivot_handover_release_error_deg", 6.0)
+        self.declare_parameter("pivot_yaw_rate_slew_radps2", 0.0)
+        self.declare_parameter("recovery_lookahead_max_m", 0.0)
+        self.declare_parameter("recovery_lookahead_xtrack_start_m", 0.05)
+        self.declare_parameter("recovery_lookahead_xtrack_gain", 1.0)
         self.declare_parameter("moving_alignment_min_speed_mps", 0.40)
         self.declare_parameter(
             "alignment_reentry_goal_distance_m",
@@ -1039,6 +1057,30 @@ class RPPController(Node):
         self.moving_course_bias_limit = math.radians(
             float(self.get_parameter("moving_course_bias_limit_deg").value)
         )
+        self.pivot_dynamic_target_enabled = bool(
+            self.get_parameter("pivot_dynamic_target_enabled").value
+        )
+        self.pivot_target_lookahead = float(
+            self.get_parameter("pivot_target_lookahead_m").value
+        )
+        self.pivot_moving_handover_enabled = bool(
+            self.get_parameter("pivot_moving_handover_enabled").value
+        )
+        self.pivot_handover_release_error = math.radians(
+            float(self.get_parameter("pivot_handover_release_error_deg").value)
+        )
+        self.pivot_yaw_rate_slew = float(
+            self.get_parameter("pivot_yaw_rate_slew_radps2").value
+        )
+        self.recovery_lookahead_max = float(
+            self.get_parameter("recovery_lookahead_max_m").value
+        )
+        self.recovery_lookahead_xtrack_start = float(
+            self.get_parameter("recovery_lookahead_xtrack_start_m").value
+        )
+        self.recovery_lookahead_xtrack_gain = float(
+            self.get_parameter("recovery_lookahead_xtrack_gain").value
+        )
         self.moving_alignment_min_speed = float(
             self.get_parameter("moving_alignment_min_speed_mps").value
         )
@@ -1656,6 +1698,7 @@ class RPPController(Node):
                     self.legacy_pivot_stationary_violation_debounce_sec
                 ),
                 reanchor_all_legs=self.post_pivot_reanchor_all_legs,
+                moving_handover=self.pivot_moving_handover_enabled,
             )
         )
         self.get_logger().warn(
@@ -2085,6 +2128,9 @@ class RPPController(Node):
         self.moving_course_bias = 0.0
         self.moving_course_bias_active = False
         self.moving_course_bias_last_time = None
+        # Stationary-pivot yaw-rate ramp state (pivot_yaw_rate_slew_radps2).
+        self.pivot_yaw_rate_output = 0.0
+        self.pivot_yaw_rate_last_time = None
 
         # Cross-track speed-cap recovery is shared by normal and terminal motion.
         self.xtrack_priority_active = False
@@ -3359,6 +3405,36 @@ class RPPController(Node):
         ):
             raise ValueError("moving_course_bias_limit_deg must be in (0, 10]")
         if not (
+            math.isfinite(self.pivot_target_lookahead)
+            and self.pivot_target_lookahead > 0.0
+        ):
+            raise ValueError("pivot_target_lookahead_m must be finite and > 0")
+        if not (
+            math.isfinite(self.pivot_handover_release_error)
+            and 0.0 < self.pivot_handover_release_error < self.pivot_enter_angle
+        ):
+            raise ValueError(
+                "pivot_handover_release_error_deg must be in (0, pivot_enter_angle_deg)"
+            )
+        if self._pivot_target_offset_limit() <= 0.0:
+            raise ValueError(
+                "pivot_enter_angle_deg - pivot_handover_release_error_deg must "
+                "leave > 1 deg for the dynamic pivot target offset"
+            )
+        if not (
+            math.isfinite(self.pivot_yaw_rate_slew) and self.pivot_yaw_rate_slew >= 0.0
+        ):
+            raise ValueError("pivot_yaw_rate_slew_radps2 must be finite and >= 0")
+        if not (
+            math.isfinite(self.recovery_lookahead_max)
+            and self.recovery_lookahead_max >= 0.0
+            and math.isfinite(self.recovery_lookahead_xtrack_start)
+            and self.recovery_lookahead_xtrack_start >= 0.0
+            and math.isfinite(self.recovery_lookahead_xtrack_gain)
+            and self.recovery_lookahead_xtrack_gain >= 0.0
+        ):
+            raise ValueError("recovery lookahead parameters must be finite and >= 0")
+        if not (
             math.isfinite(self.steering_reference_speed)
             and 0.0 < self.steering_reference_speed
             <= self.MAXIMUM_MOVING_SPEED_MPS
@@ -3643,6 +3719,8 @@ class RPPController(Node):
             self.filtered_moving_yaw_rate = 0.0
             self._reset_moving_course_bias()
             if error_abs <= 1.0e-9:
+                self.pivot_yaw_rate_output = 0.0
+                self.pivot_yaw_rate_last_time = None
                 self.last_commanded_yaw_rate_radps = 0.0
                 return 0.0
             turn_sign = 1.0 if yaw_error > 0.0 else -1.0
@@ -3652,8 +3730,36 @@ class RPPController(Node):
                 max(self.minimum_yaw_rate, requested_mag),
             )
             command = turn_sign * commanded_mag
+            if self.pivot_yaw_rate_slew > 0.0:
+                # Ramp only a rising or reversing command; a falling one is
+                # the proportional approach to the target and stays immediate
+                # so the ramp cannot add overshoot.
+                now = self.get_clock().now()
+                if self.pivot_yaw_rate_last_time is None:
+                    dt = 1.0 / self.CONTROL_HZ
+                else:
+                    dt = (now - self.pivot_yaw_rate_last_time).nanoseconds / 1e9
+                    if not math.isfinite(dt) or dt <= 0.0:
+                        dt = 1.0 / self.CONTROL_HZ
+                    dt = min(dt, self.deceleration_max_dt_sec)
+                self.pivot_yaw_rate_last_time = now
+                previous = self.pivot_yaw_rate_output
+                rising = (
+                    abs(command) > abs(previous)
+                    or command * previous < 0.0
+                )
+                if rising:
+                    maximum_change = self.pivot_yaw_rate_slew * dt
+                    command = previous + max(
+                        -maximum_change,
+                        min(maximum_change, command - previous),
+                    )
+            self.pivot_yaw_rate_output = command
             self.last_commanded_yaw_rate_radps = command
             return command
+
+        self.pivot_yaw_rate_output = 0.0
+        self.pivot_yaw_rate_last_time = None
 
         # Steer the direction of travel (reported yaw + measured course bias)
         # onto the target bearing, so a steady yaw/course offset does not
@@ -5861,12 +5967,17 @@ class RPPController(Node):
         true_error = path_heading_error
         telemetry_fresh = self._legacy_alignment_telemetry_fresh()
         if self.legacy_alignment.needs_native_command and telemetry_fresh:
+            pivot_target_bearing = self._pivot_dynamic_target_bearing(
+                path_bearing,
+                target_x,
+                target_y,
+            )
             (
                 native_active,
                 pivot_request_bearing,
                 true_error,
             ) = self.terminal_native_pivot_command(
-                path_bearing,
+                pivot_target_bearing,
                 "SEGMENT-ENTRY-PIVOT-KEEPER",
             )
 
@@ -6028,6 +6139,43 @@ class RPPController(Node):
             )
             return False
 
+        if result.directive is LegacyAlignmentDirective.COMPLETE_MOVING_HANDOVER:
+            # Pivot released while still rotating: no stationary settle. Carry
+            # the current pivot yaw-rate into the moving controller (clamped
+            # to its authority) so the rotation continues smoothly instead of
+            # being cut to zero and restarted; speed ramps from zero through
+            # the normal acceleration profile.
+            handover_rate = max(
+                -self.moving_yaw_rate_max,
+                min(self.moving_yaw_rate_max, self.last_commanded_yaw_rate_radps),
+            )
+            self.segment_alignment_active = False
+            self._reset_legacy_alignment_lifecycle("PIVOT_MOVING_HANDOVER")
+            self.reset_speed_profiles()
+            self.command_slew_speed = 0.0
+            self.command_slew_last_time = None
+            self.xtrack_priority_active = False
+            self.xtrack_priority_inside_since = None
+            self.reset_xtrack_damping_state()
+            self._reset_precision_regulator("PIVOT_MOVING_HANDOVER")
+            self.pivot_yaw_rate_output = 0.0
+            self.pivot_yaw_rate_last_time = None
+            self.moving_yaw_quiet = False
+            self.moving_yaw_rate_output = handover_rate
+            self.moving_yaw_rate_last_time = None
+            self.filtered_moving_yaw_rate = (
+                float(self.current_yaw_rate_radps)
+                if math.isfinite(float(self.current_yaw_rate_radps))
+                else 0.0
+            )
+            self.get_logger().warn(
+                "PIVOT MOVING HANDOVER / NO SETTLE | "
+                f"path_heading={math.degrees(path_heading_error):+.1f}deg | "
+                f"xtrack={self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm | "
+                f"carried_yaw_rate={math.degrees(handover_rate):+.1f}deg/s"
+            )
+            return False
+
         if result.directive is LegacyAlignmentDirective.COMPLETE_FALLTHROUGH:
             self.segment_alignment_active = False
             self._reset_legacy_alignment_lifecycle("NON_PIVOT_CAPTURE_COMPLETE")
@@ -6121,6 +6269,55 @@ class RPPController(Node):
         )
         return True
 
+    def _pivot_target_offset_limit(self):
+        """Largest angle the dynamic pivot target may sit off the line.
+
+        After a handover the rover heading is within the handover release of
+        the target, so the path-heading error is at most offset + release.
+        Keeping that 1 deg below pivot_enter_angle guarantees the handover can
+        never immediately trip the mid-leg re-entry threshold.
+        """
+        return (
+            self.pivot_enter_angle
+            - self.pivot_handover_release_error
+            - math.radians(1.0)
+        )
+
+    def _pivot_dynamic_target_bearing(self, path_bearing, line_x, line_y):
+        """Bearing from the current pose to a lookahead point on the new line.
+
+        Mirrors PX4 Mission mode (PurePursuit::calcTargetBearing): the pivot
+        aims at the line ahead, re-evaluated every cycle, so displacement of
+        the antenna during the turn is absorbed and the rover finishes the
+        turn already pointing back toward the line.  Disabled -> path bearing.
+        """
+        if not self.pivot_dynamic_target_enabled:
+            return path_bearing
+        delta_east = self.current_x - line_x
+        delta_north = self.current_y - line_y
+        signed_cross_track = (
+            -math.sin(path_bearing) * delta_east
+            + math.cos(path_bearing) * delta_north
+        )
+        limit = self._pivot_target_offset_limit()
+        correction = -math.atan2(signed_cross_track, self.pivot_target_lookahead)
+        correction = max(-limit, min(limit, correction))
+        return self.normalize_angle(path_bearing + correction)
+
+    def _recovery_lookahead(self, lookahead, abs_cross_track):
+        """Lengthen the lookahead for large xtrack (PX4 recovers at ~1.5 m).
+
+        Continuous and never shorter than the normal lookahead: below
+        recovery_lookahead_xtrack_start_m the result is exactly the input, so
+        normal straight-line tracking is unchanged.
+        """
+        if self.recovery_lookahead_max <= lookahead:
+            return lookahead
+        extra = self.recovery_lookahead_xtrack_gain * max(
+            0.0, abs_cross_track - self.recovery_lookahead_xtrack_start
+        )
+        return max(lookahead, min(self.recovery_lookahead_max, lookahead + extra))
+
     def reset_terminal_native_pivot(self):
         self.terminal_native_pivot_active = False
         self.terminal_native_pivot_true_bearing = None
@@ -6162,7 +6359,11 @@ class RPPController(Node):
         true_error = self.normalize_angle(true_bearing - self.current_yaw)
 
         if self.terminal_native_pivot_active:
-            true_bearing = self.terminal_native_pivot_true_bearing
+            if self.pivot_dynamic_target_enabled:
+                # Re-aim at the moving lookahead target every cycle.
+                self.terminal_native_pivot_true_bearing = true_bearing
+            else:
+                true_bearing = self.terminal_native_pivot_true_bearing
             true_error = self.normalize_angle(true_bearing - self.current_yaw)
         else:
             # Normal new-segment entry remains 45 deg. A rebound after a
@@ -6192,7 +6393,12 @@ class RPPController(Node):
                 f"{math.degrees(self.terminal_native_pivot_request_error):.1f}deg"
             )
 
-        if abs(true_error) <= self.terminal_native_pivot_release_error:
+        release_error = (
+            self.pivot_handover_release_error
+            if self.pivot_moving_handover_enabled
+            else self.terminal_native_pivot_release_error
+        )
+        if abs(true_error) <= release_error:
             self.get_logger().warn(
                 "PX4 PIVOT KEEPER RELEASED | "
                 f"reason={self.terminal_native_pivot_reason} | "
@@ -7723,6 +7929,8 @@ class RPPController(Node):
             self.filtered_moving_yaw_rate = 0.0
             self.last_commanded_yaw_rate_radps = 0.0
             self._reset_moving_course_bias()
+            self.pivot_yaw_rate_output = 0.0
+            self.pivot_yaw_rate_last_time = None
             output_speed = 0.0
             north = 0.0
             east = 0.0
@@ -8686,6 +8894,7 @@ class RPPController(Node):
                 self.xtrack_priority_lookahead_max,
                 self.xtrack_priority_lookahead * speed_scale,
             )
+            lookahead = self._recovery_lookahead(lookahead, abs(signed_cross_track))
             correction_limit = self.xtrack_priority_correction_limit
             neutral_band = self.xtrack_neutral_crossing_band
             correction_slew_rate = self.xtrack_correction_slew_rate
@@ -9005,6 +9214,7 @@ class RPPController(Node):
             self.line_tracking_lookahead_min,
             min(self.line_tracking_lookahead_max, lookahead),
         )
+        lookahead = self._recovery_lookahead(lookahead, abs(signed_cross_track))
 
         correction = -math.atan2(
             steering_cross_track,

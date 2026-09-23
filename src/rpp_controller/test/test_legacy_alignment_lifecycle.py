@@ -27,7 +27,11 @@ NODE_TREE = ast.parse(NODE_SOURCE)
 DEG4 = math.radians(4.0)
 YAW_30DPS = math.radians(30.0)
 YAW_98DPS = math.radians(98.0)
-NATIVE_HASH = "1211c6999c8f414c1c9799acdd4c4340d5100fd2de0b07caa1ae27f11abcae5c"
+# 2026-09-23: re-pinned for the intentional PX4-Mission-style corner change
+# (dynamic re-aimed pivot target + moving-handover release threshold, both
+# behind parameters that default off). Behaviour is covered by
+# test_pivot_mission_style_corner.py.
+NATIVE_HASH = "565ee3785dca8b06443498848866bb26948afd6fbf19fb76342b9c2a96795f29"
 
 
 def _controller_method(name: str) -> ast.FunctionDef:

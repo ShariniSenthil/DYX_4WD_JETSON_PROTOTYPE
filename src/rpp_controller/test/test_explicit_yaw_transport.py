@@ -154,6 +154,10 @@ def rpp(enabled=None):
     node._update_moving_course_bias = env["_update_moving_course_bias"].__get__(node)
     node.moving_course_bias_enabled = False
     node._reset_moving_course_bias()
+    # Pivot yaw-rate ramp off: pre-existing stationary-pivot behaviour.
+    node.pivot_yaw_rate_slew = 0.0
+    node.pivot_yaw_rate_output = 0.0
+    node.pivot_yaw_rate_last_time = None
     return node, env
 
 
