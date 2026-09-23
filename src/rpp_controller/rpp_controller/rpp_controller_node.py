@@ -400,9 +400,11 @@ class RPPController(Node):
         self.declare_parameter("moving_yaw_damping_gain_max", 0.32)
         self.declare_parameter("moving_yaw_rate_filter_alpha", 0.20)
         self.declare_parameter("moving_yaw_damping_limit_radps", 0.08)
-        # ArduRover-inspired outer lateral controller:
-        # xtrack position -> desired lateral velocity -> lateral acceleration
-        # -> yaw-rate feed-forward. Existing measured-yaw damping remains.
+        # ArduRover-inspired outer lateral state observer/controller.
+        # The state calculation stays active for diagnostics, but yaw authority
+        # is independently gated so it cannot run in parallel with the
+        # predictive trajectory/heading controller unless explicitly enabled.
+        self.declare_parameter("straight_lateral_yaw_authority_enabled", False)
         self.declare_parameter("straight_lateral_position_gain_s", 1.20)
         self.declare_parameter("straight_lateral_velocity_gain_s", 2.00)
         self.declare_parameter("straight_lateral_velocity_max_mps", 0.08)
@@ -1053,6 +1055,9 @@ class RPPController(Node):
         )
         self.moving_yaw_damping_limit = float(
             self.get_parameter("moving_yaw_damping_limit_radps").value
+        )
+        self.straight_lateral_yaw_authority_enabled = bool(
+            self.get_parameter("straight_lateral_yaw_authority_enabled").value
         )
         self.straight_lateral_position_gain = float(
             self.get_parameter("straight_lateral_position_gain_s").value
@@ -1997,6 +2002,7 @@ class RPPController(Node):
         self.straight_lateral_velocity_target_mps = 0.0
         self.straight_lateral_accel_command_mps2 = 0.0
         self.straight_lateral_yaw_rate_ff_radps = 0.0
+        self.straight_lateral_yaw_rate_ff_applied_radps = 0.0
 
         self.target_x = None
         self.target_y = None
@@ -3684,6 +3690,8 @@ class RPPController(Node):
             self.moving_yaw_rate_output = 0.0
             self.moving_yaw_rate_last_time = None
             self.filtered_moving_yaw_rate = 0.0
+            self.straight_lateral_yaw_rate_ff_radps = 0.0
+            self.straight_lateral_yaw_rate_ff_applied_radps = 0.0
             if error_abs <= 1.0e-9:
                 self.last_commanded_yaw_rate_radps = 0.0
                 return 0.0
@@ -3750,14 +3758,19 @@ class RPPController(Node):
         proportional_request = (
             0.0 if self.moving_yaw_quiet else self.moving_yaw_kp * yaw_error
         )
-        lateral_ff = float(lateral_yaw_rate_ff_radps)
-        if not math.isfinite(lateral_ff):
-            lateral_ff = 0.0
-        lateral_ff = max(
+        lateral_ff_raw = float(lateral_yaw_rate_ff_radps)
+        if not math.isfinite(lateral_ff_raw):
+            lateral_ff_raw = 0.0
+        lateral_ff_raw = max(
             -self.straight_lateral_yaw_rate_max,
-            min(self.straight_lateral_yaw_rate_max, lateral_ff),
+            min(self.straight_lateral_yaw_rate_max, lateral_ff_raw),
         )
-        requested = proportional_request + lateral_ff - damping_term
+        self.straight_lateral_yaw_rate_ff_radps = lateral_ff_raw
+        lateral_ff_applied = (
+            lateral_ff_raw if self.straight_lateral_yaw_authority_enabled else 0.0
+        )
+        self.straight_lateral_yaw_rate_ff_applied_radps = lateral_ff_applied
+        requested = proportional_request + lateral_ff_applied - damping_term
         requested = max(
             -self.moving_yaw_rate_max,
             min(self.moving_yaw_rate_max, requested),
@@ -7906,6 +7919,7 @@ class RPPController(Node):
             self.straight_lateral_velocity_target_mps = 0.0
             self.straight_lateral_accel_command_mps2 = 0.0
             self.straight_lateral_yaw_rate_ff_radps = 0.0
+            self.straight_lateral_yaw_rate_ff_applied_radps = 0.0
             output_speed = 0.0
             north = 0.0
             east = 0.0
@@ -8262,6 +8276,31 @@ class RPPController(Node):
             ),
             "steering_state": "UNKNOWN",
             "moving_yaw_quiet": bool(self.moving_yaw_quiet),
+            "lateral_yaw_authority_enabled": bool(
+                self.straight_lateral_yaw_authority_enabled
+            ),
+            "lateral_velocity_mps": None,
+            "lateral_velocity_target_mps": None,
+            "lateral_accel_command_mps2": None,
+            "lateral_yaw_rate_ff_raw_radps": None,
+            "lateral_yaw_rate_ff_applied_radps": None,
+            "trajectory_tracking_source": (
+                "CONTINUOUS_GEOMETRY_PROJECTION"
+                if self.geometry_tracking_enabled
+                else "LEGACY_NAV_PATH_CURSOR"
+            ),
+            "geometry_contract_synchronized": bool(
+                self.geometry_contract_synchronized
+            ),
+            "trajectory_projection_s_m": None,
+            "trajectory_projection_x_m": None,
+            "trajectory_projection_y_m": None,
+            "trajectory_projection_segment_index": None,
+            "trajectory_projection_raw_start_index": None,
+            "trajectory_projection_raw_end_index": None,
+            "nav_path_lookahead_m": self._finite_or_none(
+                self.nav_path_lookahead
+            ),
             "current_yaw_rad": self._finite_or_none(self.current_yaw),
             "current_yaw_deg": (
                 math.degrees(self.current_yaw)
@@ -8393,6 +8432,59 @@ class RPPController(Node):
                 pending["control_mode"] = "WAITING"
 
         pending["actual_speed_mps"] = self._finite_or_none(self.current_speed_mps)
+        pending.update(
+            {
+                "lateral_velocity_mps": self._finite_or_none(
+                    self.straight_lateral_velocity_mps
+                ),
+                "lateral_velocity_target_mps": self._finite_or_none(
+                    self.straight_lateral_velocity_target_mps
+                ),
+                "lateral_accel_command_mps2": self._finite_or_none(
+                    self.straight_lateral_accel_command_mps2
+                ),
+                "lateral_yaw_rate_ff_raw_radps": self._finite_or_none(
+                    self.straight_lateral_yaw_rate_ff_radps
+                ),
+                "lateral_yaw_rate_ff_applied_radps": self._finite_or_none(
+                    self.straight_lateral_yaw_rate_ff_applied_radps
+                ),
+                "geometry_contract_synchronized": bool(
+                    self.geometry_contract_synchronized
+                ),
+            }
+        )
+        projection = self.geometry_last_projection
+        if (
+            self.geometry_tracking_enabled
+            and projection is not None
+            and self.geometry_last_projection_cycle_token
+            == self.precision_cycle_token
+        ):
+            pending.update(
+                {
+                    "trajectory_projection_s_m": self._finite_or_none(
+                        projection.progress_s
+                    ),
+                    "trajectory_projection_x_m": self._finite_or_none(
+                        projection.point.x
+                    ),
+                    "trajectory_projection_y_m": self._finite_or_none(
+                        projection.point.y
+                    ),
+                    "trajectory_projection_segment_index": (
+                        int(projection.segment_index)
+                        if projection.segment_index is not None
+                        else None
+                    ),
+                    "trajectory_projection_raw_start_index": int(
+                        projection.raw_start_index
+                    ),
+                    "trajectory_projection_raw_end_index": int(
+                        projection.raw_end_index
+                    ),
+                }
+            )
         pending["sample_complete_monotonic_ns"] = finish_ns
         with self._rpp_debug_lock:
             self._rpp_debug_snapshot = dict(pending)

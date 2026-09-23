@@ -535,8 +535,10 @@ def generate_launch_description() -> LaunchDescription:
                         "moving_yaw_damping_gain_max": 0.32,
                         "moving_yaw_rate_filter_alpha": 0.20,
                         "moving_yaw_damping_limit_radps": 0.08,
-                        # ArduRover-inspired path-frame lateral loop.
-                        # Conservative first-field-test gains.
+                        # Keep the lateral state observer alive for diagnostics,
+                        # but do not add its yaw-rate FF on top of the predictive
+                        # trajectory/heading controller in this V6.1 test.
+                        "straight_lateral_yaw_authority_enabled": False,
                         "straight_lateral_position_gain_s": 1.20,
                         "straight_lateral_velocity_gain_s": 2.00,
                         "straight_lateral_velocity_max_mps": 0.08,
