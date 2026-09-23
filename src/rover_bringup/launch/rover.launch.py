@@ -564,7 +564,7 @@ def generate_launch_description() -> LaunchDescription:
                         # Straight-line and cross-track guidance uses the local
                         # /nav_path tangent and a path-distance lookahead.
                         "path_correction_limit_deg": 12.0,
-                        "terminal_line_correction_limit_deg": 18.0,
+                        "terminal_line_correction_limit_deg": 12.0,
                         # Field-tuned reference: 0.55m lookahead at 0.60m/s.
                         # At 0.8/1.0m/s the controller automatically looks
                         # farther ahead instead of becoming more aggressive in time.
