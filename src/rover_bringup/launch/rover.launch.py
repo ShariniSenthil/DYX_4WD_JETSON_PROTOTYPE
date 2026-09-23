@@ -535,6 +535,15 @@ def generate_launch_description() -> LaunchDescription:
                         "moving_yaw_damping_gain_max": 0.32,
                         "moving_yaw_rate_filter_alpha": 0.20,
                         "moving_yaw_damping_limit_radps": 0.08,
+                        # ArduRover-inspired path-frame lateral loop.
+                        # Conservative first-field-test gains.
+                        "straight_lateral_position_gain_s": 1.20,
+                        "straight_lateral_velocity_gain_s": 2.00,
+                        "straight_lateral_velocity_max_mps": 0.08,
+                        "straight_lateral_accel_max_mps2": 0.12,
+                        "straight_lateral_speed_floor_mps": 0.25,
+                        "straight_lateral_yaw_rate_max_radps": 0.10,
+                        "straight_velocity_filter_alpha": 0.20,
                         # V4.2: no intermediate 0.40 m/s heading-speed tier.
                         # Xtrack recovery also runs at cruise; >=15deg path-heading
                         # error is handed to stationary pivot/alignment instead.
@@ -554,7 +563,7 @@ def generate_launch_description() -> LaunchDescription:
                         #   500 mm final deceleration and the exact 30 mm stop.
                         # Straight-line and cross-track guidance uses the local
                         # /nav_path tangent and a path-distance lookahead.
-                        "path_correction_limit_deg": 18.0,
+                        "path_correction_limit_deg": 12.0,
                         "terminal_line_correction_limit_deg": 18.0,
                         # Field-tuned reference: 0.55m lookahead at 0.60m/s.
                         # At 0.8/1.0m/s the controller automatically looks
@@ -886,11 +895,21 @@ def generate_launch_description() -> LaunchDescription:
                         # Keep 0.55m at 0.60m/s, scale toward 0.90m by 1.00m/s.
                         "xtrack_priority_lookahead_m": 0.55,
                         "xtrack_priority_lookahead_max_m": 0.90,
-                        "xtrack_priority_correction_limit_deg": 22.0,
-                        "xtrack_prediction_time_sec": 0.25,
+                        # Moving correction remains below the 15deg pivot owner.
+                        "xtrack_priority_correction_limit_deg": 12.0,
+                        "xtrack_prediction_time_sec": 0.40,
                         "xtrack_rate_filter_alpha": 0.20,
                         "xtrack_correction_slew_rate_degps": 30.0,
-                        "xtrack_neutral_crossing_band_m": 0.015,
+                        "xtrack_unwind_slew_rate_degps": 60.0,
+                        "xtrack_neutral_crossing_band_m": 0.005,
+                        # Final 3m: full recapture while >30mm; tighter hold
+                        # after capture to reduce left/right snaking.
+                        "trajectory_precision_zone_distance_m": 3.0,
+                        "trajectory_precision_capture_xtrack_m": 0.030,
+                        "trajectory_precision_lookahead_m": 0.45,
+                        "trajectory_precision_prediction_time_sec": 0.55,
+                        "trajectory_precision_correction_limit_deg": 8.0,
+                        "trajectory_precision_neutral_band_m": 0.004,
                         "xtrack_priority_release_heading_deg": 4.0,
                         # Adaptive final 1.50m xtrack profile with projected crossing brake.
                         "terminal_xtrack_lookahead_m": 0.50,

@@ -275,9 +275,19 @@ class RPPController(Node):
             30.0,
         )
         self.declare_parameter(
-            "xtrack_neutral_crossing_band_m",
-            0.015,
+            "xtrack_unwind_slew_rate_degps",
+            60.0,
         )
+        self.declare_parameter(
+            "xtrack_neutral_crossing_band_m",
+            0.005,
+        )
+        self.declare_parameter("trajectory_precision_zone_distance_m", 3.0)
+        self.declare_parameter("trajectory_precision_capture_xtrack_m", 0.030)
+        self.declare_parameter("trajectory_precision_lookahead_m", 0.45)
+        self.declare_parameter("trajectory_precision_prediction_time_sec", 0.55)
+        self.declare_parameter("trajectory_precision_correction_limit_deg", 8.0)
+        self.declare_parameter("trajectory_precision_neutral_band_m", 0.004)
         self.declare_parameter(
             "xtrack_priority_release_heading_deg",
             4.0,
@@ -390,6 +400,16 @@ class RPPController(Node):
         self.declare_parameter("moving_yaw_damping_gain_max", 0.32)
         self.declare_parameter("moving_yaw_rate_filter_alpha", 0.20)
         self.declare_parameter("moving_yaw_damping_limit_radps", 0.08)
+        # ArduRover-inspired outer lateral controller:
+        # xtrack position -> desired lateral velocity -> lateral acceleration
+        # -> yaw-rate feed-forward. Existing measured-yaw damping remains.
+        self.declare_parameter("straight_lateral_position_gain_s", 1.20)
+        self.declare_parameter("straight_lateral_velocity_gain_s", 2.00)
+        self.declare_parameter("straight_lateral_velocity_max_mps", 0.08)
+        self.declare_parameter("straight_lateral_accel_max_mps2", 0.12)
+        self.declare_parameter("straight_lateral_speed_floor_mps", 0.25)
+        self.declare_parameter("straight_lateral_yaw_rate_max_radps", 0.10)
+        self.declare_parameter("straight_velocity_filter_alpha", 0.20)
         self.declare_parameter("moving_alignment_min_speed_mps", 0.40)
         self.declare_parameter(
             "alignment_reentry_goal_distance_m",
@@ -894,8 +914,29 @@ class RPPController(Node):
         self.xtrack_correction_slew_rate = math.radians(
             float(self.get_parameter("xtrack_correction_slew_rate_degps").value)
         )
+        self.xtrack_unwind_slew_rate = math.radians(
+            float(self.get_parameter("xtrack_unwind_slew_rate_degps").value)
+        )
         self.xtrack_neutral_crossing_band = float(
             self.get_parameter("xtrack_neutral_crossing_band_m").value
+        )
+        self.trajectory_precision_zone_distance = float(
+            self.get_parameter("trajectory_precision_zone_distance_m").value
+        )
+        self.trajectory_precision_capture_xtrack = float(
+            self.get_parameter("trajectory_precision_capture_xtrack_m").value
+        )
+        self.trajectory_precision_lookahead = float(
+            self.get_parameter("trajectory_precision_lookahead_m").value
+        )
+        self.trajectory_precision_prediction_time_sec = float(
+            self.get_parameter("trajectory_precision_prediction_time_sec").value
+        )
+        self.trajectory_precision_correction_limit = math.radians(
+            float(self.get_parameter("trajectory_precision_correction_limit_deg").value)
+        )
+        self.trajectory_precision_neutral_band = float(
+            self.get_parameter("trajectory_precision_neutral_band_m").value
         )
         self.xtrack_priority_release_heading = math.radians(
             float(self.get_parameter("xtrack_priority_release_heading_deg").value)
@@ -1012,6 +1053,27 @@ class RPPController(Node):
         )
         self.moving_yaw_damping_limit = float(
             self.get_parameter("moving_yaw_damping_limit_radps").value
+        )
+        self.straight_lateral_position_gain = float(
+            self.get_parameter("straight_lateral_position_gain_s").value
+        )
+        self.straight_lateral_velocity_gain = float(
+            self.get_parameter("straight_lateral_velocity_gain_s").value
+        )
+        self.straight_lateral_velocity_max = float(
+            self.get_parameter("straight_lateral_velocity_max_mps").value
+        )
+        self.straight_lateral_accel_max = float(
+            self.get_parameter("straight_lateral_accel_max_mps2").value
+        )
+        self.straight_lateral_speed_floor = float(
+            self.get_parameter("straight_lateral_speed_floor_mps").value
+        )
+        self.straight_lateral_yaw_rate_max = float(
+            self.get_parameter("straight_lateral_yaw_rate_max_radps").value
+        )
+        self.straight_velocity_filter_alpha = float(
+            self.get_parameter("straight_velocity_filter_alpha").value
         )
         self.moving_alignment_min_speed = float(
             self.get_parameter("moving_alignment_min_speed_mps").value
@@ -1928,6 +1990,13 @@ class RPPController(Node):
         self.current_speed_mps = math.inf
         self.current_yaw_rate_radps = math.inf
         self.last_odom_time = None
+        self.pose_velocity_east_mps = 0.0
+        self.pose_velocity_north_mps = 0.0
+        self.pose_velocity_valid = False
+        self.straight_lateral_velocity_mps = 0.0
+        self.straight_lateral_velocity_target_mps = 0.0
+        self.straight_lateral_accel_command_mps2 = 0.0
+        self.straight_lateral_yaw_rate_ff_radps = 0.0
 
         self.target_x = None
         self.target_y = None
@@ -2752,7 +2821,24 @@ class RPPController(Node):
             "xtrack_prediction_time_sec": (self.xtrack_prediction_time_sec),
             "xtrack_rate_filter_alpha": (self.xtrack_rate_filter_alpha),
             "xtrack_correction_slew_rate_degps": (self.xtrack_correction_slew_rate),
+            "xtrack_unwind_slew_rate_degps": self.xtrack_unwind_slew_rate,
             "xtrack_neutral_crossing_band_m": (self.xtrack_neutral_crossing_band),
+            "trajectory_precision_zone_distance_m": (
+                self.trajectory_precision_zone_distance
+            ),
+            "trajectory_precision_capture_xtrack_m": (
+                self.trajectory_precision_capture_xtrack
+            ),
+            "trajectory_precision_lookahead_m": self.trajectory_precision_lookahead,
+            "trajectory_precision_prediction_time_sec": (
+                self.trajectory_precision_prediction_time_sec
+            ),
+            "trajectory_precision_correction_limit_deg": (
+                self.trajectory_precision_correction_limit
+            ),
+            "trajectory_precision_neutral_band_m": (
+                self.trajectory_precision_neutral_band
+            ),
             "xtrack_priority_release_heading_deg": (
                 self.xtrack_priority_release_heading
             ),
@@ -3003,18 +3089,55 @@ class RPPController(Node):
                 "xtrack_priority_lookahead_max_m must be finite and >= "
                 "xtrack_priority_lookahead_m"
             )
-        if self.xtrack_neutral_crossing_band < self.xtrack_priority_enter:
+        if not (
+            0.0
+            < self.xtrack_neutral_crossing_band
+            <= self.xtrack_priority_enter
+        ):
             raise ValueError(
-                "xtrack_neutral_crossing_band_m must be >= " "xtrack_priority_enter_m"
+                "xtrack_neutral_crossing_band_m must be in "
+                "(0, xtrack_priority_enter_m]"
             )
         if not (
             self.path_correction_limit
             <= self.xtrack_priority_correction_limit
-            < math.radians(45.0)
+            < self.pivot_enter_angle
         ):
             raise ValueError(
-                "xtrack priority correction must be >= normal correction "
-                "and below 45deg"
+                "moving trajectory correction must be >= normal correction "
+                "and strictly below pivot_enter_angle_deg"
+            )
+        if self.xtrack_unwind_slew_rate < self.xtrack_correction_slew_rate:
+            raise ValueError(
+                "xtrack_unwind_slew_rate_degps must be >= "
+                "xtrack_correction_slew_rate_degps"
+            )
+        if not (
+            0.0
+            < self.trajectory_precision_neutral_band
+            <= self.xtrack_neutral_crossing_band
+        ):
+            raise ValueError(
+                "trajectory_precision_neutral_band_m must be positive and "
+                "<= xtrack_neutral_crossing_band_m"
+            )
+        if not (
+            self.xtrack_priority_exit
+            < self.trajectory_precision_capture_xtrack
+            <= self.segment_alignment_cross_track_tolerance
+        ):
+            raise ValueError(
+                "trajectory_precision_capture_xtrack_m must be greater than "
+                "xtrack_priority_exit_m and <= alignment tolerance"
+            )
+        if not (
+            0.0
+            < self.trajectory_precision_correction_limit
+            < self.pivot_enter_angle
+        ):
+            raise ValueError(
+                "trajectory_precision_correction_limit_deg must be positive "
+                "and strictly below pivot_enter_angle_deg"
             )
         if not (0.0 < self.xtrack_priority_release_heading < math.radians(45.0)):
             raise ValueError("xtrack priority release heading must be below 45deg")
@@ -3302,6 +3425,39 @@ class RPPController(Node):
                 "<= moving_yaw_rate_max_radps"
             )
         if not (
+            math.isfinite(self.straight_lateral_position_gain)
+            and self.straight_lateral_position_gain > 0.0
+            and math.isfinite(self.straight_lateral_velocity_gain)
+            and self.straight_lateral_velocity_gain > 0.0
+        ):
+            raise ValueError("straight lateral position/velocity gains must be > 0")
+        if not (
+            math.isfinite(self.straight_lateral_velocity_max)
+            and self.straight_lateral_velocity_max > 0.0
+            and math.isfinite(self.straight_lateral_accel_max)
+            and self.straight_lateral_accel_max > 0.0
+        ):
+            raise ValueError("straight lateral velocity/acceleration limits must be > 0")
+        if not (
+            math.isfinite(self.straight_lateral_speed_floor)
+            and 0.0 < self.straight_lateral_speed_floor
+            <= self.MAXIMUM_MOVING_SPEED_MPS
+        ):
+            raise ValueError(
+                "straight_lateral_speed_floor_mps must be in (0, max moving speed]"
+            )
+        if not (
+            math.isfinite(self.straight_lateral_yaw_rate_max)
+            and 0.0 < self.straight_lateral_yaw_rate_max
+            <= self.moving_yaw_rate_max
+        ):
+            raise ValueError(
+                "straight_lateral_yaw_rate_max_radps must be in "
+                "(0, moving_yaw_rate_max_radps]"
+            )
+        if not (0.0 < self.straight_velocity_filter_alpha <= 1.0):
+            raise ValueError("straight_velocity_filter_alpha must be in (0, 1]")
+        if not (
             math.isfinite(self.steering_reference_speed)
             and 0.0 < self.steering_reference_speed
             <= self.MAXIMUM_MOVING_SPEED_MPS
@@ -3502,6 +3658,7 @@ class RPPController(Node):
         *,
         stationary_pivot=False,
         translational_speed_mps=0.0,
+        lateral_yaw_rate_ff_radps=0.0,
     ):
         """Generate Jetson-owned ENU yaw-rate.
 
@@ -3593,7 +3750,14 @@ class RPPController(Node):
         proportional_request = (
             0.0 if self.moving_yaw_quiet else self.moving_yaw_kp * yaw_error
         )
-        requested = proportional_request - damping_term
+        lateral_ff = float(lateral_yaw_rate_ff_radps)
+        if not math.isfinite(lateral_ff):
+            lateral_ff = 0.0
+        lateral_ff = max(
+            -self.straight_lateral_yaw_rate_max,
+            min(self.straight_lateral_yaw_rate_max, lateral_ff),
+        )
+        requested = proportional_request + lateral_ff - damping_term
         requested = max(
             -self.moving_yaw_rate_max,
             min(self.moving_yaw_rate_max, requested),
@@ -4025,6 +4189,39 @@ class RPPController(Node):
         ):
             self.geometry_last_odom_point = (x, y)
 
+        now = self.get_clock().now()
+        self.pose_velocity_valid = False
+        if (
+            self.current_x is not None
+            and self.current_y is not None
+            and self.last_odom_time is not None
+        ):
+            pose_dt = (now - self.last_odom_time).nanoseconds / 1e9
+            if math.isfinite(pose_dt) and 1.0e-3 < pose_dt <= self.odom_timeout_sec:
+                raw_east = (x - self.current_x) / pose_dt
+                raw_north = (y - self.current_y) / pose_dt
+                raw_speed = math.hypot(raw_east, raw_north)
+                if (
+                    math.isfinite(raw_speed)
+                    and raw_speed <= 2.0 * self.MAXIMUM_MOVING_SPEED_MPS
+                ):
+                    alpha = self.straight_velocity_filter_alpha
+                    self.pose_velocity_east_mps = (
+                        alpha * raw_east
+                        + (1.0 - alpha) * self.pose_velocity_east_mps
+                    )
+                    self.pose_velocity_north_mps = (
+                        alpha * raw_north
+                        + (1.0 - alpha) * self.pose_velocity_north_mps
+                    )
+                    self.pose_velocity_valid = True
+                else:
+                    self.pose_velocity_east_mps = 0.0
+                    self.pose_velocity_north_mps = 0.0
+            else:
+                self.pose_velocity_east_mps = 0.0
+                self.pose_velocity_north_mps = 0.0
+
         self.current_x = x
         self.current_y = y
         self.current_yaw = yaw
@@ -4036,7 +4233,75 @@ class RPPController(Node):
         # Whether angular.z is the physical chassis yaw rate at pivot dynamics
         # remains a field-validation item and is exposed in pivot diagnostics.
         self.current_yaw_rate_radps = yaw_rate if math.isfinite(yaw_rate) else math.inf
-        self.last_odom_time = self.get_clock().now()
+        self.last_odom_time = now
+
+    def straight_lateral_yaw_rate_feedforward(
+        self,
+        path_bearing,
+        signed_cross_track,
+        translational_speed_mps,
+    ):
+        """Path-frame position -> velocity -> acceleration -> yaw-rate loop."""
+        if (
+            not self.pose_velocity_valid
+            or not all(
+                math.isfinite(float(value))
+                for value in (
+                    path_bearing,
+                    signed_cross_track,
+                    translational_speed_mps,
+                    self.pose_velocity_east_mps,
+                    self.pose_velocity_north_mps,
+                )
+            )
+        ):
+            self.straight_lateral_velocity_mps = 0.0
+            self.straight_lateral_velocity_target_mps = 0.0
+            self.straight_lateral_accel_command_mps2 = 0.0
+            self.straight_lateral_yaw_rate_ff_radps = 0.0
+            return 0.0
+
+        cos_path = math.cos(path_bearing)
+        sin_path = math.sin(path_bearing)
+        v_forward = (
+            cos_path * self.pose_velocity_east_mps
+            + sin_path * self.pose_velocity_north_mps
+        )
+        v_lateral = (
+            -sin_path * self.pose_velocity_east_mps
+            + cos_path * self.pose_velocity_north_mps
+        )
+
+        desired_v_lateral = -(
+            self.straight_lateral_position_gain * signed_cross_track
+        )
+        desired_v_lateral = max(
+            -self.straight_lateral_velocity_max,
+            min(self.straight_lateral_velocity_max, desired_v_lateral),
+        )
+        lateral_accel = self.straight_lateral_velocity_gain * (
+            desired_v_lateral - v_lateral
+        )
+        lateral_accel = max(
+            -self.straight_lateral_accel_max,
+            min(self.straight_lateral_accel_max, lateral_accel),
+        )
+        speed_denom = max(
+            abs(v_forward),
+            abs(float(translational_speed_mps)),
+            self.straight_lateral_speed_floor,
+        )
+        yaw_rate_ff = lateral_accel / speed_denom
+        yaw_rate_ff = max(
+            -self.straight_lateral_yaw_rate_max,
+            min(self.straight_lateral_yaw_rate_max, yaw_rate_ff),
+        )
+
+        self.straight_lateral_velocity_mps = v_lateral
+        self.straight_lateral_velocity_target_mps = desired_v_lateral
+        self.straight_lateral_accel_command_mps2 = lateral_accel
+        self.straight_lateral_yaw_rate_ff_radps = yaw_rate_ff
+        return yaw_rate_ff
 
     def nav_path_callback(self, msg):
         """Receive the complete retained 50 mm navigation trajectory.
@@ -4385,13 +4650,21 @@ class RPPController(Node):
 
         self.geometry_last_projection = projection
         self.geometry_last_projection_cycle_token = self.precision_cycle_token
+
+        # Moving trajectory target: projection is the current path target and
+        # arc-length lookahead supplies the forward trajectory direction.
+        # Dense 50 mm samples define geometry/progress, not independent yaw.
         path_bearing = None
-        if projection.segment_index is not None:
+        tangent_dx = lookup.point.x - projection.point.x
+        tangent_dy = lookup.point.y - projection.point.y
+        if math.hypot(tangent_dx, tangent_dy) > self.WAYPOINT_CHANGE_EPSILON_M:
+            path_bearing = math.atan2(tangent_dy, tangent_dx)
+        elif lookup.heading_rad is not None:
+            path_bearing = lookup.heading_rad
+        elif projection.segment_index is not None:
             path_bearing = self.path_geometry.segments[
                 projection.segment_index
             ].heading_rad
-        elif lookup.heading_rad is not None:
-            path_bearing = lookup.heading_rad
         else:
             dx = goal_x - self.current_x
             dy = goal_y - self.current_y
@@ -4518,13 +4791,11 @@ class RPPController(Node):
             lookahead_index = nx
         self.nav_path_lookahead_index = lookahead_index
 
-        # Local path tangent is derived from /nav_path itself. This is the
-        # bearing RPP follows; Mission Manager quaternion is never consulted.
-        tangent_from = max(
-            self.nav_path_segment_start_index,
-            cursor - 1,
-        )
-        tangent_to = min(goal_index, max(cursor, tangent_from + 1))
+        # Use the moving cursor->lookahead trajectory chord. Dense
+        # 50 mm samples remain geometry/progress points rather than producing
+        # a new heading from every adjacent pair.
+        tangent_from = cursor
+        tangent_to = min(goal_index, max(lookahead_index, cursor + 1))
 
         if tangent_to > tangent_from:
             ax, ay = self.nav_path_points[tangent_from]
@@ -4617,8 +4888,8 @@ class RPPController(Node):
             self.c_line_locked = False
             self.c_line_bearing = None
 
-        if self.mission_enabled and not self.first_marking_completed:
-            self.lock_c_to_p1_line("marking metadata received")
+        # C->P1 is sampled only on the explicit mission START edge.
+        # Metadata refreshes never recalculate C from a later rover pose.
 
     def target_matches_marking(self, x, y):
         for marking_x, marking_y in self.marking_waypoints:
@@ -4743,13 +5014,24 @@ class RPPController(Node):
         if not changed:
             return
 
-        # Choose the fixed incoming segment start. P1 of a fresh mission owns
-        # a C->P1 line from the current rover pose. Every later semantic goal
-        # uses the previous semantic goal, including extension->P2.
+        # P1 never samples current rover position here. C->P1 is
+        # created only by the START edge. Later semantic goals use the
+        # previous semantic goal, including extension->P2.
         fresh_p1 = new_number == 1 and previous_number != 1
-        if fresh_p1 or previous_x is None or previous_y is None:
-            start_x = self.current_x
-            start_y = self.current_y
+        if fresh_p1:
+            if (
+                self.c_line_locked
+                and self.c_line_start_x is not None
+                and self.c_line_start_y is not None
+            ):
+                start_x = self.c_line_start_x
+                start_y = self.c_line_start_y
+            else:
+                start_x = None
+                start_y = None
+        elif previous_x is None or previous_y is None:
+            start_x = None
+            start_y = None
         else:
             start_x = previous_x
             start_y = previous_y
@@ -4772,8 +5054,13 @@ class RPPController(Node):
             else:
                 self.target_path_bearing = None
 
-        # Returning from a later point to P1 represents a new mission.
-        if new_number == 1 and previous_number != 1:
+        # Only an inactive mission may clear the previous START anchor.
+        # A P1 message after START must never move the captured C position.
+        if (
+            new_number == 1
+            and previous_number != 1
+            and not self.mission_enabled
+        ):
             self.first_marking_completed = False
             self.first_marking_hold_seen = False
             self.c_line_locked = False
@@ -4857,8 +5144,6 @@ class RPPController(Node):
         )
 
         if new_number == 1 and not self.first_marking_completed:
-            if self.mission_enabled:
-                self.lock_c_to_p1_line("segment goal received")
             self.get_logger().warn(
                 "SEMANTIC GOAL ACTIVE | P1 | "
                 "C->P1 direct precision approach | "
@@ -4914,7 +5199,7 @@ class RPPController(Node):
                 self.c_line_locked = False
                 self.c_line_bearing = None
                 self.c_line_reanchored_after_pivot = False
-                self.lock_c_to_p1_line("mission enabled")
+                self.lock_c_to_p1_line("mission START")
             anchor_x = (
                 self.current_x
                 if not self.first_marking_completed
@@ -6161,10 +6446,25 @@ class RPPController(Node):
         self.runtime_entry_cursor_index = cursor
         self.runtime_entry_lookahead_index = lookahead
         self.runtime_entry_goal_index = goal_index
-        return solution
+
+        # START creates C->P1 once; tracking still uses a moving lookahead
+        # tangent so uneven-terrain disturbances can be corrected continuously.
+        line_x, line_y, path_bearing, _, _, _ = solution
+        if 0 <= cursor < len(self.runtime_entry_points):
+            tangent_to = min(lookahead, len(self.runtime_entry_points) - 1)
+            if tangent_to > cursor:
+                ax, ay = self.runtime_entry_points[cursor]
+                bx, by = self.runtime_entry_points[tangent_to]
+                dx = bx - ax
+                dy = by - ay
+                if math.hypot(dx, dy) > self.WAYPOINT_CHANGE_EPSILON_M:
+                    path_bearing = math.atan2(dy, dx)
+        return line_x, line_y, path_bearing, cursor, lookahead, goal_index
 
     def lock_c_to_p1_line(self, reason):
-        """On START, create C->P1 from current PX4/MAVROS local odometry."""
+        """Create C->P1 only from the rover pose sampled on mission START."""
+        if reason != "mission START":
+            return False
         if (
             self.first_marking_completed
             or not self.marking_waypoints
@@ -6193,6 +6493,9 @@ class RPPController(Node):
         self.c_line_start_x = start_x
         self.c_line_start_y = start_y
         self.c_line_bearing = bearing
+        self.segment_start_x = start_x
+        self.segment_start_y = start_y
+        self.target_path_bearing = bearing
         self.c_line_locked = True
         self.c_line_reanchored_after_pivot = False
         self.segment_alignment_active = True
@@ -7412,7 +7715,13 @@ class RPPController(Node):
         message.data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
         self.speed_debug_pub.publish(message)
 
-    def publish_precision_velocity_ned(self, command_bearing, result):
+    def publish_precision_velocity_ned(
+        self,
+        command_bearing,
+        result,
+        *,
+        lateral_yaw_rate_ff_radps=0.0,
+    ):
         """Publish one already-resolved translational command.
 
         This path deliberately bypasses all legacy acceleration, deceleration,
@@ -7461,6 +7770,7 @@ class RPPController(Node):
                     command_bearing,
                     stationary_pivot=False,
                     translational_speed_mps=output_speed,
+                    lateral_yaw_rate_ff_radps=lateral_yaw_rate_ff_radps,
                 )
             except (TypeError, ValueError):
                 self.get_logger().error(
@@ -7506,6 +7816,7 @@ class RPPController(Node):
         goal_distance=None,
         hard_speed_cap_mps=None,
         yaw_enu_rad=None,
+        lateral_yaw_rate_ff_radps=0.0,
     ):
         if not all(math.isfinite(value) for value in (north, east)):
             self.get_logger().error("Rejected non-finite RPP velocity command")
@@ -7592,6 +7903,9 @@ class RPPController(Node):
             self.moving_yaw_rate_last_time = None
             self.filtered_moving_yaw_rate = 0.0
             self.last_commanded_yaw_rate_radps = 0.0
+            self.straight_lateral_velocity_target_mps = 0.0
+            self.straight_lateral_accel_command_mps2 = 0.0
+            self.straight_lateral_yaw_rate_ff_radps = 0.0
             output_speed = 0.0
             north = 0.0
             east = 0.0
@@ -7611,6 +7925,7 @@ class RPPController(Node):
                         yaw_enu_rad,
                         stationary_pivot=False,
                         translational_speed_mps=output_speed,
+                        lateral_yaw_rate_ff_radps=lateral_yaw_rate_ff_radps,
                     )
                 except (TypeError, ValueError):
                     self.get_logger().error(
@@ -8449,6 +8764,7 @@ class RPPController(Node):
         line_point_y,
         *,
         terminal_mode=False,
+        trajectory_precision_mode=False,
     ):
         """Predictive, filtered and slew-limited fixed-line recovery.
 
@@ -8534,6 +8850,18 @@ class RPPController(Node):
 
             correction_slew_rate = self.terminal_xtrack_correction_slew_rate
             hard_correction_limit = self.terminal_xtrack_away_correction_limit
+        elif (
+            trajectory_precision_mode
+            and abs(signed_cross_track)
+            <= self.trajectory_precision_capture_xtrack
+        ):
+            prediction_time = self.trajectory_precision_prediction_time_sec
+            lookahead = self.trajectory_precision_lookahead
+            correction_limit = self.trajectory_precision_correction_limit
+            neutral_band = self.trajectory_precision_neutral_band
+            correction_slew_rate = self.xtrack_correction_slew_rate
+            hard_correction_limit = correction_limit
+            profile_name = "TRAJECTORY_3M_HOLD"
         else:
             prediction_time = self.xtrack_prediction_time_sec
             speed_scale = max(
@@ -8551,6 +8879,8 @@ class RPPController(Node):
             neutral_band = self.xtrack_neutral_crossing_band
             correction_slew_rate = self.xtrack_correction_slew_rate
             hard_correction_limit = correction_limit
+            if trajectory_precision_mode:
+                profile_name = "TRAJECTORY_3M_RECAPTURE"
 
         predicted_cross_track = signed_cross_track + xtrack_rate * prediction_time
 
@@ -8586,8 +8916,12 @@ class RPPController(Node):
             self.last_xtrack_correction
         )
 
-        if terminal_mode and (desired_reverses_sign or desired_reduces_magnitude):
-            active_slew_rate = self.terminal_xtrack_unwind_slew_rate
+        if desired_reverses_sign or desired_reduces_magnitude:
+            active_slew_rate = (
+                self.terminal_xtrack_unwind_slew_rate
+                if terminal_mode
+                else self.xtrack_unwind_slew_rate
+            )
         else:
             active_slew_rate = correction_slew_rate
 
@@ -8796,12 +9130,16 @@ class RPPController(Node):
         return recovery_needed and below_pivot_threshold
 
     def limit_moving_guidance_bearing(self, desired_bearing):
-        """Keep moving recovery below the PX4 45-degree pivot threshold."""
+        """Keep moving steering strictly below the 15deg pivot boundary."""
         command_error = self.normalize_angle(desired_bearing - self.current_yaw)
+        moving_limit = min(
+            self.MAX_MOVING_HEADING_ERROR_RAD,
+            max(math.radians(1.0), self.pivot_enter_angle - math.radians(1.0)),
+        )
         command_error = max(
-            -self.MAX_MOVING_HEADING_ERROR_RAD,
+            -moving_limit,
             min(
-                self.MAX_MOVING_HEADING_ERROR_RAD,
+                moving_limit,
                 command_error,
             ),
         )
@@ -10116,8 +10454,9 @@ class RPPController(Node):
             and not self.first_marking_completed
             and self.segment_goal_number == 1
         ):
-            if self.lock_c_to_p1_line("control-loop readiness"):
-                first_approach = True
+            # START is the only current-position sampling event for C->P1.
+            # Do not recreate C from a later control-loop pose.
+            first_approach = True
 
         if first_approach:
             p1_x, p1_y = self.marking_waypoints[0]
@@ -10801,6 +11140,12 @@ class RPPController(Node):
                 target_x,
                 target_y,
                 terminal_mode=terminal_active,
+                trajectory_precision_mode=(
+                    not terminal_active
+                    and goal_requires_precision_stop
+                    and 0.0 < goal_along_remaining
+                    <= self.trajectory_precision_zone_distance
+                ),
             )
 
         if not all(
@@ -10832,70 +11177,8 @@ class RPPController(Node):
                 global_xtrack_rate,
             )
 
-        if (
-            not precision_tracking_authority
-            and not terminal_active
-            and xtrack_speed_cap_active
-        ):
-            if (
-                self.precision_guidance_enabled
-                and not self.following_runtime_line
-            ):
-                xtrack_guidance_bearing = precision_guidance.limited_command_bearing_rad
-            (
-                xtrack_guidance_bearing,
-                command_heading_error,
-            ) = self.limit_moving_guidance_bearing(xtrack_guidance_bearing)
-            speed = self.xtrack_priority_speed
-            if self.precision_speed_control_enabled:
-                speed_result = self._resolve_precision_speed_for_cycle()
-                if speed_result is None:
-                    self.publish_stop()
-                    self.get_logger().error(
-                        "PRECISION SPEED REJECTED / RECOVERY SAFE HOLD"
-                    )
-                    return
-                north, east, speed = self.publish_precision_velocity_ned(
-                    xtrack_guidance_bearing,
-                    speed_result,
-                )
-            else:
-                north = speed * math.sin(xtrack_guidance_bearing)
-                east = speed * math.cos(xtrack_guidance_bearing)
-                north, east, speed = self.publish_velocity_ned(
-                    north,
-                    east,
-                    apply_acceleration=True,
-                    apply_deceleration=False,
-                    hard_speed_cap_mps=self.xtrack_priority_speed,
-                    yaw_enu_rad=xtrack_guidance_bearing,
-                )
-                self._record_published_translational_speed(speed)
-            self.log_control(
-                mode_prefix
-                + "GLOBAL DAMPED XTRACK RECOVERY / "
-                + f"HARD SPEED CAP {self.xtrack_priority_speed:.2f}MPS"
-                + f" / correction_limit="
-                + f"{math.degrees(self.xtrack_priority_correction_limit):.1f}deg"
-                + f" | xtrack={self.ground_xtrack(global_signed_cross_track) * 1000.0:+.1f}mm"
-                + f" | xtrack_rate={self.ground_xtrack(global_xtrack_rate) * 1000.0:+.1f}mm/s"
-                + f" | predicted={self.ground_xtrack(predicted_cross_track) * 1000.0:+.1f}mm"
-                + f" | metric={xtrack_error_metric * 1000.0:.1f}mm"
-                + f" | release_hold={xtrack_release_elapsed:.2f}/"
-                + f"{self.xtrack_priority_hold_sec:.2f}s"
-                + f" | correction="
-                + f"{math.degrees(applied_xtrack_correction):+.1f}deg"
-                + f" | path_error={math.degrees(path_heading_error):.1f}deg"
-                + f" | command_error="
-                + f"{math.degrees(command_heading_error):.1f}deg",
-                target_distance,
-                goal_distance,
-                command_heading_error,
-                speed,
-                north,
-                east,
-            )
-            return
+        # The 15/8 mm xtrack latch remains telemetry/release hysteresis.
+        # It no longer selects a separate moving steering/velocity controller.
 
         # --------------------------------------------------------------
         # CONTINUOUS TWO-METRE TERMINAL APPROACH
@@ -10983,6 +11266,11 @@ class RPPController(Node):
                 along_remaining,
             )
             heading_error = self.normalize_angle(guidance_bearing - self.current_yaw)
+            lateral_yaw_rate_ff = self.straight_lateral_yaw_rate_feedforward(
+                path_bearing,
+                global_signed_cross_track,
+                self.cruise_speed,
+            )
 
             profile_target = self.terminal_speed_for_along_remaining(along_remaining)
             terminal_speed_cap = (
@@ -11003,6 +11291,7 @@ class RPPController(Node):
                 goal_distance=along_remaining,
                 hard_speed_cap_mps=terminal_speed_cap,
                 yaw_enu_rad=guidance_bearing,
+                lateral_yaw_rate_ff_radps=lateral_yaw_rate_ff,
             )
             self._record_published_translational_speed(speed)
 
@@ -11052,21 +11341,19 @@ class RPPController(Node):
             guidance_bearing = precision_guidance.limited_command_bearing_rad
             signed_cross_track = precision_guidance.signed_cross_track_m
         else:
-            (
-                guidance_bearing,
-                signed_cross_track,
-            ) = self.line_guidance(
-                path_bearing,
-                target_x,
-                target_y,
-                self.path_correction_limit,
-            )
+            # One predictive trajectory follower owns the whole moving leg.
+            # Crossing 15 mm xtrack no longer changes the steering equation.
+            guidance_bearing = xtrack_guidance_bearing
+            signed_cross_track = global_signed_cross_track
             if (
                 self.precision_guidance_enabled
                 and not self.following_runtime_line
             ):
                 guidance_bearing = precision_guidance.limited_command_bearing_rad
                 signed_cross_track = precision_guidance.signed_cross_track_m
+            guidance_bearing, _ = self.limit_moving_guidance_bearing(
+                guidance_bearing
+            )
         heading_error = self.normalize_angle(guidance_bearing - self.current_yaw)
 
         # Straight-line supervisor: keep the existing 200 mm acceleration
@@ -11075,6 +11362,11 @@ class RPPController(Node):
         speed = self.apply_heading_speed_limit(
             self.cruise_speed,
             heading_error,
+        )
+        lateral_yaw_rate_ff = self.straight_lateral_yaw_rate_feedforward(
+            path_bearing,
+            signed_cross_track,
+            speed,
         )
 
         if first_approach:
@@ -11109,6 +11401,7 @@ class RPPController(Node):
             north, east, speed = self.publish_precision_velocity_ned(
                 guidance_bearing,
                 speed_result,
+                lateral_yaw_rate_ff_radps=lateral_yaw_rate_ff,
             )
         else:
             north = speed * math.sin(guidance_bearing)
@@ -11117,6 +11410,7 @@ class RPPController(Node):
                 north,
                 east,
                 yaw_enu_rad=guidance_bearing,
+                lateral_yaw_rate_ff_radps=lateral_yaw_rate_ff,
             )
             self._record_published_translational_speed(speed)
 
