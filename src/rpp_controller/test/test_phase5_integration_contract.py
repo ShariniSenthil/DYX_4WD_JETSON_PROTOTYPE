@@ -24,15 +24,15 @@ def function_source(name):
     return ast.get_source_segment(NODE, node)
 
 
+
 def test_terminal_flag_defaults_off_and_preserves_legacy_30mm_contract():
     assert 'declare_parameter("precision_terminal_enabled", False)' in NODE
     assert '"precision_terminal_enabled": False' in LAUNCH
     assert '"precision_terminal_radial_tolerance_m", 0.010' in NODE
-    assert '"waypoint_tolerance_m": 0.03' in LAUNCH
+    assert '"waypoint_tolerance_m": 0.02' in LAUNCH
     assert "target_distance <= self.waypoint_tolerance" in function_source(
         "latch_exact_marking_stop"
     )
-
 
 def test_terminal_gate_requires_complete_precision_stack_and_freshness_bound():
     validate = function_source("validate_parameters")
@@ -97,27 +97,16 @@ def test_10mm_capture_preempts_legacy_latch_and_every_moving_floor():
     assert "and self.latch_exact_marking_stop(" in control
 
 
-def test_precision_mode_20mm_does_not_enter_legacy_30mm_latch():
-    """The 10--30 mm annulus remains moving under precision authority."""
 
+def test_precision_mode_20mm_does_not_enter_legacy_30mm_latch():
     control = function_source("control_loop")
     assert '"precision_terminal_radial_tolerance_m", 0.010' in NODE
-    assert '"waypoint_tolerance_m": 0.03' in LAUNCH
-    assert (
-        "self.legacy_terminal_stop_active\n"
-        "            and goal_requires_precision_stop\n"
-        "            and self.latch_exact_marking_stop("
-    ) in control
-
+    assert '"waypoint_tolerance_m": 0.02' in LAUNCH
+    legacy = control.index("self.legacy_terminal_stop_active")
+    latch = control.index("self.latch_exact_marking_stop(", legacy)
+    assert legacy < latch
 
 def test_radial20_mode_defaults_off_and_is_mutually_exclusive_with_every_other_authority():
-    """terminal_stop_mode's own code-level default is legacy (a source
-    property that must hold regardless of deployment config); the launch
-    file's TERMINAL_STOP_MODE constant is a deliberate, operator-set
-    deployment choice (currently radial20 for field testing) and is not
-    asserted here -- only that both nodes reference the one shared constant,
-    never a hardcoded per-node value that could drift apart (R1)."""
-
     assert 'declare_parameter("terminal_stop_mode", "legacy")' in NODE
     assert LAUNCH.count('"terminal_stop_mode": TERMINAL_STOP_MODE') == 2
     assert '"radial_stop_radial_tolerance_m", 0.020' in NODE
@@ -126,28 +115,19 @@ def test_radial20_mode_defaults_off_and_is_mutually_exclusive_with_every_other_a
     precision = control.index("_step_precision_terminal_for_cycle")
     radial20 = control.index("_step_radial20_terminal_for_cycle")
     legacy = control.index("latch_exact_marking_stop")
-    # radial20 is evaluated after the Phase-5 FSM branch and before the
-    # legacy 30 mm latch, matching the Phase-5 branch's own ordering
-    # guarantee -- see test_10mm_capture_preempts_legacy_latch_and_every_moving_floor.
     assert precision < radial20 < legacy
+
     radial20_branch = control[radial20:legacy]
     assert "self.radial20_active" in control[:radial20]
     assert "RadialStopMotionDirection.ZERO" in radial20_branch
     assert "self.publish_stop()" in radial20_branch
-    assert "return" in radial20_branch
-    assert "self.terminal_bounded_guidance(" in radial20_branch
+    assert "self.xtrack_priority_guidance(" in radial20_branch
+    assert "terminal_mode=True" in radial20_branch
+    assert "self.limit_moving_guidance_bearing(" in radial20_branch
     assert "hard_speed_cap_mps=speed" in radial20_branch
 
-    # The generic pre-Phase-5 deceleration zone must not also run for
-    # radial20, or the legacy speed/guidance profile would briefly compete
-    # with the new regulator in the terminal_goal_intercept_distance_m
-    # (0.90 m) to radial_stop_terminal_guidance_distance_m (0.75 m) gap.
-    terminal_active_source = control[
-        control.index("terminal_active = (") : control.index(
-            "terminal_active = ("
-        )
-        + 400
-    ]
+    terminal_start = control.index("terminal_active = (")
+    terminal_active_source = control[terminal_start:terminal_start + 500]
     assert "not self.radial20_active" in terminal_active_source
 
     result = function_source("publish_terminal_result")
@@ -155,7 +135,6 @@ def test_radial20_mode_defaults_off_and_is_mutually_exclusive_with_every_other_a
     assert "elif self.precision_terminal_enabled:" in result
     reset = function_source("_reset_precision_terminal")
     assert "self._reset_radial20_terminal(reason)" in reset
-
 
 def test_terminal_override_is_additive_and_visible_in_speed_debug():
     resolver = function_source("_resolve_precision_speed_for_cycle")

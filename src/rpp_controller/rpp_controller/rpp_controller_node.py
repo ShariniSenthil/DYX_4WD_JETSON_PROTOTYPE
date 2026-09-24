@@ -382,10 +382,12 @@ class RPPController(Node):
         self.declare_parameter("pivot_enter_angle_deg", 45.0)
         self.declare_parameter("pivot_exit_angle_deg", 4.0)
         self.declare_parameter("alignment_hold_sec", 0.20)
-        # Stationary pivot authority from d1d982.
-        self.declare_parameter("maximum_yaw_rate_radps", 0.45)
-        self.declare_parameter("minimum_yaw_rate_radps", 0.06)
-        self.declare_parameter("pivot_yaw_kp", 1.80)
+        # Stationary pivot parameters are independent from moving steering.
+        # Phase 1 uses direct P+clamp yaw-rate control: no separate slow pivot
+        # ramp/slew that can make the turn sluggish.
+        self.declare_parameter("stationary_pivot_yaw_rate_max_radps", 0.75)
+        self.declare_parameter("stationary_pivot_yaw_rate_min_radps", 0.06)
+        self.declare_parameter("stationary_pivot_yaw_kp", 1.80)
         # Keep the tested proportional moving-yaw authority, but
         # condition tiny left/right corrections so low-speed straight driving
         # does not chatter the differential drivetrain.
@@ -400,6 +402,13 @@ class RPPController(Node):
         self.declare_parameter("moving_yaw_damping_gain_max", 0.32)
         self.declare_parameter("moving_yaw_rate_filter_alpha", 0.20)
         self.declare_parameter("moving_yaw_damping_limit_radps", 0.08)
+        # Course-over-ground bias from realtime-hardening. This belongs only
+        # to moving steering and is gated out during turns/pivots.
+        self.declare_parameter("moving_course_bias_enabled", False)
+        self.declare_parameter("moving_course_bias_time_constant_sec", 2.0)
+        self.declare_parameter("moving_course_bias_min_speed_mps", 0.50)
+        self.declare_parameter("moving_course_bias_max_yaw_rate_radps", 0.05)
+        self.declare_parameter("moving_course_bias_limit_deg", 3.0)
         # ArduRover-inspired outer lateral state observer/controller.
         # The state calculation stays active for diagnostics, but yaw authority
         # is independently gated so it cannot run in parallel with the
@@ -1024,13 +1033,15 @@ class RPPController(Node):
             float(self.get_parameter("pivot_exit_angle_deg").value)
         )
         self.alignment_hold_sec = float(self.get_parameter("alignment_hold_sec").value)
-        self.maximum_yaw_rate = float(
-            self.get_parameter("maximum_yaw_rate_radps").value
+        self.stationary_pivot_yaw_rate_max = float(
+            self.get_parameter("stationary_pivot_yaw_rate_max_radps").value
         )
-        self.minimum_yaw_rate = float(
-            self.get_parameter("minimum_yaw_rate_radps").value
+        self.stationary_pivot_yaw_rate_min = float(
+            self.get_parameter("stationary_pivot_yaw_rate_min_radps").value
         )
-        self.pivot_yaw_kp = float(self.get_parameter("pivot_yaw_kp").value)
+        self.stationary_pivot_yaw_kp = float(
+            self.get_parameter("stationary_pivot_yaw_kp").value
+        )
         self.moving_yaw_rate_max = float(
             self.get_parameter("moving_yaw_rate_max_radps").value
         )
@@ -1055,6 +1066,21 @@ class RPPController(Node):
         )
         self.moving_yaw_damping_limit = float(
             self.get_parameter("moving_yaw_damping_limit_radps").value
+        )
+        self.moving_course_bias_enabled = bool(
+            self.get_parameter("moving_course_bias_enabled").value
+        )
+        self.moving_course_bias_time_constant = float(
+            self.get_parameter("moving_course_bias_time_constant_sec").value
+        )
+        self.moving_course_bias_min_speed = float(
+            self.get_parameter("moving_course_bias_min_speed_mps").value
+        )
+        self.moving_course_bias_max_yaw_rate = float(
+            self.get_parameter("moving_course_bias_max_yaw_rate_radps").value
+        )
+        self.moving_course_bias_limit = math.radians(
+            float(self.get_parameter("moving_course_bias_limit_deg").value)
         )
         self.straight_lateral_yaw_authority_enabled = bool(
             self.get_parameter("straight_lateral_yaw_authority_enabled").value
@@ -2128,6 +2154,11 @@ class RPPController(Node):
         self.filtered_moving_yaw_rate = 0.0
         self.last_commanded_yaw_rate_radps = 0.0
 
+        # Moving steering course-bias estimator state.
+        self.moving_course_bias = 0.0
+        self.moving_course_bias_active = False
+        self.moving_course_bias_last_time = None
+
         # Cross-track speed-cap recovery is shared by normal and terminal motion.
         self.xtrack_priority_active = False
         self.xtrack_priority_inside_since = None
@@ -2896,9 +2927,9 @@ class RPPController(Node):
             "final_speed_distance_m": self.final_speed_distance,
             "waypoint_tolerance_m": self.waypoint_tolerance,
             "alignment_hold_sec": self.alignment_hold_sec,
-            "maximum_yaw_rate_radps": self.maximum_yaw_rate,
-            "minimum_yaw_rate_radps": self.minimum_yaw_rate,
-            "pivot_yaw_kp": self.pivot_yaw_kp,
+            "stationary_pivot_yaw_rate_max_radps": self.stationary_pivot_yaw_rate_max,
+            "stationary_pivot_yaw_rate_min_radps": self.stationary_pivot_yaw_rate_min,
+            "stationary_pivot_yaw_kp": self.stationary_pivot_yaw_kp,
             "alignment_reentry_goal_distance_m": (self.alignment_reentry_goal_distance),
             "terminal_line_alignment_distance_m": (
                 self.terminal_line_alignment_distance
@@ -3378,23 +3409,29 @@ class RPPController(Node):
                 "pivot_exit_angle_deg must be less than " "pivot_enter_angle_deg"
             )
         if not (
-            math.isfinite(self.minimum_yaw_rate)
-            and math.isfinite(self.maximum_yaw_rate)
-            and 0.0 < self.minimum_yaw_rate <= self.maximum_yaw_rate
+            math.isfinite(self.stationary_pivot_yaw_rate_min)
+            and math.isfinite(self.stationary_pivot_yaw_rate_max)
+            and 0.0 < self.stationary_pivot_yaw_rate_min <= self.stationary_pivot_yaw_rate_max
         ):
-            raise ValueError(
-                "0 < minimum_yaw_rate_radps <= maximum_yaw_rate_radps " "is required"
-            )
-        if not math.isfinite(self.pivot_yaw_kp) or self.pivot_yaw_kp <= 0.0:
-            raise ValueError("pivot_yaw_kp must be finite and > 0")
+            raise ValueError("stationary pivot yaw-rate limits require 0 < min <= max")
+        if not math.isfinite(self.stationary_pivot_yaw_kp) or self.stationary_pivot_yaw_kp <= 0.0:
+            raise ValueError("stationary_pivot_yaw_kp must be finite and > 0")
         if not (
             math.isfinite(self.moving_yaw_rate_max)
-            and 0.0 < self.moving_yaw_rate_max <= self.maximum_yaw_rate
+            and 0.0 < self.moving_yaw_rate_max <= self.stationary_pivot_yaw_rate_max
         ):
-            raise ValueError(
-                "moving_yaw_rate_max_radps must satisfy "
-                "0 < moving max <= pivot maximum"
-            )
+            raise ValueError("moving_yaw_rate_max_radps must be >0 and <= stationary pivot max")
+        if not (
+            math.isfinite(self.moving_course_bias_time_constant)
+            and self.moving_course_bias_time_constant > 0.0
+            and math.isfinite(self.moving_course_bias_min_speed)
+            and self.moving_course_bias_min_speed > 0.0
+            and math.isfinite(self.moving_course_bias_max_yaw_rate)
+            and self.moving_course_bias_max_yaw_rate > 0.0
+            and math.isfinite(self.moving_course_bias_limit)
+            and 0.0 < self.moving_course_bias_limit <= math.radians(10.0)
+        ):
+            raise ValueError("invalid moving course-bias parameters")
         if not math.isfinite(self.moving_yaw_kp) or self.moving_yaw_kp <= 0.0:
             raise ValueError("moving_yaw_kp must be finite and > 0")
         if not (
@@ -3658,52 +3695,102 @@ class RPPController(Node):
     def normalize_angle(angle):
         return math.atan2(math.sin(angle), math.cos(angle))
 
-    def explicit_yaw_rate_command(
-        self,
-        target_yaw_enu_rad,
-        *,
-        stationary_pivot=False,
-        translational_speed_mps=0.0,
-        lateral_yaw_rate_ff_radps=0.0,
-    ):
-        """Generate Jetson-owned ENU yaw-rate.
+    def _reset_moving_course_bias(self):
+        self.moving_course_bias = 0.0
+        self.moving_course_bias_active = False
+        self.moving_course_bias_last_time = None
 
-        Stationary pivot behavior remains unchanged. Moving steering keeps the
-        tested proportional law and adds a small hysteresis plus yaw-rate slew
-        so tiny alternating heading errors cannot create left/right chatter.
-        """
+    def _update_moving_course_bias(self, translational_speed_mps):
+        if not self.moving_course_bias_enabled:
+            self.moving_course_bias_active = False
+            return 0.0
+
+        now = self.get_clock().now()
+        if self.moving_course_bias_last_time is None:
+            dt = 1.0 / self.CONTROL_HZ
+        else:
+            dt = (now - self.moving_course_bias_last_time).nanoseconds / 1e9
+            if not math.isfinite(dt) or dt <= 0.0:
+                dt = 1.0 / self.CONTROL_HZ
+            dt = min(dt, self.deceleration_max_dt_sec)
+        self.moving_course_bias_last_time = now
+
+        forward = float(self.current_body_velocity_forward_mps)
+        left = float(self.current_body_velocity_left_mps)
+        yaw_rate = float(self.current_yaw_rate_radps)
+        sampled = (
+            math.isfinite(forward)
+            and math.isfinite(left)
+            and math.isfinite(yaw_rate)
+            and abs(float(translational_speed_mps)) >= self.moving_course_bias_min_speed
+            and forward >= self.moving_course_bias_min_speed
+            and abs(yaw_rate) <= self.moving_course_bias_max_yaw_rate
+        )
+        if sampled:
+            beta = math.atan2(left, forward)
+            beta = max(-self.moving_course_bias_limit, min(self.moving_course_bias_limit, beta))
+            alpha = dt / (self.moving_course_bias_time_constant + dt)
+            self.moving_course_bias += alpha * (beta - self.moving_course_bias)
+
+        self.moving_course_bias = max(
+            -self.moving_course_bias_limit,
+            min(self.moving_course_bias_limit, self.moving_course_bias),
+        )
+        self.moving_course_bias_active = sampled
+        return self.moving_course_bias
+
+    def stationary_pivot_yaw_rate_command(self, target_yaw_enu_rad):
         if (
             self.current_yaw is None
             or not math.isfinite(float(self.current_yaw))
             or target_yaw_enu_rad is None
             or not math.isfinite(float(target_yaw_enu_rad))
         ):
-            raise ValueError("finite current yaw and target yaw are required")
+            raise ValueError("finite current yaw and pivot target yaw are required")
 
+        self.moving_yaw_quiet = False
+        self.moving_yaw_rate_output = 0.0
+        self.moving_yaw_rate_last_time = None
+        self.filtered_moving_yaw_rate = 0.0
+        self._reset_moving_course_bias()
+        self.straight_lateral_yaw_rate_ff_radps = 0.0
+        self.straight_lateral_yaw_rate_ff_applied_radps = 0.0
+
+        yaw_error = self.normalize_angle(float(target_yaw_enu_rad) - float(self.current_yaw))
+        if abs(yaw_error) <= 1.0e-9:
+            self.last_commanded_yaw_rate_radps = 0.0
+            return 0.0
+
+        turn_sign = 1.0 if yaw_error > 0.0 else -1.0
+        magnitude = abs(self.stationary_pivot_yaw_kp * yaw_error)
+        magnitude = min(
+            self.stationary_pivot_yaw_rate_max,
+            max(self.stationary_pivot_yaw_rate_min, magnitude),
+        )
+        command = turn_sign * magnitude
+        self.last_commanded_yaw_rate_radps = command
+        return command
+
+    def moving_steering_yaw_rate_command(
+        self,
+        target_yaw_enu_rad,
+        *,
+        translational_speed_mps=0.0,
+        lateral_yaw_rate_ff_radps=0.0,
+    ):
+        if (
+            self.current_yaw is None
+            or not math.isfinite(float(self.current_yaw))
+            or target_yaw_enu_rad is None
+            or not math.isfinite(float(target_yaw_enu_rad))
+        ):
+            raise ValueError("finite current yaw and steering target yaw are required")
+
+        course_bias = self._update_moving_course_bias(translational_speed_mps)
         yaw_error = self.normalize_angle(
-            float(target_yaw_enu_rad) - float(self.current_yaw)
+            float(target_yaw_enu_rad) - (float(self.current_yaw) + course_bias)
         )
         error_abs = abs(yaw_error)
-
-        if stationary_pivot:
-            self.moving_yaw_quiet = False
-            self.moving_yaw_rate_output = 0.0
-            self.moving_yaw_rate_last_time = None
-            self.filtered_moving_yaw_rate = 0.0
-            self.straight_lateral_yaw_rate_ff_radps = 0.0
-            self.straight_lateral_yaw_rate_ff_applied_radps = 0.0
-            if error_abs <= 1.0e-9:
-                self.last_commanded_yaw_rate_radps = 0.0
-                return 0.0
-            turn_sign = 1.0 if yaw_error > 0.0 else -1.0
-            requested_mag = abs(self.pivot_yaw_kp * yaw_error)
-            commanded_mag = min(
-                self.maximum_yaw_rate,
-                max(self.minimum_yaw_rate, requested_mag),
-            )
-            command = turn_sign * commanded_mag
-            self.last_commanded_yaw_rate_radps = command
-            return command
 
         measured_yaw_rate = self.current_yaw_rate_radps
         if math.isfinite(float(measured_yaw_rate)):
@@ -3719,45 +3806,27 @@ class RPPController(Node):
         elif error_abs <= self.moving_yaw_deadband_enter:
             self.moving_yaw_quiet = True
 
-        moving_speed = max(
-            0.0,
-            min(
-                abs(float(translational_speed_mps)),
-                self.MAXIMUM_MOVING_SPEED_MPS,
-            ),
-        )
+        moving_speed = max(0.0, min(abs(float(translational_speed_mps)), self.MAXIMUM_MOVING_SPEED_MPS))
         if moving_speed <= self.steering_reference_speed:
             damping_gain = self.moving_yaw_damping_gain_min * (
                 moving_speed / self.steering_reference_speed
             )
         else:
-            speed_span = (
-                self.MAXIMUM_MOVING_SPEED_MPS - self.steering_reference_speed
-            )
-            speed_fraction = (
-                (moving_speed - self.steering_reference_speed) / speed_span
-                if speed_span > 1.0e-9
+            span = self.MAXIMUM_MOVING_SPEED_MPS - self.steering_reference_speed
+            fraction = (
+                (moving_speed - self.steering_reference_speed) / span
+                if span > 1.0e-9
                 else 1.0
             )
-            speed_fraction = max(0.0, min(1.0, speed_fraction))
-            damping_gain = (
-                self.moving_yaw_damping_gain_min
-                + speed_fraction
-                * (
-                    self.moving_yaw_damping_gain_max
-                    - self.moving_yaw_damping_gain_min
-                )
+            fraction = max(0.0, min(1.0, fraction))
+            damping_gain = self.moving_yaw_damping_gain_min + fraction * (
+                self.moving_yaw_damping_gain_max - self.moving_yaw_damping_gain_min
             )
 
         damping_term = damping_gain * self.filtered_moving_yaw_rate
-        damping_term = max(
-            -self.moving_yaw_damping_limit,
-            min(self.moving_yaw_damping_limit, damping_term),
-        )
+        damping_term = max(-self.moving_yaw_damping_limit, min(self.moving_yaw_damping_limit, damping_term))
 
-        proportional_request = (
-            0.0 if self.moving_yaw_quiet else self.moving_yaw_kp * yaw_error
-        )
+        proportional_request = 0.0 if self.moving_yaw_quiet else self.moving_yaw_kp * yaw_error
         lateral_ff_raw = float(lateral_yaw_rate_ff_radps)
         if not math.isfinite(lateral_ff_raw):
             lateral_ff_raw = 0.0
@@ -3766,15 +3835,11 @@ class RPPController(Node):
             min(self.straight_lateral_yaw_rate_max, lateral_ff_raw),
         )
         self.straight_lateral_yaw_rate_ff_radps = lateral_ff_raw
-        lateral_ff_applied = (
-            lateral_ff_raw if self.straight_lateral_yaw_authority_enabled else 0.0
-        )
+        lateral_ff_applied = lateral_ff_raw if self.straight_lateral_yaw_authority_enabled else 0.0
         self.straight_lateral_yaw_rate_ff_applied_radps = lateral_ff_applied
+
         requested = proportional_request + lateral_ff_applied - damping_term
-        requested = max(
-            -self.moving_yaw_rate_max,
-            min(self.moving_yaw_rate_max, requested),
-        )
+        requested = max(-self.moving_yaw_rate_max, min(self.moving_yaw_rate_max, requested))
 
         now = self.get_clock().now()
         if self.moving_yaw_rate_last_time is None:
@@ -3786,9 +3851,9 @@ class RPPController(Node):
             dt = min(dt, self.deceleration_max_dt_sec)
         self.moving_yaw_rate_last_time = now
 
-        maximum_change = self.moving_yaw_rate_slew * dt
+        max_change = self.moving_yaw_rate_slew * dt
         delta = requested - self.moving_yaw_rate_output
-        delta = max(-maximum_change, min(maximum_change, delta))
+        delta = max(-max_change, min(max_change, delta))
         self.moving_yaw_rate_output += delta
 
         if self.moving_yaw_quiet and abs(self.moving_yaw_rate_output) <= 1.0e-6:
@@ -3796,6 +3861,22 @@ class RPPController(Node):
 
         self.last_commanded_yaw_rate_radps = self.moving_yaw_rate_output
         return self.moving_yaw_rate_output
+
+    def explicit_yaw_rate_command(
+        self,
+        target_yaw_enu_rad,
+        *,
+        stationary_pivot=False,
+        translational_speed_mps=0.0,
+        lateral_yaw_rate_ff_radps=0.0,
+    ):
+        if stationary_pivot:
+            return self.stationary_pivot_yaw_rate_command(target_yaw_enu_rad)
+        return self.moving_steering_yaw_rate_command(
+            target_yaw_enu_rad,
+            translational_speed_mps=translational_speed_mps,
+            lateral_yaw_rate_ff_radps=lateral_yaw_rate_ff_radps,
+        )
 
     @staticmethod
     def ground_xtrack(value):
@@ -7916,6 +7997,7 @@ class RPPController(Node):
             self.moving_yaw_rate_last_time = None
             self.filtered_moving_yaw_rate = 0.0
             self.last_commanded_yaw_rate_radps = 0.0
+            self._reset_moving_course_bias()
             self.straight_lateral_velocity_target_mps = 0.0
             self.straight_lateral_accel_command_mps2 = 0.0
             self.straight_lateral_yaw_rate_ff_radps = 0.0
@@ -9206,20 +9288,20 @@ class RPPController(Node):
         pivot_heading_error,
         signed_cross_track,
     ):
-        """Allow xtrack recovery only below the configured pivot threshold.
+        """Keep intentional mid-leg xtrack recovery under moving steering.
 
-        Xtrack recovery may continue steering while the segment/path-heading
-        error is below pivot_enter_angle. At or above the configured 15deg
-        pivot threshold, it must not suppress stationary pivot/alignment.
+        Moving steering retains recovery authority while heading error is
+        inside MAX_MOVING_HEADING_ERROR_RAD. A larger error is treated as
+        a real alignment failure and may fall through to stationary alignment.
         """
         recovery_needed = (
             self.xtrack_priority_active
             or abs(signed_cross_track) >= self.xtrack_priority_enter
         )
-        below_pivot_threshold = (
-            abs(pivot_heading_error) < self.pivot_enter_angle
+        inside_moving_recovery_envelope = (
+            abs(pivot_heading_error) <= self.MAX_MOVING_HEADING_ERROR_RAD
         )
-        return recovery_needed and below_pivot_threshold
+        return recovery_needed and inside_moving_recovery_envelope
 
     def limit_moving_guidance_bearing(self, desired_bearing):
         """Keep moving steering strictly below the 15deg pivot boundary."""

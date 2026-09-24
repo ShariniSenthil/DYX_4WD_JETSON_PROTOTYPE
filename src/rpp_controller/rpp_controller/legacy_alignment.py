@@ -1,9 +1,9 @@
-"""ROS-free legacy native-pivot lifecycle.
+"""ROS-free stationary-pivot/alignment lifecycle.
 
-Outer ownership remains ``segment_alignment_active``.  Native-carrier
-generation stays in ``terminal_native_pivot_command()``.  An internal
-native-request latch is not proof a pivot was published; the lifecycle
-tracks ``native_carrier_issued`` only after a successful native publish.
+Outer ownership remains ``segment_alignment_active``. Stationary pivot
+holds zero translation and requires measured speed/yaw-rate settling
+before moving steering resumes. Phase 1 does not use the realtime
+moving-handover behavior.
 """
 
 from __future__ import annotations

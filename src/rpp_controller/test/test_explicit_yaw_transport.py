@@ -216,22 +216,61 @@ def test_exactly_one_command_publisher_and_subscription(enabled):
 
 
 def _bind_real_yaw_rate_command(node, env):
-    execute([method(RPP, "RPPController", "explicit_yaw_rate_command")], env)
+    execute(
+        [
+            method(RPP, "RPPController", "_reset_moving_course_bias"),
+            method(RPP, "RPPController", "_update_moving_course_bias"),
+            method(RPP, "RPPController", "stationary_pivot_yaw_rate_command"),
+            method(RPP, "RPPController", "moving_steering_yaw_rate_command"),
+            method(RPP, "RPPController", "explicit_yaw_rate_command"),
+        ],
+        env,
+    )
+    node._reset_moving_course_bias = env["_reset_moving_course_bias"].__get__(node)
+    node._update_moving_course_bias = env["_update_moving_course_bias"].__get__(node)
+    node.stationary_pivot_yaw_rate_command = env[
+        "stationary_pivot_yaw_rate_command"
+    ].__get__(node)
+    node.moving_steering_yaw_rate_command = env[
+        "moving_steering_yaw_rate_command"
+    ].__get__(node)
     real = env["explicit_yaw_rate_command"]
 
     node.current_yaw = 0.0
-    node.maximum_yaw_rate = 0.45
-    node.minimum_yaw_rate = 0.06
-    node.pivot_yaw_kp = 1.80
+    node.current_yaw_rate_radps = 0.0
+    node.current_body_velocity_forward_mps = 0.0
+    node.current_body_velocity_left_mps = 0.0
+    node.stationary_pivot_yaw_rate_max = 0.75
+    node.stationary_pivot_yaw_rate_min = 0.06
+    node.stationary_pivot_yaw_kp = 1.80
     node.moving_yaw_rate_max = 0.18
     node.moving_yaw_kp = 0.85
     node.moving_yaw_deadband_enter = math.radians(0.5)
     node.moving_yaw_deadband_exit = math.radians(1.0)
     node.moving_yaw_rate_slew = 0.60
+    node.moving_yaw_damping_gain_min = 0.20
+    node.moving_yaw_damping_gain_max = 0.32
+    node.moving_yaw_rate_filter_alpha = 0.20
+    node.moving_yaw_damping_limit = 0.08
     node.moving_yaw_quiet = False
     node.moving_yaw_rate_output = 0.0
     node.moving_yaw_rate_last_time = None
+    node.filtered_moving_yaw_rate = 0.0
+    node.moving_course_bias_enabled = False
+    node.moving_course_bias_time_constant = 2.0
+    node.moving_course_bias_min_speed = 0.50
+    node.moving_course_bias_max_yaw_rate = 0.05
+    node.moving_course_bias_limit = math.radians(3.0)
+    node.moving_course_bias = 0.0
+    node.moving_course_bias_active = False
+    node.moving_course_bias_last_time = None
+    node.steering_reference_speed = 0.60
+    node.straight_lateral_yaw_rate_max = 0.10
+    node.straight_lateral_yaw_authority_enabled = False
+    node.straight_lateral_yaw_rate_ff_radps = 0.0
+    node.straight_lateral_yaw_rate_ff_applied_radps = 0.0
     node.last_commanded_yaw_rate_radps = 0.0
+    node.MAXIMUM_MOVING_SPEED_MPS = 1.0
     node.CONTROL_HZ = 20.0
     node.deceleration_max_dt_sec = 0.10
     node.normalize_angle = lambda v: math.atan2(math.sin(v), math.cos(v))
@@ -241,12 +280,14 @@ def _bind_real_yaw_rate_command(node, env):
         *,
         stationary_pivot=False,
         translational_speed_mps=0.0,
+        lateral_yaw_rate_ff_radps=0.0,
     ):
         return real(
             node,
             target_yaw_enu_rad,
             stationary_pivot=stationary_pivot,
             translational_speed_mps=translational_speed_mps,
+            lateral_yaw_rate_ff_radps=lateral_yaw_rate_ff_radps,
         )
 
     node.explicit_yaw_rate_command = bound
@@ -368,6 +409,7 @@ def test_b_generic_zero_translation_remains_yaw_invalid_in_patch5():
     node.publish_motion_profile_monitor = lambda v: None
     node.command_slew_speed = 0.0
     node.command_slew_last_time = None
+    node._reset_moving_course_bias = lambda: None
     execute([method(RPP, "RPPController", "publish_velocity_ned")], env)
 
     result = env["publish_velocity_ned"](
@@ -452,9 +494,10 @@ def test_heading_speed_supervisor_keeps_full_speed_through_fixed_4deg_boundary()
     assert fn(node, 0.60, math.radians(3.0)) == pytest.approx(0.60)
     assert fn(node, 0.60, math.radians(4.0)) == pytest.approx(0.60)
 
-    # Immediately outside the 4deg envelope, use the existing alignment cap.
-    assert fn(node, 0.60, math.radians(4.01)) == pytest.approx(0.40)
-    assert fn(node, 0.60, math.radians(-4.01)) == pytest.approx(0.40)
+    # Heading error belongs to moving steering, not straight-line speed.
+    assert fn(node, 0.60, math.radians(4.01)) == pytest.approx(0.60)
+    assert fn(node, 0.60, math.radians(-4.01)) == pytest.approx(0.60)
+    assert fn(node, 0.60, math.radians(15.0)) == pytest.approx(0.60)
 
     # Never raise a lower speed from another authority/profile.
     assert fn(node, 0.25, math.radians(5.0)) == pytest.approx(0.25)
@@ -746,9 +789,9 @@ def _patch5_pivot_deps(node):
     node.cruise_speed = 1.0
     node.segment_alignment_speed = 1.0
     node.current_yaw = 0.0
-    node.maximum_yaw_rate = 0.20
-    node.minimum_yaw_rate = 0.06
-    node.pivot_yaw_kp = 1.0
+    node.stationary_pivot_yaw_rate_max = 0.20
+    node.stationary_pivot_yaw_rate_min = 0.06
+    node.stationary_pivot_yaw_kp = 1.0
     node.moving_yaw_rate_max = 0.20
     node.moving_yaw_kp = 1.00
     node.moving_yaw_quiet = False
@@ -773,7 +816,18 @@ def _patch5_pivot_deps(node):
 def test_patch5_b_pivot_is_zero_translation_with_exact_true_bearing():
     node, env = rpp(True)
     _patch5_pivot_deps(node)
-    execute([method(RPP, "RPPController", "explicit_yaw_rate_command")], env)
+    execute(
+        [
+            method(RPP, "RPPController", "_reset_moving_course_bias"),
+            method(RPP, "RPPController", "stationary_pivot_yaw_rate_command"),
+            method(RPP, "RPPController", "explicit_yaw_rate_command"),
+        ],
+        env,
+    )
+    node._reset_moving_course_bias = env["_reset_moving_course_bias"].__get__(node)
+    node.stationary_pivot_yaw_rate_command = env[
+        "stationary_pivot_yaw_rate_command"
+    ].__get__(node)
     node.explicit_yaw_rate_command = env["explicit_yaw_rate_command"].__get__(node)
     execute([method(RPP, "RPPController", "_publish_legacy_native_carrier")], env)
     result = env["_publish_legacy_native_carrier"](

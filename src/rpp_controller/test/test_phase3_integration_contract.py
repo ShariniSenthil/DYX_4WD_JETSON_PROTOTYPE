@@ -85,6 +85,7 @@ def test_every_phase3_adapter_parameter_is_explicit_in_launch():
     assert expected <= launch_keys
 
 
+
 def test_legacy_odom_acceptance_does_not_depend_on_angular_z_finiteness():
     callback = _method_source("odom_callback")
     assert "angular = msg.twist.twist.angular" in callback
@@ -94,10 +95,10 @@ def test_legacy_odom_acceptance_does_not_depend_on_angular_z_finiteness():
     ]
     assert "yaw_rate" not in unconditional_gate
     assert "yaw_rate if math.isfinite(yaw_rate) else math.inf" in callback
+    assert "now = self.get_clock().now()" in callback
     assignment = callback.index("self.current_yaw_rate_radps = yaw_rate")
-    timestamp = callback.index("self.last_odom_time = self.get_clock().now()")
+    timestamp = callback.index("self.last_odom_time = now")
     assert assignment < timestamp
-
 
 def test_invalid_or_stale_yaw_rate_stops_before_fsm_or_motion_mapping():
     source = _method_source("_run_precision_pivot_alignment")
@@ -111,12 +112,12 @@ def test_invalid_or_stale_yaw_rate_stops_before_fsm_or_motion_mapping():
     assert early_return < first_directive_mapping
 
 
+
 def test_legacy_carrier_method_remains_byte_exact():
     digest = hashlib.sha256(
         _method_source("terminal_native_pivot_command").encode("utf-8")
     ).hexdigest()
-    assert digest == "ab1a69086a10d69a3719dea04fdfd772887dfec02ee318020c47e93b3e0cea00"
-
+    assert digest == "1211c6999c8f414c1c9799acdd4c4340d5100fd2de0b07caa1ae27f11abcae5c"
 
 def test_precision_carrier_has_no_legacy_4deg_auto_release():
     source = _method_source("precision_pivot_carrier_command")

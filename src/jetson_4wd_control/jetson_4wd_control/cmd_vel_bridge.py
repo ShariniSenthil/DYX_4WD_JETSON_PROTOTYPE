@@ -12,8 +12,9 @@ PX4 output:
     /mavros/setpoint_raw/local
 
 Mode A publishes horizontal velocity with yaw ignored. Mode B publishes
-horizontal velocity plus authoritative absolute ENU yaw. This bridge never
-publishes AttitudeTarget or an active yaw-rate setpoint.
+horizontal velocity plus authoritative absolute ENU yaw and signed yaw-rate.
+The bridge is transport/safety only; it does not implement steering or pivot.
+It never publishes AttitudeTarget.
 
 With PX4 rover parameters RD_TRANS_DRV_TRN=45 and RD_TRANS_TRN_DRV=12,
 PX4 performs its native differential pivot above 45 degrees and changes back
@@ -91,7 +92,7 @@ class CmdVelBridge(Node):
 
         # Bridge-side safety ceiling for Jetson yaw-rate commands.
         # PX4 RO_YAW_RATE_LIM remains the final FCU hard ceiling.
-        self.declare_parameter("maximum_yaw_rate_radps", 0.45)
+        self.declare_parameter("maximum_yaw_rate_radps", 0.75)
 
         self.command_timeout_sec = float(
             self.get_parameter("command_timeout_sec").value
@@ -252,7 +253,7 @@ class CmdVelBridge(Node):
             "PX4 native pivot contract: enter 45deg, drive at 12deg"
         )
         self.get_logger().warn(
-            "No AttitudeTarget and no yaw-rate pivot commands"
+            "No AttitudeTarget; B-mode forwards Jetson yaw+yaw-rate atomically"
         )
 
     def _age_seconds(self, timestamp: Any) -> float:

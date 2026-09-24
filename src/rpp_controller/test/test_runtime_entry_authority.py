@@ -181,13 +181,14 @@ def test_runtime_entry_builder_has_exact_endpoints_and_max_50mm_spacing():
     assert _maximum_segment_length(points) <= 0.05 + 1.0e-12
 
 
+
 def test_start_lock_uses_current_local_odom_c_and_builds_runtime_path():
     controller = _Controller()
     controller.current_x = 2.25
     controller.current_y = -1.75
     controller.marking_waypoints = [(8.0, 4.0)]
 
-    assert controller.lock_c_to_p1_line("test mission enable")
+    assert controller.lock_c_to_p1_line("mission START")
     assert controller.c_line_start_x == 2.25
     assert controller.c_line_start_y == -1.75
     assert controller.runtime_entry_points[0] == (2.25, -1.75)
@@ -203,28 +204,26 @@ def test_start_lock_uses_current_local_odom_c_and_builds_runtime_path():
     assert controller.runtime_entry_cursor_index == 1
     assert controller.runtime_entry_goal_index == len(controller.runtime_entry_points) - 1
 
-
 def test_retained_callbacks_cannot_move_locked_start_c_before_real_pivot_reanchor():
     controller = _Controller()
     controller.current_x = 1.0
     controller.current_y = 2.0
-    assert controller.lock_c_to_p1_line("initial")
+    assert controller.lock_c_to_p1_line("mission START")
     original_start = (controller.c_line_start_x, controller.c_line_start_y)
     original_path = tuple(controller.runtime_entry_points)
 
     controller.current_x = 1.4
     controller.current_y = 2.3
-    assert controller.lock_c_to_p1_line("retained callback")
+    assert controller.lock_c_to_p1_line("retained callback") is False
     assert (controller.c_line_start_x, controller.c_line_start_y) == original_start
     assert tuple(controller.runtime_entry_points) == original_path
-
 
 def test_post_pivot_reanchor_uses_fresh_local_odom_c_prime_and_resets_cursor():
     controller = _Controller()
     controller.current_x = 0.0
     controller.current_y = 0.0
     controller.marking_waypoints = [(6.0, 0.0)]
-    assert controller.lock_c_to_p1_line("initial")
+    assert controller.lock_c_to_p1_line("mission START")
     initial_path = tuple(controller.runtime_entry_points)
 
     controller.current_x = 0.08
@@ -243,7 +242,6 @@ def test_post_pivot_reanchor_uses_fresh_local_odom_c_prime_and_resets_cursor():
     assert controller.runtime_entry_lookahead_index == 1
     assert controller.runtime_entry_goal_index == len(controller.runtime_entry_points) - 1
     assert _maximum_segment_length(controller.runtime_entry_points) <= 0.05 + 1.0e-12
-
 
 def test_runtime_reanchor_debug_outcome_reason_and_json_contract():
     expected_fields = {

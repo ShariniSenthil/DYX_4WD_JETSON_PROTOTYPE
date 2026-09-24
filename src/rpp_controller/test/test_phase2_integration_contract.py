@@ -99,6 +99,7 @@ def test_precision_features_require_primary_geometry_tracking():
     assert "require geometry_tracking_enabled=true" in validation
 
 
+
 def test_phase2_cannot_create_an_early_terminal_zero():
     init_source = _method_source("__init__")
     publication = _method_source("publish_precision_velocity_ned")
@@ -106,12 +107,11 @@ def test_phase2_cannot_create_an_early_terminal_zero():
 
     assert '"precision_terminal_target_speed_mps", 0.15' in init_source
     assert '"precision_minimum_moving_speed_mps", 0.04' in init_source
-    assert '"waypoint_tolerance_m": 0.03' in LAUNCH_SOURCE
+    assert '"waypoint_tolerance_m": 0.02' in LAUNCH_SOURCE
     assert "max(resolved_speed, self.precision_minimum_moving_speed)" in publication
     assert control.index("latch_exact_marking_stop") < control.index(
         "publish_precision_velocity_ned"
     )
-
 
 def test_precision_publication_bypasses_competing_legacy_profiles():
     precision_calls = _called_attributes("publish_precision_velocity_ned")
@@ -129,6 +129,7 @@ def test_precision_publication_bypasses_competing_legacy_profiles():
         "deceleration_speed_limit",
         "command_speed_slew_limit",
     }.issubset(legacy_calls)
+
 
 
 def test_legacy_publisher_mode_a_transport_remains_direct():
@@ -150,25 +151,28 @@ def test_legacy_publisher_mode_a_transport_remains_direct():
     assert len(selections) == 1
 
     selection = selections[0]
-    b_source = "\n".join(ast.unparse(node) for node in selection.body)
-    a_source = "\n".join(ast.unparse(node) for node in selection.orelse)
+    b_source = " ".join(ast.unparse(node) for node in selection.body)
+    a_source = " ".join(ast.unparse(node) for node in selection.orelse)
 
-    assert "publish_with_yaw(msg, yaw_enu_rad)" in b_source
-    assert "self.velocity_pub.publish(msg)" not in b_source
-
+    assert "publish_with_yaw" in b_source
+    assert "yaw_rate_enu" in b_source
+    assert "explicit_yaw_rate_command" in b_source
+    # In explicit-yaw B mode, a literal zero-speed command is intentionally
+    # published without yaw ownership. Moving commands use yaw + yaw-rate.
+    assert "if output_speed <= 1e-09" in b_source
+    assert "self.velocity_pub.publish(msg)" in b_source
+    assert "publish_with_yaw" in b_source
     assert "self.velocity_pub.publish(msg)" in a_source
     assert "publish_with_yaw" not in a_source
 
-
 def test_native_pivot_math_remains_byte_exact():
     expected = (
-        "ab1a69086a10d69a3719dea04fdfd772887dfec02ee318020c47e93b3e0cea00"
+        "1211c6999c8f414c1c9799acdd4c4340d5100fd2de0b07caa1ae27f11abcae5c"
     )
     digest = hashlib.sha256(
         _method_source("terminal_native_pivot_command").encode("utf-8")
     ).hexdigest()
     assert digest == expected
-
 
 def test_native_pivot_carrier_remains_on_legacy_publication_path():
     control = _method_source("control_loop")
@@ -238,6 +242,7 @@ def test_guidance_debug_exposes_endpoint_extension_and_final_angles():
         assert f'"{field}"' in debug
 
 
+
 def test_precision_reset_boundaries_are_explicit():
     for reason in (
         "LITERAL_STOP",
@@ -247,7 +252,6 @@ def test_precision_reset_boundaries_are_explicit():
         "PATH_INSTALLED",
         "GEOMETRY_INVALIDATED",
         "LOCALIZATION_JUMP",
-        "PIVOT_COMPLETE_RECAPTURE_ARMED",
         "PIVOT_RECAPTURE_COMPLETE",
     ):
         assert reason in NODE_SOURCE

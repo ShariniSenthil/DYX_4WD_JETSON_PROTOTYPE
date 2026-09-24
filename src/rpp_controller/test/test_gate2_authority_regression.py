@@ -35,17 +35,16 @@ def _control_region(start_marker: str, end_marker: str) -> str:
     return control[start:end]
 
 
+
 def test_legacy_recovery_branch_does_not_force_precision_speed_recovery():
-    recovery = _control_region(
-        "if (\n            not precision_tracking_authority",
-        "# CONTINUOUS TWO-METRE TERMINAL APPROACH",
-    )
+    control = _method_source("control_loop")
+    resolver = _method_source("_resolve_precision_speed_for_cycle")
 
-    assert "and not terminal_active" in recovery
-    assert "recovery_requested" not in recovery
-    assert "_resolve_precision_speed_for_cycle()" in recovery
-    assert "publish_precision_velocity_ned" in recovery
-
+    assert "if precision_tracking_authority:" in control
+    assert "self.xtrack_priority_guidance(" in control
+    assert "recovery_requested" not in resolver
+    assert "_resolve_precision_speed_for_cycle()" in control
+    assert "publish_precision_velocity_ned" in control
 
 def test_longitudinal_regulator_is_the_only_precision_recovery_state_owner():
     resolver_path = PACKAGE_ROOT / "rpp_controller" / "speed_regulator.py"
@@ -119,22 +118,18 @@ def test_zero_latches_precede_every_gate2_moving_authority():
     assert legacy_zero < terminal_authority < normal_precision
 
 
+
 def test_gate2_off_retains_legacy_guidance_and_terminal_publisher():
     normal = _control_region(
         "# Normal pass-through and non-terminal movement.",
-        "self.log_control(\n            status,",
+        "self.publish_rpp_debug(",
     )
     terminal = _control_region(
         "if terminal_active:",
         "# Normal pass-through and non-terminal movement.",
     )
 
-    assert "self.line_guidance(" in normal
-    # Precision guidance still holds bearing authority in the normal branch,
-    # but the gate is now the path actually being tracked rather than the leg
-    # index: following_runtime_line is true for the C->P1 entry leg AND for a
-    # post-pivot reanchored leg, both of which steer on a locally generated
-    # line that the /nav_path-derived guidance correction must not override.
+    assert "guidance_bearing = xtrack_guidance_bearing" in normal
     assert "self.precision_guidance_enabled" in normal
     assert "not self.following_runtime_line" in normal
     assert "if self.precision_speed_control_enabled:" in normal

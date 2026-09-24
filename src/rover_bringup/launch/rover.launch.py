@@ -69,7 +69,7 @@ FCU_DEVICE_PATH = "/dev/serial/by-id/usb-Auterion_PX4_FMU_v6X.x_0-if00"
 # UNVERIFIED from data. 1.00 m/s also sits exactly at cmd_vel_bridge's
 # non-overridable ABSOLUTE_MAXIMUM_SPEED_MPS ceiling, i.e. zero headroom.
 # Watch the first run closely and be ready to drop this back down.
-CRUISE_SPEED_MPS = 0.60
+CRUISE_SPEED_MPS = 1.00
 TERMINAL_FLOOR_SPEED_MPS = 0.15
 
 # Single source of truth for which terminal-stop authority is active.
@@ -149,7 +149,7 @@ def generate_launch_description() -> LaunchDescription:
                         # Bridge preserves the RPP ramp and only clamps
                         # commands above this production safety maximum.
                         "maximum_speed_mps": (1.00),
-                        ("maximum_yaw_rate_" "radps"): 0.45,
+                        ("maximum_yaw_rate_" "radps"): 0.75,
                     }
                 ],
             ),
@@ -379,7 +379,7 @@ def generate_launch_description() -> LaunchDescription:
                         # the old 0.50m setting -- already past the 0.5m
                         # theoretical target, so expect roughly ~1.05-1.15m /
                         # ~2.5-2.7s to reach cruise at this new 1.00m setting.
-                        "acceleration_distance_m": 0.20,
+                        "acceleration_distance_m": 0.50,
                         # Bootstrap ceiling exists only to prevent drivetrain
                         # deadlock; the profile itself starts from literal zero.
                         #
@@ -439,7 +439,7 @@ def generate_launch_description() -> LaunchDescription:
                         # ~4 cm over the final 0.6 m and the rover crossed the
                         # goal plane beside the point rather than on it.
                         "deceleration_enabled": True,
-                        "deceleration_distance_m": 0.20,
+                        "deceleration_distance_m": 0.50,
                         "deceleration_floor_speed_mps": TERMINAL_FLOOR_SPEED_MPS,
                         "deceleration_max_progress_jump_m": 0.10,
                         "deceleration_max_dt_sec": 0.10,
@@ -505,7 +505,7 @@ def generate_launch_description() -> LaunchDescription:
                         "segment_alignment_deadband_enter_cross_track_m": 0.08,
                         "segment_alignment_deadband_exit_cross_track_m": 0.04,
                         "segment_alignment_min_effective_heading_error_deg": 10.0,
-                        "segment_alignment_correction_limit_deg": 18.0,
+                        "segment_alignment_correction_limit_deg": 12.0,
                         "segment_alignment_cross_track_tolerance_m": 0.03,
                         "segment_alignment_reentry_cross_track_m": 0.08,
                         "segment_alignment_max_cross_track_m": 0.60,
@@ -517,10 +517,19 @@ def generate_launch_description() -> LaunchDescription:
                         # xtrack_priority_exit_m=0.008 remain valid for this
                         # hold time.
                         "alignment_hold_sec": 0.20,
-                        # Stationary pivot stays exactly on d1d982 behavior.
-                        "maximum_yaw_rate_radps": 0.45,
-                        "minimum_yaw_rate_radps": 0.06,
-                        "pivot_yaw_kp": 1.80,
+                        # ==================================================
+                        # 3) STATIONARY PIVOT CONTROL
+                        # Translation is zero. These parameters never tune
+                        # straight-line steering. Phase 1 uses no slow pivot
+                        # yaw-rate ramp/slew.
+                        # ==================================================
+                        "stationary_pivot_yaw_rate_max_radps": 0.75,
+                        "stationary_pivot_yaw_rate_min_radps": 0.06,
+                        "stationary_pivot_yaw_kp": 1.80,
+                        # ==================================================
+                        # 2) STRAIGHT-LINE STEERING CONTROL
+                        # Moving yaw only; independent from stationary pivot.
+                        # ==================================================
                         # Keep tested moving-yaw authority and add
                         # low-speed steering conditioning.
                         "moving_yaw_rate_max_radps": 0.18,
@@ -528,6 +537,14 @@ def generate_launch_description() -> LaunchDescription:
                         "moving_yaw_deadband_enter_deg": 0.50,
                         "moving_yaw_deadband_exit_deg": 1.00,
                         "moving_yaw_rate_slew_radps2": 0.60,
+                        # Realtime-hardening steering contribution:
+                        # compensate steady course-vs-body-yaw bias only while
+                        # driving straight and steadily.
+                        "moving_course_bias_enabled": True,
+                        "moving_course_bias_time_constant_sec": 2.0,
+                        "moving_course_bias_min_speed_mps": 0.50,
+                        "moving_course_bias_max_yaw_rate_radps": 0.05,
+                        "moving_course_bias_limit_deg": 3.0,
                         # Speed-scaled measured-yaw damping:
                         # 0.20 at 0.60m/s -> 0.32 at 1.00m/s, bounded to
                         # 0.08rad/s so damping cannot replace steering authority.

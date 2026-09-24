@@ -47,18 +47,15 @@ def test_tracking_uses_current_cycle_projection_guidance_and_shared_dt():
     assert "geometry_installed_signature" in compute
 
 
+
 def test_tracking_enabled_bypasses_legacy_xtrack_state_mutations():
     control = function_source("control_loop")
-    # Gated on the tracked path rather than the leg index: a post-pivot
-    # reanchored leg follows a runtime line, like the C->P1 entry leg, and
-    # /nav_path-derived tracking must not take authority on either.
     assert "self.precision_tracking_control_enabled" in control
     assert "and not self.following_runtime_line" in control
-    assert "if precision_tracking_authority:" in control
-    assert "else:\n            (\n                xtrack_guidance_bearing" in control
-    assert "else:\n            (\n                xtrack_speed_cap_active" in control
-    assert "not precision_tracking_authority" in control
-
+    assert control.count("if precision_tracking_authority:") >= 2
+    assert "self.xtrack_priority_guidance(" in control
+    assert "self.update_xtrack_speed_cap_state(" in control
+    assert "guidance_bearing = xtrack_guidance_bearing" in control
 
 def test_tracking_cap_and_acceleration_permission_enter_speed_resolver():
     resolver = function_source("_resolve_precision_speed_for_cycle")
