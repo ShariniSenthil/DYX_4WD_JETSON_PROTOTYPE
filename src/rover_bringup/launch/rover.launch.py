@@ -748,7 +748,24 @@ def generate_launch_description() -> LaunchDescription:
                         # -- watch the next run's terminal overshoot at
                         # arrival (not just the entry jerk) in case 0.75
                         # reintroduces that older failure mode.
-                        "radial_stop_conservative_decel_mps2": 0.75,
+                        # 2026-09-24: 0.75 -> 0.60 with brake_margin 0.003 ->
+                        # 0.018, minimum_actuatable 0.15 -> 0.07 and stop_lead
+                        # 0.035 -> 0.022 (RoboClaw closed-loop wheel speed,
+                        # firmware 05041a43). Measured on the 24_09 stage-2
+                        # bags: /rpp/deceleration_active never goes true, so
+                        # this BRAKE_PROFILE is the only terminal speed shape
+                        # (1.0 m/s until 0.67 m at 0.75 m/s^2), and the 35 mm
+                        # lead latched zero while the profile was still at
+                        # 0.21-0.24 m/s -- a hard stop landing 0-27 mm short.
+                        # New shape: braking from the 0.75 m terminal-guidance
+                        # entry (1.0 -> 0.94 m/s), ~0.14 m/s at 35 mm and the
+                        # 0.07 m/s crawl floor at the 22 mm latch. stop_lead
+                        # cannot go below radial_tolerance (0.020): the config
+                        # rejects it at startup, and entering the radial
+                        # circle latches zero anyway. 0.07 m/s has not yet
+                        # been verified on the RoboClaw drivetrain -- if the
+                        # next run stalls or jerks at the end, raise it.
+                        "radial_stop_conservative_decel_mps2": 0.60,
                         # 0.05 crashed rpp_controller_node on startup:
                         # RadialStopConfig requires brake_margin_m <=
                         # radial_stop_radial_tolerance_m (0.020m), so 0.020 is
@@ -793,9 +810,9 @@ def generate_launch_description() -> LaunchDescription:
                         # ON the point needs a settle-then-remeasure-then-
                         # creep retry, which is a controller change, not a
                         # tuning value.
-                        "radial_stop_brake_margin_m": 0.003,
-                        "radial_stop_minimum_actuatable_speed_mps": 0.15,
-                        "radial_stop_minimum_speed_stop_lead_m": 0.035,
+                        "radial_stop_brake_margin_m": 0.018,
+                        "radial_stop_minimum_actuatable_speed_mps": 0.07,
+                        "radial_stop_minimum_speed_stop_lead_m": 0.022,
                         # Forward-only stop/settle/re-measure correction.
                         # Retry is allowed only while still short of the
                         # goal plane and with <=10 mm cross-track error.
