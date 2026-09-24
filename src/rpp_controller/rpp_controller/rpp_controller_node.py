@@ -3686,6 +3686,20 @@ class RPPController(Node):
         self.moving_course_bias_active = sampled
         return self.moving_course_bias
 
+    def course_compensated_yaw(self, target_yaw_enu_rad):
+        """Published yaw that makes the direction of travel hit the target.
+
+        course = yaw + moving_course_bias, so a heading loop that drives yaw
+        to (target - bias) drives the course to target. Under the velocity +
+        explicit yaw contract PX4 steers by this field, so the bias must be
+        in it, not only in the yaw-rate error term. Zero bias (estimator off,
+        reset at stop/pivot) returns the target unchanged.
+        """
+        bias = float(self.moving_course_bias)
+        if bias == 0.0 or not math.isfinite(bias):
+            return float(target_yaw_enu_rad)
+        return self.normalize_angle(float(target_yaw_enu_rad) - bias)
+
     def explicit_yaw_rate_command(
         self,
         target_yaw_enu_rad,
@@ -7965,7 +7979,7 @@ class RPPController(Node):
 
                 if not self.velocity_pub.publish_with_yaw(
                     msg,
-                    yaw_enu_rad,
+                    self.course_compensated_yaw(yaw_enu_rad),
                     yaw_rate_enu,
                 ):
                     self.get_logger().error(

@@ -23,6 +23,7 @@ METHODS = (
     "explicit_yaw_rate_command",
     "line_guidance",
     "_recovery_lookahead",
+    "course_compensated_yaw",
 )
 
 
@@ -260,3 +261,29 @@ def test_launch_enables_compensation_and_tightens_deadband():
     assert values["moving_course_bias_limit_deg"] == 3.0
     assert values["moving_yaw_deadband_enter_deg"] == 0.15
     assert values["moving_yaw_deadband_exit_deg"] == 0.30
+
+
+def test_published_yaw_carries_course_bias():
+    """PX4 steers by the yaw field under velocity + explicit yaw, so the
+    published yaw must be target - bias (course = yaw + bias)."""
+    node = _controller()
+    node.moving_course_bias = math.radians(1.0)
+    assert math.degrees(node.course_compensated_yaw(0.0)) == pytest.approx(-1.0)
+    node.moving_course_bias = math.radians(-0.65)
+    assert math.degrees(node.course_compensated_yaw(math.radians(90.0))) == \
+        pytest.approx(90.65)
+    node.moving_course_bias = 0.0
+    assert node.course_compensated_yaw(1.234) == 1.234
+
+
+def test_published_yaw_wraps_across_pi():
+    node = _controller()
+    node.moving_course_bias = math.radians(-2.0)
+    out = node.course_compensated_yaw(math.radians(179.0))
+    assert math.degrees(out) == pytest.approx(-179.0)
+
+
+def test_moving_publish_site_sends_course_compensated_yaw():
+    src = ast.get_source_segment(RPP.read_text(), _method("publish_velocity_ned"))
+    assert "publish_with_yaw(" in src
+    assert "self.course_compensated_yaw(yaw_enu_rad)" in src
