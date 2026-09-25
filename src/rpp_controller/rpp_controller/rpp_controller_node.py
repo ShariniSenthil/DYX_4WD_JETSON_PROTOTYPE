@@ -465,6 +465,14 @@ class RPPController(Node):
         self.declare_parameter("reverse_arc_min_turn_deg", 20.0)
         self.declare_parameter("reverse_arc_max_reverse_travel_m", 1.0)
         self.declare_parameter("reverse_arc_timeout_factor", 2.5)
+        # "straight" (default): reverse straight, then the normal stationary
+        # pivot -- both sides always run at equal speed. "arc": reverse while
+        # turning; its ~0.3 m turn radius equals half the 0.63 m track, so the
+        # inner side stalls and is dragged (field, 2026-09-25).
+        self.declare_parameter("reverse_arc_mode", "straight")
+        self.declare_parameter("reverse_arc_straight_accel_mps2", 0.40)
+        self.declare_parameter("reverse_arc_straight_min_speed_mps", 0.08)
+        self.declare_parameter("reverse_arc_straight_done_tol_m", 0.02)
         self.declare_parameter("pivot_yaw_rate_slew_radps2", 0.0)
         self.declare_parameter("recovery_lookahead_max_m", 0.0)
         self.declare_parameter("recovery_lookahead_xtrack_start_m", 0.05)
@@ -1164,6 +1172,16 @@ class RPPController(Node):
                 ),
                 timeout_factor=float(
                     self.get_parameter("reverse_arc_timeout_factor").value
+                ),
+                mode=str(self.get_parameter("reverse_arc_mode").value),
+                straight_accel_mps2=float(
+                    self.get_parameter("reverse_arc_straight_accel_mps2").value
+                ),
+                straight_min_speed_mps=float(
+                    self.get_parameter("reverse_arc_straight_min_speed_mps").value
+                ),
+                straight_done_tol_m=float(
+                    self.get_parameter("reverse_arc_straight_done_tol_m").value
                 ),
             )
         )
@@ -6074,7 +6092,7 @@ class RPPController(Node):
         if first_approach and not self.reverse_arc_first_approach_enabled:
             return False
         arc = self.reverse_arc
-        if arc.fallback:
+        if arc.fallback or arc.done:
             return False
         if arc.active:
             return True
@@ -6101,6 +6119,7 @@ class RPPController(Node):
         if started:
             self.get_logger().warn(
                 "REVERSE-ARC PIVOT STARTED | "
+                f"mode={arc.config.mode} | "
                 f"turn={math.degrees(arc.turn):+.1f}deg | "
                 f"centre ahead={arc.ahead:.3f}m left={arc.left:+.3f}m | "
                 f"duration={arc.duration_sec:.2f}s"
@@ -6131,6 +6150,26 @@ class RPPController(Node):
             float(self.current_yaw_rate_radps),
         )
         self._publish_reverse_arc_debug(command, alignment_cross_track)
+        if not command.active and not command.fallback:
+            # Straight mode: the reverse is complete; the pivot itself is the
+            # normal stationary one (both sides equal and opposite).
+            self.get_logger().warn(
+                "REVERSE-ARC STRAIGHT REVERSE DONE / STATIONARY PIVOT | "
+                f"reason={command.reason} | "
+                f"reverse_travel={command.reverse_travel_m:.3f}m | "
+                f"predicted_cross={command.predicted_cross_m * 1000.0:+.1f}mm | "
+                f"elapsed={command.elapsed_sec:.2f}s"
+            )
+            self._publish_legacy_native_carrier(
+                request_bearing,
+                true_error,
+                alignment_cross_track,
+                mode_prefix,
+                target_distance,
+                goal_distance,
+                "PX4 PIVOT KEEPER / NATIVE TURN AFTER REVERSE",
+            )
+            return
         if not command.active:
             self.get_logger().error(
                 "REVERSE-ARC PIVOT ABORTED / STATIONARY PIVOT FALLBACK | "
@@ -6200,8 +6239,10 @@ class RPPController(Node):
     def _publish_reverse_arc_debug(self, command, alignment_cross_track):
         arc = self.reverse_arc
         payload = {
+            "mode": str(arc.config.mode),
             "active": bool(command.active),
             "fallback": bool(command.fallback),
+            "done": bool(arc.done),
             "reason": str(command.reason),
             "elapsed_sec": float(command.elapsed_sec),
             "turn_deg": math.degrees(arc.turn),

@@ -628,6 +628,13 @@ def generate_launch_description() -> LaunchDescription:
                         "reverse_arc_min_turn_deg": 20.0,
                         "reverse_arc_max_reverse_travel_m": 1.0,
                         "reverse_arc_timeout_factor": 2.5,
+                        # straight: reverse straight, then the stationary pivot (both sides
+                        # always equal). arc: turn radius ~half the 0.63 m track -> inner
+                        # side stalls and drags (field, 2026-09-25).
+                        "reverse_arc_mode": "straight",
+                        "reverse_arc_straight_accel_mps2": 0.40,
+                        "reverse_arc_straight_min_speed_mps": 0.08,
+                        "reverse_arc_straight_done_tol_m": 0.02,
                         "recovery_lookahead_max_m": 1.5,
                         "recovery_lookahead_xtrack_start_m": 0.05,
                         "recovery_lookahead_xtrack_gain": 1.0,
