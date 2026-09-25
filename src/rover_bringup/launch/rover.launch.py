@@ -70,11 +70,10 @@ FCU_DEVICE_PATH = "/dev/serial/by-id/usb-Auterion_PX4_FMU_v6X.x_0-if00"
 # non-overridable ABSOLUTE_MAXIMUM_SPEED_MPS ceiling, i.e. zero headroom.
 # Watch the first run closely and be ready to drop this back down.
 # 2026-09-23: 1.00 m/s is the production target speed (operator instruction).
-# 2026-09-25: 0.60 m/s test (operator instruction) to measure time/distance to
-# reach the line after pivots and large offsets before redesigning the
-# approach. acceleration_distance_m / deceleration_distance_m stay 1.00 m on
-# purpose, so both ramps drop to v^2/(2d) = ~0.18 m/s^2 (0.5 at 1.00 m/s).
-CRUISE_SPEED_MPS = 0.60
+# 2026-09-25: a 0.60 m/s test (1a58c57, stage_11_cruise06) showed the
+# nozzle-referenced line steering is under-damped (swing grows as speed and
+# lookahead drop); restored to 1.00 m/s.
+CRUISE_SPEED_MPS = 1.00
 TERMINAL_FLOOR_SPEED_MPS = 0.15
 
 # Single source of truth for which terminal-stop authority is active.
