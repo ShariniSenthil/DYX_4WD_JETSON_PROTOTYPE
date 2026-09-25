@@ -612,7 +612,9 @@ def generate_launch_description() -> LaunchDescription:
                         # pivot. Simulated end-of-turn error vs today's
                         # 250-560 mm: <= 56 mm for 90-160 deg turns, <= ~100 mm
                         # for 25-45 deg (turning-centre spread 0.33-0.60 m).
-                        "reverse_arc_pivot_enabled": False,
+                        # 2026-09-25: ENABLED for the field test. PR #6 firmware
+                        # is flashed and RD_OFFB_REV = 1 (read live from the FCU).
+                        "reverse_arc_pivot_enabled": True,
                         "reverse_arc_first_approach_enabled": False,
                         "reverse_arc_centre_ahead_left_turn_m": 0.49,
                         "reverse_arc_centre_left_left_turn_m": 0.03,
