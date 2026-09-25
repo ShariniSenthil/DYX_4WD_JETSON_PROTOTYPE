@@ -116,9 +116,17 @@ diagram is also simplified/inaccurate** on this point — trust the source
 above over either document.
 
 Key behaviors of `cmd_vel_bridge` (`src/jetson_4wd_control/jetson_4wd_control/cmd_vel_bridge.py`):
-- Streams at **50 Hz unconditionally** (line 46, 185-188) — publishes zero or
-  the live command, never stops. This is how the "≥2 Hz before OFFBOARD"
-  rule below is satisfied structurally, not by discipline.
+- Never stops streaming — publishes zero or the live command. This is how the
+  "≥2 Hz before OFFBOARD" rule below is satisfied structurally, not by
+  discipline. **Since 2026-09-25** (not yet field-verified) each RPP command
+  is forwarded **on arrival**, and RPP runs at **50 Hz** (`control_rate_hz`
+  in `rover.launch.py`; node default 20). The 50 Hz timer re-evaluates every
+  safety gate, publishes at once when the gate outcome changes, and repeats
+  the last command only as a keep-alive after 1.25 periods of silence.
+  Before this, a 20 Hz RPP was resampled by the 50 Hz timer, so each command
+  went out 1–3 times (measured 25_09 stage_9). The bridge also asks PX4 for
+  `LOCAL_POSITION_NED` at 50 Hz (`local_position_rate_hz`) on every MAVROS
+  connection; the PX4 default on this link measured 28–30 Hz.
 - **No yaw is commanded at all.** Confirmed 2026-09-01 by decoding every
   `/mavros/setpoint_raw/local` message in seven bags: `type_mask = 3527
   (0xdc7)` sets **both `IGNORE_YAW` and `IGNORE_YAW_RATE`**, and the `yaw` /

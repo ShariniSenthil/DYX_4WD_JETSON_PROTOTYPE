@@ -11,6 +11,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 RPP = ROOT / "src/rpp_controller/rpp_controller/rpp_controller_node.py"
 BRIDGE = ROOT / "src/jetson_4wd_control/jetson_4wd_control/cmd_vel_bridge.py"
+STREAM_RATE = ROOT / "src/jetson_4wd_control/jetson_4wd_control/mavlink_stream_rate.py"
 LAUNCH = ROOT / "src/rover_bringup/launch/rover.launch.py"
 MODE = "rpp_explicit_yaw_enabled"
 TOPICS = {False: "/rpp/velocity_ned", True: "/rpp/command"}
@@ -111,6 +112,12 @@ class Node:
         self.period = period
         return callback
 
+    def create_client(self, kind, name):
+        client = Client(kind, name)
+        self.clients = getattr(self, "clients", []) + [client]
+        return client
+
+
     def get_clock(self):
         return NS(now=lambda: self.time)
 
@@ -118,14 +125,61 @@ class Node:
         return NS(warn=self.logs.append, info=self.logs.append, error=self.logs.append)
 
 
+class Client:
+    """Fake MAVROS service client: records requests, answers on demand."""
+
+    def __init__(self, kind, name):
+        self.kind, self.name = kind, name
+        self.ready = True
+        self.requests, self.futures = [], []
+
+    def service_is_ready(self):
+        return self.ready
+
+    def call_async(self, request):
+        future = Future()
+        self.requests.append(request)
+        self.futures.append(future)
+        return future
+
+
+class Future:
+    def __init__(self):
+        self.callbacks, self.value = [], None
+
+    def add_done_callback(self, callback):
+        self.callbacks.append(callback)
+
+    def finish(self, success):
+        self.value = NS(success=success)
+        for callback in self.callbacks:
+            callback(self)
+
+    def result(self):
+        return self.value
+
+
+class MessageInterval:
+    class Request:
+        def __init__(self):
+            self.message_id = 0
+            self.message_rate = 0.0
+
+
 def namespace():
     policy = NS(KEEP_LAST=1, BEST_EFFORT=2, RELIABLE=3,
                 VOLATILE=4, TRANSIENT_LOCAL=5)
+    stream_rate = {"__name__": "mavlink_stream_rate"}
+    exec(compile(STREAM_RATE.read_text(), str(STREAM_RATE), "exec"), stream_rate)
     return dict(Node=Node, math=math, Any=object, Vector3Stamped=Vector,
                 RppCommand=Atomic, PositionTarget=Target, State=Message,
                 Bool=Message, UInt64=Message, ParameterDescriptor=NS,
                 QoSProfile=NS, HistoryPolicy=policy, ReliabilityPolicy=policy,
-                DurabilityPolicy=policy)
+                DurabilityPolicy=policy, MessageInterval=MessageInterval,
+                StreamRateRequester=stream_rate["StreamRateRequester"],
+                MAVLINK_MSG_ID_LOCAL_POSITION_NED=(
+                    stream_rate["MAVLINK_MSG_ID_LOCAL_POSITION_NED"]
+                ))
 
 
 def bridge(enabled=None):
@@ -828,3 +882,185 @@ def test_full_authority_pivot_has_signed_yaw_rate_and_no_vector_reconstruction()
     assert "explicit_yaw_rate_command" in pivot
     assert "atan2" not in adapter
     assert "yaw_rate_enu_radps" in adapter
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-25: 50 Hz RPP -> bridge forwards each command on arrival; the timer
+# is the safety-gate evaluation and keep-alive only. Pose stream rate request.
+# ---------------------------------------------------------------------------
+
+
+def _moving_b_command(node, yaw=0.7):
+    msg = Atomic()
+    msg.velocity_north_mps, msg.velocity_east_mps = 0.3, 0.4
+    msg.yaw_valid, msg.yaw_enu_rad = True, yaw
+    node.subscriptions[0].callback(msg)
+
+
+def _advance(node, seconds):
+    # A new Time object: timestamps the bridge already stored keep their value.
+    later = Time()
+    later.nanoseconds = node.time.nanoseconds + int(round(seconds * 1e9))
+    node.time = later
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_bridge_forwards_each_rpp_command_on_arrival_without_timer(enabled):
+    node = bridge(enabled)
+    make_ready(node)
+    if enabled:
+        _moving_b_command(node)
+    else:
+        msg = Vector()
+        msg.vector.x, msg.vector.y = 0.3, 0.4
+        node.subscriptions[0].callback(msg)
+    assert len(node.setpoint_pub.messages) == 1
+    out = node.setpoint_pub.messages[-1]
+    assert (out.velocity.x, out.velocity.y) == (0.4, 0.3)
+    assert out.type_mask == (455 if enabled else 3527)
+
+
+def test_each_fresh_command_is_published_once_not_repeated_by_timer():
+    node = bridge(True)
+    make_ready(node)
+    for step in range(5):
+        _moving_b_command(node, yaw=0.1 * step)
+        _advance(node, 0.010)
+        node._control_loop()          # timer inside the keep-alive window
+        _advance(node, 0.010)
+    yaws = [m.yaw for m in node.setpoint_pub.messages]
+    assert yaws == pytest.approx([0.0, 0.1, 0.2, 0.3, 0.4])
+
+
+def test_timer_keepalive_repeats_last_command_when_rpp_goes_quiet():
+    node = bridge(True)
+    make_ready(node)
+    _moving_b_command(node, yaw=0.5)
+    _advance(node, 0.020)
+    node._control_loop()
+    assert len(node.setpoint_pub.messages) == 1   # 20 ms < 25 ms keep-alive
+    _advance(node, 0.010)
+    node._control_loop()
+    assert len(node.setpoint_pub.messages) == 2   # 30 ms: keep-alive repeat
+    assert node.setpoint_pub.messages[-1].yaw == 0.5
+
+
+def test_timer_publishes_gate_change_immediately_inside_keepalive_window():
+    node = bridge(True)
+    make_ready(node)
+    _moving_b_command(node)
+    node.emergency_stop = True
+    _advance(node, 0.001)
+    node._control_loop()
+    assert len(node.setpoint_pub.messages) == 2
+    assert_stop(node)
+    assert node.latest_command_time is None
+
+
+def test_command_timeout_still_zeroes_when_rpp_stops_publishing():
+    node = bridge(True)
+    make_ready(node)
+    _moving_b_command(node)
+    _advance(node, 0.30)              # > command_timeout_sec 0.25
+    node._control_loop()
+    assert_stop(node)
+
+
+def test_launch_runs_rpp_at_50_hz_and_requests_50_hz_pose():
+    tree = ast.parse(LAUNCH.read_text())
+    values = {}
+    for call in ast.walk(tree):
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                and call.func.id == "Node"):
+            continue
+        kwargs = {k.arg: k.value for k in call.keywords}
+        if "parameters" not in kwargs:
+            continue
+        name = ast.literal_eval(kwargs["name"])
+        for item in ast.walk(kwargs["parameters"]):
+            if isinstance(item, ast.Dict):
+                for key, value in zip(item.keys, item.values):
+                    if isinstance(key, ast.Constant) and key.value in (
+                        "control_rate_hz", "local_position_rate_hz"
+                    ):
+                        values[(name, key.value)] = ast.literal_eval(value)
+    assert values == {
+        ("rpp_controller", "control_rate_hz"): 50.0,
+        ("cmd_vel_bridge", "local_position_rate_hz"): 50.0,
+    }
+
+
+def _stream_rate_module():
+    env = {"__name__": "mavlink_stream_rate"}
+    exec(compile(STREAM_RATE.read_text(), str(STREAM_RATE), "exec"), env)
+    return env
+
+
+def _requester(rate_hz=50.0):
+    sent = []
+    env = _stream_rate_module()
+    req = env["StreamRateRequester"](
+        message_id=env["MAVLINK_MSG_ID_LOCAL_POSITION_NED"],
+        rate_hz=rate_hz,
+        retry_sec=2.0,
+        send=lambda mid, hz: sent.append((mid, hz)) or True,
+    )
+    return req, sent
+
+
+def test_stream_rate_requests_local_position_ned_once_per_connection():
+    req, sent = _requester()
+    assert req.on_state(False, True, 0.0) is False
+    assert req.on_state(True, False, 0.5) is False        # service not ready
+    assert req.on_state(True, True, 1.0) is True
+    assert sent == [(32, 50.0)]
+    assert req.on_state(True, True, 1.1) is False         # in flight
+    req.on_response(True, req.connection_epoch)
+    assert req.confirmed
+    assert req.on_state(True, True, 9.0) is False         # confirmed
+    assert sent == [(32, 50.0)]
+
+
+def test_stream_rate_retries_after_rejection_or_no_answer():
+    req, sent = _requester()
+    req.on_state(True, True, 0.0)
+    req.on_response(False, req.connection_epoch)
+    assert req.on_state(True, True, 1.0) is False         # retry backoff
+    assert req.on_state(True, True, 2.0) is True
+    assert req.on_state(True, True, 4.0) is True          # no answer: retried
+    assert len(sent) == 3
+
+
+def test_stream_rate_rerequests_after_fcu_reconnect_and_ignores_stale_answer():
+    req, sent = _requester()
+    req.on_state(True, True, 0.0)
+    old_epoch = req.connection_epoch
+    req.on_state(False, True, 0.5)                        # PX4 reboot
+    req.on_response(True, old_epoch)                      # late answer
+    assert not req.confirmed
+    assert req.on_state(True, True, 0.6) is True
+    assert len(sent) == 2
+
+
+def test_stream_rate_zero_is_disabled():
+    req, sent = _requester(rate_hz=0.0)
+    assert req.on_state(True, True, 0.0) is False
+    assert sent == []
+
+
+def test_bridge_sends_message_interval_through_mavros_client():
+    Node.overrides = {MODE: True, "local_position_rate_hz": 50.0}
+    env = namespace()
+    execute([class_ast(BRIDGE, "CmdVelBridge")], env)
+    node = env["CmdVelBridge"]()
+    client, = node.clients
+    assert client.name == "/mavros/set_message_interval"
+    state = Message()
+    state.connected, state.armed, state.mode = True, False, "MANUAL"
+    node._state_callback(state)
+    request, = client.requests
+    assert (request.message_id, request.message_rate) == (32, 50.0)
+    client.futures[0].finish(True)
+    assert node.local_position_rate.confirmed
+    node._state_callback(state)
+    assert len(client.requests) == 1

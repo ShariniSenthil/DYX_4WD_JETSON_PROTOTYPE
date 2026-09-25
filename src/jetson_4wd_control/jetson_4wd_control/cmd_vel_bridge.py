@@ -21,8 +21,15 @@ to straight driving at 12 degrees or less.
 
 RPP owns acceleration, deceleration and all requested speed shaping. This bridge preserves
 finite RPP speeds from 0.00 through 1.00 m/s and clamps only commands above the
-configured safety maximum. It repeats the latest RPP command to PX4 at 50 Hz.
+configured safety maximum. Each accepted RPP command is gated and forwarded to
+PX4 as soon as it arrives (RPP runs at 50 Hz). The 50 Hz timer still evaluates
+every safety gate and publishes immediately when the gate outcome changes; it
+repeats the last command only as a keep-alive when no command has been
+forwarded for KEEPALIVE_PERIODS stream periods (an RPP stall).
 Literal zero remains the stop command for all safety conditions.
+
+On every new MAVROS connection the bridge also asks PX4 to stream
+LOCAL_POSITION_NED (the pose RPP steers from) at local_position_rate_hz.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ from typing import Any
 import rclpy
 from geometry_msgs.msg import Vector3Stamped
 from mavros_msgs.msg import PositionTarget, State
+from mavros_msgs.srv import MessageInterval
 from rcl_interfaces.msg import ParameterDescriptor
 from rpp_interfaces.msg import RppCommand
 from rclpy.node import Node
@@ -44,11 +52,20 @@ from rclpy.qos import (
 )
 from std_msgs.msg import Bool, UInt64
 
+from jetson_4wd_control.mavlink_stream_rate import (
+    MAVLINK_MSG_ID_LOCAL_POSITION_NED,
+    StreamRateRequester,
+)
+
 
 class CmdVelBridge(Node):
     """Gate RPP vectors and stream safe PX4 PositionTarget messages."""
 
     STREAM_HZ = 50.0
+    # Timer keep-alive: repeat the last setpoint only if nothing was published
+    # for this many stream periods. RPP normally publishes every period.
+    KEEPALIVE_PERIODS = 1.25
+    STREAM_RATE_RETRY_SEC = 2.0
     ABSOLUTE_MAXIMUM_SPEED_MPS = 1.00
     COMMAND_EPSILON = 1.0e-6
 
@@ -92,6 +109,10 @@ class CmdVelBridge(Node):
         # Bridge-side safety ceiling for Jetson yaw-rate commands.
         # PX4 RO_YAW_RATE_LIM remains the final FCU hard ceiling.
         self.declare_parameter("maximum_yaw_rate_radps", 0.45)
+
+        # PX4 LOCAL_POSITION_NED rate requested on each MAVROS connection.
+        # 0 leaves PX4's default stream rate untouched.
+        self.declare_parameter("local_position_rate_hz", 0.0)
 
         self.command_timeout_sec = float(
             self.get_parameter("command_timeout_sec").value
@@ -236,6 +257,20 @@ class CmdVelBridge(Node):
         self._late_cycle_count = 0
         self._yaw_drop_count = 0
 
+        self._last_publish_time = None
+        self._last_published_reason = None
+
+        self._message_interval_client = self.create_client(
+            MessageInterval,
+            "/mavros/set_message_interval",
+        )
+        self.local_position_rate = StreamRateRequester(
+            message_id=MAVLINK_MSG_ID_LOCAL_POSITION_NED,
+            rate_hz=float(self.get_parameter("local_position_rate_hz").value),
+            retry_sec=self.STREAM_RATE_RETRY_SEC,
+            send=self._send_message_interval,
+        )
+
         self._publish_heartbeat_health(False, force=True)
         self.timer = self.create_timer(
             1.0 / self.STREAM_HZ,
@@ -304,6 +339,7 @@ class CmdVelBridge(Node):
         self.latest_north = north
         self.latest_east = east
         self.latest_command_time = self.get_clock().now()
+        self._evaluate_and_publish(from_timer=False)
 
     def _clear_b_command(self, reason: str) -> None:
         self.latest_north = 0.0
@@ -313,6 +349,7 @@ class CmdVelBridge(Node):
         self.latest_yaw_valid = False
         self.latest_command_time = None
         self.get_logger().error(f"Rejected RPP atomic command: {reason}")
+        self._evaluate_and_publish(from_timer=False)
 
     def _rpp_command_callback(self, message: RppCommand) -> None:
         try:
@@ -377,11 +414,42 @@ class CmdVelBridge(Node):
         self.latest_yaw_rate_enu = yaw_rate_enu
         self.latest_yaw_valid = yaw_valid
         self.latest_command_time = self.get_clock().now()
+        self._evaluate_and_publish(from_timer=False)
 
     def _state_callback(self, message: State) -> None:
         self.connected = bool(message.connected)
         self.armed = bool(message.armed)
         self.mode = str(message.mode).strip().upper()
+        self.local_position_rate.on_state(
+            self.connected,
+            self._message_interval_client.service_is_ready(),
+            self.get_clock().now().nanoseconds / 1e9,
+        )
+
+    def _send_message_interval(self, message_id: int, rate_hz: float) -> bool:
+        request = MessageInterval.Request()
+        request.message_id = int(message_id)
+        request.message_rate = float(rate_hz)
+        epoch = self.local_position_rate.connection_epoch
+        future = self._message_interval_client.call_async(request)
+
+        def _done(done_future) -> None:
+            try:
+                success = bool(done_future.result().success)
+            except Exception as error:  # noqa: BLE001 - logged, then retried
+                self.get_logger().warn(
+                    f"set_message_interval id={message_id} failed: {error}"
+                )
+                success = False
+            self.local_position_rate.on_response(success, epoch)
+            log = self.get_logger().info if success else self.get_logger().warn
+            log(
+                f"PX4 message {message_id} rate {rate_hz:.1f} Hz "
+                f"{'accepted' if success else 'REJECTED; retrying'}"
+            )
+
+        future.add_done_callback(_done)
+        return True
 
     def _mission_callback(self, message: Bool) -> None:
         self.mission_enabled = bool(message.data)
@@ -462,8 +530,12 @@ class CmdVelBridge(Node):
         self.setpoint_pub.publish(message)
 
     def _control_loop(self) -> None:
+        """50 Hz timer: safety-gate evaluation and keep-alive."""
+        self._evaluate_and_publish(from_timer=True)
+
+    def _evaluate_and_publish(self, *, from_timer: bool) -> None:
         loop_time = self.get_clock().now()
-        if self._previous_loop_time is not None:
+        if from_timer and self._previous_loop_time is not None:
             interval = (
                 loop_time - self._previous_loop_time
             ).nanoseconds / 1e9
@@ -475,7 +547,8 @@ class CmdVelBridge(Node):
                     f"expected={1000.0 / self.STREAM_HZ:.1f}ms "
                     f"lateCycles={self._late_cycle_count}"
                 )
-        self._previous_loop_time = loop_time
+        if from_timer:
+            self._previous_loop_time = loop_time
 
         north = 0.0
         east = 0.0
@@ -517,6 +590,17 @@ class CmdVelBridge(Node):
                 )
             )
 
+        # The timer only re-sends when the gate outcome changed or the stream
+        # has gone quiet (RPP stall). Normally each fresh RPP command has
+        # already been forwarded by its own callback within the last period.
+        if (
+            from_timer
+            and reason == self._last_published_reason
+            and self._age_seconds(self._last_publish_time)
+            < self.KEEPALIVE_PERIODS / self.STREAM_HZ
+        ):
+            return
+
         # In B mode a safety/inhibit boundary invalidates the entire atomic
         # command. A fresh RPP command is required before motion/yaw can resume.
         if (
@@ -538,6 +622,8 @@ class CmdVelBridge(Node):
             yaw_rate_enu_radps=yaw_rate_enu,
             yaw_valid=yaw_valid,
         )
+        self._last_publish_time = loop_time
+        self._last_published_reason = reason
 
         if self._previous_yaw_valid and not yaw_valid:
             self._yaw_drop_count += 1

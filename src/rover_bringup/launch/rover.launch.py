@@ -153,6 +153,12 @@ def generate_launch_description() -> LaunchDescription:
                         # Must be >= rpp_controller maximum_yaw_rate_radps: the
                         # bridge clamps explicit yaw-rate to this value.
                         ("maximum_yaw_rate_" "radps"): 0.75,
+                        # 2026-09-25: ask PX4 for LOCAL_POSITION_NED (the
+                        # /mavros/local_position/odom source) at 50 Hz on every
+                        # MAVROS connection, to match the 50 Hz RPP loop. PX4
+                        # default on this link measured 28-30 Hz. Not stored
+                        # on the FCU; 0 leaves PX4's default.
+                        "local_position_rate_hz": 50.0,
                     }
                 ],
             ),
@@ -332,6 +338,13 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         "rpp_explicit_yaw_enabled": RPP_EXPLICIT_YAW_ENABLED,
+                        # 2026-09-25: 50 Hz, as on the 3WD rover. At 20 Hz
+                        # cmd_vel_bridge re-sent each command 1-3 times on its
+                        # 50 Hz stream, so PX4 saw a 20 Hz staircase. The pose
+                        # (LOCAL_POSITION_NED) is raised to 50 Hz by
+                        # cmd_vel_bridge on FCU connect. 25_09 stage_8/9 compute
+                        # time: p50 3.4 ms, p95 13.5 ms, 1.5% of cycles > 20 ms.
+                        "control_rate_hz": 50.0,
                         "local_frame": "map",
                         # RPP motion profile + trajectory following.
                         # Extension/dummy generation remains owned by the

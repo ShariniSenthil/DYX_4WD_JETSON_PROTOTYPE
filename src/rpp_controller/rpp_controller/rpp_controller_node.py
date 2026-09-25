@@ -124,7 +124,12 @@ class RPPController(Node):
     Node name, executable, topics, and tablet launch contract are unchanged.
     """
 
+    # Default control rate. The running node overrides it with the read-only
+    # control_rate_hz parameter (rover.launch.py sets 50 Hz). Per-cycle filter
+    # alphas are specified at this 20 Hz reference rate and are converted to
+    # the running rate so their time constants are unchanged.
     CONTROL_HZ = 20.0
+    FILTER_ALPHA_REFERENCE_HZ = 20.0
     TELEMETRY_HZ = 50.0
     MAXIMUM_MOVING_SPEED_MPS = 1.00
     MAX_MOVING_HEADING_ERROR_RAD = math.radians(30.0)
@@ -148,6 +153,22 @@ class RPPController(Node):
         self.rpp_explicit_yaw_enabled = bool(
             self.get_parameter("rpp_explicit_yaw_enabled").value
         )
+
+        self.declare_parameter(
+            "control_rate_hz",
+            20.0,
+            ParameterDescriptor(
+                read_only=True,
+                description=(
+                    "Restart-only control loop rate in Hz; one fresh command "
+                    "per cycle to cmd_vel_bridge. Set in rover.launch.py"
+                ),
+            ),
+        )
+        control_rate_hz = float(self.get_parameter("control_rate_hz").value)
+        if not (math.isfinite(control_rate_hz) and 10.0 <= control_rate_hz <= 100.0):
+            raise ValueError("control_rate_hz must be finite and in [10, 100]")
+        self.CONTROL_HZ = control_rate_hz
 
         self.declare_parameter("local_frame", "map")
         self.declare_parameter("cruise_speed_mps", 1.00)
@@ -924,8 +945,8 @@ class RPPController(Node):
         self.xtrack_prediction_time_sec = float(
             self.get_parameter("xtrack_prediction_time_sec").value
         )
-        self.xtrack_rate_filter_alpha = float(
-            self.get_parameter("xtrack_rate_filter_alpha").value
+        self.xtrack_rate_filter_alpha = self.rate_scaled_filter_alpha(
+            float(self.get_parameter("xtrack_rate_filter_alpha").value)
         )
         self.xtrack_correction_slew_rate = math.radians(
             float(self.get_parameter("xtrack_correction_slew_rate_degps").value)
@@ -1043,8 +1064,8 @@ class RPPController(Node):
         self.moving_yaw_damping_gain_max = float(
             self.get_parameter("moving_yaw_damping_gain_max").value
         )
-        self.moving_yaw_rate_filter_alpha = float(
-            self.get_parameter("moving_yaw_rate_filter_alpha").value
+        self.moving_yaw_rate_filter_alpha = self.rate_scaled_filter_alpha(
+            float(self.get_parameter("moving_yaw_rate_filter_alpha").value)
         )
         self.moving_yaw_damping_limit = float(
             self.get_parameter("moving_yaw_damping_limit_radps").value
@@ -2235,8 +2256,8 @@ class RPPController(Node):
         self.last_wait_log_time = now
         self.last_mm_monitor_log_time = now
 
-        # /rpp/debug is a 50 Hz latest-sample transport. The controller remains
-        # 20 Hz so telemetry cannot change motion dynamics. Each transport
+        # /rpp/debug is a 50 Hz latest-sample transport on its own timer, so
+        # telemetry cannot change motion dynamics at any control_rate_hz. Each transport
         # frame carries both a telemetry sequence and the source control-cycle
         # sequence/age, making repeated samples explicit and measurable.
         self._rpp_debug_lock = threading.Lock()
@@ -10472,6 +10493,22 @@ class RPPController(Node):
                 signed_cross_track=signed_cross_track,
                 along_remaining=along_remaining,
             )
+
+    def rate_scaled_filter_alpha(self, reference_alpha):
+        """Convert a per-cycle EMA alpha from the 20 Hz reference rate.
+
+        An exponential filter applied once per cycle with alpha a has a time
+        constant that depends on the cycle rate. The alpha parameters were
+        tuned at 20 Hz, so at the running rate apply
+        1 - (1 - a) ** (reference_hz / control_hz), which keeps the same
+        decay per second. Out-of-range input is returned unchanged for the
+        existing (0, 1] validation to reject.
+        """
+        alpha = float(reference_alpha)
+        if not (0.0 < alpha < 1.0) or not math.isfinite(alpha):
+            return alpha
+        exponent = self.FILTER_ALPHA_REFERENCE_HZ / float(self.CONTROL_HZ)
+        return 1.0 - (1.0 - alpha) ** exponent
 
     def _control_timer_callback(self):
         """Run one motion cycle and always commit one coherent debug sample."""

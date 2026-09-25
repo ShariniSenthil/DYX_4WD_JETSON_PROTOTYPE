@@ -14,9 +14,22 @@ def _source() -> str:
     return NODE_PATH.read_text(encoding="utf-8")
 
 
-def test_control_rate_is_unchanged_and_telemetry_is_50_hz():
+LAUNCH_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "rover_bringup"
+    / "launch"
+    / "rover.launch.py"
+)
+
+
+def test_control_rate_is_a_restart_parameter_run_at_50_hz():
     source = _source()
+    # 20 Hz stays the node default; the launch file runs the loop at 50 Hz so
+    # every 50 Hz bridge setpoint carries a freshly computed command.
     assert "CONTROL_HZ = 20.0" in source
+    assert '"control_rate_hz"' in source
+    assert "self.CONTROL_HZ = control_rate_hz" in source
+    assert '"control_rate_hz": 50.0' in LAUNCH_PATH.read_text(encoding="utf-8")
     assert "TELEMETRY_HZ = 50.0" in source
     assert "1.0 / self.TELEMETRY_HZ" in source
 
