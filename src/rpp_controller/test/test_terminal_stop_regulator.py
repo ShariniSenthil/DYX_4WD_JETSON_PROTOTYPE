@@ -228,52 +228,14 @@ def test_brake_profile_targets_literal_zero_without_a_speed_floor():
     assert braking.state is RadialStopState.BRAKE_PROFILE
     assert braking.profile_speed_mps == pytest.approx(math.sqrt(0.6 * 0.04))
 
-    # Coast-lead zero is intentionally gated by cross-track. With
-    # cross-track inside the 20 mm radial limit, the drivetrain may latch
-    # literal zero at the calibrated minimum-speed stopping lead.
     zero = driver.tick(
         along_remaining_m=0.010,
-        cross_error_m=0.0,
+        cross_error_m=0.10,
         position_derived_speed_mps=0.10,
     )
     assert zero.state is RadialStopState.ZERO_LATCH
     assert zero.forward_speed_command_mps == 0.0
     assert zero.profile_speed_mps == 0.0
-
-
-def test_large_cross_track_does_not_use_early_coast_zero_latch():
-    driver = Driver()
-    driver.tick(
-        along_remaining_m=0.40,
-        position_derived_speed_mps=0.40,
-    )
-    driver.tick(
-        along_remaining_m=0.050,
-        cross_error_m=0.10,
-        position_derived_speed_mps=0.40,
-    )
-
-    near = driver.tick(
-        along_remaining_m=0.010,
-        cross_error_m=0.10,
-        position_derived_speed_mps=0.10,
-    )
-    assert near.state is RadialStopState.BRAKE_PROFILE
-    assert near.motion_direction is MotionDirection.FORWARD
-    assert (
-        near.forward_speed_command_mps
-        >= driver.regulator.config.minimum_actuatable_speed_mps
-    )
-
-    # Crossing the goal plane remains an unconditional fail-safe zero latch.
-    at_plane = driver.tick(
-        along_remaining_m=0.0,
-        cross_error_m=0.10,
-        position_derived_speed_mps=0.10,
-    )
-    assert at_plane.state is RadialStopState.ZERO_LATCH
-    assert at_plane.motion_direction is MotionDirection.ZERO
-    assert at_plane.forward_speed_command_mps == 0.0
 
 
 @pytest.mark.parametrize("along", [0.0, -0.0001, -0.20])
@@ -455,139 +417,6 @@ def test_first_entry_inside_then_settle_outside_fails_closed():
     assert result.failure is RadialStopFailure.SETTLED_OUTSIDE_TOLERANCE
     assert result.certificate is None
     assert result.hold_zero
-
-
-def test_settled_short_inside_retry_envelope_starts_forward_corrective_pulse():
-    driver = Driver(
-        TerminalStopRegulator(
-            compact_config(
-                corrective_creep_speed_mps=0.25,
-                corrective_creep_pulse_sec=0.10,
-                corrective_creep_max_along_m=0.060,
-                corrective_creep_max_cross_m=0.010,
-                corrective_creep_max_attempts=3,
-            )
-        )
-    )
-    driver.tick(
-        along_remaining_m=0.20,
-        position_derived_speed_mps=0.40,
-    )
-    enter_zero(driver, along=0.035, cross=0.0)
-    settle(driver, along=0.035, cross=0.0)
-    retry = driver.tick(
-        along_remaining_m=0.035,
-        cross_error_m=0.0,
-        position_derived_speed_mps=0.0,
-    )
-    assert retry.state is RadialStopState.CORRECTIVE_CREEP
-    assert retry.motion_direction is MotionDirection.FORWARD
-    assert retry.forward_speed_command_mps == pytest.approx(0.25)
-    assert not retry.hold_zero
-
-
-def test_corrective_pulse_is_bounded_then_returns_to_zero_latch():
-    driver = Driver(
-        TerminalStopRegulator(
-            compact_config(
-                corrective_creep_speed_mps=0.25,
-                corrective_creep_pulse_sec=0.10,
-                corrective_creep_max_along_m=0.060,
-                corrective_creep_max_cross_m=0.010,
-                corrective_creep_max_attempts=3,
-            )
-        ),
-        dt=0.05,
-    )
-    driver.tick(
-        along_remaining_m=0.20,
-        position_derived_speed_mps=0.40,
-    )
-    enter_zero(driver, along=0.035, cross=0.0)
-    settle(driver, along=0.035, cross=0.0)
-    first = driver.tick(
-        along_remaining_m=0.035,
-        cross_error_m=0.0,
-        position_derived_speed_mps=0.0,
-    )
-    assert first.state is RadialStopState.CORRECTIVE_CREEP
-
-    second = driver.tick(
-        along_remaining_m=0.030,
-        cross_error_m=0.0,
-        position_derived_speed_mps=0.05,
-    )
-    assert second.state is RadialStopState.CORRECTIVE_CREEP
-
-    stopped = driver.tick(
-        elapsed=0.06,
-        along_remaining_m=0.025,
-        cross_error_m=0.0,
-        position_derived_speed_mps=0.05,
-    )
-    assert stopped.state is RadialStopState.ZERO_LATCH
-    assert stopped.motion_direction is MotionDirection.ZERO
-    assert stopped.forward_speed_command_mps == 0.0
-
-
-def test_corrective_pulse_stops_immediately_on_entering_20mm_circle():
-    driver = Driver(
-        TerminalStopRegulator(
-            compact_config(
-                corrective_creep_speed_mps=0.25,
-                corrective_creep_pulse_sec=0.10,
-                corrective_creep_max_along_m=0.060,
-                corrective_creep_max_cross_m=0.010,
-                corrective_creep_max_attempts=3,
-            )
-        ),
-        dt=0.05,
-    )
-    driver.tick(
-        along_remaining_m=0.20,
-        position_derived_speed_mps=0.40,
-    )
-    enter_zero(driver, along=0.035, cross=0.0)
-    settle(driver, along=0.035, cross=0.0)
-    driver.tick(
-        along_remaining_m=0.035,
-        cross_error_m=0.0,
-        position_derived_speed_mps=0.0,
-    )
-    result = driver.tick(
-        along_remaining_m=0.018,
-        cross_error_m=0.0,
-        position_derived_speed_mps=0.05,
-    )
-    assert result.state is RadialStopState.ZERO_LATCH
-    assert result.forward_speed_command_mps == 0.0
-
-
-def test_corrective_retry_never_runs_after_goal_plane_or_with_large_cross_track():
-    for along, cross in ((-0.025, 0.0), (0.035, 0.011)):
-        driver = Driver(
-            TerminalStopRegulator(
-                compact_config(
-                    corrective_creep_max_along_m=0.060,
-                    corrective_creep_max_cross_m=0.010,
-                )
-            )
-        )
-        if along > 0.0:
-            driver.tick(
-                along_remaining_m=0.20,
-                position_derived_speed_mps=0.40,
-            )
-        enter_zero(driver, along=max(0.001, along), cross=cross)
-        settle(driver, along=along, cross=cross)
-        failed = driver.tick(
-            along_remaining_m=along,
-            cross_error_m=cross,
-            position_derived_speed_mps=0.0,
-        )
-        assert failed.state is RadialStopState.HOLD_FAIL
-        assert failed.failure is RadialStopFailure.SETTLED_OUTSIDE_TOLERANCE
-        assert failed.forward_speed_command_mps == 0.0
 
 
 def test_stale_telemetry_fails_and_failure_latches_until_reset():

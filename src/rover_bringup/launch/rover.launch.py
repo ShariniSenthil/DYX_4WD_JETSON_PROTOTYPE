@@ -282,11 +282,11 @@ def generate_launch_description() -> LaunchDescription:
                         "local_frame": "map",
                         # Exact marking acceptance for P1/P2/P3/...
                         "marking_tolerance_m": 0.02,
-                        # Marking must remain inside 30 mm AND stationary
-                        # continuously before spray is requested.
+                        # Legacy arrival settling; radial20 instead requires
+                        # its stationary position-window certificate at 20 mm.
                         "arrival_settle_sec": 0.30,
-                        # After arrival validation, keep the rover at ZERO for
-                        # 3.0 s total at every real marking point P1/P2/P3/...
+                        # Legacy/precision fallback hold; certified radial20
+                        # bypasses this additional manager dwell.
                         "marking_hold_sec": 3.00,
                         "stationary_speed_tolerance_mps": 0.01,
                         # Extension/dummy semantic goal uses the SAME exact
@@ -701,126 +701,16 @@ def generate_launch_description() -> LaunchDescription:
                         "precision_tracking_histogram_max_m": 1.0,
                         "precision_tracking_monotonic_tolerance_m": 0.001,
                         "precision_tracking_cruise_threshold_mps": 0.80,
-                        # Phase-5 measured <=10 mm controller-frame stop.
-                        # Default-OFF preserves the production 30 mm latch.
+                        # September 11 radial20 stop: brake toward the goal,
+                        # then latch zero inside the 20 mm circle or at the
+                        # goal plane. No minimum-speed floor or creep retry.
+                        # Certification requires a stationary position window
+                        # within 20 mm; radial20 adds no manager 3 s dwell.
                         "terminal_stop_mode": TERMINAL_STOP_MODE,
-                        # radial20 (terminal_stop_regulator.py). Not enabled
-                        # by TERMINAL_STOP_MODE above yet.
-                        # conservative_decel_mps2 and the stationary-window
-                        # thresholds are calibration inputs -- replace with
-                        # values measured during the post-RO_SPEED_I=0.2
-                        # bench sweep before ever setting TERMINAL_STOP_MODE
-                        # to radial20 in the field. See the plan review.
                         "radial_stop_radial_tolerance_m": 0.020,
                         "radial_stop_terminal_guidance_distance_m": 0.75,
-                        # 2026-09-02: widened 0.30->0.20 / 0.010->0.05 as an
-                        # interim mitigation for the 35-50mm physical-coast
-                        # overshoot seen on every point in
-                        # mission.csv_20260902_160021/160148 -- the along<=0
-                        # guard fired exactly on time, the drivetrain just
-                        # couldn't stop that fast. Still unmeasured guesses,
-                        # just wider ones; the bench sweep is still the real
-                        # fix.
-                        #
-                        # 2026-09-03: raised 0.20->0.75 to fix a much bigger
-                        # problem introduced by the 1.0 m/s cruise deploy the
-                        # same day. At 0.20, stopping_distance(1.0 m/s) =
-                        # 1.0^2/(2*0.20) + brake_margin = 2.52 m, over 3x the
-                        # fixed 0.75 m radial_stop_terminal_guidance_distance_m
-                        # above -- so BRAKE_PROFILE was entered already "late"
-                        # relative to its own model and had to snap the
-                        # command from 1.00 m/s to ~0.51 m/s in a single
-                        # control cycle (confirmed in bag
-                        # mission.csv_20260903_101912/102226:
-                        # /rpp/command_speed_mps and /rpp/terminal_certificate,
-                        # 10/10 stops across both runs), felt as a hard brake
-                        # jerk, then crawled the last ~650mm at that gentle
-                        # 0.20 m/s^2 rate for 2.5-3s, much of it inside the
-                        # documented 0.143-0.219 m/s motor breakaway deadband
-                        # (the "slow creep"). 0.75 is the smallest value that
-                        # clears stopping_distance(1.0 m/s, 0.75) = 0.68 m <=
-                        # 0.75 m, restoring a continuous (non-jumping) speed
-                        # at BRAKE_PROFILE entry. NOTE: 0.20 was itself a
-                        # 2026-09-02 reduction from 0.30 to fix a DIFFERENT
-                        # problem -- 35-50mm terminal overshoot because the
-                        # drivetrain couldn't brake that hard near the goal.
-                        # Neither 0.20/0.30 nor this 0.75 has been bench-swept
-                        # -- watch the next run's terminal overshoot at
-                        # arrival (not just the entry jerk) in case 0.75
-                        # reintroduces that older failure mode.
-                        # 2026-09-24: 0.75 -> 0.60 with brake_margin 0.003 ->
-                        # 0.018, minimum_actuatable 0.15 -> 0.07 and stop_lead
-                        # 0.035 -> 0.022 (RoboClaw closed-loop wheel speed,
-                        # firmware 05041a43). Measured on the 24_09 stage-2
-                        # bags: /rpp/deceleration_active never goes true, so
-                        # this BRAKE_PROFILE is the only terminal speed shape
-                        # (1.0 m/s until 0.67 m at 0.75 m/s^2), and the 35 mm
-                        # lead latched zero while the profile was still at
-                        # 0.21-0.24 m/s -- a hard stop landing 0-27 mm short.
-                        # New shape: braking from the 0.75 m terminal-guidance
-                        # entry (1.0 -> 0.94 m/s), ~0.14 m/s at 35 mm and the
-                        # 0.07 m/s crawl floor at the 22 mm latch. stop_lead
-                        # cannot go below radial_tolerance (0.020): the config
-                        # rejects it at startup, and entering the radial
-                        # circle latches zero anyway. 0.07 m/s has not yet
-                        # been verified on the RoboClaw drivetrain -- if the
-                        # next run stalls or jerks at the end, raise it.
-                        "radial_stop_conservative_decel_mps2": 0.60,
-                        # 0.05 crashed rpp_controller_node on startup:
-                        # RadialStopConfig requires brake_margin_m <=
-                        # radial_stop_radial_tolerance_m (0.020m), so 0.020 is
-                        # the hard ceiling here.
-                        #
-                        # 2026-09-04: 0.015 -> 0.003. Measured from the
-                        # 2026-09-03 evening dataset (8 bags + 8 ulogs, 43
-                        # waypoints, raw GNSS RTK-FIXED for 100% of every
-                        # run): 35/43 points stopped SHORT of the surveyed
-                        # target, median 18.3 mm, sign test p = 4.2e-5, and
-                        # the settled EKF agreed with raw RTK to a median of
-                        # 1.1 mm -- so the short stop is the profile, not the
-                        # estimator.
-                        #
-                        # Mechanism. BRAKE_PROFILE commands
-                        #   sqrt(2 * conservative_decel * (along_rem - margin))
-                        # which crosses the measured 0.143 m/s motor breakaway
-                        # at margin + 0.143^2/(2*decel):
-                        #   0.015 / 0.75 -> 0.0286 m     (as-run 2026-09-03)
-                        #   0.003 / 0.75 -> 0.0166 m     (this change)
-                        # Inside that distance the command is below what the
-                        # Sabertooth pair can turn the wheels with, so the
-                        # rover stalls and the remainder is never driven.
-                        # Confirmed in mission.csv_20260903_174520: median
-                        # advance after the last non-zero command was -0.2 mm.
-                        #
-                        # conservative_decel_mps2 is left at 0.75 ON PURPOSE.
-                        # Raising it shrinks d_break too, but it also brings
-                        # BRAKE_PROFILE entry closer to the goal and that is
-                        # exactly what produced the 2026-09-02 35-50 mm coast
-                        # overshoot recorded above. One term at a time so the
-                        # next run's terminal error stays attributable. If the
-                        # next run lands short by roughly 3-17 mm as predicted
-                        # and shows no overshoot, 0.75 -> 1.00 is the staged
-                        # next step (d_break -> 0.0132 m).
-                        #
-                        # KNOWN LIMIT, do not expect this to reach zero. The
-                        # rover cannot be commanded below ~0.15 m/s (it does
-                        # not move) and cannot stop in under ~35 mm from that
-                        # speed (the 2026-09-02 overshoot). Ramping to zero
-                        # lands short; holding the floor lands long. Landing
-                        # ON the point needs a settle-then-remeasure-then-
-                        # creep retry, which is a controller change, not a
-                        # tuning value.
-                        "radial_stop_brake_margin_m": 0.018,
-                        "radial_stop_minimum_actuatable_speed_mps": 0.07,
-                        "radial_stop_minimum_speed_stop_lead_m": 0.022,
-                        # Forward-only stop/settle/re-measure correction.
-                        # Retry is allowed only while still short of the
-                        # goal plane and with <=10 mm cross-track error.
-                        "radial_stop_corrective_creep_speed_mps": 0.25,
-                        "radial_stop_corrective_creep_pulse_sec": 0.10,
-                        "radial_stop_corrective_creep_max_along_m": 0.060,
-                        "radial_stop_corrective_creep_max_cross_m": 0.010,
-                        "radial_stop_corrective_creep_max_attempts": 3,
+                        "radial_stop_conservative_decel_mps2": 0.75,
+                        "radial_stop_brake_margin_m": 0.003,
                         "radial_stop_stationary_window_sec": 0.50,
                         "radial_stop_stationary_displacement_m": 0.005,
                         "radial_stop_stationary_yaw_rate_radps": 0.050,

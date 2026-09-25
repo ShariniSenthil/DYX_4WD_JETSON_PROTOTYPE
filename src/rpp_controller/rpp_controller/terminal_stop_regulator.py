@@ -41,7 +41,6 @@ class RadialStopState(str, Enum):
     BRAKE_PROFILE = "brake_profile"
     ZERO_LATCH = "zero_latch"
     SETTLE = "settle"
-    CORRECTIVE_CREEP = "corrective_creep"
     CERTIFIED = "certified"
     HOLD_ZERO = "hold_zero"
     HOLD_FAIL = "hold_fail"
@@ -80,13 +79,6 @@ class RadialStopConfig:
     terminal_guidance_distance_m: float = 0.75
     conservative_decel_mps2: float = 0.30
     brake_margin_m: float = 0.010
-    minimum_actuatable_speed_mps: float = 0.15
-    minimum_speed_stop_lead_m: float = 0.035
-    corrective_creep_speed_mps: float = 0.25
-    corrective_creep_pulse_sec: float = 0.10
-    corrective_creep_max_along_m: float = 0.060
-    corrective_creep_max_cross_m: float = 0.010
-    corrective_creep_max_attempts: int = 3
     stationary_window_sec: float = 0.50
     stationary_displacement_m: float = 0.005
     stationary_yaw_rate_radps: float = 0.050
@@ -100,8 +92,6 @@ class RadialStopConfig:
             "terminal_guidance_distance_m",
             "conservative_decel_mps2",
             "brake_margin_m",
-            "minimum_actuatable_speed_mps",
-            "minimum_speed_stop_lead_m",
             "stationary_window_sec",
             "stationary_displacement_m",
             "stationary_yaw_rate_radps",
@@ -113,25 +103,10 @@ class RadialStopConfig:
             if not _finite_real(getattr(self, name)):
                 raise ValueError(f"{name} must be finite")
 
-        corrective_positive = (
-            "corrective_creep_speed_mps",
-            "corrective_creep_pulse_sec",
-            "corrective_creep_max_along_m",
-            "corrective_creep_max_cross_m",
-        )
-        for name in corrective_positive:
-            value = getattr(self, name)
-            if not _finite_real(value):
-                raise ValueError(f"{name} must be finite")
-            if value <= 0.0:
-                raise ValueError(f"{name} must be greater than zero")
-
         positive = (
             "radial_tolerance_m",
             "terminal_guidance_distance_m",
             "conservative_decel_mps2",
-            "minimum_actuatable_speed_mps",
-            "minimum_speed_stop_lead_m",
             "stationary_window_sec",
             "stationary_displacement_m",
             "stationary_yaw_rate_radps",
@@ -146,42 +121,6 @@ class RadialStopConfig:
             raise ValueError("brake_margin_m must be non-negative")
         if self.brake_margin_m > self.radial_tolerance_m:
             raise ValueError("brake_margin_m must not exceed radial_tolerance_m")
-        if self.minimum_speed_stop_lead_m <= self.radial_tolerance_m:
-            raise ValueError(
-                "minimum_speed_stop_lead_m must exceed radial_tolerance_m"
-            )
-        if self.minimum_speed_stop_lead_m >= self.terminal_guidance_distance_m:
-            raise ValueError(
-                "minimum_speed_stop_lead_m must be below terminal guidance distance"
-            )
-        if self.corrective_creep_speed_mps < self.minimum_actuatable_speed_mps:
-            raise ValueError(
-                "corrective_creep_speed_mps must be >= minimum_actuatable_speed_mps"
-            )
-        if self.corrective_creep_max_along_m <= self.radial_tolerance_m:
-            raise ValueError(
-                "corrective_creep_max_along_m must exceed radial_tolerance_m"
-            )
-        if self.corrective_creep_max_along_m >= self.terminal_guidance_distance_m:
-            raise ValueError(
-                "corrective_creep_max_along_m must be below terminal guidance distance"
-            )
-        if self.corrective_creep_max_cross_m >= self.radial_tolerance_m:
-            raise ValueError(
-                "corrective_creep_max_cross_m must be below radial_tolerance_m"
-            )
-        if self.corrective_creep_pulse_sec >= self.stationary_window_sec:
-            raise ValueError(
-                "corrective_creep_pulse_sec must be below stationary_window_sec"
-            )
-        if (
-            isinstance(self.corrective_creep_max_attempts, bool)
-            or not isinstance(self.corrective_creep_max_attempts, int)
-            or not 1 <= self.corrective_creep_max_attempts <= 10
-        ):
-            raise ValueError(
-                "corrective_creep_max_attempts must be an integer in [1, 10]"
-            )
         if self.terminal_guidance_distance_m <= self.radial_tolerance_m:
             raise ValueError(
                 "terminal_guidance_distance_m must exceed radial_tolerance_m"
@@ -432,8 +371,6 @@ class TerminalStopRegulator:
         self._terminal_identity: Optional[str] = None
         self._terminal_started_sec: Optional[float] = None
         self._zero_latched_sec: Optional[float] = None
-        self._corrective_creep_started_sec: Optional[float] = None
-        self._corrective_creep_attempts = 0
         self._last_timestamp_sec: Optional[float] = None
         self._failure = RadialStopFailure.NONE
         self._certificate: Optional[RadialStopCertificate] = None
@@ -526,15 +463,6 @@ class TerminalStopRegulator:
         radial = math.hypot(sample.along_remaining_m, sample.cross_error_m)
         effective_braking_speed = self.effective_braking_speed_mps(sample)
         stop_distance = self.stopping_distance_m(effective_braking_speed)
-
-        if self._state is RadialStopState.CORRECTIVE_CREEP:
-            return self._advance_corrective_creep(
-                previous,
-                sample,
-                radial,
-                stop_distance,
-                effective_braking_speed,
-            )
 
         if self._state in (
             RadialStopState.ZERO_LATCH,
@@ -661,14 +589,6 @@ class TerminalStopRegulator:
             )
 
         if radial_error_m > self.config.radial_tolerance_m:
-            if self._corrective_creep_eligible(sample, radial_error_m):
-                return self._start_corrective_creep(
-                    previous,
-                    sample,
-                    radial_error_m,
-                    stop_distance_m,
-                    effective_braking_speed_mps,
-                )
             return self._fail(
                 previous,
                 sample,
@@ -705,114 +625,9 @@ class TerminalStopRegulator:
             effective_braking_speed_mps=effective_braking_speed_mps,
         )
 
-    def _corrective_creep_eligible(
-        self,
-        sample: RadialStopInput,
-        radial_error_m: float,
-    ) -> bool:
-        # Forward-only retry for a short longitudinal miss. Cross-track must
-        # already be tight; no reverse, pivot, or line re-anchor is permitted.
-        return (
-            radial_error_m > self.config.radial_tolerance_m
-            and self._corrective_creep_attempts
-            < self.config.corrective_creep_max_attempts
-            and 0.0 < sample.along_remaining_m
-            <= self.config.corrective_creep_max_along_m
-            and abs(sample.cross_error_m)
-            <= self.config.corrective_creep_max_cross_m
-        )
-
-    def _start_corrective_creep(
-        self,
-        previous: RadialStopState,
-        sample: RadialStopInput,
-        radial_error_m: float,
-        stop_distance_m: float,
-        effective_braking_speed_mps: float,
-    ) -> RadialStopOutput:
-        self._state = RadialStopState.CORRECTIVE_CREEP
-        self._corrective_creep_started_sec = float(sample.monotonic_time_sec)
-        self._corrective_creep_attempts += 1
-        self._zero_latched_sec = None
-        self._detector.reset()
-        return self._corrective_creep_output(
-            previous,
-            sample,
-            radial_error_m=radial_error_m,
-            stop_distance_m=stop_distance_m,
-            effective_braking_speed_mps=effective_braking_speed_mps,
-        )
-
-    def _advance_corrective_creep(
-        self,
-        previous: RadialStopState,
-        sample: RadialStopInput,
-        radial_error_m: float,
-        stop_distance_m: float,
-        effective_braking_speed_mps: float,
-    ) -> RadialStopOutput:
-        if self._corrective_creep_started_sec is None:
-            raise RuntimeError("corrective creep timestamp is missing")
-
-        elapsed = (
-            float(sample.monotonic_time_sec) - self._corrective_creep_started_sec
-        )
-        stop_now = (
-            radial_error_m <= self.config.radial_tolerance_m
-            or sample.along_remaining_m <= 0.0
-            or sample.along_remaining_m > self.config.corrective_creep_max_along_m
-            or abs(sample.cross_error_m)
-            > self.config.corrective_creep_max_cross_m
-            or elapsed >= self.config.corrective_creep_pulse_sec
-        )
-        if stop_now:
-            self._enter_zero_latch(sample)
-            return self._zero_output(
-                previous,
-                sample,
-                radial_error_m=radial_error_m,
-                stop_distance_m=stop_distance_m,
-                effective_braking_speed_mps=effective_braking_speed_mps,
-            )
-
-        return self._corrective_creep_output(
-            previous,
-            sample,
-            radial_error_m=radial_error_m,
-            stop_distance_m=stop_distance_m,
-            effective_braking_speed_mps=effective_braking_speed_mps,
-        )
-
-    def _corrective_creep_output(
-        self,
-        previous: RadialStopState,
-        sample: RadialStopInput,
-        *,
-        radial_error_m: float,
-        stop_distance_m: float,
-        effective_braking_speed_mps: float,
-    ) -> RadialStopOutput:
-        command = self.config.corrective_creep_speed_mps
-        return RadialStopOutput(
-            previous_state=previous,
-            state=self._state,
-            motion_direction=MotionDirection.FORWARD,
-            forward_speed_command_mps=command,
-            hold_zero=False,
-            effective_braking_speed_mps=effective_braking_speed_mps,
-            stop_distance_m=stop_distance_m,
-            profile_speed_mps=command,
-            radial_error_m=radial_error_m,
-            stationary=False,
-            stationary_window_sec=0.0,
-            failure=RadialStopFailure.NONE,
-            certificate=None,
-        )
-
     def _enter_zero_latch(self, sample: RadialStopInput) -> None:
         self._state = RadialStopState.ZERO_LATCH
         self._zero_latched_sec = float(sample.monotonic_time_sec)
-        self._corrective_creep_started_sec = None
         self._detector.reset()
         self._detector.update(
             position_sample_time_sec=sample.position_sample_time_sec,
@@ -829,12 +644,15 @@ class TerminalStopRegulator:
         stop_distance_m: float,
         effective_braking_speed_mps: float,
     ) -> RadialStopOutput:
-        # Field logs show sub-0.15m/s commands stall/twitch the drivetrain.
-        # Zero at the measured coast lead; otherwise keep an actuatable floor.
-        if (
-            sample.along_remaining_m <= self.config.minimum_speed_stop_lead_m
-            and abs(sample.cross_error_m) <= self.config.radial_tolerance_m
-        ):
+        effective_remaining = max(
+            0.0,
+            sample.along_remaining_m - self.config.brake_margin_m,
+        )
+        profile_speed = math.sqrt(
+            2.0 * self.config.conservative_decel_mps2 * effective_remaining
+        )
+        command = min(sample.tracking_speed_command_mps, profile_speed)
+        if command <= 0.0:
             self._enter_zero_latch(sample)
             return self._zero_output(
                 previous,
@@ -843,16 +661,6 @@ class TerminalStopRegulator:
                 stop_distance_m=stop_distance_m,
                 effective_braking_speed_mps=effective_braking_speed_mps,
             )
-
-        effective_remaining = max(
-            0.0,
-            sample.along_remaining_m - self.config.brake_margin_m,
-        )
-        profile_speed = math.sqrt(
-            2.0 * self.config.conservative_decel_mps2 * effective_remaining
-        )
-        requested = min(sample.tracking_speed_command_mps, profile_speed)
-        command = max(self.config.minimum_actuatable_speed_mps, requested)
         return RadialStopOutput(
             previous_state=previous,
             state=self._state,
