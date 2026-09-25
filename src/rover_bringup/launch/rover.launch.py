@@ -526,7 +526,9 @@ def generate_launch_description() -> LaunchDescription:
                         "segment_alignment_max_cross_track_m": 0.60,
                         "terminal_line_entry_cross_track_m": 0.03,
                         "pivot_enter_angle_deg": 15.0,
-                        "pivot_exit_angle_deg": 4.0,
+                        # 2026-09-25: re-pivot from PIVOT_SETTLE only above
+                        # 6 deg (release is 3.5 deg + ~1 deg rotational coast).
+                        "pivot_exit_angle_deg": 6.0,
                         # Fast post-pivot capture releases only after
                         # terminal_native_pivot_release_error_deg=1.5 and
                         # xtrack_priority_exit_m=0.008 remain valid for this
@@ -571,9 +573,18 @@ def generate_launch_description() -> LaunchDescription:
                         #    tracking -- no stationary settle;
                         # 4) lengthen recovery lookahead up to 1.5 m for large
                         #    xtrack (unchanged below 50 mm).
-                        "pivot_dynamic_target_enabled": True,
+                        # 2026-09-25: settled pivot. Turn to the exact line
+                        # bearing (the dynamic target aims up to 8 deg off the
+                        # line, which PIVOT_SETTLE -- judged against the line
+                        # -- would re-pivot), release at 3.5 deg into a
+                        # stationary settle (speed <= 0.06 m/s, yaw rate
+                        # <= 2.9 deg/s, 0.2 s + 0.2 s hold), then drive.
+                        # Measured 24_09-25_09: the moving handover released
+                        # at 6 deg while still turning 8-12 deg/s and 3-4 deg
+                        # past the target.
+                        "pivot_dynamic_target_enabled": False,
                         "pivot_target_lookahead_m": 1.5,
-                        "pivot_moving_handover_enabled": True,
+                        "pivot_moving_handover_enabled": False,
                         "pivot_handover_release_error_deg": 6.0,
                         "pivot_yaw_rate_slew_radps2": 1.2,
                         "recovery_lookahead_max_m": 1.5,
@@ -906,7 +917,7 @@ def generate_launch_description() -> LaunchDescription:
                         "terminal_goal_intercept_distance_m": 0.90,
                         "terminal_goal_intercept_bearing_limit_deg": 22.0,
                         "terminal_native_pivot_enter_error_deg": 15.0,
-                        "terminal_native_pivot_release_error_deg": 1.5,
+                        "terminal_native_pivot_release_error_deg": 3.5,
                         # Deprecated compatibility parameter. It is no
                         # longer used to create a moving 60-degree vector;
                         # production B mode uses zero translation + true absolute yaw.

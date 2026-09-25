@@ -388,13 +388,22 @@ def _joined_key_value(name):
                     yield value.value
 
 
-def test_launch_enables_mission_style_corner():
+def test_launch_uses_settled_pivot_release():
+    # 2026-09-25: release at 3.5 deg into a stationary settle (no moving
+    # handover), pivoting to the exact line bearing; re-pivot only above 6 deg.
     values = _launch_values()
     one = lambda k: values[k][0]
-    assert one("pivot_dynamic_target_enabled") is True
+    assert one("pivot_dynamic_target_enabled") is False
     assert one("pivot_target_lookahead_m") == 1.5
-    assert one("pivot_moving_handover_enabled") is True
+    assert one("pivot_moving_handover_enabled") is False
     assert one("pivot_handover_release_error_deg") == 6.0
+    assert one("terminal_native_pivot_release_error_deg") == 3.5
+    assert one("pivot_exit_angle_deg") == 6.0
+    assert (
+        one("terminal_native_pivot_release_error_deg")
+        < one("pivot_exit_angle_deg")
+        < one("pivot_enter_angle_deg")
+    )
     assert one("pivot_yaw_rate_slew_radps2") == 1.2
     assert one("recovery_lookahead_max_m") == 1.5
 
