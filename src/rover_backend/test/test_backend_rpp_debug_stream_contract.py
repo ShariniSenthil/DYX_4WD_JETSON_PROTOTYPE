@@ -1,4 +1,10 @@
-"""Protect the backend side of the 50 Hz RPP tuning stream."""
+"""Protect the backend side of the RPP tuning stream.
+
+The Socket.IO telemetry broadcast runs at 20 Hz, the RPP control rate: /rpp/debug
+is published at 50 Hz, but only 20 of those samples per second carry a new control
+cycle, and the tablet UI is built for 20 Hz. 50 Hz full-snapshot broadcasts only
+add send-queue backlog on the Wi-Fi link.
+"""
 
 from pathlib import Path
 
@@ -10,11 +16,11 @@ ENV = PACKAGE_ROOT / "config" / "backend.env"
 ROUTES = PACKAGE_ROOT / "rover_backend" / "system_routes.py"
 
 
-def test_backend_broadcast_is_configured_for_50_hz():
-    assert "DYX_TELEMETRY_BROADCAST_HZ=50.0" in ENV.read_text(encoding="utf-8")
+def test_backend_broadcast_is_configured_for_20_hz():
+    assert "DYX_TELEMETRY_BROADCAST_HZ=20.0" in ENV.read_text(encoding="utf-8")
     source = CONFIG.read_text(encoding="utf-8")
     setting = source[source.index('"DYX_TELEMETRY_BROADCAST_HZ"') :]
-    assert "50.0" in setting[:100]
+    assert "20.0" in setting[:100]
 
 
 def test_debug_subscription_matches_latest_sample_qos():

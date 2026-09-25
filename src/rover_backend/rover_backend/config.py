@@ -454,7 +454,7 @@ def load_settings() -> Settings:
         ),
         telemetry_broadcast_hz=_read_float(
             "DYX_TELEMETRY_BROADCAST_HZ",
-            50.0,
+            20.0,
             minimum=0.5,
         ),
         # Development-only once-per-second Socket.IO rate/size/timing summary.
