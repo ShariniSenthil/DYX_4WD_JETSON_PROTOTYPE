@@ -625,16 +625,17 @@ def generate_launch_description() -> LaunchDescription:
                         "geometry_localization_jump_reset_m": 0.50,
                         "geometry_max_backward_jump_m": 0.10,
                         "geometry_max_forward_jump_m": 1.00,
-                        # 2026-09-25: re-enabled (disabled 2026-09-21 in
-                        # cbad059). Fixed marking legs steer on the
-                        # /nav_path projection bearing again, as on
-                        # 2026-09-11 (2b8c317); the C->P1 runtime line keeps
-                        # line_guidance(). The published yaw is still slewed
-                        # by precision_explicit_yaw_rate_limit_degps and
-                        # shifted by the course-bias estimate. Lookahead
-                        # time 0.65 s / cone 18 deg are the 2026-09-16
-                        # values that last ran with guidance enabled.
-                        "precision_guidance_enabled": True,
+                        # Fixed marking legs steer with line_guidance().
+                        # 2026-09-25: briefly re-enabled (a0564cf) and
+                        # reverted. With the 10 deg/s explicit-yaw slew the
+                        # projection bearing reached PX4 up to 12 deg late;
+                        # the straight fixed leg of 20260925_110733 drifted
+                        # to -199 mm (rms 173) where line_guidance held
+                        # 14-33 mm rms on 8 Sep-24 runs of the same leg.
+                        # Precision guidance was tuned on 2026-09-11 without
+                        # the slew; re-enable only together with a faster
+                        # slew and a lookahead re-tune.
+                        "precision_guidance_enabled": False,
                         "precision_speed_control_enabled": False,
                         "precision_lookahead_min_m": 0.20,
                         "precision_lookahead_max_m": 1.00,
