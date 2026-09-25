@@ -625,11 +625,16 @@ def generate_launch_description() -> LaunchDescription:
                         "geometry_localization_jump_reset_m": 0.50,
                         "geometry_max_backward_jump_m": 0.10,
                         "geometry_max_forward_jump_m": 1.00,
-                        # Production straight marking legs use one steering
-                        # authority: line_guidance() on the fixed path tangent.
-                        # Precision geometry stays installed, but projection
-                        # guidance does not overwrite the straight-line bearing.
-                        "precision_guidance_enabled": False,
+                        # 2026-09-25: re-enabled (disabled 2026-09-21 in
+                        # cbad059). Fixed marking legs steer on the
+                        # /nav_path projection bearing again, as on
+                        # 2026-09-11 (2b8c317); the C->P1 runtime line keeps
+                        # line_guidance(). The published yaw is still slewed
+                        # by precision_explicit_yaw_rate_limit_degps and
+                        # shifted by the course-bias estimate. Lookahead
+                        # time 0.65 s / cone 18 deg are the 2026-09-16
+                        # values that last ran with guidance enabled.
+                        "precision_guidance_enabled": True,
                         "precision_speed_control_enabled": False,
                         "precision_lookahead_min_m": 0.20,
                         "precision_lookahead_max_m": 1.00,

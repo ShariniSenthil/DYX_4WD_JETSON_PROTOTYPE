@@ -62,7 +62,7 @@ def test_accepted_guidance_defaults_on_while_speed_control_stays_off():
     assert declarations["precision_guidance_enabled"] is True
     assert declarations["precision_speed_control_enabled"] is False
     assert declarations["precision_lookahead_time_s"] == 0.90
-    assert '"precision_guidance_enabled": False' in LAUNCH_SOURCE
+    assert '"precision_guidance_enabled": True' in LAUNCH_SOURCE
     assert '"precision_speed_control_enabled": False' in LAUNCH_SOURCE
     assert '"precision_lookahead_time_s": 0.65' in LAUNCH_SOURCE
 
