@@ -603,6 +603,29 @@ def generate_launch_description() -> LaunchDescription:
                         "pivot_moving_handover_enabled": False,
                         "pivot_handover_release_error_deg": 6.0,
                         "pivot_yaw_rate_slew_radps2": 1.2,
+                        # 2026-09-25: reverse-arc pivot. Reverse while turning
+                        # so the nozzle (0.39 m / 0.49 m behind the right /
+                        # left turning centre, fitted from 41 pivots on 25_09)
+                        # ends on the next line. OFF until PX4 firmware PR #6
+                        # is flashed and RD_OFFB_REV = 1; if the rover does not
+                        # reverse when asked it falls back to the stationary
+                        # pivot. Simulated end-of-turn error vs today's
+                        # 250-560 mm: <= 56 mm for 90-160 deg turns, <= ~100 mm
+                        # for 25-45 deg (turning-centre spread 0.33-0.60 m).
+                        "reverse_arc_pivot_enabled": False,
+                        "reverse_arc_first_approach_enabled": False,
+                        "reverse_arc_centre_ahead_left_turn_m": 0.49,
+                        "reverse_arc_centre_left_left_turn_m": 0.03,
+                        "reverse_arc_centre_ahead_right_turn_m": 0.39,
+                        "reverse_arc_centre_left_right_turn_m": -0.044,
+                        "reverse_arc_peak_yaw_rate_degps": 35.0,
+                        "reverse_arc_min_duration_sec": 3.5,
+                        "reverse_arc_max_speed_mps": 0.30,
+                        "reverse_arc_freeze_remaining_deg": 12.0,
+                        "reverse_arc_front_weight": 0.9,
+                        "reverse_arc_min_turn_deg": 20.0,
+                        "reverse_arc_max_reverse_travel_m": 1.0,
+                        "reverse_arc_timeout_factor": 2.5,
                         "recovery_lookahead_max_m": 1.5,
                         "recovery_lookahead_xtrack_start_m": 0.05,
                         "recovery_lookahead_xtrack_gain": 1.0,

@@ -102,6 +102,7 @@ TOPICS=(
   /rpp/speed_debug
   /rpp/tracking_debug
   /rpp/pivot_debug
+  /rpp/reverse_arc
   /rpp/debug
   /rpp/terminal_certificate
   /rpp/terminal_result

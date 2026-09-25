@@ -60,6 +60,10 @@ from rpp_controller.legacy_alignment import (
     LegacyAlignmentLifecycle,
     LegacyAlignmentPhase,
 )
+from rpp_controller.reverse_arc_pivot import (
+    ReverseArcConfig,
+    ReverseArcPivot,
+)
 from rpp_controller.motion_state_machine import (
     MotionDirective,
     MotionState,
@@ -441,6 +445,26 @@ class RPPController(Node):
         self.declare_parameter("pivot_target_lookahead_m", 1.5)
         self.declare_parameter("pivot_moving_handover_enabled", False)
         self.declare_parameter("pivot_handover_release_error_deg", 6.0)
+        # Reverse-arc pivot (2026-09-25). While PX4 turns to the next line,
+        # reverse at a speed re-planned every cycle from the measured nozzle
+        # so the nozzle -- 0.39-0.49 m behind the turning centre -- ends on the
+        # next line instead of 0.3-0.6 m off it. Needs PX4 RD_OFFB_REV = 1
+        # (firmware PR #6); if the rover does not reverse when asked, the
+        # manoeuvre aborts to the stationary pivot. Explicit-yaw mode only.
+        self.declare_parameter("reverse_arc_pivot_enabled", False)
+        self.declare_parameter("reverse_arc_first_approach_enabled", False)
+        self.declare_parameter("reverse_arc_centre_ahead_left_turn_m", 0.49)
+        self.declare_parameter("reverse_arc_centre_left_left_turn_m", 0.03)
+        self.declare_parameter("reverse_arc_centre_ahead_right_turn_m", 0.39)
+        self.declare_parameter("reverse_arc_centre_left_right_turn_m", -0.044)
+        self.declare_parameter("reverse_arc_peak_yaw_rate_degps", 35.0)
+        self.declare_parameter("reverse_arc_min_duration_sec", 3.5)
+        self.declare_parameter("reverse_arc_max_speed_mps", 0.30)
+        self.declare_parameter("reverse_arc_freeze_remaining_deg", 12.0)
+        self.declare_parameter("reverse_arc_front_weight", 0.9)
+        self.declare_parameter("reverse_arc_min_turn_deg", 20.0)
+        self.declare_parameter("reverse_arc_max_reverse_travel_m", 1.0)
+        self.declare_parameter("reverse_arc_timeout_factor", 2.5)
         self.declare_parameter("pivot_yaw_rate_slew_radps2", 0.0)
         self.declare_parameter("recovery_lookahead_max_m", 0.0)
         self.declare_parameter("recovery_lookahead_xtrack_start_m", 0.05)
@@ -1096,6 +1120,52 @@ class RPPController(Node):
         )
         self.pivot_handover_release_error = math.radians(
             float(self.get_parameter("pivot_handover_release_error_deg").value)
+        )
+        self.reverse_arc_enabled = bool(
+            self.get_parameter("reverse_arc_pivot_enabled").value
+        )
+        self.reverse_arc_first_approach_enabled = bool(
+            self.get_parameter("reverse_arc_first_approach_enabled").value
+        )
+        self.reverse_arc = ReverseArcPivot(
+            ReverseArcConfig(
+                centre_ahead_left_turn_m=float(
+                    self.get_parameter("reverse_arc_centre_ahead_left_turn_m").value
+                ),
+                centre_left_left_turn_m=float(
+                    self.get_parameter("reverse_arc_centre_left_left_turn_m").value
+                ),
+                centre_ahead_right_turn_m=float(
+                    self.get_parameter("reverse_arc_centre_ahead_right_turn_m").value
+                ),
+                centre_left_right_turn_m=float(
+                    self.get_parameter("reverse_arc_centre_left_right_turn_m").value
+                ),
+                peak_yaw_rate_radps=math.radians(
+                    float(self.get_parameter("reverse_arc_peak_yaw_rate_degps").value)
+                ),
+                min_duration_sec=float(
+                    self.get_parameter("reverse_arc_min_duration_sec").value
+                ),
+                max_speed_mps=float(
+                    self.get_parameter("reverse_arc_max_speed_mps").value
+                ),
+                freeze_remaining_rad=math.radians(
+                    float(self.get_parameter("reverse_arc_freeze_remaining_deg").value)
+                ),
+                front_weight=float(
+                    self.get_parameter("reverse_arc_front_weight").value
+                ),
+                min_turn_rad=math.radians(
+                    float(self.get_parameter("reverse_arc_min_turn_deg").value)
+                ),
+                max_reverse_travel_m=float(
+                    self.get_parameter("reverse_arc_max_reverse_travel_m").value
+                ),
+                timeout_factor=float(
+                    self.get_parameter("reverse_arc_timeout_factor").value
+                ),
+            )
         )
         self.pivot_yaw_rate_slew = float(
             self.get_parameter("pivot_yaw_rate_slew_radps2").value
@@ -1969,6 +2039,11 @@ class RPPController(Node):
         self.pivot_debug_pub = self.create_publisher(
             String,
             "/rpp/pivot_debug",
+            command_qos,
+        )
+        self.reverse_arc_debug_pub = self.create_publisher(
+            String,
+            "/rpp/reverse_arc",
             command_qos,
         )
         # legacy_alignment.py's LegacyAlignmentPhase is the production-active
@@ -5986,6 +6061,171 @@ class RPPController(Node):
         )
         return north, east, speed
 
+    def _reverse_arc_owns_pivot(self, first_approach, path_bearing, target_x, target_y):
+        """True when this native-pivot cycle is flown as a reverse arc.
+
+        Starts a manoeuvre on the first eligible cycle of a latched pivot. The
+        next line is the fixed leg geometry: through the leg goal along
+        path_bearing (never rebuilt from the rover pose). A fallback latch
+        holds until the pivot releases.
+        """
+        if not (self.reverse_arc_enabled and self.rpp_explicit_yaw_enabled):
+            return False
+        if first_approach and not self.reverse_arc_first_approach_enabled:
+            return False
+        arc = self.reverse_arc
+        if arc.fallback:
+            return False
+        if arc.active:
+            return True
+        true_bearing = self.terminal_native_pivot_true_bearing
+        values = (
+            true_bearing,
+            self.current_x,
+            self.current_y,
+            self.current_yaw,
+            target_x,
+            target_y,
+            path_bearing,
+        )
+        if any(v is None or not math.isfinite(float(v)) for v in values):
+            return False
+        started = arc.start(
+            self._precision_now_sec(),
+            float(self.current_yaw),
+            float(true_bearing),
+            float(target_x),
+            float(target_y),
+            float(path_bearing),
+        )
+        if started:
+            self.get_logger().warn(
+                "REVERSE-ARC PIVOT STARTED | "
+                f"turn={math.degrees(arc.turn):+.1f}deg | "
+                f"centre ahead={arc.ahead:.3f}m left={arc.left:+.3f}m | "
+                f"duration={arc.duration_sec:.2f}s"
+            )
+        return started
+
+    def _publish_reverse_arc_pivot(
+        self,
+        request_bearing,
+        true_error,
+        alignment_cross_track,
+        mode_prefix,
+        target_distance,
+        goal_distance,
+    ):
+        """Publish one reverse-arc cycle: ramped absolute yaw + signed speed.
+
+        Bypasses publish_velocity_ned() on purpose: the 10 deg/s explicit-yaw
+        slew and the course-bias shift belong to line tracking, and the planner
+        already ramps the yaw. A negative speed is sent as a velocity opposite
+        the commanded yaw, which PX4 RD_OFFB_REV turns into reverse.
+        """
+        command = self.reverse_arc.step(
+            self._precision_now_sec(),
+            float(self.current_x),
+            float(self.current_y),
+            float(self.current_yaw),
+            float(self.current_yaw_rate_radps),
+        )
+        self._publish_reverse_arc_debug(command, alignment_cross_track)
+        if not command.active:
+            self.get_logger().error(
+                "REVERSE-ARC PIVOT ABORTED / STATIONARY PIVOT FALLBACK | "
+                f"reason={command.reason} | "
+                f"reverse_travel={command.reverse_travel_m:.3f}m | "
+                f"elapsed={command.elapsed_sec:.2f}s"
+            )
+            self._publish_legacy_native_carrier(
+                request_bearing,
+                true_error,
+                alignment_cross_track,
+                mode_prefix,
+                target_distance,
+                goal_distance,
+                "PX4 PIVOT KEEPER / REVERSE-ARC FALLBACK",
+            )
+            return
+
+        yaw = float(command.yaw_enu_rad)
+        speed = float(command.speed_mps)
+        message = Vector3Stamped()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.frame_id = "map_ned"
+        message.vector.z = 0.0
+        if abs(speed) < 1.0e-3:
+            speed = 0.0
+            message.vector.x = 0.0
+            message.vector.y = 0.0
+            published = self.velocity_pub.publish_zero_with_yaw(
+                message, yaw, command.yaw_rate_radps
+            )
+        else:
+            message.vector.x = speed * math.sin(yaw)
+            message.vector.y = speed * math.cos(yaw)
+            published = self.velocity_pub.publish_with_yaw(
+                message, yaw, command.yaw_rate_radps
+            )
+        if not published:
+            raise RuntimeError("reverse-arc velocity+yaw command rejected")
+
+        # Translation here is not a line-tracking ramp: restart tracking's
+        # speed and yaw slews from rest and from the measured yaw afterwards.
+        self.reset_speed_profiles()
+        self.command_slew_speed = 0.0
+        self.command_slew_last_time = None
+        self.explicit_yaw_slew_value = None
+        self.explicit_yaw_slew_last_time = None
+        self.publish_motion_profile_monitor(abs(speed))
+        self.log_control(
+            mode_prefix
+            + "REVERSE-ARC PIVOT"
+            + f" | {command.reason}"
+            + f" | speed={speed:+.3f}m/s"
+            + f" | yaw_ref={math.degrees(yaw):.1f}deg"
+            + f" | predicted_cross={command.predicted_cross_m * 1000.0:+.1f}mm"
+            + f" | reverse={command.reverse_travel_m:.3f}m"
+            + f" | xtrack="
+            + f"{self.ground_xtrack(alignment_cross_track) * 1000.0:+.1f}mm",
+            target_distance,
+            goal_distance,
+            true_error,
+            speed,
+            message.vector.x,
+            message.vector.y,
+        )
+
+    def _publish_reverse_arc_debug(self, command, alignment_cross_track):
+        arc = self.reverse_arc
+        payload = {
+            "active": bool(command.active),
+            "fallback": bool(command.fallback),
+            "reason": str(command.reason),
+            "elapsed_sec": float(command.elapsed_sec),
+            "turn_deg": math.degrees(arc.turn),
+            "yaw_ref_deg": math.degrees(command.yaw_enu_rad),
+            "yaw_deg": math.degrees(float(self.current_yaw)),
+            "yaw_rate_ref_degps": math.degrees(command.yaw_rate_radps),
+            "speed_mps": float(command.speed_mps),
+            "gain_k": float(command.gain_k),
+            "predicted_cross_mm": (
+                command.predicted_cross_m * 1000.0
+                if math.isfinite(command.predicted_cross_m)
+                else None
+            ),
+            "cross_track_mm": float(alignment_cross_track) * 1000.0,
+            "reverse_travel_m": float(command.reverse_travel_m),
+            "centre_ahead_m": arc.ahead,
+            "centre_left_m": arc.left,
+            "nozzle_x": float(self.current_x),
+            "nozzle_y": float(self.current_y),
+        }
+        message = String()
+        message.data = json.dumps(payload)
+        self.reverse_arc_debug_pub.publish(message)
+
     def _run_legacy_segment_alignment(
         self,
         *,
@@ -6082,15 +6322,30 @@ class RPPController(Node):
                 )
             if native_active:
                 try:
-                    self._publish_legacy_native_carrier(
-                        pivot_request_bearing,
-                        true_error,
-                        alignment_cross_track,
-                        mode_prefix,
-                        target_distance,
-                        goal_distance,
-                        "PX4 PIVOT KEEPER / NATIVE TURN HELD",
-                    )
+                    if self._reverse_arc_owns_pivot(
+                        first_approach,
+                        path_bearing,
+                        target_x,
+                        target_y,
+                    ):
+                        self._publish_reverse_arc_pivot(
+                            pivot_request_bearing,
+                            true_error,
+                            alignment_cross_track,
+                            mode_prefix,
+                            target_distance,
+                            goal_distance,
+                        )
+                    else:
+                        self._publish_legacy_native_carrier(
+                            pivot_request_bearing,
+                            true_error,
+                            alignment_cross_track,
+                            mode_prefix,
+                            target_distance,
+                            goal_distance,
+                            "PX4 PIVOT KEEPER / NATIVE TURN HELD",
+                        )
                 except Exception as error:
                     self.publish_stop()
                     self.get_logger().error(
@@ -6365,6 +6620,11 @@ class RPPController(Node):
         self.terminal_native_pivot_true_bearing = None
         self.terminal_native_pivot_request_bearing = None
         self.terminal_native_pivot_reason = ""
+        # One reverse-arc manoeuvre per latched pivot; a fallback latch also
+        # clears here, so the next pivot may try the reverse arc again.
+        reverse_arc = getattr(self, "reverse_arc", None)
+        if reverse_arc is not None:
+            reverse_arc.reset()
 
     def reset_terminal_precision_state(self):
         self.terminal_precision_armed = False
