@@ -191,6 +191,11 @@ class RPPController(Node):
         self.declare_parameter("terminal_bearing_freeze_distance_m", 0.06)
         self.declare_parameter("terminal_correction_slew_rate_degps", 8.0)
         self.declare_parameter("terminal_frozen_xtrack_abort_m", 0.035)
+        # radial20 final-approach heading freeze (default off; see
+        # radial20_heading_freeze()).
+        self.declare_parameter("radial20_heading_freeze_enabled", False)
+        self.declare_parameter("radial20_heading_freeze_distance_m", 0.30)
+        self.declare_parameter("radial20_heading_freeze_max_offset_deg", 5.0)
 
         self.declare_parameter("minimum_speed_mps", 0.04)
         self.declare_parameter("segment_alignment_speed_mps", 1.00)
@@ -846,6 +851,15 @@ class RPPController(Node):
         )
         self.terminal_frozen_xtrack_abort = float(
             self.get_parameter("terminal_frozen_xtrack_abort_m").value
+        )
+        self.radial20_heading_freeze_enabled = bool(
+            self.get_parameter("radial20_heading_freeze_enabled").value
+        )
+        self.radial20_heading_freeze_distance = float(
+            self.get_parameter("radial20_heading_freeze_distance_m").value
+        )
+        self.radial20_heading_freeze_max_offset = math.radians(
+            float(self.get_parameter("radial20_heading_freeze_max_offset_deg").value)
         )
 
         self.minimum_speed = float(self.get_parameter("minimum_speed_mps").value)
@@ -2170,6 +2184,8 @@ class RPPController(Node):
         self.terminal_bearing_frozen = False
         self.terminal_limited_correction = 0.0
         self.terminal_correction_last_update_time = None
+        self.radial20_frozen_bearing = None
+        self.radial20_frozen_goal_key = None
 
         # Latched true stationary-pivot target. Pivot output is zero N/E
         # velocity plus a bounded ENU yaw rate. No bearing-carrier translation
@@ -3226,6 +3242,25 @@ class RPPController(Node):
         if self.terminal_frozen_xtrack_abort <= self.waypoint_tolerance:
             raise ValueError(
                 "terminal_frozen_xtrack_abort_m must exceed waypoint tolerance"
+            )
+        if not (
+            math.isfinite(self.radial20_heading_freeze_distance)
+            and self.waypoint_tolerance
+            < self.radial20_heading_freeze_distance
+            <= 1.0
+        ):
+            raise ValueError(
+                "radial20_heading_freeze_distance_m must be in "
+                "(waypoint_tolerance_m, 1.0]"
+            )
+        if not (
+            math.isfinite(self.radial20_heading_freeze_max_offset)
+            and 0.0
+            < self.radial20_heading_freeze_max_offset
+            <= math.radians(15.0)
+        ):
+            raise ValueError(
+                "radial20_heading_freeze_max_offset_deg must be in (0, 15]"
             )
 
         profile_distances = (
@@ -7969,6 +8004,7 @@ class RPPController(Node):
         return north, east, output_speed
 
     def publish_stop(self):
+        self._reset_radial20_heading_freeze()
         self._reset_precision_regulator("LITERAL_STOP")
         self.publish_velocity_ned(0.0, 0.0)
         self._record_rpp_debug_command(0.0, 0.0, 0.0)
@@ -9084,6 +9120,72 @@ class RPPController(Node):
             min(limit, self.terminal_limited_correction),
         )
         return self.normalize_angle(path_bearing + self.terminal_limited_correction)
+
+    def _reset_radial20_heading_freeze(self):
+        self.radial20_frozen_bearing = None
+        self.radial20_frozen_goal_key = None
+
+    def radial20_heading_freeze(
+        self,
+        guidance_bearing,
+        path_bearing,
+        along_remaining,
+        goal_key,
+    ):
+        """Hold the heading inside the last radial20 approach distance.
+
+        The nozzle sits ~0.38 m behind the skid-steer turn centre, so a
+        heading correction at 0.2-0.5 m/s first swings the nozzle the wrong
+        way (2026-09-25 bags: a 2-4 deg correction gave +7..+12 deg course
+        and 20-50 mm extra cross-track in the last 300 mm). Inside
+        radial20_heading_freeze_distance_m this stops correcting and holds
+        the heading the rover already has, captured once per goal and
+        bounded to radial20_heading_freeze_max_offset_deg of the line.
+
+        The frozen value includes moving_course_bias because the publisher
+        subtracts it (course_compensated_yaw), so the yaw PX4 receives is the
+        heading at capture. Cleared by publish_stop() and on goal change.
+        """
+        if not self.radial20_heading_freeze_enabled:
+            self.terminal_bearing_frozen = False
+            return guidance_bearing
+
+        if goal_key != self.radial20_frozen_goal_key:
+            self._reset_radial20_heading_freeze()
+            self.radial20_frozen_goal_key = goal_key
+
+        if self.radial20_frozen_bearing is None:
+            if (
+                along_remaining is None
+                or not math.isfinite(along_remaining)
+                or along_remaining > self.radial20_heading_freeze_distance
+                or self.current_yaw is None
+                or not math.isfinite(float(self.current_yaw))
+            ):
+                self.terminal_bearing_frozen = False
+                return guidance_bearing
+
+            bias = float(self.moving_course_bias)
+            if not math.isfinite(bias):
+                bias = 0.0
+            offset = self.normalize_angle(
+                float(self.current_yaw) + bias - path_bearing
+            )
+            offset = max(
+                -self.radial20_heading_freeze_max_offset,
+                min(self.radial20_heading_freeze_max_offset, offset),
+            )
+            self.radial20_frozen_bearing = self.normalize_angle(
+                path_bearing + offset
+            )
+            self.get_logger().info(
+                "RADIAL20 HEADING FROZEN | "
+                f"along={along_remaining * 1000.0:.0f}mm "
+                f"offset_from_line={math.degrees(offset):+.2f}deg"
+            )
+
+        self.terminal_bearing_frozen = True
+        return self.radial20_frozen_bearing
 
     def publish_terminal_state(self):
         armed = Bool()
@@ -10757,6 +10859,12 @@ class RPPController(Node):
                 path_bearing,
                 desired_goal_bearing,
                 goal_along_remaining,
+            )
+            guidance_bearing = self.radial20_heading_freeze(
+                guidance_bearing,
+                path_bearing,
+                goal_along_remaining,
+                (round(goal_x, 4), round(goal_y, 4)),
             )
             speed = radial_result.forward_speed_command_mps
             north = speed * math.sin(guidance_bearing)

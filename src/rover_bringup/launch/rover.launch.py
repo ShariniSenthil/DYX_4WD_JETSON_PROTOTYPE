@@ -456,6 +456,17 @@ def generate_launch_description() -> LaunchDescription:
                         "terminal_bearing_freeze_distance_m": 0.04,
                         "terminal_correction_slew_rate_degps": 15.0,
                         "terminal_frozen_xtrack_abort_m": 0.20,
+                        # 2026-09-25: radial20 final-approach heading freeze.
+                        # Inside 0.30 m of the point the heading the rover
+                        # already has is held (bounded to 5 deg of the line)
+                        # instead of corrected: at 0.2-0.5 m/s a correction
+                        # swings the nozzle, 0.38 m behind the turn centre,
+                        # the wrong way (25_09 stage_2 bags: +7..+12 deg
+                        # course, 20-50 mm extra cross-track in the last
+                        # 300 mm on every non-pivot stop).
+                        "radial20_heading_freeze_enabled": True,
+                        "radial20_heading_freeze_distance_m": 0.30,
+                        "radial20_heading_freeze_max_offset_deg": 5.0,
                         "minimum_speed_mps": 0.04,
                         # Segment transition ownership:
                         # - RPP sends a dynamic +/-60deg carrier vector while

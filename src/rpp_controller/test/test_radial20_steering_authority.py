@@ -109,7 +109,12 @@ def _execute_radial20_branch(result):
         calls.append(("publish", north, east, kwargs))
         return north, east, math.hypot(north, east)
 
+    def freeze(bearing, path_bearing, along_remaining, goal_key):
+        calls.append(("freeze", bearing, path_bearing, along_remaining, goal_key))
+        return bearing
+
     node.terminal_bounded_guidance = guidance
+    node.radial20_heading_freeze = freeze
     node.publish_velocity_ned = publish
     source = (
         "def run(self):\n"
@@ -137,9 +142,11 @@ def test_terminal_publisher_receives_regulator_speed_as_hard_cap(speed):
     )
     calls = _execute_radial20_branch(result)
 
-    assert [call[0] for call in calls] == ["guidance", "publish"]
+    assert [call[0] for call in calls] == ["guidance", "freeze", "publish"]
     assert calls[0][1:] == pytest.approx((0.0, math.atan2(0.01, 0.2), 0.2))
-    _, north, east, options = calls[1]
+    assert calls[1][1:4] == pytest.approx((0.1, 0.0, 0.2))
+    assert calls[1][4] == (0.2, 0.01)
+    _, north, east, options = calls[2]
     assert math.hypot(north, east) == pytest.approx(speed)
     assert options == {
         "apply_acceleration": True,
