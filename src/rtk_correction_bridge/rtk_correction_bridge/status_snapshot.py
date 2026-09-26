@@ -34,6 +34,8 @@ def build_correction_status_snapshot(
     gga_last_sent_age_sec: float | None = None,
     gga_sent_total: int = 0,
     gga_send_errors: int = 0,
+    correction_source: str = "NTRIP",
+    lora_source_snapshot: Any = None,
 ) -> dict[str, Any]:
     """Build one credential-free correction-stream status payload."""
 
@@ -222,7 +224,28 @@ def build_correction_status_snapshot(
     else:
         state = "UNHEALTHY"
 
+    source_name = str(correction_source).strip().upper()
+    if source_name not in {"NTRIP", "LORA"}:
+        raise ValueError("correction_source must be NTRIP or LORA")
+
+    lora = None
+    if lora_source_snapshot is not None:
+        lora = {
+            "device": lora_source_snapshot.device,
+            "baud": int(lora_source_snapshot.baudrate),
+            "open": bool(lora_source_snapshot.serial_open),
+            "open_total": int(lora_source_snapshot.open_total),
+            "open_failures_total": int(
+                lora_source_snapshot.open_failures_total
+            ),
+            "read_errors_total": int(lora_source_snapshot.read_errors_total),
+            "bytes_read_total": int(lora_source_snapshot.bytes_read_total),
+            "last_error": lora_source_snapshot.last_error,
+        }
+
     return {
+        "correction_source": source_name,
+        "lora": lora,
         "state": state,
         "injection_mode": mode,
         "direct_inject": is_direct,

@@ -32,7 +32,32 @@ from rover_backend.rtk_process_protocol import (
 )
 
 
-RTK_PROFILE_SCHEMA_VERSION = 4
+RTK_PROFILE_SCHEMA_VERSION = 5
+
+# Global correction source (schema v5). NTRIP is the default so an upgraded
+# database behaves exactly as before until the operator selects LoRa.
+CORRECTION_SOURCE_NTRIP = "NTRIP"
+CORRECTION_SOURCE_LORA = "LORA"
+CORRECTION_SOURCES = (CORRECTION_SOURCE_NTRIP, CORRECTION_SOURCE_LORA)
+DEFAULT_LORA_SERIAL_BAUD = 57600
+
+# LoRa has no caster profile, so its worker uses the same timing defaults as
+# a newly created NTRIP profile.
+LORA_WORKER_TIMING = {
+    "connect_timeout_sec": 10.0,
+    "socket_timeout_sec": 1.0,
+    "healthy_age_sec": 5.0,
+    "stale_reconnect_sec": 10.0,
+    "reconnect_delay_sec": 5.0,
+    "first_data_timeout_sec": 10.0,
+}
+LORA_RTCM_TOPIC = "/mavros/gps_rtk/send_rtcm"
+LORA_MAX_MAVROS_RTCM_FRAME_BYTES = 720
+
+# Editing, deleting, (de)activating or switching the NTRIP profile forces RTK
+# to STOPPED only while NTRIP is the correction source (the SQL CASE on each
+# such UPDATE rtk_runtime_state). A running LoRa worker does not use any
+# profile, so those operations must not stop it.
 
 DEFAULT_DIRECT_INJECT = False
 DEFAULT_DIRECT_SERIAL_DEVICE = None
@@ -139,6 +164,53 @@ class RtkPersistedRuntimeState:
 
     revision: int
     updated_at_epoch: int
+
+
+@dataclass(
+    frozen=True,
+    slots=True,
+)
+class RtkCorrectionSourceSnapshot:
+    """Persisted global RTK correction source (schema v5)."""
+
+    source: str
+    lora_serial_device: Optional[str]
+    lora_serial_baud: int
+    lora_direct_inject: bool
+    lora_direct_serial_device: Optional[str]
+    lora_direct_serial_baud: int
+    revision: int
+    updated_at: int
+
+
+def _normalise_serial_device(
+    value: object,
+    field: str,
+) -> Optional[str]:
+    """Return None or an absolute /dev path without control characters."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RtkProfileValidationError(f"{field} must be a string or null")
+    text = value.strip()
+    if not text:
+        return None
+    if _contains_control_characters(text):
+        raise RtkProfileValidationError(
+            f"{field} must not contain control characters"
+        )
+    if not text.startswith("/dev/"):
+        raise RtkProfileValidationError(
+            f"{field} must be an absolute /dev path"
+        )
+    return text
+
+
+def _positive_int(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise RtkProfileValidationError(f"{field} must be an integer > 0")
+    return value
 
 
 def _contains_control_characters(
@@ -403,6 +475,7 @@ class RtkProfileStore:
                     1,
                     2,
                     3,
+                    4,
                     RTK_PROFILE_SCHEMA_VERSION,
                 }:
                     raise RtkProfileStoreError(
@@ -648,6 +721,52 @@ class RtkProfileStore:
                             1,
                             ?
                         )
+                        """,
+                        (now,),
+                    )
+
+                    # Schema v5: one global correction source. Created on
+                    # every upgrade path; NTRIP default keeps prior behavior.
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS rtk_correction_source (
+                            singleton_id INTEGER PRIMARY KEY
+                                CHECK(singleton_id = 1),
+
+                            source TEXT NOT NULL
+                                DEFAULT 'NTRIP'
+                                CHECK(source IN ('NTRIP', 'LORA')),
+
+                            lora_serial_device TEXT,
+                            lora_serial_baud INTEGER NOT NULL
+                                DEFAULT 57600
+                                CHECK(lora_serial_baud > 0),
+
+                            lora_direct_inject INTEGER NOT NULL
+                                DEFAULT 1
+                                CHECK(lora_direct_inject IN (0, 1)),
+                            lora_direct_serial_device TEXT,
+                            lora_direct_serial_baud INTEGER NOT NULL
+                                DEFAULT 230400
+                                CHECK(lora_direct_serial_baud > 0),
+
+                            revision INTEGER NOT NULL
+                                CHECK(revision >= 1),
+                            updated_at INTEGER NOT NULL
+                        )
+                        """
+                    )
+
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE
+                        INTO rtk_correction_source (
+                            singleton_id,
+                            source,
+                            revision,
+                            updated_at
+                        )
+                        VALUES (1, 'NTRIP', 1, ?)
                         """,
                         (now,),
                     )
@@ -1814,7 +1933,7 @@ class RtkProfileStore:
                                 UPDATE rtk_runtime_state
                                 SET
                                     active_profile_id = NULL,
-                                    desired_state = 'STOPPED',
+                                    desired_state = CASE WHEN (SELECT source FROM rtk_correction_source WHERE singleton_id = 1) = 'LORA' THEN desired_state ELSE 'STOPPED' END,
                                     revision = revision + 1,
                                     updated_at = ?
                                 WHERE singleton_id = 1
@@ -1830,7 +1949,7 @@ class RtkProfileStore:
                                 """
                                 UPDATE rtk_runtime_state
                                 SET
-                                    desired_state = 'STOPPED',
+                                    desired_state = CASE WHEN (SELECT source FROM rtk_correction_source WHERE singleton_id = 1) = 'LORA' THEN desired_state ELSE 'STOPPED' END,
                                     revision = revision + 1,
                                     updated_at = ?
                                 WHERE singleton_id = 1
@@ -1944,7 +2063,7 @@ class RtkProfileStore:
                             UPDATE rtk_runtime_state
                             SET
                                 active_profile_id = NULL,
-                                desired_state = 'STOPPED',
+                                desired_state = CASE WHEN (SELECT source FROM rtk_correction_source WHERE singleton_id = 1) = 'LORA' THEN desired_state ELSE 'STOPPED' END,
                                 revision = revision + 1,
                                 updated_at = ?
                             WHERE singleton_id = 1
@@ -2096,7 +2215,7 @@ class RtkProfileStore:
                         UPDATE rtk_runtime_state
                         SET
                             active_profile_id = ?,
-                            desired_state = 'STOPPED',
+                            desired_state = CASE WHEN (SELECT source FROM rtk_correction_source WHERE singleton_id = 1) = 'LORA' THEN desired_state ELSE 'STOPPED' END,
                             revision = revision + 1,
                             updated_at = ?
                         WHERE singleton_id = 1
@@ -2194,7 +2313,7 @@ class RtkProfileStore:
                         UPDATE rtk_runtime_state
                         SET
                             active_profile_id = NULL,
-                            desired_state = 'STOPPED',
+                            desired_state = CASE WHEN (SELECT source FROM rtk_correction_source WHERE singleton_id = 1) = 'LORA' THEN desired_state ELSE 'STOPPED' END,
                             revision = revision + 1,
                             updated_at = ?
                         WHERE singleton_id = 1
@@ -2288,7 +2407,29 @@ class RtkProfileStore:
                             )
                         )
 
-                    if desired is DesiredState.RUNNING:
+                    source_row = (
+                        self._correction_source_from_row(
+                            self._read_correction_source_row(
+                                connection
+                            )
+                        )
+                    )
+
+                    if (
+                        desired is DesiredState.RUNNING
+                        and source_row.source
+                        == CORRECTION_SOURCE_LORA
+                    ):
+                        problem = self._lora_start_problem(
+                            source_row
+                        )
+                        if problem is not None:
+                            raise RtkProfileStateError(
+                                "cannot request RUNNING: "
+                                + problem
+                            )
+
+                    elif desired is DesiredState.RUNNING:
                         active_profile_id = current[
                             "active_profile_id"
                         ]
@@ -2374,6 +2515,277 @@ class RtkProfileStore:
                 connection.close()
 
     # ==========================================================
+    # Global correction source (schema v5)
+    # ==========================================================
+
+    @staticmethod
+    def _correction_source_from_row(
+        row: sqlite3.Row,
+    ) -> RtkCorrectionSourceSnapshot:
+        return RtkCorrectionSourceSnapshot(
+            source=str(row["source"]),
+            lora_serial_device=(
+                None
+                if row["lora_serial_device"] is None
+                else str(row["lora_serial_device"])
+            ),
+            lora_serial_baud=int(row["lora_serial_baud"]),
+            lora_direct_inject=bool(row["lora_direct_inject"]),
+            lora_direct_serial_device=(
+                None
+                if row["lora_direct_serial_device"] is None
+                else str(row["lora_direct_serial_device"])
+            ),
+            lora_direct_serial_baud=int(row["lora_direct_serial_baud"]),
+            revision=int(row["revision"]),
+            updated_at=int(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _read_correction_source_row(
+        connection: sqlite3.Connection,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM rtk_correction_source
+            WHERE singleton_id = 1
+            """
+        ).fetchone()
+        if row is None:
+            raise RtkProfileStoreError("RTK correction source missing")
+        return row
+
+    def correction_source(
+        self,
+    ) -> RtkCorrectionSourceSnapshot:
+        """Return the persisted global correction source."""
+
+        with self._lock:
+            connection = self._connect()
+            try:
+                return self._correction_source_from_row(
+                    self._read_correction_source_row(connection)
+                )
+            finally:
+                connection.close()
+
+    def update_correction_source(
+        self,
+        *,
+        source: object = _UNSET,
+        lora_serial_device: object = _UNSET,
+        lora_serial_baud: object = _UNSET,
+        lora_direct_inject: object = _UNSET,
+        lora_direct_serial_device: object = _UNSET,
+        lora_direct_serial_baud: object = _UNSET,
+        require_startable: bool = False,
+    ) -> tuple[RtkCorrectionSourceSnapshot, RtkCorrectionSourceSnapshot]:
+        """Persist a partial update; return (before, after).
+
+        Omitted fields keep their stored value; an explicit None clears a
+        device path. The desired RUNNING/STOPPED state is not touched here:
+        the control service decides whether a running worker must restart.
+        With ``require_startable`` (RTK desired RUNNING) an update that would
+        leave the selected source unable to start is rejected and nothing is
+        saved.
+        """
+
+        now = self._now_epoch()
+
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    before = self._correction_source_from_row(
+                        self._read_correction_source_row(connection)
+                    )
+
+                    new_source = before.source
+                    if source is not _UNSET:
+                        if not isinstance(source, str):
+                            raise RtkProfileValidationError(
+                                "source must be NTRIP or LORA"
+                            )
+                        new_source = source.strip().upper()
+                        if new_source not in CORRECTION_SOURCES:
+                            raise RtkProfileValidationError(
+                                "source must be NTRIP or LORA"
+                            )
+
+                    lora_device = (
+                        before.lora_serial_device
+                        if lora_serial_device is _UNSET
+                        else _normalise_serial_device(
+                            lora_serial_device, "lora_serial_device"
+                        )
+                    )
+                    lora_baud = (
+                        before.lora_serial_baud
+                        if lora_serial_baud is _UNSET
+                        else _positive_int(lora_serial_baud, "lora_serial_baud")
+                    )
+                    if lora_direct_inject is _UNSET:
+                        direct = before.lora_direct_inject
+                    elif isinstance(lora_direct_inject, bool):
+                        direct = lora_direct_inject
+                    else:
+                        raise RtkProfileValidationError(
+                            "lora_direct_inject must be a boolean"
+                        )
+                    direct_device = (
+                        before.lora_direct_serial_device
+                        if lora_direct_serial_device is _UNSET
+                        else _normalise_serial_device(
+                            lora_direct_serial_device,
+                            "lora_direct_serial_device",
+                        )
+                    )
+                    direct_baud = (
+                        before.lora_direct_serial_baud
+                        if lora_direct_serial_baud is _UNSET
+                        else _positive_int(
+                            lora_direct_serial_baud, "lora_direct_serial_baud"
+                        )
+                    )
+
+                    if (
+                        lora_device is not None
+                        and direct_device is not None
+                        and os.path.realpath(lora_device)
+                        == os.path.realpath(direct_device)
+                    ):
+                        raise RtkProfileValidationError(
+                            "the LoRa radio port and the correction output "
+                            "port must be different devices"
+                        )
+
+                    changed = (
+                        new_source,
+                        lora_device,
+                        lora_baud,
+                        direct,
+                        direct_device,
+                        direct_baud,
+                    ) != (
+                        before.source,
+                        before.lora_serial_device,
+                        before.lora_serial_baud,
+                        before.lora_direct_inject,
+                        before.lora_direct_serial_device,
+                        before.lora_direct_serial_baud,
+                    )
+
+                    if changed and require_startable:
+                        problem = self._start_problem_for(
+                            connection,
+                            RtkCorrectionSourceSnapshot(
+                                source=new_source,
+                                lora_serial_device=lora_device,
+                                lora_serial_baud=lora_baud,
+                                lora_direct_inject=direct,
+                                lora_direct_serial_device=direct_device,
+                                lora_direct_serial_baud=direct_baud,
+                                revision=before.revision,
+                                updated_at=before.updated_at,
+                            ),
+                        )
+                        if problem is not None:
+                            raise RtkProfileStateError(
+                                "RTK is running and the new correction "
+                                "source cannot start: " + problem
+                            )
+
+                    if changed:
+                        connection.execute(
+                            """
+                            UPDATE rtk_correction_source
+                            SET
+                                source = ?,
+                                lora_serial_device = ?,
+                                lora_serial_baud = ?,
+                                lora_direct_inject = ?,
+                                lora_direct_serial_device = ?,
+                                lora_direct_serial_baud = ?,
+                                revision = revision + 1,
+                                updated_at = ?
+                            WHERE singleton_id = 1
+                            """,
+                            (
+                                new_source,
+                                lora_device,
+                                lora_baud,
+                                int(direct),
+                                direct_device,
+                                direct_baud,
+                                now,
+                            ),
+                        )
+
+                    after = self._correction_source_from_row(
+                        self._read_correction_source_row(connection)
+                    )
+                    connection.execute("COMMIT")
+                    return before, after
+
+                except BaseException:
+                    if connection.in_transaction:
+                        connection.execute("ROLLBACK")
+                    raise
+            finally:
+                connection.close()
+
+    def _start_problem_for(
+        self,
+        connection: sqlite3.Connection,
+        source_row: RtkCorrectionSourceSnapshot,
+    ) -> Optional[str]:
+        if source_row.source == CORRECTION_SOURCE_LORA:
+            return self._lora_start_problem(source_row)
+        runtime = connection.execute(
+            """
+            SELECT active_profile_id
+            FROM rtk_runtime_state
+            WHERE singleton_id = 1
+            """
+        ).fetchone()
+        if runtime is None or runtime["active_profile_id"] is None:
+            return "no active NTRIP profile"
+        profile = connection.execute(
+            "SELECT enabled FROM rtk_profiles WHERE id = ?",
+            (int(runtime["active_profile_id"]),),
+        ).fetchone()
+        if profile is None or not bool(profile["enabled"]):
+            return "active NTRIP profile is missing or disabled"
+        return None
+
+    def _build_lora_worker_config(
+        self,
+        source_row: RtkCorrectionSourceSnapshot,
+        run_id: str,
+    ) -> WorkerConfig:
+        problem = self._lora_start_problem(source_row)
+        if problem is not None:
+            raise RtkProfileStateError(problem)
+        try:
+            return _lora_worker_config(source_row, run_id)
+        except ConfigValidationError as error:
+            raise RtkProfileStateError(
+                "LoRa correction source is invalid"
+            ) from error
+
+    @staticmethod
+    def _lora_start_problem(
+        source: RtkCorrectionSourceSnapshot,
+    ) -> Optional[str]:
+        if source.lora_serial_device is None:
+            return "LoRa radio serial port is not configured"
+        if source.lora_direct_inject and source.lora_direct_serial_device is None:
+            return "LoRa correction output port is not configured"
+        return None
+
+    # ==========================================================
     # Runtime WorkerConfig boundary
     # ==========================================================
 
@@ -2391,6 +2803,15 @@ class RtkProfileStore:
             connection = self._connect()
 
             try:
+                source_row = self._correction_source_from_row(
+                    self._read_correction_source_row(connection)
+                )
+                if source_row.source == CORRECTION_SOURCE_LORA:
+                    return self._build_lora_worker_config(
+                        source_row,
+                        run_id,
+                    )
+
                 runtime = connection.execute(
                     """
                     SELECT active_profile_id
@@ -2545,6 +2966,41 @@ class RtkProfileStore:
 
             finally:
                 connection.close()
+
+
+def _lora_worker_config(
+    source_row: RtkCorrectionSourceSnapshot,
+    run_id: str,
+) -> WorkerConfig:
+    return WorkerConfig(
+        schema_version=WORKER_CONFIG_SCHEMA_VERSION,
+        run_id=run_id,
+        caster_host="",
+        caster_port=0,
+        mountpoint="",
+        username="",
+        password="",
+        rtcm_topic=LORA_RTCM_TOPIC,
+        gga_enabled=False,
+        gga_interval_sec=10.0,
+        gga_max_age_sec=5.0,
+        max_mavros_rtcm_frame_bytes=LORA_MAX_MAVROS_RTCM_FRAME_BYTES,
+        direct_inject=source_row.lora_direct_inject,
+        direct_serial_device=(
+            source_row.lora_direct_serial_device
+            if source_row.lora_direct_inject
+            else None
+        ),
+        direct_serial_baud=source_row.lora_direct_serial_baud,
+        direct_serial_write_timeout_sec=(
+            DEFAULT_DIRECT_SERIAL_WRITE_TIMEOUT_SEC
+        ),
+        direct_serial_reopen_sec=DEFAULT_DIRECT_SERIAL_REOPEN_SEC,
+        correction_source=CORRECTION_SOURCE_LORA,
+        lora_serial_device=source_row.lora_serial_device,
+        lora_serial_baud=source_row.lora_serial_baud,
+        **LORA_WORKER_TIMING,
+    )
 
 
 # Construction only. No filesystem/database work occurs until initialize().

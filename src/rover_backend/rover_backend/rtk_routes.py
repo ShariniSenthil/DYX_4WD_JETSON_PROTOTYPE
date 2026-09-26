@@ -38,6 +38,7 @@ from rover_backend.rtk_control_service import (
     RtkControlSnapshot,
 )
 from rover_backend.rtk_profile_store import (
+    RtkCorrectionSourceSnapshot,
     RtkPersistedRuntimeState,
     RtkProfileConflictError,
     RtkProfileNotFoundError,
@@ -48,6 +49,9 @@ from rover_backend.rtk_profile_store import (
 )
 from rover_backend.rtk_runtime_service import (
     RtkRuntimeServiceSnapshot,
+)
+from rover_backend.rtk_serial_ports import (
+    list_serial_ports,
 )
 from rover_backend.state import (
     rover_state,
@@ -253,6 +257,24 @@ def _create_values(
     )
 
     return values
+
+
+class RtkCorrectionSourceUpdateRequest(BaseModel):
+    """Partial update of the global correction source.
+
+    Omitted fields keep their value; an explicit null clears a port path.
+    """
+
+    source: Any = None
+    lora_serial_device: Any = None
+    lora_serial_baud: Any = None
+    lora_direct_inject: Any = None
+    lora_direct_serial_device: Any = None
+    lora_direct_serial_baud: Any = None
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
 
 
 def _update_values(
@@ -796,6 +818,21 @@ def _telemetry_payload() -> dict[str, Any]:
     }
 
 
+def _correction_source_payload(
+    source: RtkCorrectionSourceSnapshot,
+) -> dict[str, Any]:
+    return {
+        "source": source.source,
+        "lora_serial_device": source.lora_serial_device,
+        "lora_serial_baud": source.lora_serial_baud,
+        "lora_direct_inject": source.lora_direct_inject,
+        "lora_direct_serial_device": source.lora_direct_serial_device,
+        "lora_direct_serial_baud": source.lora_direct_serial_baud,
+        "revision": source.revision,
+        "updated_at": source.updated_at,
+    }
+
+
 def _control_payload(
     snapshot: RtkControlSnapshot,
 ) -> dict[str, Any]:
@@ -1240,12 +1277,92 @@ async def read_rtk_status(
         snapshot
     )
 
+    source = await _control_call(
+        control.correction_source
+    )
+    payload["correction_source"] = _correction_source_payload(
+        source
+    )
+
     payload.update(
         _telemetry_payload()
     )
 
     return {
         "status": payload,
+    }
+
+
+@rtk_router.get(
+    "/source",
+)
+async def read_rtk_correction_source(
+    _session: AuthenticatedSession = Depends(
+        require_auth
+    ),
+    control: RtkControlService = Depends(
+        get_rtk_control_service
+    ),
+) -> dict[str, Any]:
+    source = await _control_call(
+        control.correction_source
+    )
+    return {
+        "correction_source": _correction_source_payload(source),
+    }
+
+
+@rtk_router.put(
+    "/source",
+)
+async def update_rtk_correction_source(
+    body: RtkCorrectionSourceUpdateRequest,
+    _session: AuthenticatedSession = Depends(
+        require_auth
+    ),
+    control: RtkControlService = Depends(
+        get_rtk_control_service
+    ),
+) -> dict[str, Any]:
+    changes = body.model_dump(exclude_unset=True)
+
+    source = await _control_call(
+        lambda: control.update_correction_source(**changes)
+    )
+
+    LOGGER.info(
+        "RTK_AUDIT action=SOURCE_UPDATE user=%s source=%s "
+        "revision=%s fields=%s",
+        _session.username,
+        source.source,
+        source.revision,
+        ",".join(sorted(changes)) or "NONE",
+    )
+
+    return {
+        "correction_source": _correction_source_payload(source),
+    }
+
+
+@rtk_router.get(
+    "/serial-ports",
+)
+async def list_rtk_serial_ports(
+    _session: AuthenticatedSession = Depends(
+        require_auth
+    ),
+) -> dict[str, Any]:
+    ports = await run_in_threadpool(list_serial_ports)
+    return {
+        "ports": [
+            {
+                "path": port.path,
+                "device": port.device,
+                "label": port.label,
+                "role": port.role,
+            }
+            for port in ports
+        ],
     }
 
 

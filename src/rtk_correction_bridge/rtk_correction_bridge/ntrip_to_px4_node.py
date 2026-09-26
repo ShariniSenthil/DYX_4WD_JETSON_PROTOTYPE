@@ -43,6 +43,9 @@ from rtk_correction_bridge.rtcm_transport import (
 from rtk_correction_bridge.serial_rtcm_sink import (
     SerialRtcmSink,
 )
+from rtk_correction_bridge.serial_rtcm_source import (
+    SerialRtcmSource,
+)
 from rtk_correction_bridge.status_snapshot import (
     build_correction_status_snapshot,
 )
@@ -184,6 +187,19 @@ class NtripToPx4Node(Node):
             else 'mavros_px4'
         )
 
+        # NTRIP caster or LoRa radio on a local serial port. Everything after
+        # "bytes arrive" (parser, deadlines, health, sink) is shared.
+        self.correction_source = str(
+            getattr(worker_config, 'correction_source', 'NTRIP')
+        )
+        self.lora_serial_device = getattr(
+            worker_config, 'lora_serial_device', None
+        )
+        self.lora_serial_baud = int(
+            getattr(worker_config, 'lora_serial_baud', 57600)
+        )
+        self.is_lora = self.correction_source == 'LORA'
+
         self.effective_rtcm_frame_limit_bytes = (
             MAX_MAVROS_RTCM_FRAME_BYTES_LIMIT
             if self.direct_inject
@@ -227,6 +243,14 @@ class NtripToPx4Node(Node):
             if self.direct_inject
             else self._publish_rtcm_frame
         )
+
+        self._lora_source = None
+        if self.is_lora:
+            self._lora_source = SerialRtcmSource(
+                self.lora_serial_device,
+                baudrate=self.lora_serial_baud,
+                read_timeout_sec=self.socket_timeout_sec,
+            )
 
         status_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -308,14 +332,20 @@ class NtripToPx4Node(Node):
             '===== HARDENED NTRIP TO PX4 STARTED ====='
         )
 
-        self.get_logger().warn(
-            f'Caster            : '
-            f'{self.caster_host}:{self.caster_port}'
-        )
+        if self.is_lora:
+            self.get_logger().warn(
+                f'Correction source : LoRa radio '
+                f'{self.lora_serial_device} @ {self.lora_serial_baud}'
+            )
+        else:
+            self.get_logger().warn(
+                f'Caster            : '
+                f'{self.caster_host}:{self.caster_port}'
+            )
 
-        self.get_logger().warn(
-            f'Mountpoint        : {self.mountpoint}'
-        )
+            self.get_logger().warn(
+                f'Mountpoint        : {self.mountpoint}'
+            )
 
         self.get_logger().warn(
             f'RTCM injection mode: {self.injection_mode}'
@@ -426,6 +456,27 @@ class NtripToPx4Node(Node):
         )
 
     def _validate_parameters(self):
+        if self.correction_source not in {'NTRIP', 'LORA'}:
+            raise ValueError(
+                'correction_source must be NTRIP or LORA'
+            )
+        if self.is_lora:
+            if (
+                not isinstance(self.lora_serial_device, str)
+                or not self.lora_serial_device.startswith('/dev/')
+            ):
+                raise ValueError(
+                    'lora_serial_device must be an absolute /dev path'
+                )
+            if self.lora_serial_baud <= 0:
+                raise ValueError('lora_serial_baud must be > 0')
+            if self.gga_enabled:
+                raise ValueError('GGA is not supported over LoRa')
+        else:
+            self._validate_ntrip_parameters()
+        self._validate_common_parameters()
+
+    def _validate_ntrip_parameters(self):
 
         if not self.caster_host:
             raise ValueError(
@@ -458,6 +509,8 @@ class NtripToPx4Node(Node):
                 'NTRIP password is empty'
             )
 
+
+    def _validate_common_parameters(self):
         if not self.rtcm_topic.startswith('/'):
             raise ValueError(
                 'rtcm_topic must be absolute'
@@ -1141,6 +1194,14 @@ class NtripToPx4Node(Node):
             self._reject_rtcm_frame
         )
 
+        lora_source = getattr(self, '_lora_source', None)
+        self._lora_source = None
+        if lora_source is not None:
+            try:
+                lora_source.close()
+            except Exception:
+                pass
+
         serial_sink = self._serial_sink
         self._serial_sink = None
 
@@ -1298,6 +1359,12 @@ class NtripToPx4Node(Node):
                     ),
                     gga_sent_total=(
                         gga_status['sent_total']
+                    ),
+                    correction_source=self.correction_source,
+                    lora_source_snapshot=(
+                        None
+                        if getattr(self, '_lora_source', None) is None
+                        else self._lora_source.snapshot
                     ),
                     gga_send_errors=(
                         gga_status['send_errors']
@@ -1603,7 +1670,80 @@ class NtripToPx4Node(Node):
                 timeout_sec=0.2,
             )
 
+    def _run_lora(self):
+        """Read RTCM3 from the LoRa radio's serial port.
+
+        Same contract as the NTRIP loop: a new parser session per open, the
+        first-frame and stale-source deadlines raise TimeoutError, and any
+        failure closes the port, reports disconnected and reopens after
+        reconnect_delay_sec. A read timeout (no bytes) is the idle tick.
+        """
+
+        source = self._lora_source
+
+        while rclpy.ok():
+
+            try:
+                source.open()
+
+                self.connected = True
+                self.connection_start = time.monotonic()
+                self._new_parser_session()
+                self._publish_health(force=True)
+
+                self.get_logger().warn(
+                    'LoRa RTCM source open | '
+                    f'{self.lora_serial_device} @ {self.lora_serial_baud}'
+                )
+
+                while rclpy.ok():
+
+                    rclpy.spin_once(
+                        self,
+                        timeout_sec=0.0,
+                    )
+
+                    data = source.read(4096)
+                    now = time.monotonic()
+
+                    if data:
+                        self._process_stream_bytes(data, now)
+                        self._check_source_deadlines(now)
+                    else:
+                        self._service_parser(now)
+                        self._check_source_deadlines(now)
+                        healthy, age = self._publish_health()
+                        self._maybe_log_health()
+                        self._maybe_log_source_status(now, healthy, age)
+
+            except Exception as exc:
+
+                if rclpy.ok():
+                    self.get_logger().error(
+                        f'LoRa RTCM source error: {exc}'
+                    )
+
+            finally:
+
+                source.close()
+                self._discard_parser_session()
+                self._set_disconnected()
+
+            if rclpy.ok():
+
+                self.get_logger().warn(
+                    'Reopening LoRa port in '
+                    f'{self.reconnect_delay_sec:.1f} seconds...'
+                )
+
+                self._sleep_with_ros(
+                    self.reconnect_delay_sec
+                )
+
     def run(self):
+
+        if self.is_lora:
+            return self._run_lora()
 
         while rclpy.ok():
 

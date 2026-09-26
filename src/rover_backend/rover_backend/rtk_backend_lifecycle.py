@@ -35,6 +35,7 @@ from rover_backend.rtk_process_adapter import (
     RtkProcessAdapter,
 )
 from rover_backend.rtk_profile_store import (
+    CORRECTION_SOURCE_LORA,
     RtkProfileStore,
 )
 from rover_backend.rtk_routes import (
@@ -104,6 +105,10 @@ RuntimeFactory = Callable[
 # an operator profile edit, which already forces desired_state to STOPPED and
 # requires an explicit re-START (see rtk_control_service.update_profile), so a
 # short cache cannot cause a stale launch decision that matters operationally.
+# A correction-source switch restarts the worker at once; for up to this TTL
+# the new worker may be gated by the previous source's mode, which at worst
+# delays a launch until MAVROS is ready or lets a MAVROS-path worker start
+# before MAVROS (it then reports unhealthy until MAVROS subscribes).
 _DIRECT_INJECT_MODE_CACHE_TTL_SEC = 1.0
 
 
@@ -172,8 +177,12 @@ def _make_launch_readiness_provider(
         # MAVROS-gated path, never to an unconditional bypass.
         direct_inject = False
         try:
+            source = profile_store.correction_source()
             runtime = profile_store.runtime_state()
-            if runtime.active_profile_id is not None:
+            if source.source == CORRECTION_SOURCE_LORA:
+                # LoRa has no profile; its own output setting decides.
+                direct_inject = bool(source.lora_direct_inject)
+            elif runtime.active_profile_id is not None:
                 profile = profile_store.get_profile(
                     runtime.active_profile_id
                 )

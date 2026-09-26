@@ -28,6 +28,8 @@ from rover_backend.rtk_manager_core import (
     DesiredState,
 )
 from rover_backend.rtk_profile_store import (
+    CORRECTION_SOURCE_LORA,
+    RtkCorrectionSourceSnapshot,
     RtkPersistedRuntimeState,
     RtkProfileNotFoundError,
     RtkProfileSnapshot,
@@ -247,6 +249,87 @@ class RtkControlService:
                 after,
                 operation="active profile clear",
             )
+
+            return after
+
+    def correction_source(
+        self,
+    ) -> RtkCorrectionSourceSnapshot:
+        with self._lock:
+            return self._profile_store.correction_source()
+
+    def update_correction_source(
+        self,
+        **changes: Any,
+    ) -> RtkCorrectionSourceSnapshot:
+        """Persist the correction source; restart a running worker onto it.
+
+        Operator decision (2026-09-26): switching NTRIP <-> LoRa while RTK is
+        RUNNING saves the new source and immediately restarts the worker on
+        it, keeping RUNNING, so the next boot also starts the new source. An
+        update that would leave the source unable to start is rejected while
+        RUNNING (nothing saved). A failed restart fails closed to STOPPED.
+        """
+
+        with self._lock:
+            runtime = self._profile_store.runtime_state()
+            running = runtime.desired_state is DesiredState.RUNNING
+
+            before, after = self._profile_store.update_correction_source(
+                require_startable=running,
+                **changes,
+            )
+
+            restart = running and (
+                before.source != after.source
+                or (
+                    after.source == CORRECTION_SOURCE_LORA
+                    and before != after
+                )
+            )
+
+            LOGGER.info(
+                "RTK_CONTROL event=SOURCE_UPDATE source=%s->%s "
+                "revision=%s restart=%s",
+                before.source,
+                after.source,
+                after.revision,
+                restart,
+            )
+
+            if not restart:
+                return after
+
+            try:
+                self._runtime_service.request_stop()
+                self._runtime_service.request_start()
+            except Exception as restart_error:
+                persistence_error: Exception | None = None
+                try:
+                    self._profile_store.set_desired_state(
+                        DesiredState.STOPPED
+                    )
+                except Exception as error:
+                    persistence_error = error
+                try:
+                    self._runtime_service.request_stop()
+                except Exception:
+                    pass
+                LOGGER.error(
+                    "RTK_CONTROL event=SOURCE_RESTART_FAILED source=%s "
+                    "stop_compensation_persisted=%s",
+                    after.source,
+                    persistence_error is None,
+                )
+                if persistence_error is not None:
+                    raise RtkControlConsistencyError(
+                        "RTK source restart failed and persisted "
+                        "STOPPED compensation also failed"
+                    ) from persistence_error
+                raise RtkControlRuntimeError(
+                    "RTK source was saved but the restart failed; "
+                    "RTK is now STOPPED"
+                ) from restart_error
 
             return after
 

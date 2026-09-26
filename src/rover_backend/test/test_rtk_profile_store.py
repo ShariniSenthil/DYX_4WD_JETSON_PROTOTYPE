@@ -1364,7 +1364,9 @@ def test_schema_v3_database_migrates_to_v4(
     finally:
         connection.close()
 
-    assert version == 4
+    # v3 migrates through v4 to the current schema (v5 adds the global
+    # correction source).
+    assert version == RTK_PROFILE_SCHEMA_VERSION
 
     assert {
         "direct_inject",

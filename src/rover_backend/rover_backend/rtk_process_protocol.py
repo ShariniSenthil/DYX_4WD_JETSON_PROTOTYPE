@@ -21,7 +21,7 @@ from typing import Optional
 from rover_backend.rtk_manager_core import WorkerExitReason
 
 
-WORKER_CONFIG_SCHEMA_VERSION = 4
+WORKER_CONFIG_SCHEMA_VERSION = 5
 WORKER_STATUS_SCHEMA_VERSION = 1
 MAX_WORKER_CONFIG_BYTES = 16 * 1024
 MAX_WORKER_STATUS_BYTES = 4 * 1024
@@ -179,9 +179,24 @@ def _require_positive_finite(
     return number
 
 
+CORRECTION_SOURCE_NTRIP = "NTRIP"
+CORRECTION_SOURCE_LORA = "LORA"
+CORRECTION_SOURCES = frozenset(
+    {CORRECTION_SOURCE_NTRIP, CORRECTION_SOURCE_LORA}
+)
+DEFAULT_LORA_SERIAL_BAUD = 57600
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class WorkerConfig:
-    """Validated immutable configuration delivered to one RTK worker."""
+    """Validated immutable configuration delivered to one RTK worker.
+
+    ``correction_source`` selects where RTCM3 comes from: an NTRIP caster
+    (caster/mountpoint/credential fields required) or a LoRa radio on a
+    local serial port (``lora_serial_*`` required; caster fields ignored and
+    may be empty). The injection side (MAVROS or direct serial) is the same
+    for both sources.
+    """
 
     schema_version: int
     run_id: str
@@ -218,6 +233,10 @@ class WorkerConfig:
     direct_serial_write_timeout_sec: float = 1.0
     direct_serial_reopen_sec: float = 1.0
 
+    correction_source: str = CORRECTION_SOURCE_NTRIP
+    lora_serial_device: Optional[str] = None
+    lora_serial_baud: int = DEFAULT_LORA_SERIAL_BAUD
+
     def __post_init__(self) -> None:
         if (
             isinstance(self.schema_version, bool)
@@ -229,34 +248,97 @@ class WorkerConfig:
             )
 
         _require_nonempty_string(self.run_id, "run_id", ConfigValidationError)
-        _require_protocol_token(
-            self.caster_host,
-            "caster_host",
-            ConfigValidationError,
-        )
-        if isinstance(self.caster_port, bool) or not isinstance(
-            self.caster_port, int
+
+        if (
+            not isinstance(self.correction_source, str)
+            or self.correction_source not in CORRECTION_SOURCES
         ):
-            raise ConfigValidationError("caster_port must be an int in 1..65535")
-        if not 1 <= self.caster_port <= 65535:
-            raise ConfigValidationError("caster_port must be an int in 1..65535")
-        _require_protocol_token(
-            self.mountpoint,
-            "mountpoint",
-            ConfigValidationError,
-        )
+            raise ConfigValidationError(
+                "correction_source must be NTRIP or LORA"
+            )
 
-        _require_nonempty_string(
-            self.username,
-            "username",
-            ConfigValidationError,
-        )
+        if self.correction_source == CORRECTION_SOURCE_NTRIP:
+            _require_protocol_token(
+                self.caster_host,
+                "caster_host",
+                ConfigValidationError,
+            )
+            if isinstance(self.caster_port, bool) or not isinstance(
+                self.caster_port, int
+            ):
+                raise ConfigValidationError(
+                    "caster_port must be an int in 1..65535"
+                )
+            if not 1 <= self.caster_port <= 65535:
+                raise ConfigValidationError(
+                    "caster_port must be an int in 1..65535"
+                )
+            _require_protocol_token(
+                self.mountpoint,
+                "mountpoint",
+                ConfigValidationError,
+            )
 
-        _require_secret_string(
-            self.password,
-            "password",
-            ConfigValidationError,
-        )
+            _require_nonempty_string(
+                self.username,
+                "username",
+                ConfigValidationError,
+            )
+
+            _require_secret_string(
+                self.password,
+                "password",
+                ConfigValidationError,
+            )
+        else:
+            # LoRa carries no caster. The fields stay present (fixed wire
+            # schema) but must be plain strings/ints; they are never used.
+            for name in ("caster_host", "mountpoint", "username", "password"):
+                if not isinstance(getattr(self, name), str):
+                    raise ConfigValidationError(f"{name} must be a string")
+            if isinstance(self.caster_port, bool) or not isinstance(
+                self.caster_port, int
+            ):
+                raise ConfigValidationError("caster_port must be an int")
+
+            lora_device = self.lora_serial_device
+            if lora_device is None:
+                raise ConfigValidationError(
+                    "lora_serial_device is required when "
+                    "correction_source=LORA"
+                )
+            _require_nonempty_string(
+                lora_device,
+                "lora_serial_device",
+                ConfigValidationError,
+            )
+            if not lora_device.startswith("/dev/"):
+                raise ConfigValidationError(
+                    "lora_serial_device must be an absolute /dev path"
+                )
+            if (
+                self.direct_serial_device is not None
+                and os.path.realpath(lora_device)
+                == os.path.realpath(self.direct_serial_device)
+            ):
+                raise ConfigValidationError(
+                    "lora_serial_device must differ from "
+                    "direct_serial_device"
+                )
+
+        lora_baud = self.lora_serial_baud
+        if (
+            isinstance(lora_baud, bool)
+            or not isinstance(lora_baud, int)
+            or lora_baud <= 0
+        ):
+            raise ConfigValidationError("lora_serial_baud must be an int > 0")
+        if self.lora_serial_device is not None:
+            _require_nonempty_string(
+                self.lora_serial_device,
+                "lora_serial_device",
+                ConfigValidationError,
+            )
 
         topic = _require_protocol_token(
             self.rtcm_topic,
@@ -415,7 +497,8 @@ class WorkerConfig:
             "direct_inject=%r, direct_serial_device=%r, "
             "direct_serial_baud=%r, "
             "direct_serial_write_timeout_sec=%r, "
-            "direct_serial_reopen_sec=%r)"
+            "direct_serial_reopen_sec=%r, correction_source=%r, "
+            "lora_serial_device=%r, lora_serial_baud=%r)"
             % (
                 self.schema_version,
                 self.run_id,
@@ -440,6 +523,9 @@ class WorkerConfig:
                 self.direct_serial_baud,
                 self.direct_serial_write_timeout_sec,
                 self.direct_serial_reopen_sec,
+                self.correction_source,
+                self.lora_serial_device,
+                self.lora_serial_baud,
             )
         )
 
@@ -470,6 +556,9 @@ _WORKER_CONFIG_FIELDS = frozenset(
         "direct_serial_baud",
         "direct_serial_write_timeout_sec",
         "direct_serial_reopen_sec",
+        "correction_source",
+        "lora_serial_device",
+        "lora_serial_baud",
     }
 )
 
@@ -548,6 +637,9 @@ def encode_worker_config(config: WorkerConfig) -> bytes:
         "direct_serial_reopen_sec": (
             config.direct_serial_reopen_sec
         ),
+        "correction_source": config.correction_source,
+        "lora_serial_device": config.lora_serial_device,
+        "lora_serial_baud": config.lora_serial_baud,
     }
     encoded = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), allow_nan=False
