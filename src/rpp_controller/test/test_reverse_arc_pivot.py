@@ -334,18 +334,17 @@ def _launch_values():
     return values
 
 
-def test_node_default_off_launch_on_and_launch_lists_every_parameter():
-    # Node default stays off; rover.launch.py enables it for the field test
-    # (firmware PR #6 flashed, RD_OFFB_REV = 1). The C->P1 entry stays off.
+def test_feature_is_off_in_node_and_launch_and_launch_lists_every_parameter():
+    # 2026-09-26: disabled again in rover.launch.py (operator decision); the
+    # rover flies the ordinary stationary pivot. The C->P1 entry stays off.
     defaults = _declared_defaults()
     launch = _launch_values()
     assert defaults["reverse_arc_pivot_enabled"] is False
-    assert launch["reverse_arc_pivot_enabled"] is True
+    assert launch["reverse_arc_pivot_enabled"] is False
     assert launch["reverse_arc_first_approach_enabled"] is False
     assert set(launch) == set(defaults)
     for name, value in defaults.items():
-        if name != "reverse_arc_pivot_enabled":
-            assert launch[name] == value, name
+        assert launch[name] == value, name
 
 
 def test_node_defaults_build_a_valid_config():
