@@ -609,7 +609,9 @@ def test_legacy_param_and_precision_gate_remain_field_safe():
     assert defaults["cruise_speed_mps"] == 1.00
     assert defaults["waypoint_tolerance_m"] == 0.03
     assert '"precision_pivot_enabled": False' in LAUNCH_SOURCE
-    assert '"legacy_pivot_post_settle_hold_sec": 0.20' in LAUNCH_SOURCE
+    # Launch: 1.0 s at zero after a pivot = 0.20 settle + 0.80 hold.
+    assert '"legacy_pivot_post_settle_hold_sec": 0.80' in LAUNCH_SOURCE
+    assert '"precision_pivot_release_settle_sec": 0.20' in LAUNCH_SOURCE
     assert "RD_MAX_THR_YAW_R" not in NODE_SOURCE
     assert "RO_YAW_RATE_TH" not in NODE_SOURCE
     assert "RO_YAW_RATE_LIM" not in NODE_SOURCE

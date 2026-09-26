@@ -987,7 +987,13 @@ def generate_launch_description() -> LaunchDescription:
                         # production B mode uses zero translation + true absolute yaw.
                         "terminal_native_pivot_request_error_deg": 60.0,
                         "segment_pivot_keeper_timeout_sec": 10.0,
-                        "legacy_pivot_post_settle_hold_sec": 0.20,
+                        # 2026-09-26: 0.20 -> 0.80. After a pivot the rover
+                        # must stand at zero for 1.0 s before driving:
+                        # precision_pivot_release_settle_sec (0.20) +
+                        # this hold (0.80), both only while the stationary
+                        # gates hold (a violation restarts them). Measured
+                        # on 26_09 stage_2/3: gyro quiet -> drive 0.39-0.57 s.
+                        "legacy_pivot_post_settle_hold_sec": 0.80,
                         "segment_fast_capture_max_cross_track_m": 0.05,
                         "terminal_close_recovery_distance_m": 0.08,
                         "terminal_unready_hold_along_m": 0.05,
