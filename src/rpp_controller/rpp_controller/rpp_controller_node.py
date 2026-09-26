@@ -9251,11 +9251,13 @@ class RPPController(Node):
                     abs(self.command_slew_speed) / self.steering_reference_speed,
                 ),
             )
-            lookahead = min(
+            base_lookahead = min(
                 self.xtrack_priority_lookahead_max,
                 self.xtrack_priority_lookahead * speed_scale,
             )
-            lookahead = self._recovery_lookahead(lookahead, abs(signed_cross_track))
+            lookahead = self._recovery_lookahead(
+                base_lookahead, abs(signed_cross_track)
+            )
             correction_limit = self.xtrack_priority_correction_limit
             neutral_band = self.xtrack_neutral_crossing_band
             correction_slew_rate = self.xtrack_correction_slew_rate
@@ -9271,8 +9273,43 @@ class RPPController(Node):
         ):
             predicted_cross_track = 0.0
 
+        # GLOBAL recovery steers the turning point, not the nozzle (see
+        # line_guidance). This latch owns the whole post-pivot recovery, so
+        # line_guidance alone never reached it (26_09 stage_2: commands
+        # matched this law to 0.05-0.18 deg). The nozzle rate filter is
+        # shared with the terminal profile and must not change what it
+        # measures at that boundary, so the turning point's offset and rate
+        # are added analytically: d*sin(heading error) and
+        # d*cos(heading error)*yaw_rate. The returned cross-track, rate and
+        # prediction stay the nozzle's (latch, telemetry, terminal).
+        steering_predicted_cross_track = predicted_cross_track
+        control_point_ahead = getattr(self, "steering_control_point_ahead", 0.0)
+        if not terminal_mode and control_point_ahead > 0.0:
+            heading_offset = self.normalize_angle(self.current_yaw - path_bearing)
+            yaw_rate = float(getattr(self, "current_yaw_rate_radps", 0.0))
+            if not math.isfinite(yaw_rate):
+                yaw_rate = 0.0
+            steering_cross_track = signed_cross_track + (
+                control_point_ahead * math.sin(heading_offset)
+            )
+            steering_rate = xtrack_rate + (
+                control_point_ahead * math.cos(heading_offset) * yaw_rate
+            )
+            steering_predicted_cross_track = (
+                steering_cross_track + steering_rate * prediction_time
+            )
+            if (
+                abs(steering_cross_track) <= neutral_band
+                and abs(steering_predicted_cross_track) <= neutral_band
+                and steering_cross_track * steering_rate < 0.0
+            ):
+                steering_predicted_cross_track = 0.0
+            lookahead = self._recovery_lookahead(
+                base_lookahead, abs(steering_cross_track)
+            )
+
         desired_correction = -math.atan2(
-            predicted_cross_track,
+            steering_predicted_cross_track,
             lookahead,
         )
         desired_correction = max(

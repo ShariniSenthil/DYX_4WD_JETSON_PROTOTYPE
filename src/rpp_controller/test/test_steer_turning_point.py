@@ -167,3 +167,173 @@ def test_parameter_is_declared_read_and_validated():
     assert "steering_control_point_ahead_m must be finite and in [0, 1.0]" in source
     guidance = ast.get_source_segment(source, _method("line_guidance"))
     assert "steering_control_point_ahead" in guidance
+
+
+# --------------------------------------------------------------------------
+# xtrack_priority_guidance: the latch that owns the whole post-pivot recovery
+# (26_09 stage_2: recovery commands matched this law to 0.05-0.18 deg).
+# --------------------------------------------------------------------------
+
+PRIORITY_METHODS = ("xtrack_priority_guidance", "_recovery_lookahead")
+
+
+class _PClock:
+    def __init__(self):
+        self.ns = 0
+
+    def now(self):
+        from test_moving_course_bias import _Time
+        return _Time(self.ns)
+
+
+def _priority(ahead):
+    env = {"math": math}
+    module = ast.Module(body=[_method(n) for n in PRIORITY_METHODS], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), "<rpp>", "exec"), env)
+    node = type("N", (), {})()
+    for name in PRIORITY_METHODS:
+        setattr(node, name, env[name].__get__(node))
+    clock = _PClock()
+    node.get_clock = lambda: clock
+    node.clock = clock
+    node.normalize_angle = lambda v: math.atan2(math.sin(v), math.cos(v))
+    node.CONTROL_HZ = 50.0
+    node.MAXIMUM_MOVING_SPEED_MPS = 1.0
+    node.steering_reference_speed = 0.60
+    node.command_slew_speed = 1.0
+    # launch values
+    node.xtrack_priority_lookahead = 0.55
+    node.xtrack_priority_lookahead_max = 0.90
+    node.xtrack_priority_correction_limit = math.radians(12.0)
+    node.xtrack_prediction_time_sec = 0.25
+    node.xtrack_rate_filter_alpha = 0.20
+    node.xtrack_correction_slew_rate = math.radians(30.0)
+    node.xtrack_neutral_crossing_band = 0.015
+    node.recovery_lookahead_max = 1.5
+    node.recovery_lookahead_xtrack_start = 0.05
+    node.recovery_lookahead_xtrack_gain = 1.0
+    # terminal profile (launch values; only used by terminal_mode tests)
+    node.terminal_xtrack_prediction_time_sec = 0.35
+    node.terminal_xtrack_neutral_crossing_band = 0.005
+    node.terminal_xtrack_away_rate_threshold = 0.01
+    node.terminal_xtrack_crossing_prediction_time_sec = 0.5
+    node.terminal_xtrack_crossing_rate_threshold = 0.01
+    node.terminal_xtrack_crossing_predicted_threshold = 0.005
+    node.terminal_xtrack_away_lookahead = 0.35
+    node.terminal_xtrack_away_correction_limit = math.radians(22.0)
+    node.terminal_xtrack_crossing_lookahead = 0.35
+    node.terminal_xtrack_crossing_correction_limit = math.radians(22.0)
+    node.terminal_xtrack_lookahead = 0.50
+    node.terminal_xtrack_correction_limit = math.radians(22.0)
+    node.terminal_xtrack_correction_slew_rate = math.radians(60.0)
+    node.terminal_xtrack_unwind_slew_rate = math.radians(90.0)
+    # state
+    node.last_xtrack_sample = None
+    node.last_xtrack_sample_time = None
+    node.filtered_xtrack_rate = 0.0
+    node.last_xtrack_correction = 0.0
+    node.last_xtrack_correction_time = None
+    node.current_x = node.current_y = 0.0
+    node.current_yaw = 0.0
+    node.current_yaw_rate_radps = 0.0
+    node.steering_control_point_ahead = ahead
+    return node
+
+
+def _settle(node, cycles=200, terminal=False):
+    out = None
+    for _ in range(cycles):
+        node.clock.ns += 20_000_000
+        out = node.xtrack_priority_guidance(0.0, 0.0, 0.0, terminal_mode=terminal)
+    return out
+
+
+def test_priority_zero_offset_matches_turning_point_when_heading_on_line():
+    """Heading on the line and no yaw rate: both laws see the same point."""
+    a, b = _priority(0.0), _priority(0.5)
+    for n in (a, b):
+        n.current_y = -0.20
+    assert _settle(a)[0] == pytest.approx(_settle(b)[0])
+
+
+def test_priority_nozzle_on_line_nose_left_steers_right():
+    nozzle, turning = _priority(0.0), _priority(0.5)
+    for n in (nozzle, turning):
+        n.current_yaw = math.radians(6.0)
+    assert _settle(nozzle)[0] == pytest.approx(0.0, abs=1e-9)
+    # 0.5 * sin(6 deg) = 52 mm left of the line -> atan(0.052 / 0.90) = -3.3 deg
+    assert _settle(turning)[0] < math.radians(-3.0)
+
+
+def test_priority_returns_nozzle_cross_track_rate_and_prediction():
+    """The latch, telemetry and terminal read these -- they stay the nozzle's."""
+    nozzle, turning = _priority(0.0), _priority(0.5)
+    for n in (nozzle, turning):
+        n.current_y = -0.10
+        n.current_yaw = math.radians(8.0)
+        n.current_yaw_rate_radps = 0.2
+    a, b = _settle(nozzle), _settle(turning)
+    assert b[1] == pytest.approx(-0.10)
+    assert (b[1], b[2], b[3]) == pytest.approx((a[1], a[2], a[3]))
+
+
+def test_priority_terminal_profile_is_unchanged():
+    nozzle, turning = _priority(0.0), _priority(0.5)
+    for n in (nozzle, turning):
+        n.current_y = 0.03
+        n.current_yaw = math.radians(-5.0)
+        n.current_yaw_rate_radps = -0.1
+    assert _settle(turning, terminal=True) == pytest.approx(
+        _settle(nozzle, terminal=True)
+    )
+
+
+def test_priority_unknown_yaw_rate_is_treated_as_zero():
+    a, b = _priority(0.5), _priority(0.5)
+    for n in (a, b):
+        n.current_y = -0.2
+        n.current_yaw = math.radians(4.0)
+    a.current_yaw_rate_radps = math.inf
+    assert _settle(a)[0] == pytest.approx(_settle(b)[0])
+
+
+def _drive_priority(ahead, start_offset, start_heading_deg, seconds=10.0, dt=0.02,
+                    yaw_tau=0.45, delay=0.12):
+    """PX4 explicit-yaw plant fitted on 26_09 (delay 0-0.12 s + 0.40-0.50 s
+    lag), published yaw slewed at 10 deg/s, nozzle 0.5 m behind the turning
+    point, speed ramping 0 -> 1 m/s."""
+    node = _priority(ahead)
+    yaw = math.radians(start_heading_deg)
+    cx = NOZZLE_BEHIND_M * math.cos(yaw)
+    cy = start_offset + NOZZLE_BEHIND_M * math.sin(yaw)
+    speed, published, history, out = 0.0, yaw, [], []
+    slew = math.radians(10.0) * dt
+    lag = int(round(delay / dt))
+    for _ in range(int(seconds / dt)):
+        node.clock.ns += int(dt * 1e9)
+        speed = min(1.0, speed + 0.5 * dt)
+        node.command_slew_speed = speed
+        node.current_yaw = yaw
+        node.current_x = cx - NOZZLE_BEHIND_M * math.cos(yaw)
+        node.current_y = cy - NOZZLE_BEHIND_M * math.sin(yaw)
+        bearing, nozzle_xtrack = node.xtrack_priority_guidance(0.0, 0.0, 0.0)[:2]
+        out.append(nozzle_xtrack)
+        published += max(-slew, min(slew, bearing - published))
+        history.append(published)
+        rate = (history[max(0, len(history) - 1 - lag)] - yaw) / yaw_tau
+        node.current_yaw_rate_radps = rate
+        yaw += rate * dt
+        cx += speed * math.cos(yaw) * dt
+        cy += speed * math.sin(yaw) * dt
+    return out
+
+
+@pytest.mark.parametrize("offset,heading", [
+    (0.554, 2.9), (0.407, 4.6), (0.301, 3.1), (-0.322, -3.3), (-0.288, -3.0),
+])
+def test_priority_post_pivot_recovery_overshoot_drops(offset, heading):
+    nozzle = _drive_priority(0.0, offset, heading)
+    turning_point = _drive_priority(0.5, offset, heading)
+    assert _overshoot(nozzle) > 0.03
+    assert _overshoot(turning_point) < 0.015
+    assert max(abs(v) for v in turning_point[-100:]) < 0.01

@@ -681,7 +681,12 @@ def generate_launch_description() -> LaunchDescription:
                         # it (75 mm in 0.6 s on run 115438), which produced
                         # the start-up swing and the 58-170 mm post-pivot
                         # overshoot. Sim, 517 mm start: 93 -> 9 mm overshoot.
-                        # 0.0 restores nozzle steering.
+                        # Applies to line_guidance AND the xtrack-priority
+                        # GLOBAL recovery profile, which owns the whole
+                        # post-pivot recovery (26_09 stage_2: the first
+                        # build only covered line_guidance, 0.1-2 s per leg).
+                        # Terminal profile, latch, stop: nozzle, unchanged.
+                        # 0.0 restores nozzle steering everywhere.
                         "steering_control_point_ahead_m": 0.50,
                         "line_tracking_lookahead_m": 0.55,
                         "line_tracking_lookahead_min_m": 0.35,
