@@ -458,6 +458,21 @@ def generate_launch_description() -> LaunchDescription:
                         # ~4 cm over the final 0.6 m and the rover crossed the
                         # goal plane beside the point rather than on it.
                         "deceleration_enabled": True,
+                        # 2026-09-26 operator: slow down over the last 1.0 m
+                        # and be slow inside 200 mm. 26_09 stage_2/3 (19
+                        # stops): speed held 1.0 m/s to ~0.63 m, then the
+                        # radial20 sqrt(2*0.75*d) curve braked at a measured
+                        # 0.9 m/s^2 for ~1 s and stepped 0.15-0.19 -> 0 at
+                        # 20-27 mm -- the 1.0 m deceleration_distance_m
+                        # profile never ran. This caps speed over distance
+                        # to go: 1.0 m/s at 1.0 m -> 0.20 m/s at 0.20 m
+                        # (0.60 m/s^2), then 0.20 m/s until radial20 finishes
+                        # (its curve drops below 0.20 at ~30 mm). Speed only;
+                        # steering and the stop regulator are unchanged.
+                        "approach_slowdown_enabled": True,
+                        "approach_slowdown_distance_m": 1.00,
+                        "approach_final_distance_m": 0.20,
+                        "approach_final_speed_mps": 0.20,
                         "deceleration_distance_m": 1.00,  # 2026-09-23: operator; 0.5 m/s^2 at 1.0 m/s cruise
                         "deceleration_floor_speed_mps": TERMINAL_FLOOR_SPEED_MPS,
                         "deceleration_max_progress_jump_m": 0.10,

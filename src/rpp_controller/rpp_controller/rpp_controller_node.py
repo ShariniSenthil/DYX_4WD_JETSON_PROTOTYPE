@@ -503,6 +503,16 @@ class RPPController(Node):
         # heading; telemetry, gates and the stop still use the nozzle.
         # 0.0 = steer the nozzle (previous behaviour).
         self.declare_parameter("steering_control_point_ahead_m", 0.0)
+        # 2026-09-26: approach slowdown to every stop goal. From
+        # approach_slowdown_distance_m out, speed is capped by a constant-
+        # deceleration curve that reaches approach_final_speed_mps at
+        # approach_final_distance_m, then held there until the radial20
+        # regulator's own curve and zero latch finish the stop. Speed cap
+        # only: steering and the stop regulator are unchanged.
+        self.declare_parameter("approach_slowdown_enabled", False)
+        self.declare_parameter("approach_slowdown_distance_m", 1.0)
+        self.declare_parameter("approach_final_distance_m", 0.20)
+        self.declare_parameter("approach_final_speed_mps", 0.20)
         self.declare_parameter(
             "line_tracking_lookahead_m",
             0.55,
@@ -1226,6 +1236,19 @@ class RPPController(Node):
         self.steering_control_point_ahead = float(
             self.get_parameter("steering_control_point_ahead_m").value
         )
+        self.approach_slowdown_enabled = bool(
+            self.get_parameter("approach_slowdown_enabled").value
+        )
+        self.approach_slowdown_distance = float(
+            self.get_parameter("approach_slowdown_distance_m").value
+        )
+        self.approach_final_distance = float(
+            self.get_parameter("approach_final_distance_m").value
+        )
+        self.approach_final_speed = float(
+            self.get_parameter("approach_final_speed_mps").value
+        )
+        self.approach_speed_cap_mps = math.inf
         self.line_tracking_lookahead = float(
             self.get_parameter("line_tracking_lookahead_m").value
         )
@@ -3579,6 +3602,24 @@ class RPPController(Node):
         ):
             raise ValueError(
                 "steering_control_point_ahead_m must be finite and in [0, 1.0]"
+            )
+        if not (
+            math.isfinite(self.approach_final_distance)
+            and math.isfinite(self.approach_slowdown_distance)
+            and 0.0 < self.approach_final_distance
+            < self.approach_slowdown_distance
+            <= 3.0
+        ):
+            raise ValueError(
+                "approach distances must satisfy "
+                "0 < approach_final_distance_m < approach_slowdown_distance_m <= 3"
+            )
+        if not (
+            math.isfinite(self.approach_final_speed)
+            and 0.0 < self.approach_final_speed <= self.cruise_speed
+        ):
+            raise ValueError(
+                "approach_final_speed_mps must be finite and in (0, cruise_speed]"
             )
         if not (
             math.isfinite(self.moving_alignment_min_speed)
@@ -8265,6 +8306,12 @@ class RPPController(Node):
                 output_speed = hard_speed_cap
                 self.command_slew_speed = hard_speed_cap
 
+            # Approach slowdown to a stop goal (inf when not approaching).
+            approach_cap = getattr(self, "approach_speed_cap_mps", math.inf)
+            if output_speed > approach_cap:
+                output_speed = approach_cap
+                self.command_slew_speed = approach_cap
+
             north = direction_north * output_speed
             east = direction_east * output_speed
             if (
@@ -9625,6 +9672,34 @@ class RPPController(Node):
         correction = max(-limit, min(limit, correction))
         return self.normalize_angle(base_bearing + correction)
 
+    def approach_speed_cap(self, along_remaining):
+        """Speed ceiling while approaching a stop goal (inf = no ceiling).
+
+        Constant deceleration from cruise at approach_slowdown_distance_m
+        down to approach_final_speed_mps at approach_final_distance_m, then
+        flat at that speed. With 1.0 m / 0.20 m / 0.20 m/s at 1.0 m/s cruise
+        the deceleration is (1.0^2 - 0.2^2) / (2 * 0.8) = 0.60 m/s^2.
+        """
+        if not getattr(self, "approach_slowdown_enabled", False):
+            return math.inf
+        if not math.isfinite(along_remaining):
+            return math.inf
+        if along_remaining >= self.approach_slowdown_distance:
+            return math.inf
+        final_speed = self.approach_final_speed
+        if along_remaining <= self.approach_final_distance:
+            return final_speed
+        span = self.approach_slowdown_distance - self.approach_final_distance
+        cruise = max(self.cruise_speed, final_speed)
+        decel = (cruise * cruise - final_speed * final_speed) / (2.0 * span)
+        return min(
+            cruise,
+            math.sqrt(
+                final_speed * final_speed
+                + 2.0 * decel * (along_remaining - self.approach_final_distance)
+            ),
+        )
+
     def line_guidance(
         self,
         line_bearing,
@@ -10898,6 +10973,8 @@ class RPPController(Node):
 
     def control_loop(self):
         self._begin_precision_cycle()
+        # Recomputed below once the stop goal is known; never carried over.
+        self.approach_speed_cap_mps = math.inf
         if self.emergency_stop:
             self.publish_stop()
             self.log_waiting("emergency stop active")
@@ -11160,6 +11237,10 @@ class RPPController(Node):
         )
 
         goal_along_remaining = self.along_track_remaining(path_bearing, goal_x, goal_y)
+        if goal_requires_precision_stop:
+            self.approach_speed_cap_mps = self.approach_speed_cap(
+                goal_along_remaining
+            )
         goal_delta_east = self.current_x - goal_x
         goal_delta_north = self.current_y - goal_y
         goal_signed_cross_track = (
