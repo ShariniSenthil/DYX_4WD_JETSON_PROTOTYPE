@@ -73,11 +73,7 @@ FCU_DEVICE_PATH = "/dev/serial/by-id/usb-Auterion_PX4_FMU_v6X.x_0-if00"
 # 2026-09-25: a 0.60 m/s test (1a58c57, stage_11_cruise06) showed the
 # nozzle-referenced line steering is under-damped (swing grows as speed and
 # lookahead drop); restored to 1.00 m/s.
-# 2026-09-26: 0.75 m/s (operator). The 09-25 under-damping was measured with
-# nozzle steering; steering_control_point_ahead_m now steers the turning point.
-# The 1.0 m approach ramp scales with this: 0.75 m/s at 1.0 m -> 0.30 m/s at
-# 0.4 m -> 0.10 m/s floor.
-CRUISE_SPEED_MPS = 0.75
+CRUISE_SPEED_MPS = 1.00
 TERMINAL_FLOOR_SPEED_MPS = 0.15
 
 # Single source of truth for which terminal-stop authority is active.
