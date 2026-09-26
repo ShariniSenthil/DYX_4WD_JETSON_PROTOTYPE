@@ -249,8 +249,10 @@ def generate_launch_description() -> LaunchDescription:
                         # param1 -> Actuator Set 1 -> AUX5.
                         "press_value": 1.0,
                         # Must be the physically verified
-                        # fully-released servo position.
-                        "release_value": 0.0,
+                        # fully-released servo position: 1000 us, the
+                        # same as PWM_AUX_DIS5/FAIL5, so arming and
+                        # disarming never move the servo.
+                        "release_value": -1.0,
                         "spray_duration_sec": 0.50,
                         # mission_manager already requires <=30 mm radial error,
                         # <=0.01 m/s rover speed, then holds the marking point
