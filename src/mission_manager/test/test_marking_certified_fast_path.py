@@ -24,6 +24,9 @@ import test_lifecycle_command_behavior as harness  # noqa: E402
 
 node_module = harness.node_module
 MissionManager = harness.MissionManager
+from mission_manager.raw_gnss_spray_gate import (  # noqa: E402
+    RawGnssSprayGateConfig,
+)
 from mission_manager.precision_terminal_policy import (  # noqa: E402
     PRECISION_TERMINAL_SCHEMA_VERSION,
     PRECISION_TERMINAL_SOURCE,
@@ -102,6 +105,14 @@ def build(clock: Clock, *, mode: str = "radial20", execution: str = "AUTO"):
     m._rpp_terminal_certificate_last_rx_monotonic = None
     m._pause_reason = None
     m._resume_available = False
+    # Raw-GNSS spray gate: OFF here so these tests keep pinning the RPP-only
+    # contract; test_raw_gnss_spray_gate.py covers the gate-enabled path.
+    m.raw_gnss_spray_gate_enabled = False
+    m.raw_gnss_spray_gate_config = RawGnssSprayGateConfig()
+    m.raw_gnss_spray_evaluates_rpp_settled_miss = True
+    m._raw_gnss_gate_started = None
+    m._raw_gnss_gate_marking_number = None
+    m._raw_gnss_gate_decision = None
 
     m._run_auto_stop_if_pending = lambda: False
     m._publish_status = lambda force=False: None

@@ -265,6 +265,10 @@ def generate_launch_description() -> LaunchDescription:
                         ("marking_active_timeout_sec"): 0.50,
                         "require_px4_armed": True,
                         "require_px4_offboard": True,
+                        # Press only on mission_manager's raw-GNSS gate PASS
+                        # for this run/point, raw RTK radial <= 30 mm.
+                        "require_raw_gnss_spray_gate": True,
+                        "raw_gnss_max_radial_mm": 30.0,
                         "journal_path": (
                             "/home/flash/.ros/" "dyx_spray_controller_journal.json"
                         ),
@@ -320,6 +324,18 @@ def generate_launch_description() -> LaunchDescription:
                         "precision_terminal_enabled": False,
                         "precision_terminal_heartbeat_timeout_sec": 0.50,
                         "maximum_marking_points": 10000,
+                        # FINAL ACCURACY = RAW GNSS. RPP still stops the rover
+                        # and certifies its 20 mm estimator-frame stop; its
+                        # along/cross/overall are debug report only. Spray and
+                        # COMPLETED require raw RTK-FIXED GNSS radial error vs
+                        # the surveyed point <= 30 mm, else the point FAILS.
+                        "raw_gnss_spray_gate_enabled": True,
+                        "raw_gnss_spray_tolerance_m": 0.030,
+                        "raw_gnss_spray_window_sec": 1.0,
+                        "raw_gnss_spray_minimum_samples": 3,
+                        "raw_gnss_spray_max_scatter_m": 0.020,
+                        "raw_gnss_spray_timeout_sec": 3.0,
+                        "raw_gnss_spray_evaluates_rpp_settled_miss": True,
                     }
                 ],
             ),

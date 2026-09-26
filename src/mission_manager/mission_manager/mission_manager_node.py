@@ -67,6 +67,11 @@ from mission_manager.survey_truth import (
     SurveyTarget,
     compute_survey_truth,
 )
+from mission_manager.raw_gnss_spray_gate import (
+    RawGnssSprayGateConfig,
+    RawGnssSprayGateDecision,
+    evaluate_raw_gnss_spray_gate,
+)
 from mission_manager.precision_terminal_policy import (
     PrecisionTerminalDecision,
     PrecisionTerminalExpectation,
@@ -122,6 +127,8 @@ class MissionManager(Node):
     VALID_POINT_TYPES = {POINT_PASS_THROUGH, POINT_DUMMY_ALIGNMENT, POINT_MARKING}
     TERMINAL_POINT_STATES = {"COMPLETED", "SKIPPED", "FAILED"}
     TERMINAL_STOP_MODES = frozenset({"legacy", "precision_fsm", "radial20"})
+    # The one RPP MISSED reason that still proves a settled, zero-held stop.
+    RPP_SETTLED_MISS_REASON = "RADIAL20_SETTLED_OUTSIDE_TOLERANCE"
 
     def __init__(self) -> None:
         super().__init__("mission_manager")
@@ -160,6 +167,25 @@ class MissionManager(Node):
         # through without rejecting a genuine stop.
         self.declare_parameter("survey_truth_max_scatter_m", 0.060)
         self.declare_parameter("survey_truth_history_sec", 12.0)
+        # RAW-GNSS SPRAY GATE. When enabled, the ONLY accuracy that authorizes
+        # spray and a COMPLETED point is raw RTK-FIXED GNSS against the
+        # surveyed coordinate, radial <= raw_gnss_spray_tolerance_m. RPP still
+        # stops and certifies the rover exactly as before; its along/cross/
+        # overall numbers are debug report only. See raw_gnss_spray_gate.py.
+        self.declare_parameter("raw_gnss_spray_gate_enabled", True)
+        self.declare_parameter("raw_gnss_spray_tolerance_m", 0.030)
+        # Only fixes received after the stop are used: window, sample count
+        # and cluster scatter must all hold, every fix RTK FIXED.
+        self.declare_parameter("raw_gnss_spray_window_sec", 1.0)
+        self.declare_parameter("raw_gnss_spray_minimum_samples", 3)
+        self.declare_parameter("raw_gnss_spray_max_scatter_m", 0.020)
+        # No trustworthy measurement by this time after the stop -> FAILED.
+        self.declare_parameter("raw_gnss_spray_timeout_sec", 3.0)
+        # RPP MISSED because it SETTLED outside its own 20 mm estimator circle
+        # is a proven stationary stop; let raw GNSS decide that point too.
+        # Every other RPP MISSED reason (timeouts, stale telemetry, identity
+        # loss) has no settled stop and still fails the point directly.
+        self.declare_parameter("raw_gnss_spray_evaluates_rpp_settled_miss", True)
         self.declare_parameter("arrival_settle_sec", 0.30)
         self.declare_parameter("marking_hold_sec", 3.00)
         self.declare_parameter("stationary_speed_tolerance_mps", 0.01)
@@ -197,6 +223,26 @@ class MissionManager(Node):
         )
         self.survey_truth_history_sec = float(
             self.get_parameter("survey_truth_history_sec").value
+        )
+        self.raw_gnss_spray_gate_enabled = bool(
+            self.get_parameter("raw_gnss_spray_gate_enabled").value
+        )
+        # Validated here so a bad value fails the node at start, not mid-mission.
+        self.raw_gnss_spray_gate_config = RawGnssSprayGateConfig(
+            tolerance_m=float(
+                self.get_parameter("raw_gnss_spray_tolerance_m").value
+            ),
+            window_sec=float(self.get_parameter("raw_gnss_spray_window_sec").value),
+            minimum_samples=int(
+                self.get_parameter("raw_gnss_spray_minimum_samples").value
+            ),
+            max_scatter_m=float(
+                self.get_parameter("raw_gnss_spray_max_scatter_m").value
+            ),
+            timeout_sec=float(self.get_parameter("raw_gnss_spray_timeout_sec").value),
+        )
+        self.raw_gnss_spray_evaluates_rpp_settled_miss = bool(
+            self.get_parameter("raw_gnss_spray_evaluates_rpp_settled_miss").value
         )
         self.marking_tolerance_m = float(
             self.get_parameter("marking_tolerance_m").value
@@ -604,6 +650,13 @@ class MissionManager(Node):
         self._rpp_terminal_result_last_rx_monotonic: Optional[float] = None
         self._rpp_terminal_certificate: Optional[dict[str, Any]] = None
         self._rpp_terminal_certificate_last_rx_monotonic: Optional[float] = None
+
+        # Raw-GNSS spray gate for the current point. Started when the stop is
+        # declared, holds the one-shot verdict until the point resolves, and
+        # is always cleared via _reset_point_timers().
+        self._raw_gnss_gate_started: Optional[float] = None
+        self._raw_gnss_gate_marking_number: Optional[int] = None
+        self._raw_gnss_gate_decision: Optional[RawGnssSprayGateDecision] = None
 
         self._spray_controller_ready = False
         self._spray_controller_state: Optional[str] = None
@@ -1100,7 +1153,7 @@ class MissionManager(Node):
             self._gps_fix_type = int(message.fix_type)
             now = time.monotonic()
             self._last_gps_fix_rx_monotonic = now
-            if not self.survey_truth_enabled:
+            if not (self.survey_truth_enabled or self.raw_gnss_spray_gate_enabled):
                 return
             # GPSRAW carries position and quality in one atomic message, so a
             # sample can never be paired with a fix type from a different
@@ -1206,24 +1259,32 @@ class MissionManager(Node):
         old mission or the whole new one and never a torn list.
         """
 
+        # When the raw-GNSS spray gate has decided this point, the report
+        # carries the exact measurement that decided it, never a second one.
+        decision = self._raw_gnss_gate_decision
+        if (
+            decision is not None
+            and decision.final
+            and self._raw_gnss_gate_marking_number == marking_number
+        ):
+            payload = copy.deepcopy(decision.survey)
+            payload["spray_gate"] = decision.to_payload()
+            return payload
+
         if not self.survey_truth_enabled:
             return {
                 "measurement_source": "RAW_GNSS_SURVEY",
                 "available": False,
                 "reason": "SURVEY_TRUTH_DISABLED",
             }
-        target = None
-        previous = None
-        for candidate in self._survey_targets:
-            if candidate.point_index == marking_number:
-                target = candidate
-            elif candidate.point_index == marking_number - 1:
-                previous = candidate
-        if target is None and self._survey_targets_mode not in (None, "gps"):
+        target, previous, unavailable = self._survey_targets_for_point(
+            marking_number, require_current_mission=False
+        )
+        if unavailable is not None:
             return {
                 "measurement_source": "RAW_GNSS_SURVEY",
                 "available": False,
-                "reason": "MISSION_NOT_IN_GPS_COORDINATES",
+                "reason": unavailable,
             }
         truth = compute_survey_truth(
             target=target,
@@ -1234,16 +1295,115 @@ class MissionManager(Node):
             minimum_samples=self.survey_truth_minimum_samples,
             max_scatter_m=self.survey_truth_max_scatter_m,
             tolerance_m=self.marking_tolerance_m,
-            # _yaw is ENU (0 = east, CCW). survey_truth works in the NED
-            # sense (0 = north, CW), same convention as the surveyed bearing
-            # it falls back from, so convert rather than passing it raw.
-            fallback_bearing_rad=(
-                (math.pi / 2.0) - self._yaw
-                if isinstance(self._yaw, float) and math.isfinite(self._yaw)
-                else None
-            ),
+            fallback_bearing_rad=self._survey_fallback_bearing_rad(),
         )
         return truth.to_payload()
+
+    def _survey_fallback_bearing_rad(self) -> Optional[float]:
+        # _yaw is ENU (0 = east, CCW). survey_truth works in the NED
+        # sense (0 = north, CW), same convention as the surveyed bearing
+        # it falls back from, so convert rather than passing it raw.
+        if isinstance(self._yaw, float) and math.isfinite(self._yaw):
+            return (math.pi / 2.0) - self._yaw
+        return None
+
+    def _survey_targets_for_point(
+        self,
+        marking_number: int,
+        *,
+        require_current_mission: bool,
+    ) -> tuple[Optional[SurveyTarget], Optional[SurveyTarget], Optional[str]]:
+        """Return (target, previous_target, unavailable_reason).
+
+        With require_current_mission the targets must carry the same path
+        signature as the loaded mission, so a latched target set from another
+        mission can never authorize spray.
+        """
+
+        targets = self._survey_targets
+        if require_current_mission:
+            if self._survey_targets_mode != "gps":
+                return None, None, "MISSION_NOT_IN_GPS_COORDINATES"
+            if (
+                self._path_signature is None
+                or self._survey_targets_signature != self._path_signature
+            ):
+                return None, None, "SURVEY_TARGETS_NOT_FOR_CURRENT_MISSION"
+        target = None
+        previous = None
+        for candidate in targets:
+            if candidate.point_index == marking_number:
+                target = candidate
+            elif candidate.point_index == marking_number - 1:
+                previous = candidate
+        if target is None and self._survey_targets_mode not in (None, "gps"):
+            return None, None, "MISSION_NOT_IN_GPS_COORDINATES"
+        if target is None and require_current_mission:
+            return None, None, "NO_SURVEY_TARGET"
+        return target, previous, None
+
+    def _raw_gnss_spray_gate_step(
+        self, *, marking_number: int, now_monotonic_sec: float
+    ) -> RawGnssSprayGateDecision:
+        """Advance the one-shot raw-GNSS gate for the current stopped point.
+
+        The first call starts the collection window. A final verdict is
+        latched for the point and returned unchanged on every later call.
+        """
+
+        decision = self._raw_gnss_gate_decision
+        if (
+            decision is not None
+            and decision.final
+            and self._raw_gnss_gate_marking_number == marking_number
+        ):
+            return decision
+        if (
+            self._raw_gnss_gate_started is None
+            or self._raw_gnss_gate_marking_number != marking_number
+        ):
+            self._raw_gnss_gate_started = now_monotonic_sec
+            self._raw_gnss_gate_marking_number = marking_number
+            self._stamp_marking_timing("raw_gnss_gate_started", now_monotonic_sec)
+        target, previous, unavailable = self._survey_targets_for_point(
+            marking_number, require_current_mission=True
+        )
+        decision = evaluate_raw_gnss_spray_gate(
+            target=target,
+            previous_target=previous,
+            fixes=list(self._gnss_history),
+            stop_monotonic_sec=self._raw_gnss_gate_started,
+            now_monotonic_sec=now_monotonic_sec,
+            config=self.raw_gnss_spray_gate_config,
+            fallback_bearing_rad=self._survey_fallback_bearing_rad(),
+            unavailable_reason=unavailable,
+        )
+        self._raw_gnss_gate_decision = decision
+        if decision.final:
+            self._stamp_marking_timing("raw_gnss_gate_final", now_monotonic_sec)
+        return decision
+
+    def _raw_gnss_gate_status_payload(self) -> dict[str, Any]:
+        """Status view consumed by spray_controller as an independent check."""
+
+        payload: dict[str, Any] = {
+            "enabled": self.raw_gnss_spray_gate_enabled,
+            "tolerance_mm": self.raw_gnss_spray_gate_config.tolerance_m * 1000.0,
+            "mission_run_id": self._mission_run_id,
+            "point_id": None,
+            "status": "IDLE",
+            "pass": False,
+            "final": False,
+            "reason": None,
+            "radial_error_mm": None,
+        }
+        decision = self._raw_gnss_gate_decision
+        number = self._raw_gnss_gate_marking_number
+        if decision is not None and number is not None:
+            payload.update(decision.to_payload())
+            payload["point_id"] = f"P{number+1:04d}"
+            payload["tolerance_mm"] = decision.tolerance_m * 1000.0
+        return payload
 
     def _rtk_health_callback(self, message: Bool) -> None:
         with self._lock:
@@ -1432,6 +1592,7 @@ class MissionManager(Node):
         self._marking_hold_elapsed_sec = 0.0
         self._arrival_settle_started = None
         self._arrival_settle_elapsed_sec = 0.0
+        self._reset_raw_gnss_gate()
 
     def _precision_marking_pre_spray(
         self,
@@ -1460,9 +1621,23 @@ class MissionManager(Node):
         )
 
         if outcome == "MISSED" and self._precision_rpp_terminal_result_valid():
+            rpp_reason = str((rpp or {}).get("reason") or "RPP_MISSED")
+            if (
+                self.raw_gnss_spray_gate_enabled
+                and self.raw_gnss_spray_evaluates_rpp_settled_miss
+                and rpp_reason.upper() == self.RPP_SETTLED_MISS_REASON
+            ):
+                # RPP proved a settled stop but judged it on estimator-frame
+                # accuracy, which is debug only here. Raw GNSS decides.
+                return self._raw_gnss_gate_commit(
+                    marking_number=marking_number,
+                    point_id=point_id,
+                    now_monotonic_sec=now_monotonic_sec,
+                    rpp_captured=False,
+                )
             self._resolve_accuracy_failure(
                 marking_number=marking_number,
-                failure_reason=str((rpp or {}).get("reason") or "RPP_MISSED"),
+                failure_reason=rpp_reason,
             )
             return False
 
@@ -1533,6 +1708,14 @@ class MissionManager(Node):
             )
             return False
 
+        if self.raw_gnss_spray_gate_enabled:
+            return self._raw_gnss_gate_commit(
+                marking_number=marking_number,
+                point_id=point_id,
+                now_monotonic_sec=now_monotonic_sec,
+                rpp_captured=True,
+            )
+
         accuracy = self._capture_accuracy_snapshot(
             marking_number=marking_number,
             path_index=self._current_path_index,
@@ -1576,6 +1759,124 @@ class MissionManager(Node):
             self._publish_status(force=True)
             return False
         self._publish_marking_active(False)
+        return True
+
+    def _raw_gnss_gate_verdict(
+        self,
+        *,
+        marking_number: int,
+        point_id: str,
+        now_monotonic_sec: float,
+    ) -> Optional[RawGnssSprayGateDecision]:
+        """Shared raw-GNSS verdict handling for every marking path.
+
+        Returns the decision only on PASS. While WAITING it reports progress;
+        on FAIL it resolves the point FAILED with no spray. Either way the
+        cached accuracy snapshot is dropped so the next capture carries the
+        deciding raw measurement.
+        """
+
+        decision = self._raw_gnss_spray_gate_step(
+            marking_number=marking_number,
+            now_monotonic_sec=now_monotonic_sec,
+        )
+        self._publish_marking_active(False)
+        if not decision.final:
+            self._last_message = (
+                f"{point_id} stopped; raw GNSS accuracy check "
+                f"({decision.elapsed_sec:.2f}s): {decision.reason}; spray OFF"
+            )
+            return None
+
+        self._point_accuracy_snapshots[marking_number] = None
+        if decision.passed:
+            return decision
+
+        radial = decision.radial_error_mm
+        radial_text = f"{radial:.1f}mm" if radial is not None else "unavailable"
+        self._resolve_accuracy_failure(
+            marking_number=marking_number,
+            failure_reason=(
+                f"{decision.reason} (raw={radial_text}, "
+                f"limit={decision.tolerance_m * 1000.0:.0f}mm)"
+            ),
+            failure_source="RAW_GNSS",
+        )
+        return None
+
+    def _raw_gnss_gate_commit(
+        self,
+        *,
+        marking_number: int,
+        point_id: str,
+        now_monotonic_sec: float,
+        rpp_captured: bool,
+    ) -> bool:
+        """Spray/complete only when raw GNSS radial <= tolerance.
+
+        Called once RPP has stopped the rover (CAPTURED with a valid
+        certificate, or a settled MISSED). Returns true only when the spray
+        transaction has been committed and the caller may proceed.
+        """
+
+        decision = self._raw_gnss_gate_verdict(
+            marking_number=marking_number,
+            point_id=point_id,
+            now_monotonic_sec=now_monotonic_sec,
+        )
+        if decision is None:
+            return False
+        tolerance_mm = decision.tolerance_m * 1000.0
+
+        # Keep Phase A/B of the control loop from re-deciding this point.
+        if self._marking_hold_started is None:
+            self._marking_hold_started = now_monotonic_sec
+            self._arrival_settle_started = now_monotonic_sec
+
+        accuracy = self._capture_accuracy_snapshot(
+            marking_number=marking_number,
+            path_index=self._current_path_index,
+            outcome="ACHIEVED",
+            reason=None,
+        )
+        if rpp_captured and (
+            accuracy.get("available") is not True
+            or accuracy.get("precision_pass") is not True
+        ):
+            # Unchanged RPP contract: a CAPTURED stop must still carry its
+            # complete certified evidence. Drop the cached snapshot so the
+            # retry re-captures it with the next gate verdict.
+            self._point_accuracy_snapshots[marking_number] = None
+            self._reset_precision_marking_hold()
+            self._last_message = (
+                f"{point_id} precision evidence incomplete at hold completion"
+            )
+            return False
+
+        pending_spray = self._spray_outcome_snapshot(
+            attempted=self.spray_required,
+            outcome=("PENDING" if self.spray_required else "DISABLED"),
+        )
+        self._emit_point_event(
+            "ACCURACY_ACHIEVED",
+            marking_number,
+            self._current_path_index,
+            accuracy=accuracy,
+            spray=pending_spray,
+        )
+        self._stamp_marking_timing("accuracy_achieved", now_monotonic_sec)
+        self._spray_request_started = now_monotonic_sec
+        raw_text = f"raw={decision.radial_error_mm:.1f}mm<={tolerance_mm:.0f}mm"
+        if self.spray_required:
+            self._publish_marking_active(True)
+            self._stamp_marking_timing("marking_active_true", now_monotonic_sec)
+            self._last_message = (
+                f"{point_id} raw GNSS accuracy PASS ({raw_text}); "
+                "spray/mark triggered"
+            )
+            self._publish_status(force=True)
+            return False
+        self._last_message = f"{point_id} raw GNSS accuracy PASS ({raw_text})"
         return True
 
     # ==============================================================
@@ -3021,6 +3322,12 @@ class MissionManager(Node):
         self._marking_hold_elapsed_sec = 0.0
         self._spray_request_started = None
         self._auto_continue_until = None
+        self._reset_raw_gnss_gate()
+
+    def _reset_raw_gnss_gate(self) -> None:
+        self._raw_gnss_gate_started = None
+        self._raw_gnss_gate_marking_number = None
+        self._raw_gnss_gate_decision = None
 
     def _finish_marking_timing(self, point_id: str) -> None:
         """Freeze the completed point's transition stamps and log them once."""
@@ -3375,18 +3682,19 @@ class MissionManager(Node):
                 "speed_mps": None,
             }
 
-        # INDEPENDENT SECOND MEASUREMENT, report only.
+        # INDEPENDENT SECOND MEASUREMENT.
         #
         # Everything above this line is a verbatim copy of what RPP decided in
-        # the estimator frame -- that is the control truth and it still owns
-        # every gate: the 30 mm latch, spray, and the point verdict are
-        # unchanged by anything below.
+        # the estimator frame. RPP still owns the STOP; with
+        # raw_gnss_spray_gate_enabled its along/cross/overall numbers are
+        # controller debug data only.
         #
         # `survey` is a different question answered from a different sensor:
-        # raw GNSS against the surveyed coordinate the operator uploaded. It
-        # is attached under its own key so the two can never be confused, and
-        # it is allowed to be unavailable (degraded fix, rover still moving,
-        # local-coordinate mission) without affecting the snapshot.
+        # raw GNSS against the surveyed coordinate the operator uploaded. With
+        # the raw-GNSS spray gate enabled, it is the exact measurement that
+        # decided spray and COMPLETED/FAILED (see `survey.spray_gate`). With
+        # the gate disabled it stays report only and may be unavailable
+        # without affecting anything.
         snapshot["survey"] = self._survey_truth_for_point(marking_number)
 
         if 0 <= marking_number < len(self._point_accuracy_snapshots):
@@ -3861,6 +4169,9 @@ class MissionManager(Node):
                 spray_key in self._spray_success_keys if spray_key else False
             ),
             "marking_active": self._spray_request_started is not None,
+            # The only accuracy that authorizes spray/COMPLETED when enabled.
+            # spray_controller re-checks it independently before pressing.
+            "raw_gnss_spray_gate": self._raw_gnss_gate_status_payload(),
             "arrival_settle_elapsed_sec": round(self._arrival_settle_elapsed_sec, 3),
             "arrival_settle_required_sec": self.arrival_settle_sec,
             "marking_hold_elapsed_sec": round(self._marking_hold_elapsed_sec, 3),
@@ -3972,10 +4283,18 @@ class MissionManager(Node):
         *,
         marking_number: int,
         failure_reason: str,
+        failure_source: str = "RPP_MISSED",
     ) -> None:
-        """Record RPP MISSED as FAILED with no spray."""
+        """Record a point as FAILED with no spray.
+
+        failure_source is RPP_MISSED (no settled stop) or RAW_GNSS (the
+        raw-GNSS spray gate rejected or could not measure the stop).
+        """
 
         point_id = f"P{marking_number+1:04d}"
+        source_text = (
+            "RPP MISSED" if failure_source == "RPP_MISSED" else "raw GNSS accuracy"
+        )
 
         accuracy = self._capture_accuracy_snapshot(
             marking_number=marking_number,
@@ -3986,11 +4305,11 @@ class MissionManager(Node):
 
         spray = self._spray_outcome_snapshot(
             attempted=False,
-            outcome="NOT_ATTEMPTED_RPP_MISSED",
+            outcome=f"NOT_ATTEMPTED_{failure_source}",
             reason=failure_reason,
         )
 
-        # Absolute guarantee: RPP MISSED never authorizes spray.
+        # Absolute guarantee: a failed point never authorizes spray.
         self._publish_marking_active(False)
         self._spray_request_started = None
 
@@ -4012,8 +4331,8 @@ class MissionManager(Node):
         )
 
         self._last_message = (
-            f"{point_id} FAILED from RPP MISSED "
-            f"(overall={overall_text}); {failure_reason}"
+            f"{point_id} FAILED from {source_text} "
+            f"(rpp_overall={overall_text}); {failure_reason}"
         )
 
         self._emit_point_event(
@@ -4046,8 +4365,8 @@ class MissionManager(Node):
             self._disable_motion_preserve_estop()
 
             self._last_message = (
-                f"{point_id} FAILED from RPP MISSED "
-                f"(overall={overall_text}); waiting for NEXT"
+                f"{point_id} FAILED from {source_text} "
+                f"(rpp_overall={overall_text}); waiting for NEXT"
             )
 
         else:
@@ -4060,8 +4379,8 @@ class MissionManager(Node):
             )
 
             self._last_message = (
-                f"{point_id} FAILED from RPP MISSED "
-                f"(overall={overall_text}); continuing automatically in "
+                f"{point_id} FAILED from {source_text} "
+                f"(rpp_overall={overall_text}); continuing automatically in "
                 f"{self.AUTO_CONTINUE_DELAY_SEC:.1f}s"
             )
 
@@ -4431,7 +4750,30 @@ class MissionManager(Node):
                     )
                     return
 
-                # Hold complete. RPP CAPTURED authorizes spray.
+                # Hold complete. RPP CAPTURED stopped the rover; with the
+                # raw-GNSS gate enabled only raw GNSS may authorize spray.
+                if self.raw_gnss_spray_gate_enabled:
+                    if self._raw_gnss_gate_verdict(
+                        marking_number=marking_number,
+                        point_id=point_id,
+                        now_monotonic_sec=now,
+                    ) is None:
+                        return
+                    # Re-capture so the report carries the deciding raw
+                    # measurement. Legacy RPP carries no precision_pass, so
+                    # only completeness is required, as in the hold above.
+                    accuracy = self._capture_accuracy_snapshot(
+                        marking_number=marking_number,
+                        path_index=self._current_path_index,
+                        outcome="ACHIEVED",
+                        reason=None,
+                    )
+                    if accuracy.get("available") is not True:
+                        self._enter_error(
+                            f"{point_id} lost RPP terminal accuracy before spray"
+                        )
+                        return
+
                 pending_spray = self._spray_outcome_snapshot(
                     attempted=self.spray_required,
                     outcome=("PENDING" if self.spray_required else "DISABLED"),

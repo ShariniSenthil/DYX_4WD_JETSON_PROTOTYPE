@@ -18,6 +18,12 @@ is inside tolerance and the rover is stationary. This node independently
 re-validates mission state, point identity, PX4 state, safety topics and topic
 freshness before moving the spray servo.
 
+Accuracy contract: with require_raw_gnss_spray_gate (production default) the
+servo is pressed only when mission_manager's raw-GNSS spray gate reports PASS
+for this exact run/point with a raw RTK-FIXED radial error <=
+raw_gnss_max_radial_mm (30 mm). RPP's estimator-frame numbers never authorize
+spray.
+
 Safety properties
 -----------------
 * Non-blocking state machine (no sleep in callbacks/timers).
@@ -97,6 +103,9 @@ class SprayController(Node):
 
         self.declare_parameter("require_px4_armed", True)
         self.declare_parameter("require_px4_offboard", True)
+        # Independent re-check of mission_manager's raw-GNSS spray gate.
+        self.declare_parameter("require_raw_gnss_spray_gate", True)
+        self.declare_parameter("raw_gnss_max_radial_mm", 30.0)
 
         self.declare_parameter(
             "journal_path",
@@ -134,6 +143,12 @@ class SprayController(Node):
         self.require_px4_armed = bool(self.get_parameter("require_px4_armed").value)
         self.require_px4_offboard = bool(
             self.get_parameter("require_px4_offboard").value
+        )
+        self.require_raw_gnss_spray_gate = bool(
+            self.get_parameter("require_raw_gnss_spray_gate").value
+        )
+        self.raw_gnss_max_radial_mm = float(
+            self.get_parameter("raw_gnss_max_radial_mm").value
         )
 
         self.journal_path = Path(
@@ -274,6 +289,7 @@ class SprayController(Node):
         self.current_point_index: Optional[int] = None
         self.current_point_state: Optional[str] = None
         self.status_marking_active = False
+        self.raw_gnss_spray_gate: Optional[dict[str, Any]] = None
 
         self.last_marking_active_rx: Optional[float] = None
         self.last_mission_status_rx: Optional[float] = None
@@ -390,6 +406,7 @@ class SprayController(Node):
             "mavros_state_timeout_sec": self.mavros_state_timeout_sec,
             "mission_status_timeout_sec": self.mission_status_timeout_sec,
             "marking_active_timeout_sec": self.marking_active_timeout_sec,
+            "raw_gnss_max_radial_mm": self.raw_gnss_max_radial_mm,
         }
 
         for name, value in positive.items():
@@ -584,6 +601,15 @@ class SprayController(Node):
 
         self.status_marking_active = bool(payload.get("marking_active", False))
 
+        raw_gate = payload.get("raw_gnss_spray_gate")
+        self.raw_gnss_spray_gate = raw_gate if isinstance(raw_gate, dict) else None
+        if (
+            self.require_raw_gnss_spray_gate
+            and self.state in {self.STATE_WAIT_PRESS_ACK, self.STATE_SPRAYING}
+            and not self._raw_gnss_gate_ok()
+        ):
+            self._abort_to_release("RAW_GNSS_SPRAY_GATE_LOST_DURING_SPRAY")
+
     def _mavros_state_callback(self, msg: State) -> None:
         self.last_mavros_state_rx = time.monotonic()
 
@@ -742,8 +768,51 @@ class SprayController(Node):
         if not self._px4_gate_ok(now):
             return False
 
+        if not self._raw_gnss_gate_ok():
+            return False
+
         if not self.command_client.service_is_ready():
             return False
+
+        return True
+
+    def _raw_gnss_gate_ok(self) -> bool:
+        """Raw RTK-FIXED GNSS radial error <= raw_gnss_max_radial_mm, re-checked.
+
+        Bound to the current run and point so a PASS for another point can
+        never press the servo, and re-compared against this node's own limit
+        so a loosened mission_manager tolerance cannot widen it.
+        """
+        if not self.require_raw_gnss_spray_gate:
+            return True
+
+        gate = self.raw_gnss_spray_gate
+        if not isinstance(gate, dict):
+            return False
+
+        if gate.get("enabled") is not True:
+            return False
+
+        if gate.get("pass") is not True or gate.get("status") != "PASS":
+            return False
+
+        if gate.get("measurement_source") != "RAW_GNSS_SURVEY":
+            return False
+
+        if not self.mission_run_id or gate.get("mission_run_id") != self.mission_run_id:
+            return False
+
+        if not self.current_point_id or gate.get("point_id") != self.current_point_id:
+            return False
+
+        for key in ("radial_error_mm", "tolerance_mm"):
+            value = gate.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return False
+            if not math.isfinite(value) or value < 0.0:
+                return False
+            if value > self.raw_gnss_max_radial_mm:
+                return False
 
         return True
 
@@ -930,6 +999,9 @@ class SprayController(Node):
             "emergency_stop": self.emergency_stop,
             "marking_active": self.marking_active,
             "status_marking_active": self.status_marking_active,
+            "require_raw_gnss_spray_gate": self.require_raw_gnss_spray_gate,
+            "raw_gnss_max_radial_mm": self.raw_gnss_max_radial_mm,
+            "raw_gnss_spray_gate_ok": self._raw_gnss_gate_ok(),
             "mavros_state_age_sec": (
                 None
                 if self.last_mavros_state_rx is None
