@@ -673,6 +673,16 @@ def generate_launch_description() -> LaunchDescription:
                         # At 0.8/1.0m/s the controller automatically looks
                         # farther ahead instead of becoming more aggressive in time.
                         "steering_reference_speed_mps": 0.60,
+                        # 2026-09-26: steer the turning point, not the nozzle.
+                        # Fitted from 26_09 stage_1 at cruise: the antenna /
+                        # nozzle sits 0.54 m behind the no-sideslip point
+                        # (r = -0.74); pivots measured 0.39-0.49 m on 25_09.
+                        # Turning toward the line swung the nozzle away from
+                        # it (75 mm in 0.6 s on run 115438), which produced
+                        # the start-up swing and the 58-170 mm post-pivot
+                        # overshoot. Sim, 517 mm start: 93 -> 9 mm overshoot.
+                        # 0.0 restores nozzle steering.
+                        "steering_control_point_ahead_m": 0.50,
                         "line_tracking_lookahead_m": 0.55,
                         "line_tracking_lookahead_min_m": 0.35,
                         "line_tracking_lookahead_max_m": 0.90,

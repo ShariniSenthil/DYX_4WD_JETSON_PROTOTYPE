@@ -496,6 +496,13 @@ class RPPController(Node):
         # with actual command speed instead of being re-normalized to whatever
         # cruise speed is selected, so 0.8/1.0 m/s look farther ahead in time.
         self.declare_parameter("steering_reference_speed_mps", 0.60)
+        # 2026-09-26: steer the turning point, not the nozzle. The nozzle
+        # (GNSS antenna, pose origin) sits this far BEHIND the point the rover
+        # turns about, so turning toward the line first swings the nozzle away
+        # from it. line_guidance() steers a point this far ahead along the
+        # heading; telemetry, gates and the stop still use the nozzle.
+        # 0.0 = steer the nozzle (previous behaviour).
+        self.declare_parameter("steering_control_point_ahead_m", 0.0)
         self.declare_parameter(
             "line_tracking_lookahead_m",
             0.55,
@@ -1215,6 +1222,9 @@ class RPPController(Node):
         )
         self.steering_reference_speed = float(
             self.get_parameter("steering_reference_speed_mps").value
+        )
+        self.steering_control_point_ahead = float(
+            self.get_parameter("steering_control_point_ahead_m").value
         )
         self.line_tracking_lookahead = float(
             self.get_parameter("line_tracking_lookahead_m").value
@@ -3562,6 +3572,13 @@ class RPPController(Node):
         ):
             raise ValueError(
                 "steering_reference_speed_mps must be finite and in (0, 1.0]"
+            )
+        if not (
+            math.isfinite(self.steering_control_point_ahead)
+            and 0.0 <= self.steering_control_point_ahead <= 1.0
+        ):
+            raise ValueError(
+                "steering_control_point_ahead_m must be finite and in [0, 1.0]"
             )
         if not (
             math.isfinite(self.moving_alignment_min_speed)
@@ -9603,28 +9620,46 @@ class RPPController(Node):
             -math.sin(line_bearing) * delta_east + math.cos(line_bearing) * delta_north
         )
 
+        # Steer the turning point, not the nozzle. The nozzle sits
+        # steering_control_point_ahead_m behind it, so its lateral velocity is
+        # v*sin(heading error) - d*yaw_rate: turning toward the line first
+        # swings the nozzle away. Steering the nozzle with a lookahead shorter
+        # than d (0.35 m minimum at start-up) is locally unstable, and at
+        # cruise it leaves the loop underdamped (26_09 stage_1: 58-170 mm
+        # overshoot after every pivot). The turning point has no such term.
+        # The nozzle lands on the line once the heading matches the line.
+        # Only steering uses this; signed_cross_track stays the nozzle's.
+        control_point_ahead = getattr(self, "steering_control_point_ahead", 0.0)
+        steering_signed_cross_track = signed_cross_track + (
+            control_point_ahead
+            * math.sin(self.normalize_angle(self.current_yaw - line_bearing))
+        )
+
         # Keep the measured cross-track untouched for telemetry/mission gates,
         # but remove the +/-5 mm noise corridor from steering authority.
         # Subtracting the corridor outside the band makes the correction
         # continuous at the boundary (no steering step at 5 mm).
         cross_track_excess = max(
             0.0,
-            abs(signed_cross_track) - self.line_tracking_xtrack_deadband,
+            abs(steering_signed_cross_track) - self.line_tracking_xtrack_deadband,
         )
         steering_cross_track = math.copysign(
             cross_track_excess,
-            signed_cross_track,
+            steering_signed_cross_track,
         )
 
         lookahead = (
             self.line_tracking_lookahead_speed_gain * abs(self.command_slew_speed)
-            + self.line_tracking_lookahead_xtrack_gain * abs(signed_cross_track)
+            + self.line_tracking_lookahead_xtrack_gain
+            * abs(steering_signed_cross_track)
         )
         lookahead = max(
             self.line_tracking_lookahead_min,
             min(self.line_tracking_lookahead_max, lookahead),
         )
-        lookahead = self._recovery_lookahead(lookahead, abs(signed_cross_track))
+        lookahead = self._recovery_lookahead(
+            lookahead, abs(steering_signed_cross_track)
+        )
 
         correction = -math.atan2(
             steering_cross_track,
