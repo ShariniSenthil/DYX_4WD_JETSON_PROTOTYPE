@@ -49,6 +49,12 @@ from mission_manager_interfaces.srv import ReleaseEmergencyStop
 from std_srvs.srv import Trigger
 
 from mission_manager.marking_arrival_policy import after_fail_mode_action
+from mission_manager.rtk_runtime_policy import (
+    FloatPauseAction,
+    RtkRunningAction,
+    RtkRuntimeConfig,
+    RtkRuntimePolicy,
+)
 from mission_manager.path_contract import (
     PendingPreparedPath,
     build_segment_goal_metadata,
@@ -92,6 +98,10 @@ class MissionManager(Node):
 
     FCU_STATE_STALE_SEC = 3.0
     GPS_FIX_STALE_SEC = 10.0
+    # RTK FLOAT auto-pause: FIXED must hold this long before auto-resume, and a
+    # FLOAT pause not auto-resumed within the second value needs manual Resume.
+    RTK_FLOAT_FIXED_HOLD_SEC = 3.0
+    RTK_FLOAT_MANUAL_AFTER_SEC = 120.0
     RTK_STATUS_STALE_SEC = 15.0
     MAX_RTK_CORRECTION_AGE_SEC = 20.0
     OFFBOARD_STREAM_SETTLE_SEC = 0.60
@@ -639,9 +649,17 @@ class MissionManager(Node):
         self._rtk_correction_age_sec: Optional[float] = None
         self._last_rtk_age_rx_monotonic: Optional[float] = None
 
-        # Fresh RTK FLOAT is warning-only once a mission is already RUNNING.
-        # This latch prevents repeated warning events at the control-loop rate.
+        # Runtime RTK policy (operator-approved 2026-09-26): FLOAT stops the
+        # rover and auto-resumes after FIXED holds 3 s; anything below FLOAT,
+        # stale GPS status, or FLOAT lasting 120 s needs a manual Resume.
         self._rtk_float_warning_active = False
+        self._rtk_policy = RtkRuntimePolicy(
+            RtkRuntimeConfig(
+                fixed_hold_sec=self.RTK_FLOAT_FIXED_HOLD_SEC,
+                float_manual_after_sec=self.RTK_FLOAT_MANUAL_AFTER_SEC,
+                gps_stale_sec=self.GPS_FIX_STALE_SEC,
+            )
+        )
 
         self._backend_heartbeat_healthy = False
 
@@ -1721,65 +1739,171 @@ class MissionManager(Node):
         )
 
     def _monitor_runtime_rtk(self) -> None:
-        """Keep fresh RTK FLOAT warning-only while a mission is RUNNING.
+        """Runtime RTK policy while RUNNING (operator-approved 2026-09-26).
 
-        Runtime policy:
-          * fresh fix_type=6: continue normally;
-          * fresh fix_type=5 (RTK FLOAT): continue motion and notify once;
-          * stale GPSRAW or fix_type < 5: preserve the existing pause behavior.
+          * fresh fix_type 6 (FIXED): continue;
+          * fresh fix_type 5 (FLOAT): stop at once and pause as RTK_FLOAT,
+            which auto-resumes once FIXED holds RTK_FLOAT_FIXED_HOLD_SEC
+            (_monitor_rtk_float_pause); if a spray press is already in
+            progress it finishes first and the pause follows;
+          * DGPS / 3D / 2D / no fix, or GPSRAW stale: stop and pause as
+            RTK_LOST, which needs a manual Resume.
 
-        START/RESUME/NEXT still use _rtk_motion_ok(), so they continue to
-        require a fresh RTK FIXED solution before granting motion authority.
-        Correction-age/health remain monitor-only.
+        START/RESUME/NEXT still use _rtk_motion_ok(), so they require a fresh
+        RTK FIXED solution before granting motion authority. Correction-age
+        and correction-health remain monitor-only.
         """
         if self._state != "RUNNING":
             self._rtk_float_warning_active = False
             return
 
-        gps_age = self._age(self._last_gps_fix_rx_monotonic)
+        was_deferring = self._rtk_policy.spray_deferral_active
+        action = self._rtk_policy.running(
+            time.monotonic(),
+            int(self._gps_fix_type),
+            self._age(self._last_gps_fix_rx_monotonic),
+            self._spray_request_started is not None,
+        )
 
-        # Fresh RTK FLOAT is degraded accuracy, not a runtime stop condition.
-        if gps_age <= self.GPS_FIX_STALE_SEC and self._gps_fix_type == 5:
-            if not self._rtk_float_warning_active:
-                self._rtk_float_warning_active = True
+        if action is RtkRunningAction.CONTINUE:
+            return
+
+        if action is RtkRunningAction.DEFER_FLOAT_UNTIL_SPRAY_DONE:
+            if not was_deferring:
                 self._last_message = (
-                    "RTK FLOAT (fix_type=5); mission continuing - "
-                    "position accuracy degraded"
+                    "RTK FLOAT (fix_type=5) during spray; finishing this press, "
+                    "then pausing"
                 )
-                self._emit_system_event(
-                    "RTK_FLOAT",
-                    self._last_message,
-                )
+                self.get_logger().warn(self._last_message)
                 self._publish_status(force=True)
             return
 
-        # One recovery event when FLOAT returns to a fresh FIXED solution.
-        if gps_age <= self.GPS_FIX_STALE_SEC and self._gps_fix_type == 6:
-            if self._rtk_float_warning_active:
-                self._rtk_float_warning_active = False
-                self._last_message = (
-                    "RTK FIXED recovered; mission continuing normally"
-                )
-                self._emit_system_event(
-                    "RTK_RECOVERED",
-                    self._last_message,
-                )
-                self._publish_status(force=True)
-            return
-
-        # Severe GNSS loss keeps the existing fail-safe pause behavior.
-        self._rtk_float_warning_active = False
-        ok, reason = self._rtk_motion_ok()
-
-        if not ok:
-            self._pause_reason = "RTK_LOST"
+        if action is RtkRunningAction.PAUSE_FLOAT:
+            self._pause_reason = "RTK_FLOAT"
             self._resume_available = False
             self._state = "PAUSED"
+            self._rtk_float_warning_active = True
             self._reset_arrival_state()
             self._disable_motion_preserve_estop()
-            self._last_message = f"{reason}; rover stopped and mission paused"
-            self._emit_system_event("RTK_PAUSED", reason)
+            self._last_message = (
+                "RTK FLOAT (fix_type=5); rover stopped. Mission will auto-resume "
+                f"after RTK FIXED holds {self.RTK_FLOAT_FIXED_HOLD_SEC:.0f} s"
+            )
+            self._emit_system_event("RTK_FLOAT", self._last_message)
             self._publish_status(force=True)
+            return
+
+        # PAUSE_LOST: severe GNSS loss keeps the manual-resume pause.
+        self._rtk_float_warning_active = False
+        _ok, reason = self._rtk_motion_ok()
+        self._pause_reason = "RTK_LOST"
+        self._resume_available = False
+        self._state = "PAUSED"
+        self._reset_arrival_state()
+        self._disable_motion_preserve_estop()
+        self._last_message = f"{reason}; rover stopped and mission paused"
+        self._emit_system_event("RTK_PAUSED", reason)
+        self._publish_status(force=True)
+
+    def _monitor_rtk_float_pause(self) -> None:
+        """Hold, auto-resume or escalate a PAUSED/RTK_FLOAT mission."""
+        now = time.monotonic()
+        action = self._rtk_policy.float_paused(
+            now,
+            int(self._gps_fix_type),
+            self._age(self._last_gps_fix_rx_monotonic),
+        )
+        if action is FloatPauseAction.HOLD:
+            held = self._rtk_policy.fixed_held_sec(now)
+            if held > 0.0:
+                self._last_message = (
+                    f"RTK FIXED for {held:.1f}/"
+                    f"{self.RTK_FLOAT_FIXED_HOLD_SEC:.0f} s; auto-resume pending"
+                )
+            return
+
+        if action is FloatPauseAction.AUTO_RESUME:
+            self._auto_resume_after_rtk_float()
+            return
+
+        if action is FloatPauseAction.ESCALATE_LOST:
+            _ok, reason = self._rtk_motion_ok()
+            self._escalate_rtk_float_to_manual(
+                "RTK_LOST",
+                f"{reason} while paused for RTK FLOAT; manual Resume required",
+            )
+            return
+
+        self._escalate_rtk_float_to_manual(
+            "RTK_FLOAT_TIMEOUT",
+            f"RTK FLOAT for {self.RTK_FLOAT_MANUAL_AFTER_SEC:.0f} s without "
+            f"{self.RTK_FLOAT_FIXED_HOLD_SEC:.0f} s of FIXED; manual Resume required",
+        )
+
+    def _escalate_rtk_float_to_manual(self, pause_reason: str, message: str) -> None:
+        self._rtk_float_warning_active = False
+        self._rtk_policy.reset()
+        self._pause_reason = pause_reason
+        self._resume_available = False
+        self._last_message = message
+        self._emit_system_event("RTK_PAUSED", message)
+        self.get_logger().warn(message)
+        self._publish_status(force=True)
+
+    def _auto_resume_after_rtk_float(self) -> None:
+        """Resume an RTK_FLOAT pause after FIXED held; never touches PX4 mode.
+
+        Same final gate as _resume_service: E-stop released, PX4 still
+        connected + armed + OFFBOARD on fresh state, and _motion_health_status
+        (prepared mission + fresh FIXED). Anything else becomes a manual pause.
+        """
+        if self._emergency_stop:
+            self._escalate_rtk_float_to_manual(
+                "ESTOP",
+                "RTK FIXED recovered but emergency stop is active; "
+                "manual Resume required",
+            )
+            return
+        if not self._px4_offboard_armed_fresh_locked():
+            self._escalate_rtk_float_to_manual(
+                "RTK_FLOAT_MANUAL",
+                "RTK FIXED recovered but PX4 is not armed in OFFBOARD "
+                f"(mode={self._px4_mode}, armed={self._px4_armed}); "
+                "manual Resume required",
+            )
+            return
+        ok, reason = self._motion_health_status(
+            require_ready_state=False,
+            require_estop_released=True,
+        )
+        if not ok:
+            self._escalate_rtk_float_to_manual(
+                "RTK_FLOAT_MANUAL",
+                f"RTK FIXED recovered but motion is not healthy: {reason}; "
+                "manual Resume required",
+            )
+            return
+
+        held = self._rtk_policy.fixed_held_sec(time.monotonic())
+        self._rtk_policy.reset()
+        self._rtk_float_warning_active = False
+        self._pause_reason = None
+        self._resume_available = False
+        self._state = "RUNNING"
+        self._last_error = None
+        self._reset_arrival_state()
+        self._publish_goal()
+        self._enable_motion()
+        # A FLOAT->FIXED re-fix can move the reported position 100-500 mm
+        # with no change in eph/sats/DOP; later points are marked against
+        # the new fix.
+        self._last_message = (
+            f"RTK FIXED held {held:.1f} s; mission auto-resumed "
+            "(RTK re-fix: position may have shifted)"
+        )
+        self._emit_system_event("RTK_RECOVERED", self._last_message)
+        self.get_logger().warn(self._last_message)
+        self._publish_status(force=True)
 
     def _px4_offboard_armed_fresh_locked(self) -> bool:
         """True when fresh MAVROS state shows connected + OFFBOARD + armed.
@@ -1872,8 +1996,16 @@ class MissionManager(Node):
         )
 
     def _monitor_pause_recovery(self) -> None:
-        """Advertise Resume when the condition that caused the pause recovers."""
+        """Advertise Resume when the condition that caused the pause recovers.
+
+        An RTK_FLOAT pause is never advertised for manual Resume here: it
+        auto-resumes or escalates in _monitor_rtk_float_pause().
+        """
         if self._state != "PAUSED":
+            return
+
+        if self._pause_reason == "RTK_FLOAT":
+            self._monitor_rtk_float_pause()
             return
 
         if self._pause_reason == "ESTOP" and self._emergency_stop:
@@ -3678,6 +3810,20 @@ class MissionManager(Node):
                 and self._rtk_correction_age_sec > self.MAX_RTK_CORRECTION_AGE_SEC
             ),
             "rtk_gate_mode": "FRESH_FIX_TYPE_6_ONLY",
+            "rtk_runtime_policy": "FLOAT_PAUSE_AUTO_RESUME",
+            "rtk_auto_resume_pending": (
+                self._state == "PAUSED" and self._pause_reason == "RTK_FLOAT"
+            ),
+            "rtk_fixed_hold_sec": round(
+                self._rtk_policy.fixed_held_sec(time.monotonic()), 2
+            ),
+            "rtk_fixed_hold_required_sec": self.RTK_FLOAT_FIXED_HOLD_SEC,
+            "rtk_float_paused_sec": (
+                round(self._rtk_policy.float_paused_sec(time.monotonic()), 1)
+                if self._state == "PAUSED" and self._pause_reason == "RTK_FLOAT"
+                else 0.0
+            ),
+            "rtk_float_manual_after_sec": self.RTK_FLOAT_MANUAL_AFTER_SEC,
             # Survey-truth reporting health. The panel keeps showing RPP's
             # live view; these say whether the REPORT will be able to carry a
             # physical measurement for the points completed so far.

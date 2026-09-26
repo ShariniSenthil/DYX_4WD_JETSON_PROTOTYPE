@@ -285,6 +285,18 @@ achieves a real stop.
   `_rtk_motion_ok()`** (fresh `fix_type == 6` at START/RESUME/NEXT), pinned by
   `src/mission_manager/test/test_rtk_motion_gate_contract.py`. A trajectory
   can be READY while RTK is FLOAT; that must not be read as "safe to move".
+- **Runtime RTK policy while RUNNING (operator-approved 2026-09-26, not yet
+  field-tested)** — `mission_manager/rtk_runtime_policy.py`, wired in
+  `_monitor_runtime_rtk()` / `_monitor_rtk_float_pause()`. Before this, FLOAT
+  was warning-only and the rover kept driving **and marking** on a FLOAT
+  position. Now: fresh FLOAT (fix_type 5) → stop at once, pause reason
+  `RTK_FLOAT`, **auto-resume** after FIXED holds 3 s continuously (never
+  changes PX4 mode or arms; requires PX4 still OFFBOARD+armed, E-stop released,
+  motion health OK, else manual). DGPS/3D/2D/no fix or GPSRAW stale 10 s →
+  `RTK_LOST`, **manual** Resume (also if it happens during a FLOAT pause).
+  FLOAT pause not auto-resumed within 120 s → `RTK_FLOAT_TIMEOUT`, manual. A
+  spray press already in progress finishes before the FLOAT pause. The
+  tablet only knows `RTK_LOST`, so a FLOAT pause shows "RESUME BLOCKED".
 
 ## Live-captured params (2026-08-31 evening, matches HEAD `7ac712b`)
 
