@@ -15,6 +15,9 @@ worker. Operators must use the authenticated /api/rtk control surface rather
 than launching an NTRIP/RTCM ROS node directly.
 """
 
+import math
+import os
+
 from launch import LaunchDescription
 
 from launch.actions import ExecuteProcess
@@ -73,8 +76,38 @@ FCU_DEVICE_PATH = "/dev/serial/by-id/usb-Auterion_PX4_FMU_v6X.x_0-if00"
 # 2026-09-25: a 0.60 m/s test (1a58c57, stage_11_cruise06) showed the
 # nozzle-referenced line steering is under-damped (swing grows as speed and
 # lookahead drop); restored to 1.00 m/s.
-CRUISE_SPEED_MPS = 1.00
+#
+# Production cruise/profile contract:
+# - cruise is selected only at process start, never changed live in RUNNING;
+# - supported field-test range is 0.60..1.00 m/s;
+# - acceleration and semantic-goal deceleration both use fixed 0.800 m
+#   geometry regardless of selected cruise.
+CRUISE_SPEED_MIN_MPS = 0.60
+CRUISE_SPEED_MAX_MPS = 1.00
+LONGITUDINAL_PROFILE_DISTANCE_M = 0.80
 TERMINAL_FLOOR_SPEED_MPS = 0.15
+
+
+def _selected_cruise_speed_mps() -> float:
+    """Read one restart-only cruise speed and fail closed on bad input."""
+    raw = os.environ.get("DYX_CRUISE_SPEED_MPS", "1.00").strip()
+    try:
+        selected = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "DYX_CRUISE_SPEED_MPS must be a finite number in [0.60, 1.00]"
+        ) from exc
+    if not (
+        math.isfinite(selected)
+        and CRUISE_SPEED_MIN_MPS <= selected <= CRUISE_SPEED_MAX_MPS
+    ):
+        raise RuntimeError(
+            "DYX_CRUISE_SPEED_MPS must be finite and in [0.60, 1.00]"
+        )
+    return selected
+
+
+CRUISE_SPEED_MPS = _selected_cruise_speed_mps()
 
 # Single source of truth for which terminal-stop authority is active.
 # rpp_controller and mission_manager each independently declare and validate
@@ -398,7 +431,7 @@ def generate_launch_description() -> LaunchDescription:
                         # the old 0.50m setting -- already past the 0.5m
                         # theoretical target, so expect roughly ~1.05-1.15m /
                         # ~2.5-2.7s to reach cruise at this new 1.00m setting.
-                        "acceleration_distance_m": 1.00,  # 2026-09-23: operator; 0.5 m/s^2 at 1.0 m/s cruise
+                        "acceleration_distance_m": LONGITUDINAL_PROFILE_DISTANCE_M,
                         # Bootstrap ceiling exists only to prevent drivetrain
                         # deadlock; the profile itself starts from literal zero.
                         #
@@ -466,10 +499,10 @@ def generate_launch_description() -> LaunchDescription:
                         # Before: 1.0 m/s held to ~0.63 m, then radial20
                         # sqrt(2*0.75*d) braked at ~0.9 m/s^2 for ~1 s
                         # (26_09 stage_2/3, 19 stops). Speed only.
-                        "approach_slowdown_enabled": True,
+                        "approach_slowdown_enabled": False,
                         "approach_slowdown_distance_m": 1.00,
                         "approach_min_speed_mps": 0.10,
-                        "deceleration_distance_m": 1.00,  # 2026-09-23: operator; 0.5 m/s^2 at 1.0 m/s cruise
+                        "deceleration_distance_m": LONGITUDINAL_PROFILE_DISTANCE_M,
                         "deceleration_floor_speed_mps": TERMINAL_FLOOR_SPEED_MPS,
                         "deceleration_max_progress_jump_m": 0.10,
                         "deceleration_max_dt_sec": 0.10,
@@ -803,7 +836,9 @@ def generate_launch_description() -> LaunchDescription:
                         "precision_tracking_histogram_bin_width_m": 0.001,
                         "precision_tracking_histogram_max_m": 1.0,
                         "precision_tracking_monotonic_tolerance_m": 0.001,
-                        "precision_tracking_cruise_threshold_mps": 0.80,
+                        "precision_tracking_cruise_threshold_mps": min(
+                            0.80, CRUISE_SPEED_MPS
+                        ),
                         # September 11 radial20 stop: brake toward the goal,
                         # then latch zero inside the 20 mm circle or at the
                         # goal plane. No minimum-speed floor or creep retry.
@@ -811,7 +846,7 @@ def generate_launch_description() -> LaunchDescription:
                         # within 20 mm; radial20 adds no manager 3 s dwell.
                         "terminal_stop_mode": TERMINAL_STOP_MODE,
                         "radial_stop_radial_tolerance_m": 0.020,
-                        "radial_stop_terminal_guidance_distance_m": 0.75,
+                        "radial_stop_terminal_guidance_distance_m": 0.90,
                         "radial_stop_conservative_decel_mps2": 0.75,
                         "radial_stop_brake_margin_m": 0.003,
                         "radial_stop_stationary_window_sec": 0.50,

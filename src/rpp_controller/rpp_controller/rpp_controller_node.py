@@ -180,7 +180,7 @@ class RPPController(Node):
         # Distance-based acceleration profile. It is used at mission start
         # and re-armed after every completed marking before the next leg.
         self.declare_parameter("acceleration_enabled", True)
-        self.declare_parameter("acceleration_distance_m", 0.20)
+        self.declare_parameter("acceleration_distance_m", 0.80)
         self.declare_parameter("acceleration_startup_ceiling_mps", 0.15)
         self.declare_parameter("acceleration_max_progress_jump_m", 0.10)
         self.declare_parameter("acceleration_max_dt_sec", 0.10)
@@ -195,7 +195,7 @@ class RPPController(Node):
         # extension/dummy coordinate and reaches 0.15 m/s at the 30 mm boundary.
         # Pass-through/interpolation points do not activate this profile.
         self.declare_parameter("deceleration_enabled", True)
-        self.declare_parameter("deceleration_distance_m", 0.50)
+        self.declare_parameter("deceleration_distance_m", 0.80)
         self.declare_parameter(
             "deceleration_floor_speed_mps",
             0.15,
@@ -3610,6 +3610,12 @@ class RPPController(Node):
         ):
             raise ValueError(
                 "approach_min_speed_mps must be finite and in (0, cruise_speed]"
+            )
+        if self.radial20_active and self.approach_slowdown_enabled:
+            raise ValueError(
+                "approach_slowdown_enabled must be false in radial20 mode; "
+                "fixed semantic-goal deceleration is the sole production "
+                "terminal speed envelope"
             )
         if not (
             math.isfinite(self.moving_alignment_min_speed)
@@ -10395,9 +10401,17 @@ class RPPController(Node):
         position_derived_speed = self._radial_stop_position_derived_speed_mps(
             position_sample_time_sec
         )
+        fixed_distance_profile_speed = self.deceleration_speed_limit(
+            self.cruise_speed,
+            float(along_remaining),
+        )
         tracking_speed_command = max(
             0.0,
             float(self.precision_last_published_translational_speed_mps),
+        )
+        tracking_speed_command = min(
+            tracking_speed_command,
+            fixed_distance_profile_speed,
         )
         yaw_rate = (
             float(self.current_yaw_rate_radps)
@@ -11296,6 +11310,8 @@ class RPPController(Node):
             and (
                 self.radial_stop_request_armed
                 or goal_distance
+                <= self.radial_stop_config.terminal_guidance_distance_m
+                or goal_along_remaining
                 <= self.radial_stop_config.terminal_guidance_distance_m
             )
         ):

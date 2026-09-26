@@ -100,7 +100,7 @@ def test_wiring():
     assert "approach_speed_cap_mps" in publish
 
 
-def test_launch_enables_one_metre_proportional_with_010_floor():
+def test_launch_keeps_proportional_slowdown_disabled_for_radial20():
     tree = ast.parse(LAUNCH.read_text())
     values = {}
     for n in ast.walk(tree):
@@ -108,6 +108,6 @@ def test_launch_enables_one_metre_proportional_with_010_floor():
             for k, v in zip(n.keys, n.values):
                 if isinstance(k, ast.Constant) and isinstance(v, ast.Constant):
                     values.setdefault(k.value, v.value)
-    assert values["approach_slowdown_enabled"] is True
+    assert values["approach_slowdown_enabled"] is False
     assert values["approach_slowdown_distance_m"] == 1.00
     assert values["approach_min_speed_mps"] == 0.10
