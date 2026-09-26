@@ -428,7 +428,8 @@ class RoverBackendRosNode(Node):
     SPRAY_CONFIG_ACK_TIMEOUT_SEC = 1.50
 
     # These must match the configured AUX5 output endpoints in PX4.
-    SPRAY_PWM_MIN_US = 1000.0
+    # Must match PWM_AUX_MIN5/MAX5 on the FCU.
+    SPRAY_PWM_MIN_US = 800.0
     SPRAY_PWM_MAX_US = 2000.0
 
     def __init__(self) -> None:
