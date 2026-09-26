@@ -89,7 +89,7 @@ class SprayController(Node):
         # ==========================================================
         self.declare_parameter("enabled", True)
         self.declare_parameter("press_value", -1.0)
-        self.declare_parameter("release_value", -0.666667)
+        self.declare_parameter("release_value", 0.090909)
         self.declare_parameter("spray_duration_sec", 0.50)
         self.declare_parameter("pre_spray_stable_sec", 0.25)
 

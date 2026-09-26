@@ -247,16 +247,16 @@ def generate_launch_description() -> LaunchDescription:
                         # Confirmed Jetson/PX4 command path:
                         # MAV_CMD_DO_SET_ACTUATOR (187)
                         # param1 -> Actuator Set 1 -> AUX5.
-                        # PWM = 1400 + 600 * value with
-                        # PWM_AUX_MIN5/MAX5 = 800/2000.
-                        # Press: 800 us, the spray position.
+                        # PWM = 1450 + 550 * value with
+                        # PWM_AUX_MIN5/MAX5 = 900/2000.
+                        # Press: 900 us, the spray position.
                         "press_value": -1.0,
-                        # Release: 1000 us, the physically verified rest
-                        # position. Must equal PWM_AUX_DIS5/FAIL5: PX4
+                        # Release: 1500 us, the physically verified rest
+                        # position. Must equal PWM_AUX_DIS5: PX4
                         # outputs DIS5 while disarmed and the last
                         # commanded value while armed, so any mismatch
                         # moves the servo on every arm and disarm.
-                        "release_value": -0.666667,
+                        "release_value": 0.090909,
                         "spray_duration_sec": 0.50,
                         # mission_manager already requires <=30 mm radial error,
                         # <=0.01 m/s rover speed, then holds the marking point

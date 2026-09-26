@@ -429,7 +429,7 @@ class RoverBackendRosNode(Node):
 
     # These must match the configured AUX5 output endpoints in PX4.
     # Must match PWM_AUX_MIN5/MAX5 on the FCU.
-    SPRAY_PWM_MIN_US = 800.0
+    SPRAY_PWM_MIN_US = 900.0
     SPRAY_PWM_MAX_US = 2000.0
 
     def __init__(self) -> None:

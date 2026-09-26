@@ -5,8 +5,8 @@ frontend.
 
 The frontend works in PWM microseconds:
 
-     800 us -> -1.0 actuator command   (PWM_AUX_MIN5)
-    1400 us ->  0.0 actuator command
+     900 us -> -1.0 actuator command   (PWM_AUX_MIN5)
+    1450 us ->  0.0 actuator command
     2000 us -> +1.0 actuator command   (PWM_AUX_MAX5)
 
 The conversion and ROS acknowledgement are handled by ros_bridge.py.
@@ -68,13 +68,13 @@ def _validate_pwm(
             },
         ) from error
 
-    if pwm < 800.0 or pwm > 2000.0:
+    if pwm < 900.0 or pwm > 2000.0:
         raise HTTPException(
             status_code=422,
             detail={
                 "success": False,
                 "message": (
-                    f"{field_name} must be between " "800 and 2000 microseconds."
+                    f"{field_name} must be between " "900 and 2000 microseconds."
                 ),
             },
         )
